@@ -62,3 +62,39 @@ def test_result_shapes_finite_logz_and_equal_resampling() -> None:
     assert result.logwt.shape == (result.samples.shape[0],)
     assert jnp.isfinite(result.logz)
     assert result.resample_equal(random.PRNGKey(3), n=10).shape == (10, 3)
+
+
+def test_failure_to_replace_returns_result_with_live_contribution() -> None:
+    result = run_static_nested(
+        random.PRNGKey(4),
+        lambda theta: float(theta[0]),
+        lambda u: u,
+        ndim=1,
+        nlive=3,
+        dlogz=0.0,
+        maxiter=10,
+        max_attempts=1,
+    )
+
+    assert result.success is False
+    assert "max_attempts=1" in result.message
+    assert result.ncall > result.nlive
+    assert result.samples.shape[1:] == (1,)
+    assert result.logwt.shape == (result.samples.shape[0],)
+    assert jnp.isfinite(result.logz)
+
+
+def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
+    result = run_static_nested(
+        random.PRNGKey(5),
+        lambda theta: float(-(theta[0] ** 2)),
+        lambda u: u[0],
+        ndim=1,
+        nlive=5,
+        maxiter=0,
+    )
+
+    assert result.samples_u.shape == (5, 1)
+    assert result.samples.shape == (5, 1)
+    assert result.logl.shape == (5,)
+    assert result.logwt.shape == (5,)

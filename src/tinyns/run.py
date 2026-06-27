@@ -14,16 +14,38 @@ from tinyns.samplers import draw_constrained_prior
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
+def _as_points(array, ndim: int):
+    """Return an array with trailing dimension ``ndim`` for sample points."""
+
+    array = jnp.asarray(array)
+    if ndim == 1 and array.ndim == 1:
+        return array.reshape((-1, 1))
+    if array.shape[-1:] != (ndim,):
+        raise ValueError(f"point arrays must have trailing shape ({ndim},)")
+    return array
+
+
+def _as_point(array, ndim: int):
+    """Return a single point with shape ``(ndim,)``."""
+
+    array = jnp.asarray(array)
+    if ndim == 1 and array.shape == ():
+        return array.reshape((1,))
+    if array.shape != (ndim,):
+        raise ValueError(f"point must have shape ({ndim},)")
+    return array
+
+
 def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
     if vectorized:
-        return jnp.asarray(loglike(theta_live), dtype=float)
+        return jnp.asarray(loglike(theta_live), dtype=float).reshape((-1,))
     return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
 
 
-def _transform_live_points(prior_transform, u_live, *, vectorized: bool):
+def _transform_live_points(prior_transform, u_live, ndim: int, *, vectorized: bool):
     if vectorized:
-        return jnp.asarray(prior_transform(u_live))
-    return jnp.asarray([prior_transform(u) for u in u_live])
+        return _as_points(prior_transform(u_live), ndim)
+    return jnp.stack([_as_point(prior_transform(u), ndim) for u in u_live])
 
 
 def _logzerr(logwt, logl, logz: float, nlive: int) -> float:
@@ -64,7 +86,9 @@ def run_static_nested(
     key = random.PRNGKey(int(key)) if isinstance(key, int) else key
     key, init_key = random.split(key)
     live_u = random.uniform(init_key, shape=(nlive, ndim))
-    live_theta = _transform_live_points(prior_transform, live_u, vectorized=vectorized)
+    live_theta = _transform_live_points(
+        prior_transform, live_u, ndim, vectorized=vectorized
+    )
     live_logl = _evaluate_live_points(loglike, live_theta, vectorized=vectorized)
     ncall = nlive
 
@@ -102,14 +126,14 @@ def run_static_nested(
             max_attempts=max_attempts,
         )
         ncall += calls
-        live_u = live_u.at[worst].set(new_u)
-        live_theta = live_theta.at[worst].set(new_theta)
-        live_logl = live_logl.at[worst].set(new_logl)
-
         if not accepted:
             success = False
             message = f"max_attempts={max_attempts} hit during constrained prior draw"
             break
+
+        live_u = live_u.at[worst].set(new_u)
+        live_theta = live_theta.at[worst].set(new_theta)
+        live_logl = live_logl.at[worst].set(new_logl)
 
         logz_remain = logx_new + float(jnp.max(live_logl))
         delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
