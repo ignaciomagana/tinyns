@@ -692,7 +692,7 @@ def test_local_sampler_max_attempts_is_respected() -> None:
 def test_draw_constrained_rwalk_jax_counts_walks_on_easy_target() -> None:
     from tinyns.samplers import draw_constrained_rwalk_jax
 
-    walks = 7
+    walks = 5
     live_u = jnp.full((4, 2), 0.5)
     live_logl = jnp.zeros(4)
 
@@ -706,10 +706,65 @@ def test_draw_constrained_rwalk_jax_counts_walks_on_easy_target() -> None:
         2,
         walks=walks,
         step_scale=0.01,
+        max_attempts=100,
     )
 
     assert ncall == walks
     assert accepted is True
+    assert math.isfinite(logl)
+
+
+def test_draw_constrained_rwalk_jax_retries_until_chain_succeeds() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    walks = 3
+    live_u = jnp.asarray([[0.1], [0.95]])
+    live_logl = live_u[:, 0]
+
+    _, _, _, logl, ncall, accepted = draw_constrained_rwalk_jax(
+        random.PRNGKey(5),
+        lambda theta: theta[0],
+        identity_prior_transform,
+        0.9,
+        live_u,
+        live_logl,
+        1,
+        walks=walks,
+        step_scale=1e-6,
+        max_attempts=30,
+    )
+
+    assert accepted is True
+    assert ncall >= walks
+    assert ncall % walks == 0
+    assert logl >= 0.9
+
+
+def test_draw_constrained_rwalk_jax_exhausts_full_walk_batches() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    walks = 5
+    max_attempts = 12
+    live_u = jnp.full((4, 2), 0.5)
+    live_logl = jnp.zeros(4)
+
+    _, u, theta, logl, ncall, accepted = draw_constrained_rwalk_jax(
+        random.PRNGKey(321),
+        gaussian_loglike,
+        identity_prior_transform,
+        math.inf,
+        live_u,
+        live_logl,
+        2,
+        walks=walks,
+        step_scale=0.01,
+        max_attempts=max_attempts,
+    )
+
+    assert accepted is False
+    assert ncall == (max_attempts // walks) * walks
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
     assert math.isfinite(logl)
 
 

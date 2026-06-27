@@ -152,6 +152,8 @@ sampler = NestedSampler(
 
 This keeps the top-level nested-sampling loop in Python, but runs each constrained random-walk replacement on device using JAX. It is intended for GPU-native likelihoods where Python proposal-by-proposal synchronization is expensive.
 
+The JAX rwalk kernel matches the Python rwalk replacement semantics: it retries fresh live-point seeds until a full `walks`-step chain has at least `min_accepts` accepted moves or `max_attempts` is exhausted.
+
 Currently only `sample="rwalk"` supports `kernel="jax"`. Validate evidence calibration before using the experimental JAX kernel for production inference.
 
 ### `min_accepts`

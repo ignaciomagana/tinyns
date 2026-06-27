@@ -583,9 +583,7 @@ def test_progress_printer_pads_shorter_final_line(capsys) -> None:
 
     captured = capsys.readouterr()
     assert "sample=x" in captured.out
-    padded_short_line = "sample=x" + " " * (
-        len("sample=longer-name") - len("sample=x")
-    )
+    padded_short_line = "sample=x" + " " * (len("sample=longer-name") - len("sample=x"))
     assert padded_short_line in captured.out
     assert "\x1b" not in captured.out
     assert "[K" not in captured.out
@@ -612,8 +610,9 @@ def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
         walks=5,
         step_scale=0.05,
     )
-    result = sampler.run(random.PRNGKey(0), maxiter=20, dlogz=0.0)
+    result = sampler.run(random.PRNGKey(0), dlogz=10.0)
 
+    assert result.success is True
     assert math.isfinite(result.logz)
     assert result.metadata["kernel"] == "jax"
 
@@ -642,5 +641,5 @@ def test_jax_kernel_non_rwalk_raises(sample: str) -> None:
         sample=sample,
         kernel="jax",
     )
-    with pytest.raises(NotImplementedError, match="sample=\"rwalk\""):
+    with pytest.raises(NotImplementedError, match='sample="rwalk"'):
         sampler.run(random.PRNGKey(0), maxiter=1)
