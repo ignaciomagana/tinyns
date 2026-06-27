@@ -146,6 +146,90 @@ def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     assert isinstance(diagnostics["warnings"], list)
     assert diagnostics["information"] == result.information()
     assert diagnostics["nposterior"] == 4
+    assert "max_weight_fraction" in diagnostics
+    assert "posterior_weight_entropy" in diagnostics
+    assert "posterior_weight_entropy_fraction" in diagnostics
+    assert "live_weight_fraction" in diagnostics
+    assert "dead_weight_fraction" in diagnostics
+
+
+def test_max_weight_fraction_returns_expected_value() -> None:
+    result = make_result()
+    result.logwt = jnp.log(jnp.array([0.2, 0.3, 0.5]))
+
+    assert np.isclose(result.max_weight_fraction(), 0.5)
+
+
+def test_posterior_weight_entropy_is_finite_and_positive() -> None:
+    result = make_result()
+
+    entropy = result.posterior_weight_entropy()
+
+    assert np.isfinite(entropy)
+    assert entropy > 0.0
+
+
+def test_posterior_weight_entropy_fraction_near_one_for_equal_weights() -> None:
+    result = make_result()
+    result.logwt = jnp.zeros(10)
+
+    assert np.isclose(result.posterior_weight_entropy_fraction(), 1.0)
+
+
+def test_degenerate_weights_have_high_max_weight_and_low_entropy_fraction() -> None:
+    result = make_result()
+    result.logwt = jnp.concatenate([jnp.array([0.0]), jnp.full(99, -1000.0)])
+
+    assert result.max_weight_fraction() > 0.9
+    assert result.posterior_weight_entropy_fraction() < 0.1
+
+
+def test_live_weight_fraction_uses_nlive_final_metadata() -> None:
+    result = make_result()
+    result.logwt = jnp.log(jnp.array([0.1, 0.2, 0.3, 0.4]))
+    result.metadata = {"nlive_final": 2}
+
+    assert np.isclose(result.live_weight_fraction(), 0.7)
+
+
+def test_dead_and_live_weight_fractions_sum_to_one_with_valid_metadata() -> None:
+    result = make_result()
+    result.logwt = jnp.log(jnp.array([0.1, 0.2, 0.3, 0.4]))
+    result.metadata = {"nlive_final": 2}
+
+    total_weight_fraction = (
+        result.dead_weight_fraction() + result.live_weight_fraction()
+    )
+
+    assert np.isclose(total_weight_fraction, 1.0)
+
+
+def test_diagnostics_high_live_weight_triggers_warning() -> None:
+    result = make_result()
+    result.logwt = jnp.log(jnp.array([0.1, 0.1, 0.4, 0.4]))
+    result.metadata = {"nlive_final": 2, "dlogz": 0.1}
+
+    diagnostics = result.diagnostics()
+
+    assert (
+        "final live points carry most posterior weight; consider tighter dlogz or "
+        "more live points"
+    ) in diagnostics["warnings"]
+    assert (
+        "large final-live weight fraction; evidence may be sensitive to stopping"
+    ) in diagnostics["warnings"]
+
+
+def test_diagnostics_high_max_weight_triggers_warning() -> None:
+    result = make_result()
+    result.logwt = jnp.log(jnp.array([0.85, 0.05, 0.05, 0.05]))
+
+    diagnostics = result.diagnostics()
+
+    assert (
+        "posterior dominated by a small number of weighted samples"
+        in diagnostics["warnings"]
+    )
 
 
 def test_diagnostics_includes_iteration_counts_when_present() -> None:

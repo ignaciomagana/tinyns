@@ -106,6 +106,12 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "niter": diagnostics.get("niter"),
         "ndead": diagnostics.get("ndead"),
         "posterior_ess": float(result.posterior_ess()),
+        "live_weight_fraction": diagnostics.get("live_weight_fraction"),
+        "dead_weight_fraction": diagnostics.get("dead_weight_fraction"),
+        "max_weight_fraction": diagnostics.get("max_weight_fraction"),
+        "posterior_weight_entropy_fraction": diagnostics.get(
+            "posterior_weight_entropy_fraction"
+        ),
         "success": bool(result.success),
         "message": str(result.message),
         "warnings": diagnostics.get("warnings", []),

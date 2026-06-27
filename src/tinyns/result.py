@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numbers
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,6 +72,60 @@ class NestedSamplingResult:
 
         return float(effective_sample_size_from_log_weights(self.logwt))
 
+    def max_weight_fraction(self) -> float:
+        """Return the largest normalized posterior weight fraction."""
+
+        weights = self.weights()
+        if weights.size == 0:
+            return 0.0
+        return float(jnp.max(weights))
+
+    def posterior_weight_entropy(self) -> float:
+        """Return the Shannon entropy of normalized posterior weights."""
+
+        weights = self.weights()
+        if weights.size == 0:
+            return 0.0
+        positive = weights > 0.0
+        return float(-jnp.sum(weights[positive] * jnp.log(weights[positive])))
+
+    def posterior_weight_entropy_fraction(self) -> float:
+        """Return posterior weight entropy as a fraction of equal-weight entropy."""
+
+        n = int(jnp.asarray(self.logwt).size)
+        if n <= 1:
+            return 0.0
+        fraction = self.posterior_weight_entropy() / float(jnp.log(n))
+        return float(jnp.clip(fraction, 0.0, 1.0))
+
+    def live_weight_fraction(self) -> float:
+        """Return posterior weight fraction in final live points.
+
+        The sampler records final live points as the last ``metadata["nlive_final"]``
+        weighted samples. If this metadata is missing or invalid, return ``0.0``
+        so diagnostics remain simple and conservative.
+        """
+
+        metadata = {} if self.metadata is None else self.metadata
+        nlive_final = metadata.get("nlive_final")
+        nweights = int(jnp.asarray(self.logwt).size)
+        if (
+            nlive_final is None
+            or not isinstance(nlive_final, numbers.Integral)
+            or nlive_final <= 0
+            or nlive_final > nweights
+        ):
+            return 0.0
+        return float(jnp.sum(self.weights()[-nlive_final:]))
+
+    def dead_weight_fraction(self) -> float:
+        """Return posterior weight fraction in dead points."""
+
+        live_fraction = self.live_weight_fraction()
+        if live_fraction <= 0.0:
+            return 0.0
+        return float(jnp.clip(1.0 - live_fraction, 0.0, 1.0))
+
     def insertion_indices(self):
         """Return recorded live-point insertion indices, if available."""
 
@@ -93,12 +148,31 @@ class NestedSamplingResult:
         metadata = {} if self.metadata is None else self.metadata
         posterior_ess = self.posterior_ess()
         nposterior = int(jnp.asarray(self.logwt).size)
+        max_weight_fraction = self.max_weight_fraction()
+        posterior_weight_entropy = self.posterior_weight_entropy()
+        entropy_fraction = self.posterior_weight_entropy_fraction()
+        live_weight_fraction = self.live_weight_fraction()
+        dead_weight_fraction = self.dead_weight_fraction()
         warnings: list[str] = []
 
         if not self.success:
             warnings.append(self.message)
         if posterior_ess < 100.0:
             warnings.append("low posterior ESS")
+        if max_weight_fraction > 0.1:
+            warnings.append("posterior dominated by a small number of weighted samples")
+        if entropy_fraction < 0.5:
+            warnings.append("low posterior weight entropy")
+        if live_weight_fraction > 0.5:
+            warnings.append(
+                "final live points carry most posterior weight; consider tighter "
+                "dlogz or more live points"
+            )
+        if live_weight_fraction > 0.25 and metadata.get("dlogz", 0.0) >= 0.1:
+            warnings.append(
+                "large final-live weight fraction; evidence may be sensitive to "
+                "stopping"
+            )
 
         replacement_failures = metadata.get("replacement_failures")
         if replacement_failures is not None and replacement_failures > 0:
@@ -135,6 +209,11 @@ class NestedSamplingResult:
             "logzerr": float(self.logzerr),
             "information": self.information(),
             "posterior_ess": posterior_ess,
+            "max_weight_fraction": max_weight_fraction,
+            "posterior_weight_entropy": posterior_weight_entropy,
+            "posterior_weight_entropy_fraction": entropy_fraction,
+            "live_weight_fraction": live_weight_fraction,
+            "dead_weight_fraction": dead_weight_fraction,
             "ncall": int(self.ncall),
             "nlive": int(self.nlive),
             "ndim": int(self.ndim),
