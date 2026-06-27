@@ -9,16 +9,19 @@ estimates.
 ## Current status and limitations
 
 This is an early, static nested-sampling implementation intended for correctness
-experiments and low-dimensional examples. The only replacement sampler currently
-implemented is brute-force rejection from the prior: it repeatedly draws a fresh
-unit-cube point and keeps it only if its likelihood exceeds the current nested
-sampling threshold. That approach is simple and useful for toy problems, but it
-becomes inefficient very quickly as dimension or likelihood concentration grows.
+experiments and low-dimensional examples. The default replacement sampler,
+`sample="prior"`, is brute-force rejection from the prior: it repeatedly draws a
+fresh unit-cube point and keeps it only if its likelihood exceeds the current
+nested-sampling threshold. That approach is correctness-first and useful for toy
+problems, but it becomes inefficient very quickly as dimension or likelihood
+concentration grows.
 
 In particular:
 
-- only `sample="prior"` is supported;
-- no random-walk, slice, or MCMC constrained sampler is implemented yet;
+- this is static nested sampling only; dynamic nested sampling is not
+  implemented;
+- no slice sampler is implemented;
+- no fully vectorized replacement sampler is implemented yet;
 - replacement attempts are capped by `max_attempts`, and hitting that cap returns
   `success=False` with the partial result rather than raising during the run;
 - evidence and live-point bookkeeping are included, but error estimates are only
@@ -44,5 +47,32 @@ key = jax.random.PRNGKey(0)
 sampler = NestedSampler(loglike, prior_transform, ndim=1, nlive=200)
 result = sampler.run(key, dlogz=0.1)
 
+print(result.summary())
+```
+
+
+## Random-walk constrained sampler
+
+For slightly less wasteful constrained draws, `sample="rwalk"` starts from an
+existing live point and performs reflected Gaussian random-walk moves in the unit
+cube, accepting only proposals whose likelihood remains above the current nested
+sampling threshold. The `walks` option controls how many accepted-or-rejected
+proposal steps are attempted for each replacement, and `step_scale` controls the
+Gaussian proposal scale in unit-cube coordinates.
+
+This sampler is still deliberately simple. It is useful for small examples, but
+it is not yet a production-grade multimodal sampler.
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim=2,
+    nlive=200,
+    sample="rwalk",
+    walks=25,
+    step_scale=0.1,
+)
+result = sampler.run(key, dlogz=0.5)
 print(result.summary())
 ```
