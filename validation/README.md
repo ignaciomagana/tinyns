@@ -18,3 +18,6 @@ Suggested workflow:
 python validation/run_validation.py --output validation_results.json
 python validation/summarize_validation.py validation_results.json
 ```
+
+
+`rslice` is available in the validation harness and is a useful comparison against coordinate-wise `slice`, especially on correlated targets. It remains a local, simple random-direction constrained slice sampler in the unit cube, not a full PolyChord-style slice sampler.

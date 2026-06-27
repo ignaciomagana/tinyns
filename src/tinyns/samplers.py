@@ -233,6 +233,104 @@ def draw_constrained_slice(
     return new_key, best_u, best_theta, best_logl, ncall, False
 
 
+def draw_constrained_rslice(
+    key: PRNGKeyLike,
+    loglike: LogLikelihood,
+    prior_transform: PriorTransform,
+    logl_min: float,
+    live_u,
+    live_logl,
+    ndim: int,
+    *,
+    slices: int = 5,
+    slice_steps: int = 10,
+    step_scale: float = 0.1,
+    max_attempts: int = 10_000,
+):
+    """Draw a constrained replacement with random-direction slice updates.
+
+    A live point is chosen as the seed. The copied seed does not count as a
+    successful replacement; at least one random-direction proposal must satisfy
+    the likelihood constraint. Proposals are reflected into the unit cube before
+    evaluating ``prior_transform`` and ``loglike``.
+    """
+    if ndim <= 0:
+        raise ValueError("ndim must be a positive integer")
+    if slices <= 0:
+        raise ValueError("slices must be a positive integer")
+    if slice_steps <= 0:
+        raise ValueError("slice_steps must be a positive integer")
+    if step_scale <= 0:
+        raise ValueError("step_scale must be positive")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be a positive integer")
+
+    live_u = jnp.asarray(live_u)
+    live_logl = jnp.asarray(live_logl)
+    if live_u.ndim != 2 or live_u.shape[1] != ndim:
+        raise ValueError(f"live_u must have shape (nlive, {ndim})")
+    nlive = live_u.shape[0]
+    if nlive <= 0:
+        raise ValueError("live_u must contain at least one live point")
+    if live_logl.shape != (nlive,):
+        raise ValueError(f"live_logl must have shape ({nlive},)")
+
+    new_key, seed_key = random.split(key)
+    seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
+    current_u = live_u[seed_idx]
+    current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
+    current_logl = float(live_logl[seed_idx])
+
+    best_u = current_u
+    best_theta = current_theta
+    best_logl = current_logl
+    ncall = 0
+
+    for _ in range(max_attempts):
+        moved = False
+        for _ in range(slices):
+            new_key, direction_key, bracket_key = random.split(new_key, 3)
+            direction = random.normal(direction_key, shape=(ndim,))
+            norm = float(jnp.linalg.norm(direction))
+            if not math.isfinite(norm) or norm <= 0.0:
+                continue
+            direction = direction / norm
+
+            r = random.uniform(bracket_key, shape=())
+            left = -r * step_scale
+            right = left + step_scale
+
+            for _ in range(slice_steps):
+                new_key, proposal_key = random.split(new_key)
+                alpha = left + random.uniform(proposal_key, shape=()) * (right - left)
+                u_prop = reflect_unit_cube(current_u + alpha * direction)
+                theta_prop = _validate_theta_shape(prior_transform(u_prop), ndim)
+                logl_prop = float(loglike(theta_prop))
+                ncall += 1
+
+                if logl_prop > best_logl:
+                    best_u = u_prop
+                    best_theta = theta_prop
+                    best_logl = logl_prop
+
+                if logl_prop >= logl_min:
+                    current_u = u_prop
+                    current_theta = theta_prop
+                    current_logl = logl_prop
+                    moved = True
+                    break
+
+                if bool(alpha < 0):
+                    left = alpha
+                else:
+                    right = alpha
+
+        if moved:
+            return new_key, current_u, current_theta, current_logl, ncall, True
+
+    return new_key, best_u, best_theta, best_logl, ncall, False
+
+
 def draw_constrained_rwalk(
     key: PRNGKeyLike,
     loglike: LogLikelihood,

@@ -87,10 +87,11 @@ partial `NestedSamplingResult`.
 | `"prior"` | Brute-force rejection from the prior; robust and correctness-first, but inefficient as dimension or likelihood concentration grows. |
 | `"rwalk"` | Reflected random-walk constrained sampler in the unit cube. |
 | `"slice"` | Coordinate-wise constrained slice sampler in the unit cube. |
+| `"rslice"` | Random-direction constrained slice sampler in the unit cube; often better for correlated targets than coordinate-wise `"slice"`. |
 
 `sample="prior"` supports vectorized replacement proposals with
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
-Vectorized `rwalk` and `slice` are not implemented yet.
+Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
 ## Design philosophy
 
@@ -111,7 +112,7 @@ programming language.
 - Static nested sampling only.
 - No dynamic nested sampling.
 - No full ellipsoidal bounding.
-- No full vectorized `rwalk` or `slice` replacement sampler.
+- No full vectorized `rwalk`, `slice`, or `rslice` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
 - Replacement attempts are capped by `max_attempts`; hitting the cap returns
   `success=False` with a partial result rather than raising during the run.

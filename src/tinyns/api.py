@@ -26,14 +26,14 @@ class NestedSampler:
     vectorized:
         Whether ``loglike`` and ``prior_transform`` accept batches of points.
     sample:
-        Sampling strategy. ``"prior"``, ``"rwalk"``, and ``"slice"`` are
+        Sampling strategy. ``"prior"``, ``"rwalk"``, ``"slice"``, and ``"rslice"`` are
         currently supported.
     max_attempts:
         Cap on rejection attempts per constrained prior draw.
     **kwargs:
         Additional sampler options. ``walks`` and ``step_scale`` are used by
         ``sample="rwalk"``; ``slices``, ``slice_steps``, and ``step_scale`` are
-        used by ``sample="slice"``.
+        used by ``sample="slice"`` and ``sample="rslice"``.
     """
 
     def __init__(
@@ -52,8 +52,10 @@ class NestedSampler:
             raise ValueError("ndim must be a positive integer")
         if nlive <= 0:
             raise ValueError("nlive must be a positive integer")
-        if sample not in {"prior", "rwalk", "slice"}:
-            raise ValueError("sample must be one of {'prior', 'rwalk', 'slice'}")
+        if sample not in {"prior", "rwalk", "slice", "rslice"}:
+            raise ValueError(
+                "sample must be one of {'prior', 'rwalk', 'slice', 'rslice'}"
+            )
         if not callable(loglike):
             raise TypeError("loglike must be callable")
         if not callable(prior_transform):

@@ -54,7 +54,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
-    elif sampler_name == "slice":
+    elif sampler_name in {"slice", "rslice"}:
         kwargs["slices"] = args.slices
         kwargs["slice_steps"] = args.slice_steps
 
@@ -125,7 +125,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["gaussian1d", "gaussian2d", "correlated_gaussian2d"],
     )
-    parser.add_argument("--samplers", nargs="+", default=["prior", "rwalk", "slice"])
+    parser.add_argument(
+        "--samplers", nargs="+", default=["prior", "rwalk", "slice", "rslice"]
+    )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--dlogz", type=float, default=0.1)
