@@ -45,6 +45,10 @@ def draw_constrained_prior(
         new_key, draw_key = random.split(new_key)
         u = random.uniform(draw_key, shape=(ndim,))
         theta = jnp.asarray(prior_transform(u))
+        if ndim == 1 and theta.shape == ():
+            theta = theta.reshape((1,))
+        if theta.shape != (ndim,):
+            raise ValueError(f"prior_transform must return shape ({ndim},)")
         logl = float(loglike(theta))
 
         if best_u is None or logl > best_logl:
