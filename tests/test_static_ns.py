@@ -355,3 +355,122 @@ def test_vectorized_loglike_wrong_initial_shape_raises() -> None:
             maxiter=0,
             vectorized=True,
         )
+
+
+def test_progress_interval_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="progress_interval"):
+        run_static_nested(
+            random.PRNGKey(20),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=1,
+            nlive=5,
+            maxiter=1,
+            progress_interval=0,
+        )
+
+
+def test_callback_interval_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="callback_interval"):
+        run_static_nested(
+            random.PRNGKey(21),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=1,
+            nlive=5,
+            maxiter=1,
+            callback_interval=0,
+        )
+
+
+def test_callback_must_be_callable() -> None:
+    with pytest.raises(TypeError, match="callback"):
+        run_static_nested(
+            random.PRNGKey(22),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=1,
+            nlive=5,
+            maxiter=1,
+            callback="not callable",
+        )
+
+
+def test_callback_is_called_during_short_run() -> None:
+    states = []
+
+    result = run_static_nested(
+        random.PRNGKey(23),
+        lambda theta: 0.0,
+        lambda u: u,
+        ndim=1,
+        nlive=5,
+        maxiter=3,
+        callback=states.append,
+        callback_interval=1,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert states
+    assert {"iter", "logz", "dlogz", "ncall", "sample"}.issubset(states[0])
+
+
+def test_callback_can_stop_run_gracefully() -> None:
+    def callback(state):
+        return False if state["iter"] >= 2 else None
+
+    result = run_static_nested(
+        random.PRNGKey(24),
+        lambda theta: 0.0,
+        lambda u: u,
+        ndim=1,
+        nlive=5,
+        maxiter=10,
+        callback=callback,
+        callback_interval=1,
+    )
+
+    assert result.success is False
+    assert result.message == "stopped by callback"
+    assert result.metadata["stopped_by_callback"] is True
+    assert jnp.isfinite(result.logz)
+    assert result.samples.shape[0] > 0
+
+
+def test_progress_true_does_not_crash(capsys) -> None:
+    run_static_nested(
+        random.PRNGKey(25),
+        lambda theta: 0.0,
+        lambda u: u,
+        ndim=1,
+        nlive=5,
+        maxiter=2,
+        progress=True,
+        progress_interval=1,
+    )
+
+    captured = capsys.readouterr()
+    assert "iter=" in captured.out
+    assert "logz=" in captured.out
+
+
+def test_format_progress_line_contains_core_fields() -> None:
+    from tinyns.run import _format_progress_line
+
+    line = _format_progress_line(
+        {
+            "iter": 1,
+            "logz": -5.0,
+            "dlogz": 0.1,
+            "ncall": 10,
+            "logl_min": -1.0,
+            "logl_live_max": 2.0,
+            "replacement_mean_ncall_so_far": 3.0,
+            "sample": "slice",
+        }
+    )
+
+    assert isinstance(line, str)
+    assert "iter=" in line
+    assert "logz=" in line
+    assert "dlogz=" in line
