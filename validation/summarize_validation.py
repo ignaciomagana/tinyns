@@ -50,6 +50,12 @@ def _recommendation(summary: dict) -> str:
         return "try smaller dlogz or more live points"
     if (summary.get("mean_max_weight_fraction") or 0.0) > 0.1:
         return "posterior weights concentrated; increase nlive"
+    max_rank_mean_z = summary.get("max_abs_insertion_rank_mean_z")
+    if max_rank_mean_z is not None and max_rank_mean_z > 4:
+        return "statistically significant insertion-rank bias"
+    mean_rank_mean_z = summary.get("mean_abs_insertion_rank_mean_z")
+    if mean_rank_mean_z is not None and mean_rank_mean_z > 3:
+        return "systematic insertion-rank bias"
     mean_rank_error = summary.get("mean_abs_insertion_rank_mean_error")
     if mean_rank_error is not None and mean_rank_error > 0.1:
         return "suspicious insertion ranks: possible constrained-sampler bias"
@@ -94,6 +100,16 @@ def summarize_results(results: list[dict]) -> list[dict]:
             row["insertion_rank_std_error"]
             for row in rows
             if row.get("insertion_rank_std_error") is not None
+        ]
+        insertion_rank_mean_z_scores = [
+            row["insertion_rank_mean_z"]
+            for row in rows
+            if row.get("insertion_rank_mean_z") is not None
+        ]
+        insertion_rank_std_ratios = [
+            row["insertion_rank_std_ratio"]
+            for row in rows
+            if row.get("insertion_rank_std_ratio") is not None
         ]
         summary = {
             "target": target,
@@ -196,6 +212,17 @@ def summarize_results(results: list[dict]) -> list[dict]:
             "mean_abs_insertion_rank_std_error": _mean_or_none(
                 [abs(error) for error in insertion_rank_std_errors]
             ),
+            "mean_abs_insertion_rank_mean_z": _mean_or_none(
+                [abs(score) for score in insertion_rank_mean_z_scores]
+            ),
+            "max_abs_insertion_rank_mean_z": (
+                max(abs(score) for score in insertion_rank_mean_z_scores)
+                if insertion_rank_mean_z_scores
+                else None
+            ),
+            "mean_insertion_rank_std_ratio": _mean_or_none(
+                insertion_rank_std_ratios
+            ),
             "mean_posterior_std": _row_mean_or_none(
                 [row.get("posterior_std") for row in rows]
             ),
@@ -238,6 +265,8 @@ def print_table(summaries: list[dict]) -> None:
         "mean_posterior_ess",
         "mean_abs_insertion_rank_mean_error",
         "mean_abs_insertion_rank_std_error",
+        "mean_abs_insertion_rank_mean_z",
+        "mean_insertion_rank_std_ratio",
         "recommendation",
     ]
     labels = {
@@ -252,6 +281,8 @@ def print_table(summaries: list[dict]) -> None:
         "mean_posterior_ess": "mean_ess",
         "mean_abs_insertion_rank_mean_error": "rank_mean_err",
         "mean_abs_insertion_rank_std_error": "rank_std_err",
+        "mean_abs_insertion_rank_mean_z": "rank_mean_z",
+        "mean_insertion_rank_std_ratio": "rank_std_ratio",
     }
     widths = {
         col: max(len(labels.get(col, col)), *(len(_fmt(row[col])) for row in summaries))

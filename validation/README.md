@@ -51,6 +51,8 @@ Insertion ranks test whether new constrained replacements are distributed like d
 
 Large systematic deviations can indicate biased or poorly mixed constrained replacement samplers, even when a run reports `success=True`.
 
+Insertion-rank mean errors should be interpreted with their sampling uncertainty. A small absolute rank-mean error can be significant when thousands of insertion ranks are recorded. Validation summaries therefore report insertion-rank z-scores.
+
 Qualitative targets such as `ring2d` may not have analytic evidence references. For these targets, inspect posterior summaries, insertion-rank behavior, replacement failures, and seed-to-seed stability.
 
 ## Comparing sampler settings

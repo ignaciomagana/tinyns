@@ -165,10 +165,12 @@ def draw_constrained_slice(
 ):
     """Draw a constrained replacement with coordinate-wise slice updates.
 
-    A live point is chosen as the seed. The copied live seed does not count
-    toward ``min_accepts``; at least ``min_accepts`` accepted constrained moves
-    are required. Proposals are reflected into the unit cube before evaluating
-    ``prior_transform`` and ``loglike``.
+    A live point is chosen as the seed. ``slices`` is the number of coordinate
+    update attempts per replacement attempt. The copied live seed does not count
+    toward ``min_accepts``; ``min_accepts`` is a minimum accepted-move sanity
+    check after the full update length, not a chain length. Proposals are
+    reflected into the unit cube before evaluating ``prior_transform`` and
+    ``loglike``.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -192,19 +194,20 @@ def draw_constrained_slice(
     if live_logl.shape != (nlive,):
         raise ValueError(f"live_logl must have shape ({nlive},)")
 
-    new_key, seed_key = random.split(key)
-    seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
-    current_u = live_u[seed_idx]
-    current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
-    current_logl = float(live_logl[seed_idx])
-
     best_u = None
     best_theta = None
     best_logl = -math.inf
     ncall = 0
-    accepted_moves = 0
+    new_key = key
 
     while ncall < max_attempts:
+        new_key, seed_key = random.split(new_key)
+        seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
+        current_u = live_u[seed_idx]
+        current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
+        current_logl = float(live_logl[seed_idx])
+        accepted_moves = 0
+
         for _ in range(slices):
             if ncall >= max_attempts:
                 break
@@ -235,8 +238,6 @@ def draw_constrained_slice(
                     current_theta = theta_prop
                     current_logl = logl_prop
                     accepted_moves += 1
-                    if accepted_moves >= min_accepts:
-                        break
                     # Continue with the next coordinate update after a
                     # successful constrained move.
                     break
@@ -245,8 +246,6 @@ def draw_constrained_slice(
                     left = x_prop
                 else:
                     right = x_prop
-            if accepted_moves >= min_accepts:
-                break
 
         if accepted_moves >= min_accepts:
             return new_key, current_u, current_theta, current_logl, ncall, True
@@ -271,9 +270,11 @@ def draw_constrained_rslice(
 ):
     """Draw a constrained replacement with random-direction slice updates.
 
-    A live point is chosen as the seed. The copied live seed does not count
-    toward ``min_accepts``; at least ``min_accepts`` accepted constrained moves
-    are required. Proposals are reflected into the unit cube before evaluating
+    A live point is chosen as the seed. ``slices`` is the number of
+    random-direction update attempts per replacement attempt. The copied live
+    seed does not count toward ``min_accepts``; ``min_accepts`` is a minimum
+    accepted-move sanity check after the full update length, not a chain length.
+    Proposals are reflected into the unit cube before evaluating
     ``prior_transform`` and ``loglike``.
     """
     if ndim <= 0:
@@ -298,19 +299,20 @@ def draw_constrained_rslice(
     if live_logl.shape != (nlive,):
         raise ValueError(f"live_logl must have shape ({nlive},)")
 
-    new_key, seed_key = random.split(key)
-    seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
-    current_u = live_u[seed_idx]
-    current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
-    current_logl = float(live_logl[seed_idx])
-
-    best_u = current_u
-    best_theta = current_theta
-    best_logl = current_logl
+    best_u = None
+    best_theta = None
+    best_logl = -math.inf
     ncall = 0
-    accepted_moves = 0
+    new_key = key
 
     while ncall < max_attempts:
+        new_key, seed_key = random.split(new_key)
+        seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
+        current_u = live_u[seed_idx]
+        current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
+        current_logl = float(live_logl[seed_idx])
+        accepted_moves = 0
+
         for _ in range(slices):
             if ncall >= max_attempts:
                 break
@@ -345,8 +347,6 @@ def draw_constrained_rslice(
                     current_theta = theta_prop
                     current_logl = logl_prop
                     accepted_moves += 1
-                    if accepted_moves >= min_accepts:
-                        break
                     # Continue with the next random-direction update after a
                     # successful constrained move.
                     break
@@ -355,8 +355,6 @@ def draw_constrained_rslice(
                     left = alpha
                 else:
                     right = alpha
-            if accepted_moves >= min_accepts:
-                break
 
         if accepted_moves >= min_accepts:
             return new_key, current_u, current_theta, current_logl, ncall, True
@@ -380,10 +378,10 @@ def draw_constrained_rwalk(
 ):
     """Draw a constrained replacement with a reflected random walk.
 
-    A live point is chosen as the seed, then Gaussian proposals are reflected
-    into the unit cube. The copied live seed does not count toward
-    ``min_accepts``; at least ``min_accepts`` accepted constrained moves are
-    required.
+    A live point is chosen as the seed, then ``walks`` reflected Gaussian
+    transition proposals are attempted per replacement attempt. The copied live
+    seed does not count toward ``min_accepts``; ``min_accepts`` is a minimum
+    accepted-move sanity check after the full update length, not a chain length.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -405,19 +403,20 @@ def draw_constrained_rwalk(
     if live_logl.shape != (nlive,):
         raise ValueError(f"live_logl must have shape ({nlive},)")
 
-    new_key, seed_key = random.split(key)
-    seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
-    current_u = live_u[seed_idx]
-    current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
-    current_logl = float(live_logl[seed_idx])
-
     best_u = None
     best_theta = None
     best_logl = -math.inf
     ncall = 0
-    accepted_moves = 0
+    new_key = key
 
     while ncall < max_attempts:
+        new_key, seed_key = random.split(new_key)
+        seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
+        current_u = live_u[seed_idx]
+        current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
+        current_logl = float(live_logl[seed_idx])
+        accepted_moves = 0
+
         for _ in range(walks):
             if ncall >= max_attempts:
                 break
@@ -438,8 +437,6 @@ def draw_constrained_rwalk(
                 current_theta = theta_prop
                 current_logl = logl_prop
                 accepted_moves += 1
-                if accepted_moves >= min_accepts:
-                    break
 
         if accepted_moves >= min_accepts:
             return new_key, current_u, current_theta, current_logl, ncall, True

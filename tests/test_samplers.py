@@ -567,3 +567,123 @@ def test_min_accepts_impossible_budget_returns_unaccepted(draw, kwargs) -> None:
 
     assert accepted is False
     assert ncall == 1
+
+
+def test_draw_constrained_rwalk_walks_are_full_update_length() -> None:
+    ndim = 2
+    live_u = jnp.array([[0.4, 0.5], [0.6, 0.5]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    *_, ncall, accepted = draw_constrained_rwalk(
+        random.PRNGKey(100),
+        gaussian_loglike,
+        identity_prior_transform,
+        -100.0,
+        live_u,
+        live_logl,
+        ndim,
+        walks=5,
+        step_scale=0.01,
+        max_attempts=20,
+        min_accepts=1,
+    )
+
+    assert accepted is True
+    assert ncall >= 5
+
+
+def test_draw_constrained_rwalk_single_walk_still_works() -> None:
+    ndim = 2
+    live_u = jnp.array([[0.4, 0.5], [0.6, 0.5]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    *_, ncall, accepted = draw_constrained_rwalk(
+        random.PRNGKey(101),
+        gaussian_loglike,
+        identity_prior_transform,
+        -100.0,
+        live_u,
+        live_logl,
+        ndim,
+        walks=1,
+        step_scale=0.01,
+        max_attempts=20,
+        min_accepts=1,
+    )
+
+    assert accepted is True
+    assert ncall == 1
+
+
+def test_draw_constrained_slice_slices_are_full_update_length_when_possible() -> None:
+    ndim = 2
+    live_u = jnp.array([[0.4, 0.5], [0.6, 0.5]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    *_, ncall, accepted = draw_constrained_slice(
+        random.PRNGKey(102),
+        gaussian_loglike,
+        identity_prior_transform,
+        -100.0,
+        live_u,
+        live_logl,
+        ndim,
+        slices=5,
+        slice_steps=3,
+        step_scale=0.01,
+        max_attempts=20,
+        min_accepts=1,
+    )
+
+    assert accepted is True
+    assert ncall > 1
+
+
+def test_draw_constrained_rslice_slices_are_full_update_length_when_possible() -> None:
+    ndim = 2
+    live_u = jnp.array([[0.4, 0.5], [0.6, 0.5]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    *_, ncall, accepted = draw_constrained_rslice(
+        random.PRNGKey(103),
+        gaussian_loglike,
+        identity_prior_transform,
+        -100.0,
+        live_u,
+        live_logl,
+        ndim,
+        slices=5,
+        slice_steps=3,
+        step_scale=0.01,
+        max_attempts=20,
+        min_accepts=1,
+    )
+
+    assert accepted is True
+    assert ncall > 1
+
+
+def test_local_sampler_max_attempts_is_respected() -> None:
+    ndim = 2
+    live_u = jnp.array([[0.4, 0.5], [0.6, 0.5]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    for sampler, kwargs in [
+        (draw_constrained_rwalk, {"walks": 5, "step_scale": 0.01}),
+        (draw_constrained_slice, {"slices": 5, "slice_steps": 3, "step_scale": 0.01}),
+        (draw_constrained_rslice, {"slices": 5, "slice_steps": 3, "step_scale": 0.01}),
+    ]:
+        *_, ncall, accepted = sampler(
+            random.PRNGKey(104),
+            gaussian_loglike,
+            identity_prior_transform,
+            math.inf,
+            live_u,
+            live_logl,
+            ndim,
+            max_attempts=2,
+            min_accepts=1,
+            **kwargs,
+        )
+        assert accepted is False
+        assert ncall == 2

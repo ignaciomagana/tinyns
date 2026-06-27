@@ -44,6 +44,8 @@ def insertion_rank_stats(result) -> dict:
         "insertion_rank_std": None,
         "insertion_rank_mean_error": None,
         "insertion_rank_std_error": None,
+        "insertion_rank_mean_z": None,
+        "insertion_rank_std_ratio": None,
     }
     if count < 2:
         return none_stats
@@ -57,12 +59,16 @@ def insertion_rank_stats(result) -> dict:
     rank_mean = float(np.mean(normalized_ranks))
     rank_std = float(np.std(normalized_ranks, ddof=1))
     expected_std = 1.0 / np.sqrt(12.0)
+    rank_mean_z = (rank_mean - 0.5) / np.sqrt((1.0 / 12.0) / count)
+    rank_std_ratio = rank_std / expected_std
     return {
         "insertion_rank_count": count,
         "insertion_rank_mean": rank_mean,
         "insertion_rank_std": rank_std,
         "insertion_rank_mean_error": rank_mean - 0.5,
         "insertion_rank_std_error": rank_std - expected_std,
+        "insertion_rank_mean_z": float(rank_mean_z),
+        "insertion_rank_std_ratio": float(rank_std_ratio),
     }
 
 
