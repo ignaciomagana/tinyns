@@ -65,7 +65,11 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         **kwargs,
     )
     result = sampler.run(
-        jax.random.PRNGKey(seed), dlogz=args.dlogz, maxiter=args.maxiter
+        jax.random.PRNGKey(seed),
+        dlogz=args.dlogz,
+        maxiter=args.maxiter,
+        progress=args.progress,
+        progress_interval=args.progress_interval,
     )
     diagnostics = result.diagnostics()
     sample_mean, sample_cov = _posterior_moments(result, seed)
@@ -131,6 +135,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slice-steps", type=int, default=10)
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--max-attempts", type=int, default=10000)
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show tinyns progress output for each validation run.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=100,
+        help="Progress print interval passed to NestedSampler.run.",
+    )
     parser.add_argument("--output", type=str, default=None)
     return parser.parse_args()
 
