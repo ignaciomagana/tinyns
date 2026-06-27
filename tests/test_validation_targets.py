@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from validation.targets import available_targets, gaussian_1d, get_target
@@ -12,6 +13,7 @@ def test_available_targets_contains_expected_names() -> None:
         "gaussian2d",
         "correlated_gaussian2d",
         "banana2d",
+        "ring2d",
         "eggbox2d",
     }
 
@@ -39,6 +41,22 @@ def test_correlated_gaussian_covariance_has_expected_off_diagonal() -> None:
     assert target.expected_cov is not None
     assert target.expected_cov[0, 1] == pytest.approx(0.8)
     assert target.expected_cov[1, 0] == pytest.approx(0.8)
+
+
+def test_ring_2d_target_has_expected_geometry() -> None:
+    target = get_target("ring2d")
+
+    assert target.ndim == 2
+    np.testing.assert_allclose(
+        np.asarray(target.prior_transform(jnp.array([0.5, 0.5]))),
+        np.array([0.0, 0.0]),
+    )
+
+    loglike_on_ring = float(target.loglike(jnp.array([1.0, 0.0])))
+    loglike_at_center = float(target.loglike(jnp.array([0.0, 0.0])))
+
+    assert loglike_on_ring == pytest.approx(0.0)
+    assert loglike_at_center < loglike_on_ring
 
 
 def test_unknown_target_raises_key_error() -> None:
