@@ -20,10 +20,11 @@ In particular:
 
 - this is static nested sampling only; dynamic nested sampling is not
   implemented;
-- no slice sampler is implemented;
+- `sample="slice"` provides a simple coordinate-wise constrained sampler in
+  the unit cube;
 - vectorized replacement is implemented for `sample="prior"` rejection draws;
-- vectorized `sample="rwalk"` is not implemented yet and currently raises
-  before the run starts;
+- vectorized `sample="rwalk"` and `sample="slice"` are not implemented yet
+  and currently raise before the run starts;
 - replacement attempts are capped by `max_attempts`, and hitting that cap returns
   `success=False` with the partial result rather than raising during the run;
 - evidence and live-point bookkeeping are included, but error estimates are only
@@ -59,7 +60,7 @@ If `sample="prior"` and `vectorized=True`, `tinyns` batches constrained
 prior-rejection replacement proposals. This can reduce callback overhead when
 your `prior_transform` and `loglike` naturally accept arrays, but it does **not**
 yet JIT or vectorize the whole nested-sampling loop. The loop remains a small
-Python loop, and vectorized `sample="rwalk"` is not implemented yet.
+Python loop, and vectorized `sample="rwalk"` and `sample="slice"` are not implemented yet.
 
 ```python
 def prior_transform(u):
@@ -115,3 +116,44 @@ sampler = NestedSampler(
 result = sampler.run(key, dlogz=0.5)
 print(result.summary())
 ```
+
+
+## Coordinate slice constrained sampler
+
+`sample="slice"` provides a simple coordinate-wise constrained sampler in the
+unit cube. For each replacement, it starts from an existing live point, picks
+coordinate axes, and proposes reflected one-dimensional slice moves that must
+stay above the current nested-sampling likelihood threshold. This can be a more
+robust alternative to naive prior rejection and the simple random-walk sampler
+for small low-dimensional examples.
+
+The main knobs are:
+
+- `slices`: how many coordinate-slice updates to try for each replacement
+  attempt.
+- `slice_steps`: how many shrinkage proposals to try inside each coordinate
+  slice update.
+- `step_scale`: the initial bracket width in unit-cube coordinates.
+
+This is intentionally modest: it is **not** a full PolyChord-style slice
+sampler, it is not vectorized yet, and the package remains static nested
+sampling only.
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim=2,
+    nlive=200,
+    sample="slice",
+    slices=5,
+    slice_steps=10,
+    step_scale=0.1,
+)
+result = sampler.run(key, dlogz=0.5)
+print(result.summary())
+```
+
+See `examples/gaussian_2d_slice.py` for a complete 2D Gaussian example that
+prints the expected log evidence and equally resampled posterior mean and
+covariance.
