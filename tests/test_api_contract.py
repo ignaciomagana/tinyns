@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tinyns import NestedSampler, NestedSamplingResult
+from tinyns import NestedSampler, NestedSamplingResult, run_static_nested
 
 
 def loglike(theta: np.ndarray) -> float:
@@ -17,9 +17,14 @@ def prior_transform(unit: np.ndarray) -> np.ndarray:
 def test_public_exports() -> None:
     import tinyns
 
-    assert tinyns.__all__ == ["NestedSampler", "NestedSamplingResult"]
+    assert tinyns.__all__ == [
+        "NestedSampler",
+        "NestedSamplingResult",
+        "run_static_nested",
+    ]
     assert tinyns.NestedSampler is NestedSampler
     assert tinyns.NestedSamplingResult is NestedSamplingResult
+    assert tinyns.run_static_nested is run_static_nested
 
 
 def test_nested_sampler_stores_configuration() -> None:
@@ -58,8 +63,16 @@ def test_nested_sampler_validates_configuration() -> None:
         NestedSampler(None, prior_transform, ndim=3)  # type: ignore[arg-type]
 
 
-def test_run_is_declared_but_not_implemented_yet() -> None:
-    sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=500)
+def test_nested_sampler_run_returns_result() -> None:
+    sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=20)
 
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        sampler.run(key=np.array([0, 0]), dlogz=0.1, maxiter=10, progress=False)
+    result = sampler.run(
+        key=np.array([0, 0], dtype=np.uint32),
+        dlogz=0.1,
+        maxiter=50,
+        progress=False,
+    )
+
+    assert isinstance(result, NestedSamplingResult)
+    assert result.ndim == 3
+    assert result.nlive == 20

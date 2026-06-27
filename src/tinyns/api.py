@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from tinyns.result import NestedSamplingResult
+from tinyns.run import run_static_nested
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
@@ -92,5 +93,16 @@ class NestedSampler:
             Whether to display progress information when implemented.
         """
 
-        _ = (key, dlogz, maxiter, progress)
-        raise NotImplementedError("NestedSampler.run is not implemented yet")
+        return run_static_nested(
+            key,
+            self.loglike,
+            self.prior_transform,
+            self.ndim,
+            self.nlive,
+            dlogz=dlogz,
+            maxiter=maxiter,
+            sample=self.sample,
+            vectorized=self.vectorized,
+            max_attempts=self.max_attempts,
+            progress=progress,
+        )
