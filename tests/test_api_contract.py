@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tinyns import NestedSampler, NestedSamplerResult, NestedSamplingResult
+from tinyns import NestedSampler, NestedSamplingResult
 
 
 def loglike(theta: np.ndarray) -> float:
@@ -17,14 +17,9 @@ def prior_transform(unit: np.ndarray) -> np.ndarray:
 def test_public_exports() -> None:
     import tinyns
 
-    assert tinyns.__all__ == [
-        "NestedSampler",
-        "NestedSamplingResult",
-        "NestedSamplerResult",
-    ]
+    assert tinyns.__all__ == ["NestedSampler", "NestedSamplingResult"]
     assert tinyns.NestedSampler is NestedSampler
     assert tinyns.NestedSamplingResult is NestedSamplingResult
-    assert tinyns.NestedSamplerResult is NestedSamplerResult
 
 
 def test_nested_sampler_stores_configuration() -> None:
