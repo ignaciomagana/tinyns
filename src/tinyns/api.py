@@ -163,6 +163,11 @@ class NestedSampler:
 
         state, checkpoint_config = load_checkpoint_npz(checkpoint_path)
         self._validate_checkpoint_config(checkpoint_config)
+        if not state.success and "max_attempts" in state.message:
+            raise ValueError(
+                "cannot resume checkpoint saved after replacement failure: "
+                f"{state.message}"
+            )
         output_path = (
             checkpoint_path if checkpoint_path_out is None else checkpoint_path_out
         )
