@@ -14,6 +14,7 @@ from tinyns.samplers import (
     draw_constrained_prior,
     draw_constrained_prior_vectorized,
     draw_constrained_rwalk,
+    draw_constrained_slice,
 )
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -82,23 +83,38 @@ def run_static_nested(
     batch_size: int = 128,
     walks: int = 25,
     step_scale: float = 0.1,
+    slices: int = 5,
+    slice_steps: int = 10,
 ):
-    """Run a simple static nested-sampling loop."""
+    """Run a simple static nested-sampling loop.
+
+    The replacement ``sample`` strategy may be ``"prior"``, ``"rwalk"``, or
+    ``"slice"``.
+    """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
-    if sample not in {"prior", "rwalk"}:
-        raise ValueError("sample must currently be one of {'prior', 'rwalk'}")
+    if sample not in {"prior", "rwalk", "slice"}:
+        raise ValueError("sample must be one of {'prior', 'rwalk', 'slice'}")
     if sample == "rwalk" and vectorized:
         raise NotImplementedError(
             'vectorized rwalk is not implemented yet; use vectorized=False '
             'with sample="rwalk"'
         )
+    if sample == "slice" and vectorized:
+        raise NotImplementedError(
+            'vectorized slice sampling is not implemented yet; use vectorized=False '
+            'with sample="slice"'
+        )
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
+    if slices <= 0:
+        raise ValueError("slices must be a positive integer")
+    if slice_steps <= 0:
+        raise ValueError("slice_steps must be a positive integer")
     if maxiter is None:
         maxiter = 10_000 * ndim
     if maxiter < 0:
@@ -175,7 +191,7 @@ def run_static_nested(
                     vectorized=False,
                     max_attempts=max_attempts,
                 )
-        else:
+        elif sample == "rwalk":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rwalk(
                 key,
                 loglike,
@@ -185,6 +201,20 @@ def run_static_nested(
                 live_logl,
                 ndim,
                 walks=walks,
+                step_scale=step_scale,
+                max_attempts=max_attempts,
+            )
+        else:
+            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
+                key,
+                loglike,
+                prior_transform,
+                logl_worst,
+                live_u,
+                live_logl,
+                ndim,
+                slices=slices,
+                slice_steps=slice_steps,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
             )
@@ -273,6 +303,8 @@ def run_static_nested(
             "nposterior": nposterior,
             "walks": walks,
             "step_scale": step_scale,
+            "slices": slices,
+            "slice_steps": slice_steps,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),

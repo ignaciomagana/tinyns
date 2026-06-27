@@ -136,6 +136,69 @@ def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
     assert result.metadata["step_scale"] == 0.2
 
 
+def test_static_nested_slice_1d_gaussian_returns_finite_logz() -> None:
+    def loglike(theta):
+        return float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi))
+
+    result = run_static_nested(
+        random.PRNGKey(14),
+        loglike,
+        lambda u: 20.0 * u - 10.0,
+        ndim=1,
+        nlive=40,
+        dlogz=0.1,
+        maxiter=300,
+        sample="slice",
+        slices=3,
+        slice_steps=5,
+        step_scale=0.2,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["sample"] == "slice"
+    assert result.metadata["slices"] == 3
+    assert result.metadata["slice_steps"] == 5
+
+
+def test_static_nested_slice_2d_gaussian_returns_finite_logz() -> None:
+    def loglike(theta):
+        return float(-0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi))
+
+    result = run_static_nested(
+        random.PRNGKey(15),
+        loglike,
+        lambda u: 20.0 * u - 10.0,
+        ndim=2,
+        nlive=50,
+        dlogz=0.2,
+        maxiter=400,
+        sample="slice",
+        slices=4,
+        slice_steps=6,
+        step_scale=0.2,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.samples.shape[1:] == (2,)
+    assert result.metadata["sample"] == "slice"
+
+
+def test_static_nested_vectorized_slice_raises_clear_error() -> None:
+    with pytest.raises(
+        NotImplementedError, match="vectorized slice sampling is not implemented yet"
+    ):
+        run_static_nested(
+            random.PRNGKey(16),
+            lambda theta_batch: -jnp.sum(theta_batch**2, axis=1),
+            lambda u_batch: u_batch,
+            ndim=2,
+            nlive=10,
+            maxiter=1,
+            sample="slice",
+            vectorized=True,
+        )
+
+
 def test_replacement_stats_metadata_after_normal_run() -> None:
     result = run_static_nested(
         random.PRNGKey(7),
