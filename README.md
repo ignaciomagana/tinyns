@@ -159,3 +159,28 @@ not to be a formal speed benchmark.
 The validation summary includes heuristic calibration warnings such as repeated
 large evidence z-scores, high live-point weight fraction, and concentrated
 posterior weights.
+
+## Checkpoint and resume
+
+Long static nested-sampling runs can save active checkpoints:
+
+```python
+result = sampler.run(
+    key,
+    checkpoint_path="run.checkpoint.npz",
+    checkpoint_interval=100,
+)
+```
+
+A checkpoint stores the active live points, accumulated dead points, PRNG key,
+iteration counters, and sampler metadata. It does not serialize user functions.
+To resume, reconstruct the same sampler and call:
+
+```python
+result = sampler.resume("run.checkpoint.npz")
+```
+
+The sampler configuration must match the checkpoint. Checkpoints are distinct
+from final result files saved with `result.save_npz(...)`. Checkpoints use NumPy
+`.npz` files to avoid extra dependencies. Checkpoint/resume is intended for
+static nested sampling; dynamic nested sampling is not implemented yet.

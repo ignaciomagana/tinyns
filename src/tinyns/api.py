@@ -6,6 +6,7 @@ from typing import Any
 
 from tinyns.result import NestedSamplingResult
 from tinyns.run import run_static_nested
+from tinyns.state import load_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
@@ -80,6 +81,8 @@ class NestedSampler:
         progress_interval: int = 100,
         callback=None,
         callback_interval: int = 100,
+        checkpoint_path=None,
+        checkpoint_interval: int = 100,
     ) -> NestedSamplingResult:
         """Run nested sampling and return a :class:`NestedSamplingResult`."""
 
@@ -98,6 +101,89 @@ class NestedSampler:
             progress_interval=progress_interval,
             callback=callback,
             callback_interval=callback_interval,
+            checkpoint_path=checkpoint_path,
+            checkpoint_interval=checkpoint_interval,
+            walks=self.kwargs.get("walks", 25),
+            step_scale=self.kwargs.get("step_scale", 0.1),
+            batch_size=self.kwargs.get("batch_size", 128),
+            slices=self.kwargs.get("slices", 5),
+            slice_steps=self.kwargs.get("slice_steps", 10),
+        )
+
+    def _checkpoint_config(self) -> dict[str, object]:
+        return {
+            "ndim": int(self.ndim),
+            "nlive": int(self.nlive),
+            "sample": str(self.sample),
+            "vectorized": bool(self.vectorized),
+            "max_attempts": int(self.max_attempts),
+            "batch_size": int(self.kwargs.get("batch_size", 128)),
+            "walks": int(self.kwargs.get("walks", 25)),
+            "step_scale": float(self.kwargs.get("step_scale", 0.1)),
+            "slices": int(self.kwargs.get("slices", 5)),
+            "slice_steps": int(self.kwargs.get("slice_steps", 10)),
+        }
+
+    def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
+        current = self._checkpoint_config()
+        for name in ("ndim", "nlive", "sample", "vectorized"):
+            if checkpoint_config.get(name) != current[name]:
+                raise ValueError(
+                    f"checkpoint {name}={checkpoint_config.get(name)!r} is not "
+                    f"compatible with sampler {name}={current[name]!r}"
+                )
+        for name in (
+            "max_attempts",
+            "batch_size",
+            "walks",
+            "step_scale",
+            "slices",
+            "slice_steps",
+        ):
+            if checkpoint_config.get(name) != current[name]:
+                raise ValueError(
+                    f"checkpoint {name}={checkpoint_config.get(name)!r} is not "
+                    f"compatible with sampler {name}={current[name]!r}"
+                )
+
+    def resume(
+        self,
+        checkpoint_path,
+        *,
+        dlogz: float = 0.1,
+        maxiter: int | None = None,
+        progress: bool = False,
+        progress_interval: int = 100,
+        callback=None,
+        callback_interval: int = 100,
+        checkpoint_path_out=None,
+        checkpoint_interval: int = 100,
+    ) -> NestedSamplingResult:
+        """Resume nested sampling from an active checkpoint ``.npz`` file."""
+
+        state, checkpoint_config = load_checkpoint_npz(checkpoint_path)
+        self._validate_checkpoint_config(checkpoint_config)
+        output_path = (
+            checkpoint_path if checkpoint_path_out is None else checkpoint_path_out
+        )
+        return run_static_nested(
+            state.key,
+            self.loglike,
+            self.prior_transform,
+            self.ndim,
+            self.nlive,
+            dlogz=dlogz,
+            maxiter=maxiter,
+            sample=self.sample,
+            vectorized=self.vectorized,
+            max_attempts=self.max_attempts,
+            progress=progress,
+            progress_interval=progress_interval,
+            callback=callback,
+            callback_interval=callback_interval,
+            checkpoint_path=output_path,
+            checkpoint_interval=checkpoint_interval,
+            initial_state=state,
             walks=self.kwargs.get("walks", 25),
             step_scale=self.kwargs.get("step_scale", 0.1),
             batch_size=self.kwargs.get("batch_size", 128),
