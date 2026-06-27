@@ -53,6 +53,43 @@ print(result.summary())
 ```
 
 
+## Vectorized prior-rejection example
+
+If `sample="prior"` and `vectorized=True`, `tinyns` batches constrained
+prior-rejection replacement proposals. This can reduce callback overhead when
+your `prior_transform` and `loglike` naturally accept arrays, but it does **not**
+yet JIT or vectorize the whole nested-sampling loop. The loop remains a small
+Python loop, and vectorized `sample="rwalk"` is not implemented yet.
+
+```python
+def prior_transform(u):
+    # u has shape (batch, 2). Return shape (batch, 2).
+    return -10.0 + 20.0 * u
+
+
+def loglike(theta):
+    # theta has shape (batch, 2). Return shape (batch,).
+    return -0.5 * jnp.sum(theta**2, axis=1) - jnp.log(2.0 * jnp.pi)
+
+
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim=2,
+    nlive=200,
+    sample="prior",
+    vectorized=True,
+    batch_size=256,
+)
+result = sampler.run(key, dlogz=0.5)
+print(result.summary())
+```
+
+See `examples/vectorized_gaussian_2d.py` for a complete 2D Gaussian example
+that prints the expected log evidence and equally resampled posterior
+mean/standard deviation.
+
+
 ## Random-walk constrained sampler
 
 For slightly less wasteful constrained draws, `sample="rwalk"` starts from an
