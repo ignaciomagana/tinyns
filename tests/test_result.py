@@ -148,6 +148,16 @@ def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     assert diagnostics["nposterior"] == 4
 
 
+def test_diagnostics_includes_iteration_counts_when_present() -> None:
+    result = make_result()
+    result.metadata = {"niter": 12, "ndead": 12}
+
+    diagnostics = result.diagnostics()
+
+    assert diagnostics["niter"] == 12
+    assert diagnostics["ndead"] == 12
+
+
 def test_diagnostics_low_ess_triggers_warning() -> None:
     result = NestedSamplingResult(
         samples_u=jnp.zeros((101, 1)),

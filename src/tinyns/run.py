@@ -235,6 +235,9 @@ def run_static_nested(
 
     logz = float(logsumexp(logwt))
     logzerr = _logzerr(logwt, logl, logz, nlive)
+    niter = len(dead_logl)
+    nlive_final = int(live_logl.size)
+    nposterior = int(logwt.size)
     if replacement_ncall:
         mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
         max_replacement_ncall = int(max(replacement_ncall))
@@ -264,6 +267,10 @@ def run_static_nested(
             "sample": sample,
             "dlogz": dlogz,
             "maxiter": maxiter,
+            "niter": niter,
+            "ndead": niter,
+            "nlive_final": nlive_final,
+            "nposterior": nposterior,
             "walks": walks,
             "step_scale": step_scale,
             "batch_size": batch_size,

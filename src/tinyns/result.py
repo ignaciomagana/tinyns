@@ -142,6 +142,10 @@ class NestedSamplingResult:
             "warnings": warnings,
         }
 
+        if "niter" in metadata:
+            diagnostics["niter"] = metadata["niter"]
+        if "ndead" in metadata:
+            diagnostics["ndead"] = metadata["ndead"]
         if "replacement_mean_ncall" in metadata:
             diagnostics["replacement_mean_ncall"] = metadata[
                 "replacement_mean_ncall"

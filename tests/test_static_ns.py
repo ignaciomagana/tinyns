@@ -104,6 +104,10 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
     assert result.metadata["mean_replacement_ncall"] == 0.0
     assert result.metadata["max_replacement_ncall"] == 0
     assert result.metadata["replacement_acceptance_proxy"] == 0.0
+    assert result.metadata["niter"] == 0
+    assert result.metadata["ndead"] == 0
+    assert result.metadata["nlive_final"] == result.nlive
+    assert result.metadata["nposterior"] == result.nlive
 
 
 def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
@@ -151,9 +155,17 @@ def test_replacement_stats_metadata_after_normal_run() -> None:
             "mean_replacement_ncall",
             "max_replacement_ncall",
             "replacement_acceptance_proxy",
+            "niter",
+            "ndead",
+            "nlive_final",
+            "nposterior",
         ]
     ).issubset(metadata)
     assert len(metadata["replacement_ncall"]) > 0
+    assert metadata["niter"] == len(metadata["replacement_ncall"])
+    assert metadata["ndead"] == metadata["niter"]
+    assert metadata["nlive_final"] == result.nlive
+    assert metadata["nposterior"] == result.logwt.size
     assert metadata["replacement_failures"] == 0
     assert metadata["mean_replacement_ncall"] > 0.0
     assert metadata["max_replacement_ncall"] >= 1
