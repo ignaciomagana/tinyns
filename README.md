@@ -1,34 +1,26 @@
 # tinyns
 
 `tinyns` is a tiny, dynesty-style nested sampler for JAX-friendly likelihoods.
-It provides a compact interface that transforms unit-cube samples through a user
-prior, evaluates a log likelihood, and returns a structured
-`NestedSamplingResult` containing posterior samples, weights, and evidence
-estimates.
+The core public API is deliberately small: provide `loglike`,
+`prior_transform`, and `ndim`, then call `NestedSampler(...).run(key)`.
 
-## Current status and limitations
+## Install
 
-This is an early, static nested-sampling implementation intended for correctness
-experiments and low-dimensional examples. The default replacement sampler,
-`sample="prior"`, is brute-force rejection from the prior: it repeatedly draws a
-fresh unit-cube point and keeps it only if its likelihood exceeds the current
-nested-sampling threshold. That approach is correctness-first and useful for toy
-problems, but it becomes inefficient very quickly as dimension or likelihood
-concentration grows.
+From source:
 
-In particular:
+```bash
+git clone <repo-url>
+cd tinyns
+python -m pip install .
+```
 
-- this is static nested sampling only; dynamic nested sampling is not
-  implemented;
-- `sample="slice"` provides a simple coordinate-wise constrained sampler in
-  the unit cube;
-- vectorized replacement is implemented for `sample="prior"` rejection draws;
-- vectorized `sample="rwalk"` and `sample="slice"` are not implemented yet
-  and currently raise before the run starts;
-- replacement attempts are capped by `max_attempts`, and hitting that cap returns
-  `success=False` with the partial result rather than raising during the run;
-- evidence and live-point bookkeeping are included, but error estimates are only
-  lightweight diagnostics for this toy implementation.
+Editable development install:
+
+```bash
+git clone <repo-url>
+cd tinyns
+python -m pip install -e '.[dev]'
+```
 
 ## Minimal working example
 
@@ -53,107 +45,59 @@ result = sampler.run(key, dlogz=0.1)
 print(result.summary())
 ```
 
+## Minimal API
 
-## Vectorized prior-rejection example
+| API | Purpose |
+| --- | --- |
+| `NestedSampler(loglike, prior_transform, ndim, ...)` | Dynesty-style sampler facade for static nested sampling. |
+| `NestedSamplingResult` | Result container with samples, weights, evidence estimates, status, and metadata. |
+| `result.summary()` | Human-readable run summary. |
+| `result.diagnostics()` | Plain-dict diagnostics, including ESS, call counts, and warnings. |
+| `result.resample_equal(key, n=None)` | Equally weighted posterior samples via systematic resampling. |
+| `result.to_numpy()` | Plain dictionary with array fields converted to NumPy arrays. |
+| `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
 
-If `sample="prior"` and `vectorized=True`, `tinyns` batches constrained
-prior-rejection replacement proposals. This can reduce callback overhead when
-your `prior_transform` and `loglike` naturally accept arrays, but it does **not**
-yet JIT or vectorize the whole nested-sampling loop. The loop remains a small
-Python loop, and vectorized `sample="rwalk"` and `sample="slice"` are not implemented yet.
+## Replacement samplers
 
-```python
-def prior_transform(u):
-    # u has shape (batch, 2). Return shape (batch, 2).
-    return -10.0 + 20.0 * u
+| `sample` | Description |
+| --- | --- |
+| `"prior"` | Brute-force rejection from the prior; robust and correctness-first, but inefficient as dimension or likelihood concentration grows. |
+| `"rwalk"` | Reflected random-walk constrained sampler in the unit cube. |
+| `"slice"` | Coordinate-wise constrained slice sampler in the unit cube. |
 
+`sample="prior"` supports vectorized replacement proposals with
+`vectorized=True`; the full nested-sampling loop remains a small Python loop.
+Vectorized `rwalk` and `slice` are not implemented yet.
 
-def loglike(theta):
-    # theta has shape (batch, 2). Return shape (batch,).
-    return -0.5 * jnp.sum(theta**2, axis=1) - jnp.log(2.0 * jnp.pi)
+## Design philosophy
 
+- **Tiny:** keep dependencies and abstractions minimal.
+- **Dynesty-style:** expose familiar `loglike + prior_transform + ndim` entry
+  points and lightweight dynesty-compatible exports.
+- **JAX-friendly:** support JAX arrays, PRNG keys, and JAX-compatible callbacks
+  without requiring users to define model objects.
+- **Correctness and diagnostics first:** prefer clear bookkeeping, tests, and
+  warnings over premature speedups.
 
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim=2,
-    nlive=200,
-    sample="prior",
-    vectorized=True,
-    batch_size=256,
-)
-result = sampler.run(key, dlogz=0.5)
-print(result.summary())
-```
+## Limitations
 
-See `examples/vectorized_gaussian_2d.py` for a complete 2D Gaussian example
-that prints the expected log evidence and equally resampled posterior
-mean/standard deviation.
+`tinyns` is an early v0.1-oriented implementation for correctness experiments
+and low-dimensional examples. It is intentionally not a probabilistic
+programming language.
 
+- Static nested sampling only.
+- No dynamic nested sampling.
+- No full ellipsoidal bounding.
+- No full vectorized `rwalk` or `slice` replacement sampler.
+- Not a PPL; users provide functions, not model objects.
+- Replacement attempts are capped by `max_attempts`; hitting the cap returns
+  `success=False` with a partial result rather than raising during the run.
+- Evidence and live-point bookkeeping are included, but error estimates are
+  lightweight diagnostics for this toy implementation.
 
-## Random-walk constrained sampler
+## Additional examples
 
-For slightly less wasteful constrained draws, `sample="rwalk"` starts from an
-existing live point and performs reflected Gaussian random-walk moves in the unit
-cube, accepting only proposals whose likelihood remains above the current nested
-sampling threshold. The `walks` option controls how many accepted-or-rejected
-proposal steps are attempted for each replacement, and `step_scale` controls the
-Gaussian proposal scale in unit-cube coordinates.
-
-This sampler is still deliberately simple. It is useful for small examples, but
-it is not yet a production-grade multimodal sampler.
-
-```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim=2,
-    nlive=200,
-    sample="rwalk",
-    walks=25,
-    step_scale=0.1,
-)
-result = sampler.run(key, dlogz=0.5)
-print(result.summary())
-```
-
-
-## Coordinate slice constrained sampler
-
-`sample="slice"` provides a simple coordinate-wise constrained sampler in the
-unit cube. For each replacement, it starts from an existing live point, picks
-coordinate axes, and proposes reflected one-dimensional slice moves that must
-stay above the current nested-sampling likelihood threshold. This can be a more
-robust alternative to naive prior rejection and the simple random-walk sampler
-for small low-dimensional examples.
-
-The main knobs are:
-
-- `slices`: how many coordinate-slice updates to try for each replacement
-  attempt.
-- `slice_steps`: how many shrinkage proposals to try inside each coordinate
-  slice update.
-- `step_scale`: the initial bracket width in unit-cube coordinates.
-
-This is intentionally modest: it is **not** a full PolyChord-style slice
-sampler, it is not vectorized yet, and the package remains static nested
-sampling only.
-
-```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim=2,
-    nlive=200,
-    sample="slice",
-    slices=5,
-    slice_steps=10,
-    step_scale=0.1,
-)
-result = sampler.run(key, dlogz=0.5)
-print(result.summary())
-```
-
-See `examples/gaussian_2d_slice.py` for a complete 2D Gaussian example that
-prints the expected log evidence and equally resampled posterior mean and
-covariance.
+- `examples/gaussian_2d.py`: 2D Gaussian with prior rejection.
+- `examples/gaussian_2d_rwalk.py`: reflected random-walk constrained sampling.
+- `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling.
+- `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
