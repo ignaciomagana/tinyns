@@ -45,6 +45,14 @@ against coordinate-wise `slice`, especially on correlated targets. It remains a
 local, simple random-direction constrained slice sampler in the unit cube, not a
 full PolyChord-style slice sampler.
 
+## Insertion-rank diagnostics
+
+Insertion ranks test whether new constrained replacements are distributed like draws from the constrained prior. For normalized ranks, the expected mean is about 0.5 and the expected standard deviation is about 1/sqrt(12).
+
+Large systematic deviations can indicate biased or poorly mixed constrained replacement samplers, even when a run reports `success=True`.
+
+Qualitative targets such as `ring2d` may not have analytic evidence references. For these targets, inspect posterior summaries, insertion-rank behavior, replacement failures, and seed-to-seed stability.
+
 ## Comparing sampler settings
 
 Use `validation/compare_validation.py` to compare settings such as
