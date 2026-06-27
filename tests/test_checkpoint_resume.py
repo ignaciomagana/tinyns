@@ -1,3 +1,4 @@
+import json
 import math
 
 import jax.numpy as jnp
@@ -209,3 +210,31 @@ def test_resume_rejects_inconsistent_dead_count(tmp_path):
             maxiter=5,
             initial_state=state,
         )
+
+
+def test_checkpoint_kernel_mismatch_raises(tmp_path):
+    path = tmp_path / "jax.checkpoint.npz"
+    make_sampler(sample="rwalk", kernel="jax", walks=3, step_scale=0.05).run(
+        14, maxiter=2, dlogz=0.0, checkpoint_path=path
+    )
+
+    with pytest.raises(ValueError, match="kernel"):
+        make_sampler(sample="rwalk", kernel="python", walks=3, step_scale=0.05).resume(
+            path, maxiter=3
+        )
+
+
+def test_checkpoint_missing_kernel_defaults_to_python(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    old_path = tmp_path / "old.checkpoint.npz"
+    make_sampler(kernel="python").run(15, maxiter=2, checkpoint_path=path)
+    with np.load(path) as data:
+        values = {name: data[name] for name in data.files}
+    config = json.loads(str(values["config_json"].item()))
+    config.pop("kernel", None)
+    values["config_json"] = np.asarray(json.dumps(config, sort_keys=True))
+    np.savez(old_path, **values)
+
+    result = make_sampler(kernel="python").resume(old_path, maxiter=3)
+
+    assert result.metadata["kernel"] == "python"

@@ -687,3 +687,43 @@ def test_local_sampler_max_attempts_is_respected() -> None:
         )
         assert accepted is False
         assert ncall == 2
+
+
+def test_draw_constrained_rwalk_jax_counts_walks_on_easy_target() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    walks = 7
+    live_u = jnp.full((4, 2), 0.5)
+    live_logl = jnp.zeros(4)
+
+    _, _, _, logl, ncall, accepted = draw_constrained_rwalk_jax(
+        random.PRNGKey(123),
+        gaussian_loglike,
+        identity_prior_transform,
+        -math.inf,
+        live_u,
+        live_logl,
+        2,
+        walks=walks,
+        step_scale=0.01,
+    )
+
+    assert ncall == walks
+    assert accepted is True
+    assert math.isfinite(logl)
+
+
+def test_draw_constrained_rwalk_jax_rejects_invalid_min_accepts() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    with pytest.raises(ValueError, match="min_accepts"):
+        draw_constrained_rwalk_jax(
+            random.PRNGKey(0),
+            gaussian_loglike,
+            identity_prior_transform,
+            -math.inf,
+            jnp.full((2, 2), 0.5),
+            jnp.zeros(2),
+            2,
+            min_accepts=0,
+        )

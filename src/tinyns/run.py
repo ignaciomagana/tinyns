@@ -17,6 +17,7 @@ from tinyns.samplers import (
     draw_constrained_prior_vectorized,
     draw_constrained_rslice,
     draw_constrained_rwalk,
+    draw_constrained_rwalk_jax,
     draw_constrained_slice,
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
@@ -146,6 +147,7 @@ def run_static_nested(
     dlogz: float = 0.1,
     maxiter: int | None = None,
     sample: str = "prior",
+    kernel: str = "python",
     vectorized: bool = False,
     max_attempts: int = 10_000,
     progress: bool = False,
@@ -173,6 +175,16 @@ def run_static_nested(
         raise ValueError("nlive must be a positive integer")
     if sample not in {"prior", "rwalk", "slice", "rslice"}:
         raise ValueError("sample must be one of {'prior', 'rwalk', 'slice', 'rslice'}")
+    if kernel not in {"python", "jax"}:
+        raise ValueError("kernel must be one of {'python', 'jax'}")
+    if kernel == "jax" and sample != "rwalk":
+        raise NotImplementedError(
+            'kernel="jax" is currently only supported with sample="rwalk"'
+        )
+    if kernel == "jax" and vectorized:
+        raise NotImplementedError(
+            'kernel="jax" with vectorized=True is not implemented yet'
+        )
     if sample == "rwalk" and vectorized:
         raise NotImplementedError(
             "vectorized rwalk is not implemented yet; use vectorized=False "
@@ -219,6 +231,7 @@ def run_static_nested(
         "ndim": int(ndim),
         "nlive": int(nlive),
         "sample": str(sample),
+        "kernel": str(kernel),
         "vectorized": bool(vectorized),
         "max_attempts": int(max_attempts),
         "batch_size": int(batch_size),
@@ -379,7 +392,12 @@ def run_static_nested(
                     max_attempts=max_attempts,
                 )
         elif sample == "rwalk":
-            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rwalk(
+            rwalk_draw = (
+                draw_constrained_rwalk_jax
+                if kernel == "jax"
+                else draw_constrained_rwalk
+            )
+            key, new_u, new_theta, new_logl, calls, accepted = rwalk_draw(
                 key,
                 loglike,
                 prior_transform,
@@ -558,6 +576,7 @@ def run_static_nested(
         message=message,
         metadata={
             "sample": sample,
+            "kernel": kernel,
             "dlogz": dlogz,
             "maxiter": maxiter,
             "niter": niter,
