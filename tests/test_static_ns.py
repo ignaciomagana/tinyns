@@ -175,10 +175,12 @@ def test_insertion_indices_metadata_after_normal_run() -> None:
 
     metadata = result.metadata
     insertion_indices = metadata["insertion_indices"]
+    assert metadata["insertion_index_nslots"] == result.nlive
     assert metadata["insertion_index_nlive"] == result.nlive - 1
     assert insertion_indices.shape == (len(metadata["replacement_ncall"]),)
     assert insertion_indices.size > 0
     assert bool(jnp.all(insertion_indices >= 0))
+    assert bool(jnp.all(insertion_indices < metadata["insertion_index_nslots"]))
     assert bool(jnp.all(insertion_indices <= metadata["insertion_index_nlive"]))
 
 

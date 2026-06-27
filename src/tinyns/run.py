@@ -262,6 +262,7 @@ def run_static_nested(
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),
+            "insertion_index_nslots": nlive,
             "insertion_index_nlive": nlive - 1,
             "replacement_failures": int(replacement_failures),
             "mean_replacement_ncall": mean_replacement_ncall,
