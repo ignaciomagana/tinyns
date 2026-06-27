@@ -514,7 +514,8 @@ def test_progress_true_does_not_crash(capsys) -> None:
     assert "iter=" in captured.out
     assert "logz=" in captured.out
     assert "sample=" in captured.out
-    assert "\x1b[K" in captured.out
+    assert "\x1b" not in captured.out
+    assert "[K" not in captured.out
 
 
 def test_format_progress_line_contains_core_fields() -> None:
@@ -537,3 +538,20 @@ def test_format_progress_line_contains_core_fields() -> None:
     assert "iter=" in line
     assert "logz=" in line
     assert "dlogz=" in line
+
+
+def test_progress_printer_pads_shorter_final_line(capsys) -> None:
+    from tinyns.run import _ProgressPrinter
+
+    printer = _ProgressPrinter()
+    printer.print("sample=longer-name", final=False)
+    printer.print("sample=x", final=True)
+
+    captured = capsys.readouterr()
+    assert "sample=x" in captured.out
+    padded_short_line = "sample=x" + " " * (
+        len("sample=longer-name") - len("sample=x")
+    )
+    assert padded_short_line in captured.out
+    assert "\x1b" not in captured.out
+    assert "[K" not in captured.out

@@ -120,10 +120,17 @@ def _format_progress_line(state: dict[str, object]) -> str:
     )
 
 
-def _print_progress_line(line: str, *, final: bool = False) -> None:
-    """Print one dependency-free progress line, clearing terminal residue."""
+class _ProgressPrinter:
+    """Print dependency-free progress updates without ANSI escape sequences."""
 
-    print("\r" + line + "\x1b[K", end="\n" if final else "", flush=True)
+    def __init__(self) -> None:
+        self._last_len = 0
+
+    def print(self, line: str, *, final: bool = False) -> None:
+        padding = " " * max(0, self._last_len - len(line))
+        end = "\n" if final else "\r"
+        print("\r" + line + padding, end=end, flush=True)
+        self._last_len = 0 if final else len(line)
 
 
 def run_static_nested(
@@ -214,6 +221,7 @@ def run_static_nested(
     message = "converged"
     stopped_by_callback = False
     logx_final = 0.0
+    progress_printer = _ProgressPrinter() if progress else None
 
     for i in range(maxiter):
         worst = int(jnp.argmin(live_logl))
@@ -333,8 +341,8 @@ def run_static_nested(
                 if callback(state) is False:
                     message = "stopped by callback"
                     stopped_by_callback = True
-            if progress:
-                _print_progress_line(_format_progress_line(state), final=True)
+            if progress_printer is not None:
+                progress_printer.print(_format_progress_line(state), final=True)
             break
 
         other_live_logl = jnp.delete(live_logl, worst)
@@ -374,10 +382,10 @@ def run_static_nested(
                 message = "stopped by callback"
                 stopped_by_callback = True
                 final_iteration = True
-        if progress and (
+        if progress_printer is not None and (
             i + 1 == 1 or (i + 1) % progress_interval == 0 or final_iteration
         ):
-            _print_progress_line(_format_progress_line(state), final=final_iteration)
+            progress_printer.print(_format_progress_line(state), final=final_iteration)
         if final_iteration:
             break
     else:
