@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
+import jax
 import jax.numpy as jnp
-from jax import random
+from jax import lax, random
 
 from tinyns.math import reflect_unit_cube
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
@@ -361,6 +363,136 @@ def draw_constrained_rslice(
 
     return new_key, best_u, best_theta, best_logl, ncall, False
 
+
+
+@lru_cache(maxsize=32)
+def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
+    """Return a cached compiled one-chain constrained rwalk kernel."""
+
+    @jax.jit
+    def kernel(key, logl_min, live_u, live_logl, step_scale, min_accepts):
+        nlive = live_u.shape[0]
+        key, seed_key = random.split(key)
+        seed_idx = random.randint(seed_key, shape=(), minval=0, maxval=nlive)
+        current_u = live_u[seed_idx]
+        current_theta = jnp.asarray(prior_transform(current_u))
+        current_logl = live_logl[seed_idx]
+
+        best_u = current_u
+        best_theta = current_theta
+        best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
+        accepted_moves = jnp.asarray(0, dtype=jnp.int32)
+
+        def one_step(carry, _):
+            (key, current_u, current_theta, current_logl, best_u, best_theta,
+             best_logl, accepted_moves) = carry
+            key, proposal_key = random.split(key)
+            step = step_scale * random.normal(proposal_key, shape=(ndim,))
+            u_prop = reflect_unit_cube(current_u + step)
+            theta_prop = jnp.asarray(prior_transform(u_prop))
+            logl_prop = jnp.asarray(loglike(theta_prop))
+
+            is_best = logl_prop > best_logl
+            best_u = jnp.where(is_best, u_prop, best_u)
+            best_theta = jnp.where(is_best, theta_prop, best_theta)
+            best_logl = jnp.where(is_best, logl_prop, best_logl)
+
+            accept = logl_prop >= logl_min
+            current_u = jnp.where(accept, u_prop, current_u)
+            current_theta = jnp.where(accept, theta_prop, current_theta)
+            current_logl = jnp.where(accept, logl_prop, current_logl)
+            accepted_moves = accepted_moves + accept.astype(jnp.int32)
+            return (
+                key,
+                current_u,
+                current_theta,
+                current_logl,
+                best_u,
+                best_theta,
+                best_logl,
+                accepted_moves,
+            ), None
+
+        (
+            key,
+            current_u,
+            current_theta,
+            current_logl,
+            best_u,
+            best_theta,
+            best_logl,
+            accepted_moves,
+        ), _ = lax.scan(
+            one_step,
+            (
+                key,
+                current_u,
+                current_theta,
+                current_logl,
+                best_u,
+                best_theta,
+                best_logl,
+                accepted_moves,
+            ),
+            xs=None,
+            length=walks,
+        )
+        accepted = accepted_moves >= min_accepts
+        new_u = jnp.where(accepted, current_u, best_u)
+        new_theta = jnp.where(accepted, current_theta, best_theta)
+        new_logl = jnp.where(accepted, current_logl, best_logl)
+        return key, new_u, new_theta, new_logl, jnp.asarray(walks), accepted
+
+    return kernel
+
+
+def draw_constrained_rwalk_jax(
+    key: PRNGKeyLike,
+    loglike: LogLikelihood,
+    prior_transform: PriorTransform,
+    logl_min: float,
+    live_u,
+    live_logl,
+    ndim: int,
+    *,
+    walks: int = 25,
+    step_scale: float = 0.1,
+    max_attempts: int = 10_000,
+    min_accepts: int = 1,
+):
+    """Draw a constrained replacement with a compiled JAX rwalk kernel."""
+    if ndim <= 0:
+        raise ValueError("ndim must be a positive integer")
+    if walks <= 0:
+        raise ValueError("walks must be a positive integer")
+    if step_scale <= 0:
+        raise ValueError("step_scale must be positive")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be a positive integer")
+    _validate_min_accepts(min_accepts)
+    if walks > max_attempts:
+        raise ValueError("walks must be less than or equal to max_attempts")
+
+    live_u = jnp.asarray(live_u)
+    live_logl = jnp.asarray(live_logl)
+    if live_u.ndim != 2 or live_u.shape[1] != ndim:
+        raise ValueError(f"live_u must have shape (nlive, {ndim})")
+    nlive = live_u.shape[0]
+    if nlive <= 0:
+        raise ValueError("live_u must contain at least one live point")
+    if live_logl.shape != (nlive,):
+        raise ValueError(f"live_logl must have shape ({nlive},)")
+
+    kernel = _make_rwalk_jax_kernel(loglike, prior_transform, int(ndim), int(walks))
+    new_key, new_u, new_theta, new_logl, ncall, accepted = kernel(
+        key,
+        jnp.asarray(logl_min),
+        live_u,
+        live_logl,
+        jnp.asarray(step_scale),
+        jnp.asarray(min_accepts),
+    )
+    return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
 
 def draw_constrained_rwalk(
     key: PRNGKeyLike,

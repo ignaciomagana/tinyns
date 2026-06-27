@@ -589,3 +589,58 @@ def test_progress_printer_pads_shorter_final_line(capsys) -> None:
     assert padded_short_line in captured.out
     assert "\x1b" not in captured.out
     assert "[K" not in captured.out
+
+
+def _jax_loglike(theta):
+    return -0.5 * jnp.sum(((theta - 0.5) / 0.1) ** 2)
+
+
+def _jax_prior_transform(u):
+    return u
+
+
+def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
+    from tinyns import NestedSampler
+
+    sampler = NestedSampler(
+        _jax_loglike,
+        _jax_prior_transform,
+        ndim=2,
+        nlive=25,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.05,
+    )
+    result = sampler.run(random.PRNGKey(0), maxiter=20, dlogz=0.0)
+
+    assert math.isfinite(result.logz)
+    assert result.metadata["kernel"] == "jax"
+
+
+def test_kernel_python_is_default_and_invalid_kernel_raises() -> None:
+    from tinyns import NestedSampler
+
+    sampler = NestedSampler(_jax_loglike, _jax_prior_transform, ndim=2, nlive=10)
+    assert sampler.kernel == "python"
+
+    with pytest.raises(ValueError, match="kernel"):
+        NestedSampler(
+            _jax_loglike, _jax_prior_transform, ndim=2, nlive=10, kernel="invalid"
+        )
+
+
+@pytest.mark.parametrize("sample", ["slice", "rslice"])
+def test_jax_kernel_non_rwalk_raises(sample: str) -> None:
+    from tinyns import NestedSampler
+
+    sampler = NestedSampler(
+        _jax_loglike,
+        _jax_prior_transform,
+        ndim=2,
+        nlive=10,
+        sample=sample,
+        kernel="jax",
+    )
+    with pytest.raises(NotImplementedError, match="sample=\"rwalk\""):
+        sampler.run(random.PRNGKey(0), maxiter=1)

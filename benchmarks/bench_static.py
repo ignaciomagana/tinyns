@@ -55,16 +55,18 @@ def _mean(values: list[float | int | None]) -> float | None:
 def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return grouped benchmark summaries by ``(target, sampler)``."""
 
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in results:
-        grouped[(row["target"], row["sampler"])].append(row)
+        key = (row["target"], row["sampler"], row.get("kernel", "python"))
+        grouped[key].append(row)
 
     summaries = []
-    for (target, sampler), rows in sorted(grouped.items()):
+    for (target, sampler, kernel), rows in sorted(grouped.items()):
         summaries.append(
             {
                 "target": target,
                 "sampler": sampler,
+                "kernel": kernel,
                 "nruns": len(rows),
                 "mean_seconds": _mean([row.get("seconds") for row in rows]),
                 "mean_iter_per_s": _mean(
@@ -99,6 +101,7 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "max_attempts": args.max_attempts,
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
+        "kernel": args.kernel,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -141,6 +144,7 @@ def run_one(
     return {
         "target": target_name,
         "sampler": sampler_name,
+        "kernel": args.kernel,
         "seed": seed,
         "nlive": args.nlive,
         "ndim": target.ndim,
@@ -179,12 +183,12 @@ def _fmt(value: Any, precision: int = 3) -> str:
 
 def print_results(results: list[dict[str, Any]]) -> None:
     print(
-        "target sampler seed seconds niter ncall iter/s ncall/s repl_ncall "
+        "target sampler kernel seed seconds niter ncall iter/s ncall/s repl_ncall "
         "logz logzerr success warnings"
     )
     for row in results:
         print(
-            f"{row['target']} {row['sampler']} {row['seed']} "
+            f"{row['target']} {row['sampler']} {row['kernel']} {row['seed']} "
             f"{_fmt(row['seconds'])} {_fmt(row['niter'])} {row['ncall']} "
             f"{_fmt(row['iterations_per_second'])} "
             f"{_fmt(row['likelihood_calls_per_second'])} "
@@ -196,12 +200,12 @@ def print_results(results: list[dict[str, Any]]) -> None:
 def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print()
     print(
-        "target sampler nruns mean_seconds mean_iter_per_s mean_ncall_per_s "
+        "target sampler kernel nruns mean_seconds mean_iter_per_s mean_ncall_per_s "
         "mean_ncall mean_repl_ncall success_fraction"
     )
     for row in summaries:
         print(
-            f"{row['target']} {row['sampler']} {row['nruns']} "
+            f"{row['target']} {row['sampler']} {row['kernel']} {row['nruns']} "
             f"{_fmt(row['mean_seconds'])} {_fmt(row['mean_iter_per_s'])} "
             f"{_fmt(row['mean_ncall_per_s'])} {_fmt(row['mean_ncall'])} "
             f"{_fmt(row['mean_repl_ncall'])} {_fmt(row['success_fraction'])}"
@@ -224,6 +228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=10000)
+    parser.add_argument("--kernel", choices=["python", "jax"], default="python")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--progress", action="store_true")
     return parser.parse_args(argv)

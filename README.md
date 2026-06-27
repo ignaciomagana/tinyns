@@ -136,6 +136,24 @@ calibration should be checked with repeated validation runs.
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
 Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
+### Experimental JAX replacement kernel
+
+For JAX-native likelihoods, `sample="rwalk"` supports an experimental compiled replacement kernel:
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    sample="rwalk",
+    kernel="jax",
+)
+```
+
+This keeps the top-level nested-sampling loop in Python, but runs each constrained random-walk replacement on device using JAX. It is intended for GPU-native likelihoods where Python proposal-by-proposal synchronization is expensive.
+
+Currently only `sample="rwalk"` supports `kernel="jax"`. Validate evidence calibration before using the experimental JAX kernel for production inference.
+
 ### `min_accepts`
 
 For `rwalk`, `slice`, and `rslice`, `min_accepts` requires multiple accepted

@@ -35,7 +35,8 @@ class NestedSampler:
         Additional sampler options. ``walks`` and ``step_scale`` are used by
         ``sample="rwalk"``; ``slices``, ``slice_steps``, and ``step_scale`` are
         used by ``sample="slice"`` and ``sample="rslice"``. ``min_accepts`` is
-        used by ``"rwalk"``, ``"slice"``, and ``"rslice"``.
+        used by ``"rwalk"``, ``"slice"``, and ``"rslice"``. ``kernel`` may be
+        ``"python"`` (default) or experimental ``"jax"`` for ``sample="rwalk"``.
     """
 
     def __init__(
@@ -58,6 +59,9 @@ class NestedSampler:
             raise ValueError(
                 "sample must be one of {'prior', 'rwalk', 'slice', 'rslice'}"
             )
+        kernel = kwargs.get("kernel", "python")
+        if kernel not in {"python", "jax"}:
+            raise ValueError("kernel must be one of {'python', 'jax'}")
         if not callable(loglike):
             raise TypeError("loglike must be callable")
         if not callable(prior_transform):
@@ -69,6 +73,7 @@ class NestedSampler:
         self.nlive = nlive
         self.vectorized = vectorized
         self.sample = sample
+        self.kernel = kernel
         self.max_attempts = max_attempts
         self.kwargs = dict(kwargs)
 
@@ -96,6 +101,7 @@ class NestedSampler:
             dlogz=dlogz,
             maxiter=maxiter,
             sample=self.sample,
+            kernel=self.kernel,
             vectorized=self.vectorized,
             max_attempts=self.max_attempts,
             progress=progress,
@@ -117,6 +123,7 @@ class NestedSampler:
             "ndim": int(self.ndim),
             "nlive": int(self.nlive),
             "sample": str(self.sample),
+            "kernel": str(self.kernel),
             "vectorized": bool(self.vectorized),
             "max_attempts": int(self.max_attempts),
             "batch_size": int(self.kwargs.get("batch_size", 128)),
@@ -129,7 +136,13 @@ class NestedSampler:
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
         current = self._checkpoint_config()
-        for name in ("ndim", "nlive", "sample", "vectorized"):
+        if "kernel" not in checkpoint_config:
+            checkpoint_config = {**checkpoint_config, "kernel": "python"}
+        if checkpoint_config.get("kernel") not in {"python", "jax"}:
+            raise ValueError(
+                f"checkpoint kernel={checkpoint_config.get('kernel')!r} is invalid"
+            )
+        for name in ("ndim", "nlive", "sample", "kernel", "vectorized"):
             if checkpoint_config.get(name) != current[name]:
                 raise ValueError(
                     f"checkpoint {name}={checkpoint_config.get(name)!r} is not "
@@ -189,6 +202,7 @@ class NestedSampler:
             dlogz=dlogz,
             maxiter=maxiter,
             sample=self.sample,
+            kernel=self.kernel,
             vectorized=self.vectorized,
             max_attempts=self.max_attempts,
             progress=progress,
