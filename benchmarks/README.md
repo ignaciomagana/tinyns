@@ -14,4 +14,17 @@ python benchmarks/bench_static.py \
   --output bench.json
 ```
 
+For the recommended JAX random-walk fast path, run:
+
+```bash
+python benchmarks/bench_static.py \
+  --targets gaussian2d correlated_gaussian2d \
+  --samplers rwalk \
+  --kernel jax \
+  --seeds 0 1 2 \
+  --nlive 200 \
+  --dlogz 0.1 \
+  --output bench_rwalk_jax.json
+```
+
 The benchmark reports wall time, iterations/sec, likelihood calls/sec, replacement cost, and basic diagnostics. It is intended to guide optimization, not to replace validation.
