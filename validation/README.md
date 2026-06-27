@@ -38,16 +38,22 @@ The recommendation column is heuristic and should be treated as a debugging aid,
 not a formal statistical test.
 
 
-`rslice` is available in the validation harness and is a useful comparison against coordinate-wise `slice`, especially on correlated targets. It remains a local, simple random-direction constrained slice sampler in the unit cube, not a full PolyChord-style slice sampler.
+`rslice` is available in the validation harness and is a useful comparison
+against coordinate-wise `slice`, especially on correlated targets. It remains a
+local, simple random-direction constrained slice sampler in the unit cube, not a
+full PolyChord-style slice sampler.
 
-When `slice` or `rslice` show poor evidence coverage, compare the default
-`--min-accepts 1` against a more decorrelated run such as `--min-accepts 3`.
-Higher values require more accepted constrained moves per replacement and
-therefore increase likelihood calls.
+## Comparing sampler settings
 
-## Comparing validation runs
+Use `validation/compare_validation.py` to compare settings such as
+`min_accepts=1` and `min_accepts=3`.
 
-To compare two validation runs, for example `min_accepts=1` versus `min_accepts=3`:
+A setting is not better merely because it performs more accepted local moves.
+Prefer settings that improve coverage, reduce large evidence z-scores, and keep
+likelihood-call cost reasonable.
+
+To compare two validation runs, for example `min_accepts=1` versus
+`min_accepts=3`:
 
 ```bash
 python validation/compare_validation.py \
