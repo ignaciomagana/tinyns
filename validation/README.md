@@ -19,6 +19,26 @@ python validation/run_validation.py --output validation_results.json
 python validation/summarize_validation.py validation_results.json
 ```
 
+Recommended smoke-to-medium validation command for JAX-native users:
+
+```bash
+python validation/run_validation.py \
+  --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
+  --samplers rwalk \
+  --kernel jax \
+  --seeds 0 1 2 3 4 5 6 7 8 9 \
+  --nlive 200 \
+  --dlogz 0.1 \
+  --output validation_rwalk_jax_fulltargets_nlive200_dlogz01.json
+
+python validation/summarize_validation.py \
+  validation_rwalk_jax_fulltargets_nlive200_dlogz01.json
+```
+
+This is the recommended smoke-to-medium validation command for JAX-native users.
+
+`slice` and `rslice` remain available, but repeated-seed validation should be run before relying on their evidence estimates.
+
 ## Interpreting validation summaries
 
 The validation harness is meant to detect reliability problems across repeated
