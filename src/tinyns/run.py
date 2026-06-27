@@ -112,6 +112,7 @@ def run_static_nested(
     dead_logwt = []
     logz_dead = -math.inf
     replacement_ncall = []
+    insertion_indices = []
     replacement_failures = 0
     success = True
     message = "converged"
@@ -188,6 +189,12 @@ def run_static_nested(
             message = f"max_attempts={max_attempts} hit during constrained prior draw"
             break
 
+        other_live_logl = jnp.delete(live_logl, worst)
+        insertion_index = int(
+            jnp.searchsorted(jnp.sort(other_live_logl), new_logl, side="right")
+        )
+        insertion_indices.append(insertion_index)
+
         live_u = live_u.at[worst].set(new_u)
         live_theta = live_theta.at[worst].set(new_theta)
         live_logl = live_logl.at[worst].set(new_logl)
@@ -254,6 +261,8 @@ def run_static_nested(
             "step_scale": step_scale,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
+            "insertion_indices": jnp.asarray(insertion_indices, dtype=int),
+            "insertion_index_nlive": nlive - 1,
             "replacement_failures": int(replacement_failures),
             "mean_replacement_ncall": mean_replacement_ncall,
             "max_replacement_ncall": max_replacement_ncall,

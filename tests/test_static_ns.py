@@ -162,6 +162,26 @@ def test_replacement_stats_metadata_after_normal_run() -> None:
     )
 
 
+def test_insertion_indices_metadata_after_normal_run() -> None:
+    result = run_static_nested(
+        random.PRNGKey(70),
+        lambda theta: float(-jnp.sum(theta**2)),
+        lambda u: u,
+        ndim=2,
+        nlive=10,
+        dlogz=0.1,
+        maxiter=20,
+    )
+
+    metadata = result.metadata
+    insertion_indices = metadata["insertion_indices"]
+    assert metadata["insertion_index_nlive"] == result.nlive - 1
+    assert insertion_indices.shape == (len(metadata["replacement_ncall"]),)
+    assert insertion_indices.size > 0
+    assert bool(jnp.all(insertion_indices >= 0))
+    assert bool(jnp.all(insertion_indices <= metadata["insertion_index_nlive"]))
+
+
 def test_failure_to_replace_increments_replacement_failures() -> None:
     result = run_static_nested(
         random.PRNGKey(8),
