@@ -364,36 +364,24 @@ def draw_constrained_rslice(
 
 
 @lru_cache(maxsize=32)
-def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
+def _make_rwalk_jax_kernel(
+    loglike, prior_transform, ndim: int, walks: int, replacement_chains: int
+):
     """Return a cached compiled retrying constrained rwalk kernel."""
 
     @jax.jit
-    def kernel(
-        key, logl_min, live_u, live_logl, step_scale, min_accepts, max_attempt_batches
-    ):
+    def kernel(key, logl_min, live_u, live_logl, step_scale, min_accepts, max_batches):
         nlive = live_u.shape[0]
         template_u = live_u[0]
         template_theta = jnp.asarray(prior_transform(template_u))
         initial_best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
         initial_ncall = jnp.asarray(0, dtype=jnp.int32)
         initial_done = jnp.asarray(False)
-        initial_attempt_index = jnp.asarray(0, dtype=jnp.int32)
+        initial_batch_index = jnp.asarray(0, dtype=jnp.int32)
+        batch_ncall = jnp.asarray(walks * replacement_chains, dtype=jnp.int32)
 
         def cond(state):
-            (
-                _key,
-                _ncall,
-                done,
-                _accepted,
-                _out_u,
-                _out_theta,
-                _out_logl,
-                _best_u,
-                _best_theta,
-                _best_logl,
-                attempt_index,
-            ) = state
-            return (~done) & (attempt_index < max_attempt_batches)
+            return (~state[2]) & (state[10] < max_batches)
 
         def body(state):
             (
@@ -407,18 +395,22 @@ def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
                 best_u,
                 best_theta,
                 best_logl,
-                attempt_index,
+                batch_index,
             ) = state
 
             key, seed_key = random.split(key)
-            seed_idx = random.randint(seed_key, shape=(), minval=0, maxval=nlive)
+            seed_idx = random.randint(
+                seed_key, shape=(replacement_chains,), minval=0, maxval=nlive
+            )
             current_u = live_u[seed_idx]
-            current_theta = jnp.asarray(prior_transform(current_u))
+            current_theta = jax.vmap(prior_transform)(current_u)
             current_logl = live_logl[seed_idx]
             attempt_best_u = current_u
             attempt_best_theta = current_theta
-            attempt_best_logl = initial_best_logl
-            accepted_moves = jnp.asarray(0, dtype=jnp.int32)
+            attempt_best_logl = jnp.full(
+                (replacement_chains,), -jnp.inf, live_logl.dtype
+            )
+            accepted_moves = jnp.zeros((replacement_chains,), dtype=jnp.int32)
 
             def one_step(carry, _):
                 (
@@ -432,19 +424,23 @@ def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
                     accepted_moves,
                 ) = carry
                 key, proposal_key = random.split(key)
-                step = step_scale * random.normal(proposal_key, shape=(ndim,))
+                step = step_scale * random.normal(
+                    proposal_key, shape=(replacement_chains, ndim)
+                )
                 u_prop = reflect_unit_cube(current_u + step)
-                theta_prop = jnp.asarray(prior_transform(u_prop))
-                logl_prop = jnp.asarray(loglike(theta_prop))
+                theta_prop = jax.vmap(prior_transform)(u_prop)
+                logl_prop = jax.vmap(loglike)(theta_prop)
 
                 is_best = logl_prop > attempt_best_logl
-                attempt_best_u = jnp.where(is_best, u_prop, attempt_best_u)
-                attempt_best_theta = jnp.where(is_best, theta_prop, attempt_best_theta)
+                attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
+                attempt_best_theta = jnp.where(
+                    is_best[:, None], theta_prop, attempt_best_theta
+                )
                 attempt_best_logl = jnp.where(is_best, logl_prop, attempt_best_logl)
 
                 accept = logl_prop >= logl_min
-                current_u = jnp.where(accept, u_prop, current_u)
-                current_theta = jnp.where(accept, theta_prop, current_theta)
+                current_u = jnp.where(accept[:, None], u_prop, current_u)
+                current_theta = jnp.where(accept[:, None], theta_prop, current_theta)
                 current_logl = jnp.where(accept, logl_prop, current_logl)
                 accepted_moves = accepted_moves + accept.astype(jnp.int32)
                 return (
@@ -486,29 +482,39 @@ def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
                 length=walks,
             )
 
-            is_global_best = attempt_best_logl > best_logl
-            best_u = jnp.where(is_global_best, attempt_best_u, best_u)
-            best_theta = jnp.where(is_global_best, attempt_best_theta, best_theta)
-            best_logl = jnp.where(is_global_best, attempt_best_logl, best_logl)
+            batch_best_idx = jnp.argmax(attempt_best_logl)
+            batch_best_logl = attempt_best_logl[batch_best_idx]
+            is_global_best = batch_best_logl > best_logl
+            best_u = jnp.where(is_global_best, attempt_best_u[batch_best_idx], best_u)
+            best_theta = jnp.where(
+                is_global_best, attempt_best_theta[batch_best_idx], best_theta
+            )
+            best_logl = jnp.where(is_global_best, batch_best_logl, best_logl)
 
-            accepted = accepted_moves >= min_accepts
-            out_u = jnp.where(accepted, current_u, out_u)
-            out_theta = jnp.where(accepted, current_theta, out_theta)
-            out_logl = jnp.where(accepted, current_logl, out_logl)
-            ncall = ncall + jnp.asarray(walks, dtype=jnp.int32)
-            attempt_index = attempt_index + jnp.asarray(1, dtype=jnp.int32)
+            success_mask = accepted_moves >= min_accepts
+            any_success = jnp.any(success_mask)
+            key, select_key = random.split(key)
+            selection_scores = jnp.where(
+                success_mask, random.uniform(select_key, (replacement_chains,)), -1.0
+            )
+            selected_idx = jnp.argmax(selection_scores)
+            out_u = jnp.where(any_success, current_u[selected_idx], out_u)
+            out_theta = jnp.where(any_success, current_theta[selected_idx], out_theta)
+            out_logl = jnp.where(any_success, current_logl[selected_idx], out_logl)
+            ncall = ncall + batch_ncall
+            batch_index = batch_index + jnp.asarray(1, dtype=jnp.int32)
             return (
                 key,
                 ncall,
-                accepted,
-                accepted,
+                any_success,
+                any_success,
                 out_u,
                 out_theta,
                 out_logl,
                 best_u,
                 best_theta,
                 best_logl,
-                attempt_index,
+                batch_index,
             )
 
         (
@@ -522,7 +528,7 @@ def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
             best_u,
             best_theta,
             best_logl,
-            _attempt_index,
+            _batch_index,
         ) = lax.while_loop(
             cond,
             body,
@@ -537,7 +543,7 @@ def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
                 template_u,
                 template_theta,
                 initial_best_logl,
-                initial_attempt_index,
+                initial_batch_index,
             ),
         )
         new_u = jnp.where(done, out_u, best_u)
@@ -561,6 +567,7 @@ def draw_constrained_rwalk_jax(
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
     min_accepts: int = 1,
+    replacement_chains: int = 1,
 ):
     """Draw a constrained replacement with a compiled JAX rwalk kernel."""
     if ndim <= 0:
@@ -572,8 +579,15 @@ def draw_constrained_rwalk_jax(
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
     _validate_min_accepts(min_accepts)
-    if walks > max_attempts:
-        raise ValueError("walks must be less than or equal to max_attempts")
+    if (
+        not isinstance(replacement_chains, int)
+        or isinstance(replacement_chains, bool)
+        or replacement_chains <= 0
+    ):
+        raise ValueError("replacement_chains must be a positive integer")
+    batch_ncall = int(walks) * int(replacement_chains)
+    if batch_ncall > max_attempts:
+        raise ValueError("max_attempts must be at least walks * replacement_chains")
 
     live_u = jnp.asarray(live_u)
     live_logl = jnp.asarray(live_logl)
@@ -585,8 +599,10 @@ def draw_constrained_rwalk_jax(
     if live_logl.shape != (nlive,):
         raise ValueError(f"live_logl must have shape ({nlive},)")
 
-    kernel = _make_rwalk_jax_kernel(loglike, prior_transform, int(ndim), int(walks))
-    max_attempt_batches = max_attempts // walks
+    kernel = _make_rwalk_jax_kernel(
+        loglike, prior_transform, int(ndim), int(walks), int(replacement_chains)
+    )
+    max_batches = max_attempts // batch_ncall
     new_key, new_u, new_theta, new_logl, ncall, accepted = kernel(
         key,
         jnp.asarray(logl_min),
@@ -594,7 +610,7 @@ def draw_constrained_rwalk_jax(
         live_logl,
         jnp.asarray(step_scale),
         jnp.asarray(min_accepts),
-        jnp.asarray(max_attempt_batches, dtype=jnp.int32),
+        jnp.asarray(max_batches, dtype=jnp.int32),
     )
     return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
 

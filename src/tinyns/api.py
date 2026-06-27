@@ -75,6 +75,19 @@ class NestedSampler:
         self.sample = sample
         self.kernel = kernel
         self.max_attempts = max_attempts
+
+        replacement_chains = kwargs.get("replacement_chains", 1)
+        if (
+            not isinstance(replacement_chains, int)
+            or isinstance(replacement_chains, bool)
+            or replacement_chains <= 0
+        ):
+            raise ValueError("replacement_chains must be a positive integer")
+        if replacement_chains != 1 and not (sample == "rwalk" and kernel == "jax"):
+            raise NotImplementedError(
+                "replacement_chains is currently supported only for "
+                "sample='rwalk', kernel='jax'"
+            )
         self.kwargs = dict(kwargs)
 
     def run(
@@ -116,6 +129,7 @@ class NestedSampler:
             slices=self.kwargs.get("slices", 5),
             slice_steps=self.kwargs.get("slice_steps", 10),
             min_accepts=self.kwargs.get("min_accepts", 1),
+            replacement_chains=self.kwargs.get("replacement_chains", 1),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -132,6 +146,7 @@ class NestedSampler:
             "slices": int(self.kwargs.get("slices", 5)),
             "slice_steps": int(self.kwargs.get("slice_steps", 10)),
             "min_accepts": int(self.kwargs.get("min_accepts", 1)),
+            "replacement_chains": int(self.kwargs.get("replacement_chains", 1)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -156,10 +171,11 @@ class NestedSampler:
             "slices",
             "slice_steps",
             "min_accepts",
+            "replacement_chains",
         ):
             checkpoint_value = (
                 checkpoint_config.get(name, 1)
-                if name == "min_accepts"
+                if name in {"min_accepts", "replacement_chains"}
                 else checkpoint_config.get(name)
             )
             if checkpoint_value != current[name]:
@@ -218,4 +234,5 @@ class NestedSampler:
             slices=self.kwargs.get("slices", 5),
             slice_steps=self.kwargs.get("slice_steps", 10),
             min_accepts=self.kwargs.get("min_accepts", 1),
+            replacement_chains=self.kwargs.get("replacement_chains", 1),
         )

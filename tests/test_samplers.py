@@ -782,3 +782,84 @@ def test_draw_constrained_rwalk_jax_rejects_invalid_min_accepts() -> None:
             2,
             min_accepts=0,
         )
+
+
+def test_draw_constrained_rwalk_jax_batched_chains_first_batch_succeeds() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    _, _, _, logl, ncall, accepted = draw_constrained_rwalk_jax(
+        random.PRNGKey(42),
+        gaussian_loglike,
+        identity_prior_transform,
+        -math.inf,
+        jnp.full((8, 2), 0.5),
+        jnp.zeros(8),
+        2,
+        walks=5,
+        replacement_chains=4,
+        step_scale=0.01,
+        max_attempts=100,
+    )
+
+    assert accepted is True
+    assert ncall == 20
+    assert math.isfinite(logl)
+
+
+def test_draw_constrained_rwalk_jax_batched_chains_exhausts_max_attempts() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    _, _, _, logl, ncall, accepted = draw_constrained_rwalk_jax(
+        random.PRNGKey(43),
+        gaussian_loglike,
+        identity_prior_transform,
+        math.inf,
+        jnp.full((8, 2), 0.5),
+        jnp.zeros(8),
+        2,
+        walks=5,
+        replacement_chains=4,
+        step_scale=0.01,
+        max_attempts=100,
+    )
+
+    assert accepted is False
+    assert ncall == 100
+    assert math.isfinite(logl)
+
+
+@pytest.mark.parametrize("replacement_chains", [0, True])
+def test_draw_constrained_rwalk_jax_rejects_invalid_replacement_chains(
+    replacement_chains,
+) -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    with pytest.raises(ValueError, match="replacement_chains"):
+        draw_constrained_rwalk_jax(
+            random.PRNGKey(0),
+            gaussian_loglike,
+            identity_prior_transform,
+            -math.inf,
+            jnp.full((2, 2), 0.5),
+            jnp.zeros(2),
+            2,
+            replacement_chains=replacement_chains,
+        )
+
+
+def test_draw_constrained_rwalk_jax_rejects_batch_larger_than_max_attempts() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    with pytest.raises(ValueError, match=r"walks \* replacement_chains"):
+        draw_constrained_rwalk_jax(
+            random.PRNGKey(0),
+            gaussian_loglike,
+            identity_prior_transform,
+            -math.inf,
+            jnp.full((2, 2), 0.5),
+            jnp.zeros(2),
+            2,
+            walks=5,
+            replacement_chains=4,
+            max_attempts=19,
+        )

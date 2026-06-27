@@ -160,6 +160,7 @@ def run_static_nested(
     slices: int = 5,
     slice_steps: int = 10,
     min_accepts: int = 1,
+    replacement_chains: int = 1,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -222,6 +223,17 @@ def run_static_nested(
         or min_accepts <= 0
     ):
         raise ValueError("min_accepts must be a positive integer")
+    if (
+        not isinstance(replacement_chains, int)
+        or isinstance(replacement_chains, bool)
+        or replacement_chains <= 0
+    ):
+        raise ValueError("replacement_chains must be a positive integer")
+    if replacement_chains != 1 and not (sample == "rwalk" and kernel == "jax"):
+        raise NotImplementedError(
+            "replacement_chains is currently supported only for "
+            "sample='rwalk', kernel='jax'"
+        )
     if maxiter is None:
         maxiter = 10_000 * ndim
     if maxiter < 0:
@@ -240,6 +252,7 @@ def run_static_nested(
         "slices": int(slices),
         "slice_steps": int(slice_steps),
         "min_accepts": int(min_accepts),
+        "replacement_chains": int(replacement_chains),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -409,6 +422,11 @@ def run_static_nested(
                 step_scale=step_scale,
                 max_attempts=max_attempts,
                 min_accepts=min_accepts,
+                **(
+                    {"replacement_chains": replacement_chains}
+                    if kernel == "jax"
+                    else {}
+                ),
             )
         elif sample == "slice":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
@@ -592,6 +610,7 @@ def run_static_nested(
             "slices": slices,
             "slice_steps": slice_steps,
             "min_accepts": min_accepts,
+            "replacement_chains": replacement_chains,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),
