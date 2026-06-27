@@ -156,6 +156,7 @@ def run_static_nested(
     step_scale: float = 0.1,
     slices: int = 5,
     slice_steps: int = 10,
+    min_accepts: int = 1,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -202,6 +203,12 @@ def run_static_nested(
         raise ValueError("slices must be a positive integer")
     if slice_steps <= 0:
         raise ValueError("slice_steps must be a positive integer")
+    if (
+        not isinstance(min_accepts, int)
+        or isinstance(min_accepts, bool)
+        or min_accepts <= 0
+    ):
+        raise ValueError("min_accepts must be a positive integer")
     if maxiter is None:
         maxiter = 10_000 * ndim
     if maxiter < 0:
@@ -218,6 +225,7 @@ def run_static_nested(
         "step_scale": float(step_scale),
         "slices": int(slices),
         "slice_steps": int(slice_steps),
+        "min_accepts": int(min_accepts),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -364,6 +372,7 @@ def run_static_nested(
                 walks=walks,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
         elif sample == "slice":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
@@ -378,6 +387,7 @@ def run_static_nested(
                 slice_steps=slice_steps,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
         else:
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rslice(
@@ -392,6 +402,7 @@ def run_static_nested(
                 slice_steps=slice_steps,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
         ncall += calls
         replacement_ncall.append(int(calls))
@@ -539,6 +550,7 @@ def run_static_nested(
             "step_scale": step_scale,
             "slices": slices,
             "slice_steps": slice_steps,
+            "min_accepts": min_accepts,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),
