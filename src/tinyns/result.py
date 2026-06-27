@@ -84,18 +84,28 @@ class NestedSamplingResult:
     def summary(self) -> str:
         """Return a human-readable multi-line summary of the result."""
 
-        return "\n".join(
+        lines = [
+            f"logz: {self.logz}",
+            f"logzerr: {self.logzerr}",
+            f"ncall: {self.ncall}",
+            f"nlive: {self.nlive}",
+            f"ndim: {self.ndim}",
+            f"posterior ESS: {self.posterior_ess()}",
+        ]
+        metadata = {} if self.metadata is None else self.metadata
+        if "mean_replacement_ncall" in metadata:
+            lines.append(
+                f"replacement mean ncall: {metadata['mean_replacement_ncall']}"
+            )
+        if "replacement_failures" in metadata:
+            lines.append(f"replacement failures: {metadata['replacement_failures']}")
+        lines.extend(
             [
-                f"logz: {self.logz}",
-                f"logzerr: {self.logzerr}",
-                f"ncall: {self.ncall}",
-                f"nlive: {self.nlive}",
-                f"ndim: {self.ndim}",
-                f"posterior ESS: {self.posterior_ess()}",
                 f"success: {self.success}",
                 f"message: {self.message}",
             ]
         )
+        return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain Python dictionary representation of the result."""

@@ -73,3 +73,16 @@ def test_to_dict_contains_expected_keys() -> None:
     }
     assert data["metadata"] == {"status": "complete"}
     assert data["metadata"] is not result.metadata
+
+
+def test_summary_contains_replacement_information_when_present() -> None:
+    result = make_result()
+    result.metadata = {
+        "mean_replacement_ncall": 2.5,
+        "replacement_failures": 1,
+    }
+
+    summary = result.summary()
+
+    assert "replacement mean ncall: 2.5" in summary
+    assert "replacement failures: 1" in summary

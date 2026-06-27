@@ -99,6 +99,8 @@ def run_static_nested(
     dead_logl = []
     dead_logwt = []
     logz_dead = -math.inf
+    replacement_ncall = []
+    replacement_failures = 0
     success = True
     message = "converged"
     logx_final = 0.0
@@ -142,7 +144,9 @@ def run_static_nested(
                 max_attempts=max_attempts,
             )
         ncall += calls
+        replacement_ncall.append(int(calls))
         if not accepted:
+            replacement_failures += 1
             success = False
             message = f"max_attempts={max_attempts} hit during constrained prior draw"
             break
@@ -180,6 +184,18 @@ def run_static_nested(
 
     logz = float(logsumexp(logwt))
     logzerr = _logzerr(logwt, logl, logz, nlive)
+    if replacement_ncall:
+        mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
+        max_replacement_ncall = int(max(replacement_ncall))
+        replacement_acceptance_proxy = (
+            1.0 / mean_replacement_ncall
+            if math.isfinite(mean_replacement_ncall) and mean_replacement_ncall > 0.0
+            else 0.0
+        )
+    else:
+        mean_replacement_ncall = 0.0
+        max_replacement_ncall = 0
+        replacement_acceptance_proxy = 0.0
 
     return NestedSamplingResult(
         samples_u=samples_u,
@@ -199,5 +215,10 @@ def run_static_nested(
             "maxiter": maxiter,
             "walks": walks,
             "step_scale": step_scale,
+            "replacement_ncall": replacement_ncall,
+            "replacement_failures": int(replacement_failures),
+            "mean_replacement_ncall": mean_replacement_ncall,
+            "max_replacement_ncall": max_replacement_ncall,
+            "replacement_acceptance_proxy": replacement_acceptance_proxy,
         },
     )

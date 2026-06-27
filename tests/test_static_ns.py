@@ -98,6 +98,11 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
     assert result.samples.shape == (5, 1)
     assert result.logl.shape == (5,)
     assert result.logwt.shape == (5,)
+    assert result.metadata["replacement_ncall"] == []
+    assert result.metadata["replacement_failures"] == 0
+    assert result.metadata["mean_replacement_ncall"] == 0.0
+    assert result.metadata["max_replacement_ncall"] == 0
+    assert result.metadata["replacement_acceptance_proxy"] == 0.0
 
 
 def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
@@ -124,3 +129,51 @@ def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
     assert result.metadata["sample"] == "rwalk"
     assert result.metadata["walks"] == 5
     assert result.metadata["step_scale"] == 0.2
+
+
+def test_replacement_stats_metadata_after_normal_run() -> None:
+    result = run_static_nested(
+        random.PRNGKey(7),
+        lambda theta: float(-jnp.sum(theta**2)),
+        lambda u: u,
+        ndim=2,
+        nlive=10,
+        dlogz=0.1,
+        maxiter=20,
+    )
+
+    metadata = result.metadata
+    assert set(
+        [
+            "replacement_ncall",
+            "replacement_failures",
+            "mean_replacement_ncall",
+            "max_replacement_ncall",
+            "replacement_acceptance_proxy",
+        ]
+    ).issubset(metadata)
+    assert len(metadata["replacement_ncall"]) > 0
+    assert metadata["replacement_failures"] == 0
+    assert metadata["mean_replacement_ncall"] > 0.0
+    assert metadata["max_replacement_ncall"] >= 1
+    assert (
+        metadata["replacement_acceptance_proxy"]
+        == 1.0 / metadata["mean_replacement_ncall"]
+    )
+
+
+def test_failure_to_replace_increments_replacement_failures() -> None:
+    result = run_static_nested(
+        random.PRNGKey(8),
+        lambda theta: float(theta[0]),
+        lambda u: u,
+        ndim=1,
+        nlive=3,
+        dlogz=0.0,
+        maxiter=10,
+        max_attempts=1,
+    )
+
+    assert result.success is False
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["replacement_ncall"][-1] == 1
