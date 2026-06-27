@@ -57,6 +57,24 @@ print(result.summary())
 | `result.to_numpy()` | Plain dictionary with array fields converted to NumPy arrays. |
 | `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
 
+## Saving and loading results
+
+Final results can be saved without extra dependencies using NumPy `.npz`:
+
+```python
+from tinyns import NestedSamplingResult
+
+result.save_npz("run.npz")
+loaded = NestedSamplingResult.load_npz("run.npz")
+```
+
+The `.npz` file stores weighted samples, evidence estimates, status, and
+JSON-serialized metadata. Equal-weight posterior samples are not stored because
+they can be regenerated with `resample_equal`.
+
+HDF5 is not part of the core package to keep dependencies minimal. If needed,
+HDF5 support can be added later as an optional extra.
+
 ## Progress and callbacks
 
 `tinyns` has dependency-free progress reporting:
