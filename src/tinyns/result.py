@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 
 from tinyns.math import (
     effective_sample_size_from_log_weights,
@@ -205,3 +206,44 @@ class NestedSamplingResult:
             "message": self.message,
             "metadata": None if self.metadata is None else dict(self.metadata),
         }
+
+    def to_numpy(self) -> dict[str, object]:
+        """Return a plain dictionary with array fields converted to NumPy arrays."""
+
+        return {
+            "samples_u": np.asarray(self.samples_u),
+            "samples": np.asarray(self.samples),
+            "logl": np.asarray(self.logl),
+            "logwt": np.asarray(self.logwt),
+            "logz": float(self.logz),
+            "logzerr": float(self.logzerr),
+            "ncall": int(self.ncall),
+            "nlive": int(self.nlive),
+            "ndim": int(self.ndim),
+            "success": bool(self.success),
+            "message": str(self.message),
+            "metadata": None if self.metadata is None else dict(self.metadata),
+        }
+
+    def to_dynesty_dict(self) -> dict[str, object]:
+        """Return a lightweight dynesty-compatibility dictionary.
+
+        This is not a full dynesty ``Results`` object, only a lightweight
+        compatibility dict using dynesty-like keys where tinyns has matching
+        fields.
+        """
+
+        result = {
+            "samples": np.asarray(self.samples),
+            "samples_u": np.asarray(self.samples_u),
+            "logl": np.asarray(self.logl),
+            "logwt": np.asarray(self.logwt),
+            "logz": float(self.logz),
+            "logzerr": float(self.logzerr),
+            "ncall": int(self.ncall),
+            "nlive": int(self.nlive),
+        }
+        metadata = {} if self.metadata is None else self.metadata
+        if "replacement_acceptance_proxy" in metadata:
+            result["eff"] = metadata["replacement_acceptance_proxy"]
+        return result
