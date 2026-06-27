@@ -116,3 +116,11 @@ def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
     assert len(payload["results"]) == 1
     assert payload["results"][0]["kernel"] == "jax"
     assert payload["results"][0]["success"] is True
+
+
+def test_benchmark_parser_accepts_replacement_chains() -> None:
+    from benchmarks.bench_static import parse_args
+
+    args = parse_args(["--replacement-chains", "4"])
+
+    assert args.replacement_chains == 4

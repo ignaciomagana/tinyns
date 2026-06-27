@@ -238,3 +238,46 @@ def test_checkpoint_missing_kernel_defaults_to_python(tmp_path):
     result = make_sampler(kernel="python").resume(old_path, maxiter=3)
 
     assert result.metadata["kernel"] == "python"
+
+
+def _rewrite_checkpoint_config(path, update):
+    with np.load(path) as data:
+        arrays = {name: data[name] for name in data.files}
+    config = json.loads(str(arrays["config_json"].item()))
+    update(config)
+    arrays["config_json"] = np.asarray(json.dumps(config, sort_keys=True))
+    with open(path, "wb") as file:
+        np.savez_compressed(file, **arrays)
+
+
+def test_checkpoint_config_includes_replacement_chains(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(sample="rwalk", kernel="jax", walks=3, replacement_chains=2).run(
+        16, maxiter=1, dlogz=0.0, checkpoint_path=path
+    )
+
+    _, config = load_checkpoint_npz(path)
+
+    assert config["replacement_chains"] == 2
+
+
+def test_resume_rejects_replacement_chains_mismatch(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(sample="rwalk", kernel="jax", walks=3, replacement_chains=2).run(
+        17, maxiter=1, dlogz=0.0, checkpoint_path=path
+    )
+
+    with pytest.raises(ValueError, match="replacement_chains"):
+        make_sampler(sample="rwalk", kernel="jax", walks=3).resume(path, maxiter=2)
+
+
+def test_old_checkpoint_missing_replacement_chains_defaults_to_one(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(sample="rwalk", walks=3).run(
+        18, maxiter=1, dlogz=0.0, checkpoint_path=path
+    )
+    _rewrite_checkpoint_config(path, lambda config: config.pop("replacement_chains"))
+
+    result = make_sampler(sample="rwalk", walks=3).resume(path, maxiter=2)
+
+    assert result.metadata["replacement_chains"] == 1

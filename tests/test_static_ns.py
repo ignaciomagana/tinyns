@@ -643,3 +643,41 @@ def test_jax_kernel_non_rwalk_raises(sample: str) -> None:
     )
     with pytest.raises(NotImplementedError, match='sample="rwalk"'):
         sampler.run(random.PRNGKey(0), maxiter=1)
+
+
+def test_nested_sampler_rwalk_jax_records_replacement_chains() -> None:
+    from tinyns import NestedSampler
+
+    sampler = NestedSampler(
+        _jax_loglike,
+        _jax_prior_transform,
+        ndim=2,
+        nlive=25,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.05,
+        replacement_chains=4,
+    )
+    result = sampler.run(random.PRNGKey(1), dlogz=10.0)
+
+    assert result.success is True
+    assert result.metadata["replacement_chains"] == 4
+
+
+@pytest.mark.parametrize(
+    ("sample", "kernel"), [("rwalk", "python"), ("slice", "python")]
+)
+def test_unsupported_replacement_chains_raise(sample: str, kernel: str) -> None:
+    from tinyns import NestedSampler
+
+    with pytest.raises(NotImplementedError, match="replacement_chains"):
+        NestedSampler(
+            _jax_loglike,
+            _jax_prior_transform,
+            ndim=2,
+            nlive=10,
+            sample=sample,
+            kernel=kernel,
+            replacement_chains=4,
+        )

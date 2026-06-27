@@ -48,3 +48,11 @@ def test_insertion_rank_stats_biased_ranks_have_large_mean_z() -> None:
 
     assert stats["insertion_rank_mean_z"] is not None
     assert stats["insertion_rank_mean_z"] > 10.0
+
+
+def test_validation_parser_accepts_replacement_chains() -> None:
+    from validation.run_validation import parse_args
+
+    args = parse_args(["--replacement-chains", "4"])
+
+    assert args.replacement_chains == 4

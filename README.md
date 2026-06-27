@@ -129,6 +129,29 @@ print(result.summary())
 print(result.diagnostics())
 ```
 
+
+### Batched JAX replacement chains
+
+For GPU-native likelihoods, `rwalk+jax` can run several independent replacement chains in parallel:
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    sample="rwalk",
+    kernel="jax",
+    walks=25,
+    replacement_chains=16,
+)
+```
+
+Here `walks` is the length of each chain, while `replacement_chains` is the number of independent chains run in parallel per replacement batch. This can improve wall time on GPU by evaluating many proposals in parallel.
+
+The replacement remains valid only if a successful chain is selected without favoring higher-likelihood endpoints. `tinyns` selects randomly among successful chains.
+
+> Warning: Increasing `replacement_chains` increases likelihood evaluations per replacement attempt. It is useful only when the likelihood benefits from batched/device parallelism.
+
 For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python"` with `sample="rwalk"`.
 
 `kernel="jax"` currently supports `sample="rwalk"` only. The top-level nested-sampling loop remains in Python; only the constrained replacement kernel is compiled.

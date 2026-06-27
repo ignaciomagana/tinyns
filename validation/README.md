@@ -37,6 +37,21 @@ python validation/summarize_validation.py \
 
 This is the recommended smoke-to-medium validation command for JAX-native users.
 
+Batched JAX replacement-chain validation example:
+
+```bash
+python validation/run_validation.py \
+  --targets gaussian2d correlated_gaussian2d \
+  --samplers rwalk \
+  --kernel jax \
+  --replacement-chains 16 \
+  --seeds 0 1 2 3 4 \
+  --nlive 200 \
+  --dlogz 0.1 \
+  --output validation_rwalk_jax_chains16.json
+```
+
+
 `slice` and `rslice` remain available, but repeated-seed validation should be run before relying on their evidence estimates.
 
 ## Interpreting validation summaries

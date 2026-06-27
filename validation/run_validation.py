@@ -98,6 +98,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
         "kernel": args.kernel,
+        "replacement_chains": args.replacement_chains,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -159,6 +160,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "slice_steps": args.slice_steps,
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
+        "replacement_chains": args.replacement_chains,
         "max_attempts": args.max_attempts,
         "seed": seed,
         "ndim": target.ndim,
@@ -196,7 +198,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--targets",
@@ -216,6 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--max-attempts", type=int, default=10000)
     parser.add_argument("--min-accepts", type=int, default=1)
+    parser.add_argument("--replacement-chains", type=int, default=1)
     parser.add_argument("--kernel", choices=["python", "jax"], default="python")
     parser.add_argument(
         "--progress",
@@ -229,11 +232,11 @@ def parse_args() -> argparse.Namespace:
         help="Progress print interval passed to NestedSampler.run.",
     )
     parser.add_argument("--output", type=str, default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     results = []
     for target_name in args.targets:
         for sampler_name in args.samplers:
