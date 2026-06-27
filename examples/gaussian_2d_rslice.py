@@ -40,6 +40,7 @@ def main():
         slices=5,
         slice_steps=10,
         step_scale=0.1,
+        min_accepts=3,
     )
     result = sampler.run(run_key, dlogz=0.5)
 

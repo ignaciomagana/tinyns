@@ -20,6 +20,15 @@ def _validate_theta_shape(theta, ndim: int):
     return theta
 
 
+def _validate_min_accepts(min_accepts: int) -> None:
+    if (
+        not isinstance(min_accepts, int)
+        or isinstance(min_accepts, bool)
+        or min_accepts <= 0
+    ):
+        raise ValueError("min_accepts must be a positive integer")
+
+
 def draw_constrained_prior(
     key: PRNGKeyLike,
     loglike: LogLikelihood,
@@ -152,6 +161,7 @@ def draw_constrained_slice(
     slice_steps: int = 10,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
+    min_accepts: int = 1,
 ):
     """Draw a constrained replacement with coordinate-wise slice updates.
 
@@ -170,6 +180,7 @@ def draw_constrained_slice(
         raise ValueError("step_scale must be positive")
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
+    _validate_min_accepts(min_accepts)
 
     live_u = jnp.asarray(live_u)
     live_logl = jnp.asarray(live_logl)
@@ -191,10 +202,12 @@ def draw_constrained_slice(
     best_theta = None
     best_logl = -math.inf
     ncall = 0
+    accepted_moves = 0
 
-    for _ in range(max_attempts):
-        moved = False
+    while ncall < max_attempts:
         for _ in range(slices):
+            if ncall >= max_attempts:
+                break
             new_key, axis_key, bracket_key = random.split(new_key, 3)
             axis = int(random.randint(axis_key, shape=(), minval=0, maxval=ndim))
             x = current_u[axis]
@@ -203,6 +216,8 @@ def draw_constrained_slice(
             right = left + step_scale
 
             for _ in range(slice_steps):
+                if ncall >= max_attempts:
+                    break
                 new_key, proposal_key = random.split(new_key)
                 x_prop = left + random.uniform(proposal_key, shape=()) * (right - left)
                 u_prop = reflect_unit_cube(current_u.at[axis].set(x_prop))
@@ -219,7 +234,7 @@ def draw_constrained_slice(
                     current_u = u_prop
                     current_theta = theta_prop
                     current_logl = logl_prop
-                    moved = True
+                    accepted_moves += 1
                     break
 
                 if bool(x_prop < x):
@@ -227,7 +242,12 @@ def draw_constrained_slice(
                 else:
                     right = x_prop
 
-        if moved:
+                if accepted_moves >= min_accepts:
+                    break
+            if accepted_moves >= min_accepts:
+                break
+
+        if accepted_moves >= min_accepts:
             return new_key, current_u, current_theta, current_logl, ncall, True
 
     return new_key, best_u, best_theta, best_logl, ncall, False
@@ -246,6 +266,7 @@ def draw_constrained_rslice(
     slice_steps: int = 10,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
+    min_accepts: int = 1,
 ):
     """Draw a constrained replacement with random-direction slice updates.
 
@@ -264,6 +285,7 @@ def draw_constrained_rslice(
         raise ValueError("step_scale must be positive")
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
+    _validate_min_accepts(min_accepts)
 
     live_u = jnp.asarray(live_u)
     live_logl = jnp.asarray(live_logl)
@@ -285,10 +307,12 @@ def draw_constrained_rslice(
     best_theta = current_theta
     best_logl = current_logl
     ncall = 0
+    accepted_moves = 0
 
-    for _ in range(max_attempts):
-        moved = False
+    while ncall < max_attempts:
         for _ in range(slices):
+            if ncall >= max_attempts:
+                break
             new_key, direction_key, bracket_key = random.split(new_key, 3)
             direction = random.normal(direction_key, shape=(ndim,))
             norm = float(jnp.linalg.norm(direction))
@@ -301,6 +325,8 @@ def draw_constrained_rslice(
             right = left + step_scale
 
             for _ in range(slice_steps):
+                if ncall >= max_attempts:
+                    break
                 new_key, proposal_key = random.split(new_key)
                 alpha = left + random.uniform(proposal_key, shape=()) * (right - left)
                 u_prop = reflect_unit_cube(current_u + alpha * direction)
@@ -317,7 +343,7 @@ def draw_constrained_rslice(
                     current_u = u_prop
                     current_theta = theta_prop
                     current_logl = logl_prop
-                    moved = True
+                    accepted_moves += 1
                     break
 
                 if bool(alpha < 0):
@@ -325,7 +351,12 @@ def draw_constrained_rslice(
                 else:
                     right = alpha
 
-        if moved:
+                if accepted_moves >= min_accepts:
+                    break
+            if accepted_moves >= min_accepts:
+                break
+
+        if accepted_moves >= min_accepts:
             return new_key, current_u, current_theta, current_logl, ncall, True
 
     return new_key, best_u, best_theta, best_logl, ncall, False
@@ -343,6 +374,7 @@ def draw_constrained_rwalk(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
+    min_accepts: int = 1,
 ):
     """Draw a constrained replacement with a reflected random walk.
 
@@ -358,6 +390,7 @@ def draw_constrained_rwalk(
         raise ValueError("step_scale must be positive")
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
+    _validate_min_accepts(min_accepts)
 
     live_u = jnp.asarray(live_u)
     live_logl = jnp.asarray(live_logl)
@@ -379,10 +412,12 @@ def draw_constrained_rwalk(
     best_theta = None
     best_logl = -math.inf
     ncall = 0
+    accepted_moves = 0
 
-    for _ in range(max_attempts):
-        moved = False
+    while ncall < max_attempts:
         for _ in range(walks):
+            if ncall >= max_attempts:
+                break
             new_key, proposal_key = random.split(new_key)
             step = step_scale * random.normal(proposal_key, shape=(ndim,))
             u_prop = reflect_unit_cube(current_u + step)
@@ -399,9 +434,11 @@ def draw_constrained_rwalk(
                 current_u = u_prop
                 current_theta = theta_prop
                 current_logl = logl_prop
-                moved = True
+                accepted_moves += 1
+                if accepted_moves >= min_accepts:
+                    break
 
-        if moved:
+        if accepted_moves >= min_accepts:
             return new_key, current_u, current_theta, current_logl, ncall, True
 
     return new_key, best_u, best_theta, best_logl, ncall, False

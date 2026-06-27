@@ -39,3 +39,8 @@ not a formal statistical test.
 
 
 `rslice` is available in the validation harness and is a useful comparison against coordinate-wise `slice`, especially on correlated targets. It remains a local, simple random-direction constrained slice sampler in the unit cube, not a full PolyChord-style slice sampler.
+
+When `slice` or `rslice` show poor evidence coverage, compare the default
+`--min-accepts 1` against a more decorrelated run such as `--min-accepts 3`.
+Higher values require more accepted constrained moves per replacement and
+therefore increase likelihood calls.

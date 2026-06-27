@@ -51,6 +51,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "nlive": args.nlive,
         "max_attempts": args.max_attempts,
         "step_scale": args.step_scale,
+        "min_accepts": args.min_accepts,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -94,6 +95,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
     return {
         "target": target_name,
         "sampler": sampler_name,
+        "min_accepts": args.min_accepts,
         "seed": seed,
         "ndim": target.ndim,
         "logz": float(result.logz),
@@ -145,6 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slice-steps", type=int, default=10)
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--max-attempts", type=int, default=10000)
+    parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument(
         "--progress",
         action="store_true",

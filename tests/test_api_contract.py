@@ -167,6 +167,7 @@ def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
         sample="rwalk",
         walks=5,
         step_scale=0.2,
+        min_accepts=2,
     )
 
     result = sampler.run(
@@ -180,6 +181,7 @@ def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
     assert result.metadata["sample"] == "rwalk"
     assert result.metadata["walks"] == 5
     assert result.metadata["step_scale"] == 0.2
+    assert result.metadata["min_accepts"] == 2
 
 
 def test_nested_sampler_slice_gaussian_returns_finite_logz() -> None:
@@ -192,6 +194,7 @@ def test_nested_sampler_slice_gaussian_returns_finite_logz() -> None:
         slices=3,
         slice_steps=5,
         step_scale=0.2,
+        min_accepts=2,
     )
 
     result = sampler.run(
@@ -205,6 +208,7 @@ def test_nested_sampler_slice_gaussian_returns_finite_logz() -> None:
     assert result.metadata["sample"] == "slice"
     assert result.metadata["slices"] == 3
     assert result.metadata["slice_steps"] == 5
+    assert result.metadata["min_accepts"] == 2
 
 
 def test_nested_sampler_vectorized_rslice_raises_on_run() -> None:
@@ -233,6 +237,7 @@ def test_nested_sampler_rslice_gaussian_returns_finite_logz() -> None:
         slices=3,
         slice_steps=5,
         step_scale=0.2,
+        min_accepts=2,
     )
 
     result = sampler.run(
@@ -244,3 +249,11 @@ def test_nested_sampler_rslice_gaussian_returns_finite_logz() -> None:
     assert math.isfinite(result.logz)
     assert jnp.isfinite(result.logz)
     assert result.metadata["sample"] == "rslice"
+    assert result.metadata["min_accepts"] == 2
+
+
+def test_nested_sampler_rejects_invalid_min_accepts_on_run() -> None:
+    sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=20, min_accepts=0)
+
+    with pytest.raises(ValueError, match="min_accepts"):
+        sampler.run(key=np.array([3, 4], dtype=np.uint32), maxiter=1)
