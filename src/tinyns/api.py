@@ -75,6 +75,9 @@ class NestedSampler:
         dlogz: float = 0.1,
         maxiter: int | None = None,
         progress: bool = False,
+        progress_interval: int = 100,
+        callback=None,
+        callback_interval: int = 100,
     ) -> NestedSamplingResult:
         """Run nested sampling and return a :class:`NestedSamplingResult`."""
 
@@ -90,6 +93,9 @@ class NestedSampler:
             vectorized=self.vectorized,
             max_attempts=self.max_attempts,
             progress=progress,
+            progress_interval=progress_interval,
+            callback=callback,
+            callback_interval=callback_interval,
             walks=self.kwargs.get("walks", 25),
             step_scale=self.kwargs.get("step_scale", 0.1),
             batch_size=self.kwargs.get("batch_size", 128),

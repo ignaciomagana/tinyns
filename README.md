@@ -57,6 +57,29 @@ print(result.summary())
 | `result.to_numpy()` | Plain dictionary with array fields converted to NumPy arrays. |
 | `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
 
+## Progress and callbacks
+
+`tinyns` has dependency-free progress reporting:
+
+```python
+result = sampler.run(key, progress=True, progress_interval=50)
+```
+
+For custom logging or early stopping, pass a callback:
+
+```python
+def callback(state):
+    print(state["iter"], state["logz"], state["dlogz"])
+    if state["iter"] > 1000:
+        return False
+
+
+result = sampler.run(key, callback=callback, callback_interval=25)
+```
+
+Returning `False` from the callback stops the run gracefully and returns a
+partial `NestedSamplingResult`.
+
 ## Replacement samplers
 
 | `sample` | Description |
@@ -100,6 +123,7 @@ programming language.
 - `examples/gaussian_2d.py`: 2D Gaussian with prior rejection.
 - `examples/gaussian_2d_rwalk.py`: reflected random-walk constrained sampling.
 - `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling.
+- `examples/progress_and_callback.py`: dependency-free progress and callbacks.
 - `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
 
 ## Validation

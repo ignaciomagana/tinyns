@@ -67,6 +67,58 @@ def _logzerr(logwt, logl, logz: float, nlive: int) -> float:
     return float(jnp.sqrt(jnp.maximum(information / nlive, 0.0)))
 
 
+def _make_run_state(
+    *,
+    iteration: int,
+    logz: float,
+    dlogz: float,
+    ncall: int,
+    logl_min: float,
+    logl_live_max: float,
+    sample: str,
+    nlive: int,
+    ndim: int,
+    replacement_ncall: list[int],
+    replacement_failures: int,
+) -> dict[str, object]:
+    if replacement_ncall:
+        replacement_mean_ncall_so_far = float(
+            sum(replacement_ncall) / len(replacement_ncall)
+        )
+    else:
+        replacement_mean_ncall_so_far = None
+    return {
+        "iter": int(iteration),
+        "logz": float(logz),
+        "dlogz": float(dlogz),
+        "ncall": int(ncall),
+        "logl_min": float(logl_min),
+        "logl_live_max": float(logl_live_max),
+        "sample": str(sample),
+        "nlive": int(nlive),
+        "ndim": int(ndim),
+        "replacement_mean_ncall_so_far": replacement_mean_ncall_so_far,
+        "replacement_failures": int(replacement_failures),
+    }
+
+
+def _format_progress_line(state: dict[str, object]) -> str:
+    """Format one dependency-free progress line for a run state."""
+
+    repl = state.get("replacement_mean_ncall_so_far")
+    repl_text = "n/a" if repl is None else f"{float(repl):.1f}"
+    return (
+        f"iter={int(state['iter']):05d} "
+        f"logz={float(state['logz']):.3f} "
+        f"dlogz={float(state['dlogz']):.3f} "
+        f"ncall={int(state['ncall'])} "
+        f"logl_min={float(state['logl_min']):.3g} "
+        f"logl_live_max={float(state['logl_live_max']):.3g} "
+        f"repl_ncall={repl_text} "
+        f"sample={state['sample']}"
+    )
+
+
 def run_static_nested(
     key: PRNGKeyLike,
     loglike: LogLikelihood,
@@ -80,6 +132,9 @@ def run_static_nested(
     vectorized: bool = False,
     max_attempts: int = 10_000,
     progress: bool = False,
+    progress_interval: int = 100,
+    callback=None,
+    callback_interval: int = 100,
     batch_size: int = 128,
     walks: int = 25,
     step_scale: float = 0.1,
@@ -99,16 +154,22 @@ def run_static_nested(
         raise ValueError("sample must be one of {'prior', 'rwalk', 'slice'}")
     if sample == "rwalk" and vectorized:
         raise NotImplementedError(
-            'vectorized rwalk is not implemented yet; use vectorized=False '
+            "vectorized rwalk is not implemented yet; use vectorized=False "
             'with sample="rwalk"'
         )
     if sample == "slice" and vectorized:
         raise NotImplementedError(
-            'vectorized slice sampling is not implemented yet; use vectorized=False '
+            "vectorized slice sampling is not implemented yet; use vectorized=False "
             'with sample="slice"'
         )
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
+    if progress_interval <= 0:
+        raise ValueError("progress_interval must be a positive integer")
+    if callback_interval <= 0:
+        raise ValueError("callback_interval must be a positive integer")
+    if callback is not None and not callable(callback):
+        raise TypeError("callback must be callable")
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
     if slices <= 0:
@@ -139,6 +200,7 @@ def run_static_nested(
     replacement_failures = 0
     success = True
     message = "converged"
+    stopped_by_callback = False
     logx_final = 0.0
 
     for i in range(maxiter):
@@ -224,6 +286,29 @@ def run_static_nested(
             replacement_failures += 1
             success = False
             message = f"max_attempts={max_attempts} hit during constrained prior draw"
+            logz_remain = logx_new + float(jnp.max(live_logl))
+            delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+            state = _make_run_state(
+                iteration=i + 1,
+                logz=logz_dead,
+                dlogz=delta_logz,
+                ncall=ncall,
+                logl_min=logl_worst,
+                logl_live_max=float(jnp.max(live_logl)),
+                sample=sample,
+                nlive=nlive,
+                ndim=ndim,
+                replacement_ncall=replacement_ncall,
+                replacement_failures=replacement_failures,
+            )
+            if callback is not None and (
+                i + 1 == 1 or (i + 1) % callback_interval == 0
+            ):
+                if callback(state) is False:
+                    message = "stopped by callback"
+                    stopped_by_callback = True
+            if progress:
+                print(_format_progress_line(state), end="\n")
             break
 
         other_live_logl = jnp.delete(live_logl, worst)
@@ -238,12 +323,36 @@ def run_static_nested(
 
         logz_remain = logx_new + float(jnp.max(live_logl))
         delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
-        if progress and (i + 1) % 100 == 0:
-            print(
-                f"iter={i + 1} logz={logz_dead:.6g} "
-                f"dlogz={delta_logz:.6g} ncall={ncall}"
-            )
-        if delta_logz < dlogz:
+        final_iteration = delta_logz < dlogz or i + 1 == maxiter
+        if i + 1 == maxiter and delta_logz >= dlogz:
+            success = False
+            message = f"maxiter={maxiter} reached"
+        state = _make_run_state(
+            iteration=i + 1,
+            logz=logz_dead,
+            dlogz=delta_logz,
+            ncall=ncall,
+            logl_min=logl_worst,
+            logl_live_max=float(jnp.max(live_logl)),
+            sample=sample,
+            nlive=nlive,
+            ndim=ndim,
+            replacement_ncall=replacement_ncall,
+            replacement_failures=replacement_failures,
+        )
+        if callback is not None and (
+            i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
+        ):
+            if callback(state) is False:
+                success = False
+                message = "stopped by callback"
+                stopped_by_callback = True
+                final_iteration = True
+        if progress and (
+            i + 1 == 1 or (i + 1) % progress_interval == 0 or final_iteration
+        ):
+            print(_format_progress_line(state), end="\n" if final_iteration else "\r")
+        if final_iteration:
             break
     else:
         success = False
@@ -314,5 +423,8 @@ def run_static_nested(
             "mean_replacement_ncall": mean_replacement_ncall,
             "max_replacement_ncall": max_replacement_ncall,
             "replacement_acceptance_proxy": replacement_acceptance_proxy,
+            "progress_interval": progress_interval,
+            "callback_interval": callback_interval,
+            "stopped_by_callback": bool(stopped_by_callback),
         },
     )
