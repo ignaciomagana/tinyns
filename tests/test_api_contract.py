@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tinyns import NestedSampler, NestedSamplerResult
+from tinyns import NestedSampler, NestedSamplerResult, NestedSamplingResult
 
 
 def loglike(theta: np.ndarray) -> float:
@@ -17,18 +17,36 @@ def prior_transform(unit: np.ndarray) -> np.ndarray:
 def test_public_exports() -> None:
     import tinyns
 
-    assert tinyns.__all__ == ["NestedSampler", "NestedSamplerResult"]
+    assert tinyns.__all__ == [
+        "NestedSampler",
+        "NestedSamplingResult",
+        "NestedSamplerResult",
+    ]
     assert tinyns.NestedSampler is NestedSampler
+    assert tinyns.NestedSamplingResult is NestedSamplingResult
     assert tinyns.NestedSamplerResult is NestedSamplerResult
 
 
 def test_nested_sampler_stores_configuration() -> None:
-    sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=500)
+    sampler = NestedSampler(
+        loglike,
+        prior_transform,
+        ndim=3,
+        nlive=500,
+        vectorized=True,
+        sample="prior",
+        max_attempts=123,
+        bootstrap=10,
+    )
 
     assert sampler.loglike is loglike
     assert sampler.prior_transform is prior_transform
     assert sampler.ndim == 3
     assert sampler.nlive == 500
+    assert sampler.vectorized is True
+    assert sampler.sample == "prior"
+    assert sampler.max_attempts == 123
+    assert sampler.kwargs == {"bootstrap": 10}
 
 
 def test_nested_sampler_validates_configuration() -> None:
@@ -38,6 +56,9 @@ def test_nested_sampler_validates_configuration() -> None:
     with pytest.raises(ValueError, match="nlive"):
         NestedSampler(loglike, prior_transform, ndim=3, nlive=0)
 
+    with pytest.raises(ValueError, match="sample"):
+        NestedSampler(loglike, prior_transform, ndim=3, sample="slice")
+
     with pytest.raises(TypeError, match="loglike"):
         NestedSampler(None, prior_transform, ndim=3)  # type: ignore[arg-type]
 
@@ -46,11 +67,4 @@ def test_run_is_declared_but_not_implemented_yet() -> None:
     sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=500)
 
     with pytest.raises(NotImplementedError, match="not implemented"):
-        sampler.run(key=np.array([0, 0]), dlogz=0.1)
-
-
-def test_run_validates_dlogz_before_implementation_placeholder() -> None:
-    sampler = NestedSampler(loglike, prior_transform, ndim=3)
-
-    with pytest.raises(ValueError, match="dlogz"):
-        sampler.run(key=np.array([0, 0]), dlogz=0.0)
+        sampler.run(key=np.array([0, 0]), dlogz=0.1, maxiter=10, progress=False)
