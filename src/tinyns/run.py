@@ -10,7 +10,7 @@ from jax.scipy.special import logsumexp
 
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
-from tinyns.samplers import draw_constrained_prior
+from tinyns.samplers import draw_constrained_prior, draw_constrained_rwalk
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
@@ -68,14 +68,16 @@ def run_static_nested(
     vectorized: bool = False,
     max_attempts: int = 10_000,
     progress: bool = False,
+    walks: int = 25,
+    step_scale: float = 0.1,
 ):
     """Run a simple static nested-sampling loop."""
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
-    if sample != "prior":
-        raise ValueError("sample must currently be 'prior'")
+    if sample not in {"prior", "rwalk"}:
+        raise ValueError("sample must currently be one of {'prior', 'rwalk'}")
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
     if maxiter is None:
@@ -116,15 +118,29 @@ def run_static_nested(
         logz_dead = float(jnp.logaddexp(logz_dead, logwt))
         logx_final = logx_new
 
-        key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_prior(
-            key,
-            loglike,
-            prior_transform,
-            logl_worst,
-            ndim,
-            vectorized=False,
-            max_attempts=max_attempts,
-        )
+        if sample == "prior":
+            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_prior(
+                key,
+                loglike,
+                prior_transform,
+                logl_worst,
+                ndim,
+                vectorized=False,
+                max_attempts=max_attempts,
+            )
+        else:
+            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rwalk(
+                key,
+                loglike,
+                prior_transform,
+                logl_worst,
+                live_u,
+                live_logl,
+                ndim,
+                walks=walks,
+                step_scale=step_scale,
+                max_attempts=max_attempts,
+            )
         ncall += calls
         if not accepted:
             success = False
@@ -177,5 +193,11 @@ def run_static_nested(
         ndim=ndim,
         success=success,
         message=message,
-        metadata={"sample": sample, "dlogz": dlogz, "maxiter": maxiter},
+        metadata={
+            "sample": sample,
+            "dlogz": dlogz,
+            "maxiter": maxiter,
+            "walks": walks,
+            "step_scale": step_scale,
+        },
     )
