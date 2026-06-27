@@ -42,7 +42,14 @@ def _as_point(array, ndim: int):
 
 def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
     if vectorized:
-        return jnp.asarray(loglike(theta_live), dtype=float).reshape((-1,))
+        logl = jnp.asarray(loglike(theta_live), dtype=float).reshape((-1,))
+        expected_shape = (theta_live.shape[0],)
+        if logl.shape != expected_shape:
+            raise ValueError(
+                "vectorized loglike must return one value per live point; "
+                f"expected shape {expected_shape}, got {logl.shape}"
+            )
+        return logl
     return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
 
 
