@@ -98,37 +98,46 @@ result = sampler.run(key, callback=callback, callback_interval=25)
 Returning `False` from the callback stops the run gracefully and returns a
 partial `NestedSamplingResult`.
 
-## Replacement samplers
+## Sampler recommendations
 
-| `sample` | Description |
-| --- | --- |
-| `"prior"` | Brute-force rejection from the prior; robust and correctness-first, but inefficient as dimension or likelihood concentration grows. |
-| `"rwalk"` | Reflected random-walk constrained sampler in the unit cube. |
-| `"slice"` | Coordinate-wise constrained slice sampler in the unit cube. |
-| `"rslice"` | Random-direction constrained slice sampler in the unit cube; often better for correlated targets than coordinate-wise `"slice"`. |
+`tinyns` supports several constrained-replacement samplers:
 
-`sample="prior"` supports vectorized replacement proposals with
-`vectorized=True`; the full nested-sampling loop remains a small Python loop.
-Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
+| sampler | use case | caveats |
+|---|---|---|
+| `prior` | Conceptual baseline; brute-force rejection from the prior | Can be extremely expensive as likelihood constraints tighten |
+| `rwalk` | Recommended robust default for low-dimensional problems | More likelihood calls than slice-like samplers |
+| `slice` | Fast coordinate-wise constrained slice updates | Can under-cover evidence uncertainty; validate on correlated targets |
+| `rslice` | Fast random-direction constrained slice updates | Experimental; validate before relying on evidence estimates |
 
-## Decorrelation controls
-
-For MCMC-like constrained replacement samplers (`rwalk`, `slice`, and
-`rslice`), `min_accepts` requires multiple accepted constrained moves before a
-replacement is returned:
+The current recommended starting point for nontrivial low-dimensional problems is:
 
 ```python
 sampler = NestedSampler(
     loglike,
     prior_transform,
-    ndim=2,
-    sample="rslice",
-    min_accepts=3,
+    ndim,
+    sample="rwalk",
 )
 ```
 
-Increasing `min_accepts` can improve decorrelation from the seed live point,
-but increases likelihood calls. It is ignored by brute-force `sample="prior"`.
+For faster exploratory runs, `slice` and `rslice` may be useful, but evidence
+calibration should be checked with repeated validation runs.
+
+`sample="prior"` supports vectorized replacement proposals with
+`vectorized=True`; the full nested-sampling loop remains a small Python loop.
+Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
+
+### `min_accepts`
+
+For `rwalk`, `slice`, and `rslice`, `min_accepts` requires multiple accepted
+constrained moves before returning a replacement. The default is
+`min_accepts=1`.
+
+Increasing `min_accepts` can increase likelihood-call cost and is not guaranteed
+to improve evidence calibration. In the current validation suite,
+`min_accepts=3` did not generally improve calibration and made several runs
+worse. Treat it as an experimental diagnostic knob rather than a recommended
+default.
 
 ## Design philosophy
 
