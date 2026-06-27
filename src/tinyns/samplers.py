@@ -23,7 +23,7 @@ def draw_constrained_prior(
     """Draw a point from the prior subject to a likelihood constraint.
 
     Points are drawn uniformly from the unit cube, transformed through
-    ``prior_transform``, and accepted once ``loglike(theta) > logl_min``. If no
+    ``prior_transform``, and accepted once ``loglike(theta) >= logl_min``. If no
     attempted point satisfies the constraint, the best attempted point is
     returned with ``accepted`` set to ``False``.
     """
@@ -52,7 +52,7 @@ def draw_constrained_prior(
             best_theta = theta
             best_logl = logl
 
-        if logl > logl_min:
+        if logl >= logl_min:
             return new_key, u, theta, logl, ncall, True
 
     return new_key, best_u, best_theta, best_logl, max_attempts, False
