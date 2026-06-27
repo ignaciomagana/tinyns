@@ -44,3 +44,17 @@ When `slice` or `rslice` show poor evidence coverage, compare the default
 `--min-accepts 1` against a more decorrelated run such as `--min-accepts 3`.
 Higher values require more accepted constrained moves per replacement and
 therefore increase likelihood calls.
+
+## Comparing validation runs
+
+To compare two validation runs, for example `min_accepts=1` versus `min_accepts=3`:
+
+```bash
+python validation/compare_validation.py \
+  validation_min_accepts1.json validation_min_accepts3.json \
+  --labels min1 min3
+```
+
+The comparison table reports changes in coverage, absolute evidence error,
+large-z outlier fraction, maximum z-score, and likelihood-call cost. The verdict
+column is heuristic and should be treated as a debugging aid.
