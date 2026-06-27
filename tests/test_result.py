@@ -336,3 +336,104 @@ def test_diagnostics_bad_insertion_indices_triggers_warning() -> None:
         "insertion indices look non-uniform; constrained sampler may be biased or "
         "poorly mixed"
     ) in diagnostics["warnings"]
+
+
+def test_result_npz_round_trip(tmp_path) -> None:
+    result = make_result()
+    result.success = False
+    result.message = "stopped"
+    path = tmp_path / "result.npz"
+
+    result.save_npz(path)
+    loaded = NestedSamplingResult.load_npz(path)
+
+    np.testing.assert_allclose(
+        np.asarray(loaded.samples_u), np.asarray(result.samples_u)
+    )
+    np.testing.assert_allclose(np.asarray(loaded.samples), np.asarray(result.samples))
+    np.testing.assert_allclose(np.asarray(loaded.logl), np.asarray(result.logl))
+    np.testing.assert_allclose(np.asarray(loaded.logwt), np.asarray(result.logwt))
+    assert loaded.logz == result.logz
+    assert loaded.logzerr == result.logzerr
+    assert loaded.ncall == result.ncall
+    assert loaded.nlive == result.nlive
+    assert loaded.ndim == result.ndim
+    assert loaded.success == result.success
+    assert loaded.message == result.message
+
+
+def test_result_npz_round_trip_metadata_jsonable(tmp_path) -> None:
+    result = make_result()
+    result.metadata = {
+        "name": "demo",
+        "count": np.int64(3),
+        "scale": np.float64(1.5),
+        "ok": np.bool_(True),
+        "items": [1, "two", False],
+        "nested": {"value": jnp.asarray(2.0)},
+        "numpy_array": np.array([1, 2, 3]),
+        "jax_array": jnp.array([[1.0, 2.0], [3.0, 4.0]]),
+        "unsupported": object(),
+    }
+    path = tmp_path / "metadata.npz"
+
+    result.save_npz(path)
+    loaded = NestedSamplingResult.load_npz(path)
+
+    assert loaded.metadata is not None
+    assert loaded.metadata["name"] == "demo"
+    assert loaded.metadata["count"] == 3
+    assert loaded.metadata["scale"] == 1.5
+    assert loaded.metadata["ok"] is True
+    assert loaded.metadata["items"] == [1, "two", False]
+    assert loaded.metadata["nested"] == {"value": 2.0}
+    assert loaded.metadata["numpy_array"] == [1, 2, 3]
+    assert loaded.metadata["jax_array"] == [[1.0, 2.0], [3.0, 4.0]]
+    assert isinstance(loaded.metadata["unsupported"], str)
+
+
+def test_loaded_result_npz_still_behaves_like_result(tmp_path) -> None:
+    result = make_result()
+    path = tmp_path / "result.npz"
+    result.save_npz(path)
+
+    loaded = NestedSamplingResult.load_npz(path)
+
+    assert np.isclose(float(jnp.sum(loaded.weights())), 1.0)
+    assert loaded.posterior_ess() > 0.0
+    assert isinstance(loaded.diagnostics(), dict)
+    assert loaded.resample_equal(random.PRNGKey(0), n=3).shape == (3, result.ndim)
+    assert isinstance(loaded.summary(), str)
+    assert isinstance(loaded.to_numpy()["samples"], np.ndarray)
+    assert isinstance(loaded.to_dynesty_dict()["samples"], np.ndarray)
+
+
+def test_result_npz_bad_format_version_raises(tmp_path) -> None:
+    path = tmp_path / "bad.npz"
+    np.savez_compressed(
+        path,
+        samples_u=np.zeros((1, 1)),
+        samples=np.zeros((1, 1)),
+        logl=np.zeros(1),
+        logwt=np.zeros(1),
+        logz=0.0,
+        logzerr=0.0,
+        ncall=1,
+        nlive=1,
+        ndim=1,
+        success=True,
+        message="",
+        metadata_json="null",
+        format_version="bad-version",
+    )
+
+    with np.testing.assert_raises(ValueError):
+        NestedSamplingResult.load_npz(path)
+
+
+def test_result_npz_missing_required_key_raises(tmp_path) -> None:
+    path = tmp_path / "missing.npz"
+    np.savez_compressed(path, format_version="tinyns-result-npz-v1")
+
+    with np.testing.assert_raises(ValueError):
+        NestedSamplingResult.load_npz(path)

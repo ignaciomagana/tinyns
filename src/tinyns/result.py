@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import numbers
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,83 @@ from tinyns.math import (
     systematic_resample,
 )
 from tinyns.types import ArrayLike
+
+_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v1"
+_RESULT_NPZ_REQUIRED_KEYS = {
+    "samples_u",
+    "samples",
+    "logl",
+    "logwt",
+    "logz",
+    "logzerr",
+    "ncall",
+    "nlive",
+    "ndim",
+    "success",
+    "message",
+    "metadata_json",
+    "format_version",
+}
+
+
+def _metadata_to_jsonable(metadata):
+    """Return metadata converted to JSON-compatible Python values."""
+
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return {
+            str(key): _metadata_to_jsonable(value)
+            for key, value in metadata.items()
+        }
+    if isinstance(metadata, list):
+        return [_metadata_to_jsonable(value) for value in metadata]
+    if isinstance(metadata, (str, bool, int, float)) or metadata is None:
+        return metadata
+    if isinstance(metadata, np.generic):
+        return metadata.item()
+
+    try:
+        array = np.asarray(metadata)
+    except (TypeError, ValueError):
+        return str(metadata)
+
+    if array.dtype == object:
+        return str(metadata)
+    if array.ndim == 0:
+        scalar = array.item()
+        if isinstance(scalar, (str, bool, int, float)) or scalar is None:
+            return scalar
+        return str(scalar)
+    return array.tolist()
+
+
+def _metadata_from_jsonable(metadata):
+    """Return metadata loaded from its JSON-compatible representation."""
+
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return {
+            str(key): _metadata_from_jsonable(value)
+            for key, value in metadata.items()
+        }
+    if isinstance(metadata, list):
+        return [_metadata_from_jsonable(value) for value in metadata]
+    if isinstance(metadata, (str, bool, int, float)) or metadata is None:
+        return metadata
+    return str(metadata)
+
+
+def _npz_scalar(value):
+    """Return a Python scalar from a NumPy value loaded from ``np.load``."""
+
+    array = np.asarray(value)
+    if array.shape == ():
+        return array.item()
+    if array.size == 1:
+        return array.reshape(()).item()
+    raise ValueError("expected scalar value in result .npz file")
 
 
 @dataclass
@@ -274,6 +352,63 @@ class NestedSamplingResult:
             ]
         )
         return "\n".join(lines)
+
+    def save_npz(self, path) -> None:
+        """Save the final result to a compressed NumPy ``.npz`` file."""
+
+        metadata_json = json.dumps(_metadata_to_jsonable(self.metadata))
+        np.savez_compressed(
+            path,
+            samples_u=np.asarray(self.samples_u),
+            samples=np.asarray(self.samples),
+            logl=np.asarray(self.logl),
+            logwt=np.asarray(self.logwt),
+            logz=np.asarray(float(self.logz)),
+            logzerr=np.asarray(float(self.logzerr)),
+            ncall=np.asarray(int(self.ncall)),
+            nlive=np.asarray(int(self.nlive)),
+            ndim=np.asarray(int(self.ndim)),
+            success=np.asarray(bool(self.success)),
+            message=np.asarray(str(self.message)),
+            metadata_json=np.asarray(metadata_json),
+            format_version=np.asarray(_RESULT_NPZ_FORMAT_VERSION),
+        )
+
+    @classmethod
+    def load_npz(cls, path) -> NestedSamplingResult:
+        """Load a result previously written by :meth:`save_npz`."""
+
+        with np.load(path) as data:
+            keys = set(data.files)
+            missing = sorted(_RESULT_NPZ_REQUIRED_KEYS - keys)
+            if missing:
+                joined = ", ".join(missing)
+                raise ValueError(f"missing required result .npz keys: {joined}")
+
+            format_version = str(_npz_scalar(data["format_version"]))
+            if format_version != _RESULT_NPZ_FORMAT_VERSION:
+                raise ValueError(
+                    "unknown result .npz format_version: "
+                    f"{format_version!r}; expected {_RESULT_NPZ_FORMAT_VERSION!r}"
+                )
+
+            metadata_json = str(_npz_scalar(data["metadata_json"]))
+            metadata = _metadata_from_jsonable(json.loads(metadata_json))
+
+            return cls(
+                samples_u=jnp.asarray(data["samples_u"]),
+                samples=jnp.asarray(data["samples"]),
+                logl=jnp.asarray(data["logl"]),
+                logwt=jnp.asarray(data["logwt"]),
+                logz=float(_npz_scalar(data["logz"])),
+                logzerr=float(_npz_scalar(data["logzerr"])),
+                ncall=int(_npz_scalar(data["ncall"])),
+                nlive=int(_npz_scalar(data["nlive"])),
+                ndim=int(_npz_scalar(data["ndim"])),
+                success=bool(_npz_scalar(data["success"])),
+                message=str(_npz_scalar(data["message"])),
+                metadata=metadata,
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain Python dictionary representation of the result."""
