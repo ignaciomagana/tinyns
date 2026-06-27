@@ -6,6 +6,7 @@ import math
 import os
 
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 from jax.scipy.special import logsumexp
 
@@ -241,10 +242,6 @@ def run_static_nested(
         )
         live_logl = _evaluate_live_points(loglike, live_theta, vectorized=vectorized)
         ncall = nlive
-        dead_u = []
-        dead_theta = []
-        dead_logl = []
-        dead_logwt = []
         logz_dead = -math.inf
         replacement_ncall = []
         insertion_indices = []
@@ -259,10 +256,16 @@ def run_static_nested(
         live_u = initial_state.live_u
         live_theta = initial_state.live_theta
         live_logl = initial_state.live_logl
-        dead_u = list(initial_state.dead_u)
-        dead_theta = list(initial_state.dead_theta)
-        dead_logl = list(initial_state.dead_logl)
-        dead_logwt = list(initial_state.dead_logwt)
+        checkpoint_dead_count = len(initial_state.dead_logl)
+        if not (
+            len(initial_state.dead_u)
+            == len(initial_state.dead_theta)
+            == checkpoint_dead_count
+            == len(initial_state.dead_logwt)
+        ):
+            raise ValueError(
+                "checkpoint dead point arrays have inconsistent lengths"
+            )
         logz_dead = float(initial_state.logz_dead)
         logx_final = float(initial_state.logx_final)
         ncall = int(initial_state.ncall)
@@ -277,6 +280,21 @@ def run_static_nested(
             raise ValueError(
                 f"maxiter={maxiter} is smaller than checkpoint iteration={iteration}"
             )
+        if checkpoint_dead_count != iteration:
+            raise ValueError(
+                "checkpoint dead point count must match checkpoint iteration; "
+                f"got {checkpoint_dead_count} dead points and iteration={iteration}"
+            )
+
+    dead_u_storage = np.empty((maxiter, ndim), dtype=np.asarray(live_u).dtype)
+    dead_theta_storage = np.empty((maxiter, ndim), dtype=np.asarray(live_theta).dtype)
+    dead_logl_storage = np.empty((maxiter,), dtype=np.asarray(live_logl).dtype)
+    dead_logwt_storage = np.empty((maxiter,), dtype=np.asarray(live_logl).dtype)
+    if initial_state is not None and iteration:
+        dead_u_storage[:iteration] = np.asarray(jnp.stack(initial_state.dead_u))
+        dead_theta_storage[:iteration] = np.asarray(jnp.stack(initial_state.dead_theta))
+        dead_logl_storage[:iteration] = np.asarray(initial_state.dead_logl)
+        dead_logwt_storage[:iteration] = np.asarray(initial_state.dead_logwt)
 
     initial_iteration = iteration
     final_delta_logz = math.inf
@@ -288,10 +306,10 @@ def run_static_nested(
             live_u=live_u,
             live_theta=live_theta,
             live_logl=live_logl,
-            dead_u=dead_u,
-            dead_theta=dead_theta,
-            dead_logl=dead_logl,
-            dead_logwt=dead_logwt,
+            dead_u=[jnp.asarray(point) for point in dead_u_storage[:iteration]],
+            dead_theta=[jnp.asarray(point) for point in dead_theta_storage[:iteration]],
+            dead_logl=[float(x) for x in dead_logl_storage[:iteration]],
+            dead_logwt=[float(x) for x in dead_logwt_storage[:iteration]],
             logz_dead=logz_dead,
             logx_final=logx_final,
             ncall=ncall,
@@ -318,10 +336,10 @@ def run_static_nested(
         logwidth = logdiffexp(logx_prev, logx_new)
         logwt = float(logwidth + logl_worst)
 
-        dead_u.append(live_u[worst])
-        dead_theta.append(live_theta[worst])
-        dead_logl.append(logl_worst)
-        dead_logwt.append(logwt)
+        dead_u_storage[i] = np.asarray(live_u[worst])
+        dead_theta_storage[i] = np.asarray(live_theta[worst])
+        dead_logl_storage[i] = logl_worst
+        dead_logwt_storage[i] = logwt
         logz_dead = float(jnp.logaddexp(logz_dead, logwt))
         logx_final = logx_new
 
@@ -493,11 +511,15 @@ def run_static_nested(
 
     live_logwt = logx_final - math.log(nlive) + live_logl
 
-    if dead_u:
-        samples_u = jnp.concatenate([jnp.stack(dead_u), live_u], axis=0)
-        samples = jnp.concatenate([jnp.stack(dead_theta), live_theta], axis=0)
-        logl = jnp.concatenate([jnp.asarray(dead_logl), live_logl], axis=0)
-        logwt = jnp.concatenate([jnp.asarray(dead_logwt), live_logwt], axis=0)
+    dead_u_arr = jnp.asarray(dead_u_storage[:iteration])
+    dead_theta_arr = jnp.asarray(dead_theta_storage[:iteration])
+    dead_logl_arr = jnp.asarray(dead_logl_storage[:iteration])
+    dead_logwt_arr = jnp.asarray(dead_logwt_storage[:iteration])
+    if iteration:
+        samples_u = jnp.concatenate([dead_u_arr, live_u], axis=0)
+        samples = jnp.concatenate([dead_theta_arr, live_theta], axis=0)
+        logl = jnp.concatenate([dead_logl_arr, live_logl], axis=0)
+        logwt = jnp.concatenate([dead_logwt_arr, live_logwt], axis=0)
     else:
         samples_u = live_u
         samples = live_theta
@@ -506,7 +528,7 @@ def run_static_nested(
 
     logz = float(logsumexp(logwt))
     logzerr = _logzerr(logwt, logl, logz, nlive)
-    niter = len(dead_logl)
+    niter = int(iteration)
     nlive_final = int(live_logl.size)
     nposterior = int(logwt.size)
     if replacement_ncall:

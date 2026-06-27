@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from tinyns import NestedSampler
+from tinyns.run import run_static_nested
 from tinyns.state import load_checkpoint_npz
 
 
@@ -175,3 +176,36 @@ def test_resume_rejects_checkpoint_after_replacement_failure(tmp_path):
     assert "max_attempts" in result.message
     with pytest.raises(ValueError, match="replacement failure"):
         failed_sampler.resume(path, maxiter=10, dlogz=0.0)
+
+
+def test_checkpoint_created_after_preallocation_can_be_loaded(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+
+    make_sampler().run(12, maxiter=3, dlogz=0.0, checkpoint_path=path)
+    state, config = load_checkpoint_npz(path)
+
+    assert state.iteration == len(state.dead_logl)
+    assert len(state.dead_u) == state.iteration
+    assert config["ndim"] == 2
+
+
+def test_resume_rejects_inconsistent_dead_count(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler().run(13, maxiter=3, dlogz=0.0, checkpoint_path=path)
+    state, _ = load_checkpoint_npz(path)
+    state.dead_u = state.dead_u[:-1]
+    state.dead_theta = state.dead_theta[:-1]
+    state.dead_logl = state.dead_logl[:-1]
+    state.dead_logwt = state.dead_logwt[:-1]
+
+    with pytest.raises(ValueError, match="dead point count.*iteration"):
+        run_static_nested(
+            state.key,
+            loglike,
+            prior_transform,
+            ndim=2,
+            nlive=20,
+            dlogz=0.0,
+            maxiter=5,
+            initial_state=state,
+        )
