@@ -98,3 +98,29 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
     assert result.samples.shape == (5, 1)
     assert result.logl.shape == (5,)
     assert result.logwt.shape == (5,)
+
+
+def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
+    def loglike(theta):
+        return float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi))
+
+    def prior_transform(u):
+        return 20.0 * u - 10.0
+
+    result = run_static_nested(
+        random.PRNGKey(6),
+        loglike,
+        prior_transform,
+        ndim=1,
+        nlive=40,
+        dlogz=0.1,
+        maxiter=300,
+        sample="rwalk",
+        walks=5,
+        step_scale=0.2,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["sample"] == "rwalk"
+    assert result.metadata["walks"] == 5
+    assert result.metadata["step_scale"] == 0.2

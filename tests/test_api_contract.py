@@ -37,8 +37,10 @@ def test_nested_sampler_stores_configuration() -> None:
         ndim=3,
         nlive=500,
         vectorized=True,
-        sample="prior",
+        sample="rwalk",
         max_attempts=123,
+        walks=12,
+        step_scale=0.2,
         bootstrap=10,
     )
 
@@ -47,9 +49,9 @@ def test_nested_sampler_stores_configuration() -> None:
     assert sampler.ndim == 3
     assert sampler.nlive == 500
     assert sampler.vectorized is True
-    assert sampler.sample == "prior"
+    assert sampler.sample == "rwalk"
     assert sampler.max_attempts == 123
-    assert sampler.kwargs == {"bootstrap": 10}
+    assert sampler.kwargs == {"walks": 12, "step_scale": 0.2, "bootstrap": 10}
 
 
 def test_nested_sampler_validates_configuration() -> None:
@@ -92,3 +94,27 @@ def test_nested_sampler_run_constant_likelihood_gives_finite_logz() -> None:
 
     assert math.isfinite(result.logz)
     assert jnp.isfinite(result.logz)
+
+
+def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
+    sampler = NestedSampler(
+        lambda theta: float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi)),
+        lambda u: 20.0 * u - 10.0,
+        ndim=1,
+        nlive=40,
+        sample="rwalk",
+        walks=5,
+        step_scale=0.2,
+    )
+
+    result = sampler.run(
+        key=np.array([2, 3], dtype=np.uint32),
+        dlogz=0.1,
+        maxiter=300,
+    )
+
+    assert math.isfinite(result.logz)
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["sample"] == "rwalk"
+    assert result.metadata["walks"] == 5
+    assert result.metadata["step_scale"] == 0.2
