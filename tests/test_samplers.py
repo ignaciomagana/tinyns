@@ -6,7 +6,11 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
-from tinyns.samplers import draw_constrained_prior, draw_constrained_rwalk
+from tinyns.samplers import (
+    draw_constrained_prior,
+    draw_constrained_prior_vectorized,
+    draw_constrained_rwalk,
+)
 
 
 def gaussian_loglike(theta):
@@ -174,4 +178,47 @@ def test_draw_constrained_rwalk_rejects_invalid_parameters_and_shapes() -> None:
             live_u,
             jnp.ones((2,)),
             2,
+        )
+
+
+def test_draw_constrained_prior_vectorized_accepts_easy_threshold() -> None:
+    ndim = 2
+
+    _, u, theta, logl, ncall, accepted = draw_constrained_prior_vectorized(
+        random.PRNGKey(9),
+        lambda theta_batch: -jnp.sum(theta_batch**2, axis=1),
+        lambda u_batch: u_batch,
+        -10.0,
+        ndim,
+        batch_size=4,
+    )
+
+    assert accepted is True
+    assert u.shape == (ndim,)
+    assert theta.shape == (ndim,)
+    assert logl >= -10.0
+    assert ncall == 4
+
+
+def test_draw_constrained_prior_vectorized_rejects_invalid_batch_size() -> None:
+    with pytest.raises(ValueError, match="batch_size"):
+        draw_constrained_prior_vectorized(
+            random.PRNGKey(10),
+            lambda theta_batch: jnp.zeros((theta_batch.shape[0],)),
+            lambda u_batch: u_batch,
+            -math.inf,
+            2,
+            batch_size=0,
+        )
+
+
+def test_draw_constrained_prior_vectorized_rejects_wrong_prior_shape() -> None:
+    with pytest.raises(ValueError, match="prior_transform"):
+        draw_constrained_prior_vectorized(
+            random.PRNGKey(11),
+            lambda theta_batch: jnp.zeros((theta_batch.shape[0],)),
+            lambda u_batch: u_batch[:, 0],
+            -math.inf,
+            2,
+            batch_size=3,
         )

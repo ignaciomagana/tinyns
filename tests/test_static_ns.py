@@ -177,3 +177,43 @@ def test_failure_to_replace_increments_replacement_failures() -> None:
     assert result.success is False
     assert result.metadata["replacement_failures"] == 1
     assert result.metadata["replacement_ncall"][-1] == 1
+
+
+def test_vectorized_prior_constant_likelihood_returns_finite_logz() -> None:
+    result = run_static_nested(
+        random.PRNGKey(9),
+        lambda theta_batch: jnp.zeros((theta_batch.shape[0],)),
+        lambda u_batch: u_batch,
+        ndim=2,
+        nlive=20,
+        dlogz=0.1,
+        maxiter=50,
+        vectorized=True,
+        batch_size=8,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.samples.shape[1:] == (2,)
+    assert all(ncall == 8 for ncall in result.metadata["replacement_ncall"])
+
+
+def test_vectorized_prior_1d_gaussian_returns_finite_logz() -> None:
+    def loglike(theta_batch):
+        theta = theta_batch[:, 0]
+        return -0.5 * theta**2 - 0.5 * math.log(2.0 * math.pi)
+
+    result = run_static_nested(
+        random.PRNGKey(10),
+        loglike,
+        lambda u_batch: 20.0 * u_batch - 10.0,
+        ndim=1,
+        nlive=30,
+        dlogz=0.2,
+        maxiter=100,
+        vectorized=True,
+        batch_size=6,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.samples.shape[1:] == (1,)
+    assert result.metadata["batch_size"] == 6
