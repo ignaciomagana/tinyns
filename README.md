@@ -100,14 +100,38 @@ partial `NestedSamplingResult`.
 
 ## Sampler recommendations
 
-`tinyns` supports several constrained-replacement samplers:
+| sampler | kernel | recommendation | notes |
+|---|---|---|---|
+| `prior` | `python` | Conceptual baseline | Brute-force constrained rejection; can become very expensive |
+| `rwalk` | `python` | Reliable baseline | Calibrated on repeated Gaussian validation; CPU/Python local kernel |
+| `rwalk` | `jax` | Recommended fast path for JAX-native likelihoods | Runs constrained random-walk replacements on device; currently the best validated fast path |
+| `slice` | `python` | Exploratory / problem-dependent | Fast, but validate evidence calibration on your target geometry |
+| `rslice` | `python` | Experimental | Not currently recommended as the default evidence sampler |
 
-| sampler | use case | caveats |
-|---|---|---|
-| `prior` | Conceptual baseline; brute-force rejection from the prior | Can be extremely expensive as likelihood constraints tighten |
-| `rwalk` | Recommended robust default for low-dimensional problems | More likelihood calls than slice-like samplers |
-| `slice` | Fast coordinate-wise constrained slice updates | Can under-cover evidence uncertainty; validate on correlated targets |
-| `rslice` | Fast random-direction constrained slice updates | Experimental; validate before relying on evidence estimates |
+For JAX-native likelihoods, the recommended reliable fast path is:
+
+```python
+from tinyns import NestedSampler
+
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    nlive=200,
+    sample="rwalk",
+    kernel="jax",
+    walks=25,
+    step_scale=0.1,
+)
+
+result = sampler.run(key, dlogz=0.1)
+print(result.summary())
+print(result.diagnostics())
+```
+
+For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python"` with `sample="rwalk"`.
+
+`kernel="jax"` currently supports `sample="rwalk"` only. The top-level nested-sampling loop remains in Python; only the constrained replacement kernel is compiled.
 
 For local constrained samplers, step-count parameters are decorrelation lengths:
 
@@ -118,46 +142,21 @@ For local constrained samplers, step-count parameters are decorrelation lengths:
 
 The sampler does not return merely after the first accepted local move; it runs the requested local update length.
 
-The current recommended starting point for nontrivial low-dimensional problems is:
-
-```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-)
-```
-
-For faster exploratory runs, `slice` may be useful, but evidence
-calibration should be checked with repeated validation runs. Treat `rslice` as
-experimental.
-
 `sample="prior"` supports vectorized replacement proposals with
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
 Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
-### JAX replacement kernel
+## Current validation status
 
-For JAX-native likelihoods, the recommended reliable fast path is:
+The recommended `sample="rwalk", kernel="jax"` path has been checked with repeated-seed validation on:
 
-```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-    kernel="jax",
-    walks=25,
-    step_scale=0.1,
-)
-```
+- `gaussian2d`
+- `correlated_gaussian2d`
+- `ring2d`
+- `banana2d`
+- `eggbox2d`
 
-This keeps the top-level nested-sampling loop in Python but runs each constrained random-walk replacement on device. It avoids proposal-by-proposal Python/GPU synchronization while preserving the same replacement semantics as the Python `rwalk` kernel.
-
-The JAX rwalk kernel matches the Python rwalk replacement semantics: it retries fresh live-point seeds until a full `walks`-step chain has at least `min_accepts` accepted moves or `max_attempts` is exhausted.
-
-`kernel="jax"` currently supports `sample="rwalk"` only. Use `kernel="python"` for `prior`, `slice`, and `rslice`.
+The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. Users should still validate on their own target geometry before relying on evidence values.
 
 ### `min_accepts`
 
@@ -201,6 +200,7 @@ programming language.
 
 - `examples/gaussian_2d.py`: 2D Gaussian with prior rejection.
 - `examples/gaussian_2d_rwalk.py`: reflected random-walk constrained sampling.
+- `examples/gaussian_2d_rwalk_jax.py`: JAX-native random-walk replacement kernel.
 - `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling.
 - `examples/progress_and_callback.py`: dependency-free progress and callbacks.
 - `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
