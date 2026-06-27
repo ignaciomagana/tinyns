@@ -151,6 +151,10 @@ def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     assert "posterior_weight_entropy_fraction" in diagnostics
     assert "live_weight_fraction" in diagnostics
     assert "dead_weight_fraction" in diagnostics
+    assert "final_delta_logz" in diagnostics
+    assert "final_logx" in diagnostics
+    assert "final_logz_dead" in diagnostics
+    assert "final_logl_live_max" in diagnostics
 
 
 def test_max_weight_fraction_returns_expected_value() -> None:
@@ -228,6 +232,18 @@ def test_diagnostics_high_max_weight_triggers_warning() -> None:
 
     assert (
         "posterior dominated by a small number of weighted samples"
+        in diagnostics["warnings"]
+    )
+
+
+def test_diagnostics_success_with_high_final_delta_logz_triggers_warning() -> None:
+    result = make_result()
+    result.metadata = {"dlogz": 0.1, "final_delta_logz": 0.2}
+
+    diagnostics = result.diagnostics()
+
+    assert (
+        "successful run has final_delta_logz above requested dlogz"
         in diagnostics["warnings"]
     )
 
