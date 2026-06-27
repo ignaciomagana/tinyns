@@ -68,6 +68,23 @@ def test_nested_sampler_validates_configuration() -> None:
         NestedSampler(None, prior_transform, ndim=3)  # type: ignore[arg-type]
 
 
+def test_nested_sampler_vectorized_rwalk_raises_on_run() -> None:
+    sampler = NestedSampler(
+        lambda theta_batch: -0.5 * jnp.sum(theta_batch**2, axis=1),
+        lambda u_batch: 2.0 * u_batch - 1.0,
+        ndim=2,
+        nlive=10,
+        vectorized=True,
+        sample="rwalk",
+    )
+
+    assert sampler.vectorized is True
+    assert sampler.sample == "rwalk"
+    with pytest.raises(
+        NotImplementedError, match="vectorized rwalk is not implemented yet"
+    ):
+        sampler.run(key=np.array([4, 5], dtype=np.uint32), maxiter=1)
+
 def test_nested_sampler_run_returns_result() -> None:
     sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=20)
 

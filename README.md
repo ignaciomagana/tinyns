@@ -21,7 +21,9 @@ In particular:
 - this is static nested sampling only; dynamic nested sampling is not
   implemented;
 - no slice sampler is implemented;
-- no fully vectorized replacement sampler is implemented yet;
+- vectorized replacement is implemented for `sample="prior"` rejection draws;
+- vectorized `sample="rwalk"` is not implemented yet and currently raises
+  before the run starts;
 - replacement attempts are capped by `max_attempts`, and hitting that cap returns
   `success=False` with the partial result rather than raising during the run;
 - evidence and live-point bookkeeping are included, but error estimates are only

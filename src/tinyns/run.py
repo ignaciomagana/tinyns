@@ -83,6 +83,11 @@ def run_static_nested(
         raise ValueError("nlive must be a positive integer")
     if sample not in {"prior", "rwalk"}:
         raise ValueError("sample must currently be one of {'prior', 'rwalk'}")
+    if sample == "rwalk" and vectorized:
+        raise NotImplementedError(
+            'vectorized rwalk is not implemented yet; use vectorized=False '
+            'with sample="rwalk"'
+        )
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
     if batch_size <= 0:
