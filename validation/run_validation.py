@@ -33,15 +33,54 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _posterior_moments(result, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def insertion_rank_stats(result) -> dict:
+    """Return normalized insertion-rank diagnostics for a sampler result."""
+
+    insertion_indices = np.asarray(result.insertion_indices(), dtype=float)
+    count = int(insertion_indices.size)
+    none_stats = {
+        "insertion_rank_count": count,
+        "insertion_rank_mean": None,
+        "insertion_rank_std": None,
+        "insertion_rank_mean_error": None,
+        "insertion_rank_std_error": None,
+    }
+    if count < 2:
+        return none_stats
+
+    metadata = {} if getattr(result, "metadata", None) is None else result.metadata
+    nslots = metadata.get("insertion_index_nslots")
+    if nslots is None or nslots <= 0:
+        return none_stats
+
+    normalized_ranks = (insertion_indices + 0.5) / float(nslots)
+    rank_mean = float(np.mean(normalized_ranks))
+    rank_std = float(np.std(normalized_ranks, ddof=1))
+    expected_std = 1.0 / np.sqrt(12.0)
+    return {
+        "insertion_rank_count": count,
+        "insertion_rank_mean": rank_mean,
+        "insertion_rank_std": rank_std,
+        "insertion_rank_mean_error": rank_mean - 0.5,
+        "insertion_rank_std_error": rank_std - expected_std,
+    }
+
+
+def _posterior_moments(
+    result, seed: int
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     ess = result.posterior_ess()
     n = min(5000, max(1000, int(ess)))
     samples = np.asarray(result.resample_equal(jax.random.PRNGKey(seed + 10_000), n=n))
+    if samples.size == 0:
+        return None, None, None
+    samples = np.atleast_2d(samples)
     sample_mean = np.mean(samples, axis=0)
     sample_cov = np.cov(samples, rowvar=False)
     if result.ndim == 1:
         sample_cov = np.asarray(sample_cov).reshape((1, 1))
-    return sample_mean, sample_cov
+    sample_std = np.sqrt(np.diag(sample_cov))
+    return sample_mean, sample_cov, sample_std
 
 
 def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, Any]:
@@ -73,7 +112,7 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         progress_interval=args.progress_interval,
     )
     diagnostics = result.diagnostics()
-    sample_mean, sample_cov = _posterior_moments(result, seed)
+    sample_mean, sample_cov, sample_std = _posterior_moments(result, seed)
 
     logz_error = None
     abs_logz_error = None
@@ -86,16 +125,33 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
 
     mean_error_norm = None
     if target.expected_mean is not None:
-        mean_error_norm = float(np.linalg.norm(sample_mean - target.expected_mean))
+        mean_error_norm = (
+            float(np.linalg.norm(sample_mean - target.expected_mean))
+            if sample_mean is not None
+            else None
+        )
 
     cov_error_frobenius = None
     if target.expected_cov is not None:
-        cov_error_frobenius = float(np.linalg.norm(sample_cov - target.expected_cov))
+        cov_error_frobenius = (
+            float(np.linalg.norm(sample_cov - target.expected_cov))
+            if sample_cov is not None
+            else None
+        )
 
     return {
         "target": target_name,
         "sampler": sampler_name,
+        "nlive": args.nlive,
+        "dlogz": args.dlogz,
+        "maxiter": args.maxiter,
+        "sample": sampler_name,
+        "walks": args.walks,
+        "slices": args.slices,
+        "slice_steps": args.slice_steps,
+        "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
+        "max_attempts": args.max_attempts,
         "seed": seed,
         "ndim": target.ndim,
         "logz": float(result.logz),
@@ -123,6 +179,10 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "replacement_failures": diagnostics.get("replacement_failures", 0),
         "sample_mean": sample_mean,
         "sample_cov": sample_cov,
+        "posterior_mean": sample_mean,
+        "posterior_cov": sample_cov,
+        "posterior_std": sample_std,
+        **insertion_rank_stats(result),
         "mean_error_norm": mean_error_norm,
         "cov_error_frobenius": cov_error_frobenius,
     }

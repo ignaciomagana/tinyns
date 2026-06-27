@@ -25,6 +25,14 @@ def _median_or_none(values: list[float]) -> float | None:
     return float(np.median(values)) if values else None
 
 
+def _row_mean_or_none(values: list[Any]) -> float | None:
+    row_means = []
+    for value in values:
+        if isinstance(value, list):
+            row_means.append(float(np.mean(value)))
+    return _mean_or_none(row_means)
+
+
 def _recommendation(summary: dict) -> str:
     """Return a simple heuristic validation recommendation.
 
@@ -42,6 +50,12 @@ def _recommendation(summary: dict) -> str:
         return "try smaller dlogz or more live points"
     if (summary.get("mean_max_weight_fraction") or 0.0) > 0.1:
         return "posterior weights concentrated; increase nlive"
+    mean_rank_error = summary.get("mean_abs_insertion_rank_mean_error")
+    if mean_rank_error is not None and mean_rank_error > 0.1:
+        return "suspicious insertion ranks: possible constrained-sampler bias"
+    std_rank_error = summary.get("mean_abs_insertion_rank_std_error")
+    if std_rank_error is not None and std_rank_error > 0.1:
+        return "suspicious insertion-rank spread: possible constrained-sampler bias"
     return "ok"
 
 
@@ -71,6 +85,16 @@ def summarize_results(results: list[dict]) -> list[dict]:
         ]
         warnings = sum(len(row.get("warnings", [])) for row in rows)
         failures = sum(int(row.get("replacement_failures") or 0) for row in rows)
+        insertion_rank_mean_errors = [
+            row["insertion_rank_mean_error"]
+            for row in rows
+            if row.get("insertion_rank_mean_error") is not None
+        ]
+        insertion_rank_std_errors = [
+            row["insertion_rank_std_error"]
+            for row in rows
+            if row.get("insertion_rank_std_error") is not None
+        ]
         summary = {
             "target": target,
             "sampler": sampler,
@@ -145,6 +169,36 @@ def summarize_results(results: list[dict]) -> list[dict]:
                     if row.get("posterior_ess") is not None
                 ]
             ),
+            "mean_insertion_rank_count": _mean_or_none(
+                [
+                    row["insertion_rank_count"]
+                    for row in rows
+                    if row.get("insertion_rank_count") is not None
+                ]
+            ),
+            "mean_insertion_rank_mean": _mean_or_none(
+                [
+                    row["insertion_rank_mean"]
+                    for row in rows
+                    if row.get("insertion_rank_mean") is not None
+                ]
+            ),
+            "mean_abs_insertion_rank_mean_error": _mean_or_none(
+                [abs(error) for error in insertion_rank_mean_errors]
+            ),
+            "mean_insertion_rank_std": _mean_or_none(
+                [
+                    row["insertion_rank_std"]
+                    for row in rows
+                    if row.get("insertion_rank_std") is not None
+                ]
+            ),
+            "mean_abs_insertion_rank_std_error": _mean_or_none(
+                [abs(error) for error in insertion_rank_std_errors]
+            ),
+            "mean_posterior_std": _row_mean_or_none(
+                [row.get("posterior_std") for row in rows]
+            ),
             "mean_replacement_ncall": _mean_or_none(
                 [
                     row["replacement_mean_ncall"]
@@ -182,6 +236,8 @@ def print_table(summaries: list[dict]) -> None:
         "max_abs_z_score",
         "mean_ncall",
         "mean_posterior_ess",
+        "mean_abs_insertion_rank_mean_error",
+        "mean_abs_insertion_rank_std_error",
         "recommendation",
     ]
     labels = {
@@ -194,6 +250,8 @@ def print_table(summaries: list[dict]) -> None:
         "max_abs_z_score": "max|z|",
         "mean_ncall": "mean_ncall",
         "mean_posterior_ess": "mean_ess",
+        "mean_abs_insertion_rank_mean_error": "rank_mean_err",
+        "mean_abs_insertion_rank_std_error": "rank_std_err",
     }
     widths = {
         col: max(len(labels.get(col, col)), *(len(_fmt(row[col])) for row in summaries))

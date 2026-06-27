@@ -133,6 +133,26 @@ def compare_summaries(
                 "delta_frac_abs_z_gt_2": _delta(
                     candidate.get("frac_abs_z_gt_2"), baseline.get("frac_abs_z_gt_2")
                 ),
+                "baseline_mean_abs_insertion_rank_mean_error": baseline.get(
+                    "mean_abs_insertion_rank_mean_error"
+                ),
+                "candidate_mean_abs_insertion_rank_mean_error": candidate.get(
+                    "mean_abs_insertion_rank_mean_error"
+                ),
+                "delta_mean_abs_insertion_rank_mean_error": _delta(
+                    candidate.get("mean_abs_insertion_rank_mean_error"),
+                    baseline.get("mean_abs_insertion_rank_mean_error"),
+                ),
+                "baseline_mean_abs_insertion_rank_std_error": baseline.get(
+                    "mean_abs_insertion_rank_std_error"
+                ),
+                "candidate_mean_abs_insertion_rank_std_error": candidate.get(
+                    "mean_abs_insertion_rank_std_error"
+                ),
+                "delta_mean_abs_insertion_rank_std_error": _delta(
+                    candidate.get("mean_abs_insertion_rank_std_error"),
+                    baseline.get("mean_abs_insertion_rank_std_error"),
+                ),
                 "baseline_mean_ncall": baseline_ncall,
                 "candidate_mean_ncall": candidate_ncall,
                 "ncall_ratio": _ratio(candidate_ncall, baseline_ncall),

@@ -168,3 +168,26 @@ def test_cli_can_write_output_json(tmp_path) -> None:
     assert written["labels"] == ["base", "candidate"]
     assert written["baseline"] == "base"
     assert written["comparisons"][0]["candidate"] == "candidate"
+
+
+def test_compare_summaries_includes_insertion_rank_delta_fields() -> None:
+    rows = compare_summaries(
+        {
+            "base": [
+                _summary(
+                    mean_abs_insertion_rank_mean_error=0.04,
+                    mean_abs_insertion_rank_std_error=0.02,
+                )
+            ],
+            "candidate": [
+                _summary(
+                    mean_abs_insertion_rank_mean_error=0.07,
+                    mean_abs_insertion_rank_std_error=0.01,
+                )
+            ],
+        },
+        "base",
+    )
+
+    assert rows[0]["delta_mean_abs_insertion_rank_mean_error"] == 0.030000000000000006
+    assert rows[0]["delta_mean_abs_insertion_rank_std_error"] == -0.01
