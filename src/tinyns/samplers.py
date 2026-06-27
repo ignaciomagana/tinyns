@@ -68,6 +68,77 @@ def draw_constrained_prior(
     return new_key, best_u, best_theta, best_logl, max_attempts, False
 
 
+def draw_constrained_prior_vectorized(
+    key: PRNGKeyLike,
+    loglike: LogLikelihood,
+    prior_transform: PriorTransform,
+    logl_min: float,
+    ndim: int,
+    *,
+    batch_size: int = 128,
+    max_attempts: int = 10_000,
+):
+    """Draw a constrained prior replacement using batched proposals.
+
+    Proposals are drawn from the unit cube in batches. The first point in a
+    batch with ``loglike(theta) >= logl_min`` is accepted. If no proposal is
+    accepted after at least ``max_attempts`` likelihood evaluations, the best
+    attempted point is returned with ``accepted`` set to ``False``.
+    """
+    if ndim <= 0:
+        raise ValueError("ndim must be a positive integer")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be a positive integer")
+
+    best_u = None
+    best_theta = None
+    best_logl = -math.inf
+    ncall = 0
+    new_key = key
+
+    while ncall < max_attempts:
+        new_key, draw_key = random.split(new_key)
+        u_batch = random.uniform(draw_key, shape=(batch_size, ndim))
+        theta_batch = jnp.asarray(prior_transform(u_batch))
+        if theta_batch.shape != (batch_size, ndim):
+            raise ValueError(
+                "vectorized prior_transform must return shape "
+                f"({batch_size}, {ndim})"
+            )
+        logl_batch = jnp.asarray(loglike(theta_batch), dtype=float)
+        try:
+            logl_batch = logl_batch.reshape((batch_size,))
+        except TypeError as exc:
+            raise ValueError(
+                f"vectorized loglike must return {batch_size} values"
+            ) from exc
+
+        ncall += batch_size
+
+        batch_best_idx = int(jnp.argmax(logl_batch))
+        batch_best_logl = float(logl_batch[batch_best_idx])
+        if best_u is None or batch_best_logl > best_logl:
+            best_u = u_batch[batch_best_idx]
+            best_theta = theta_batch[batch_best_idx]
+            best_logl = batch_best_logl
+
+        accepted_mask = logl_batch >= logl_min
+        if bool(jnp.any(accepted_mask)):
+            accept_idx = int(jnp.argmax(accepted_mask))
+            return (
+                new_key,
+                u_batch[accept_idx],
+                theta_batch[accept_idx],
+                float(logl_batch[accept_idx]),
+                ncall,
+                True,
+            )
+
+    return new_key, best_u, best_theta, best_logl, ncall, False
+
+
 def draw_constrained_rwalk(
     key: PRNGKeyLike,
     loglike: LogLikelihood,

@@ -10,7 +10,11 @@ from jax.scipy.special import logsumexp
 
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
-from tinyns.samplers import draw_constrained_prior, draw_constrained_rwalk
+from tinyns.samplers import (
+    draw_constrained_prior,
+    draw_constrained_prior_vectorized,
+    draw_constrained_rwalk,
+)
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
@@ -68,6 +72,7 @@ def run_static_nested(
     vectorized: bool = False,
     max_attempts: int = 10_000,
     progress: bool = False,
+    batch_size: int = 128,
     walks: int = 25,
     step_scale: float = 0.1,
 ):
@@ -80,6 +85,8 @@ def run_static_nested(
         raise ValueError("sample must currently be one of {'prior', 'rwalk'}")
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
     if maxiter is None:
         maxiter = 10_000 * ndim
     if maxiter < 0:
@@ -121,15 +128,40 @@ def run_static_nested(
         logx_final = logx_new
 
         if sample == "prior":
-            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_prior(
-                key,
-                loglike,
-                prior_transform,
-                logl_worst,
-                ndim,
-                vectorized=False,
-                max_attempts=max_attempts,
-            )
+            if vectorized:
+                (
+                    key,
+                    new_u,
+                    new_theta,
+                    new_logl,
+                    calls,
+                    accepted,
+                ) = draw_constrained_prior_vectorized(
+                    key,
+                    loglike,
+                    prior_transform,
+                    logl_worst,
+                    ndim,
+                    batch_size=batch_size,
+                    max_attempts=max_attempts,
+                )
+            else:
+                (
+                    key,
+                    new_u,
+                    new_theta,
+                    new_logl,
+                    calls,
+                    accepted,
+                ) = draw_constrained_prior(
+                    key,
+                    loglike,
+                    prior_transform,
+                    logl_worst,
+                    ndim,
+                    vectorized=False,
+                    max_attempts=max_attempts,
+                )
         else:
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rwalk(
                 key,
@@ -215,6 +247,7 @@ def run_static_nested(
             "maxiter": maxiter,
             "walks": walks,
             "step_scale": step_scale,
+            "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "replacement_failures": int(replacement_failures),
             "mean_replacement_ncall": mean_replacement_ncall,

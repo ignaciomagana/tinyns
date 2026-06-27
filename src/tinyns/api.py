@@ -90,4 +90,5 @@ class NestedSampler:
             progress=progress,
             walks=self.kwargs.get("walks", 25),
             step_scale=self.kwargs.get("step_scale", 0.1),
+            batch_size=self.kwargs.get("batch_size", 128),
         )
