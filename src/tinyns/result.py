@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import numbers
 from dataclasses import dataclass
 from typing import Any
@@ -301,6 +302,13 @@ class NestedSamplingResult:
         if insertion_indices.size >= 20 and insertion_index_nslots > 0:
             normalized_ranks = (insertion_indices + 0.5) / insertion_index_nslots
             mean_normalized_rank = float(jnp.mean(normalized_ranks))
+            rank_count = int(insertion_indices.size)
+            insertion_rank_mean_z = (mean_normalized_rank - 0.5) / math.sqrt(
+                (1.0 / 12.0) / rank_count
+            )
+            insertion_rank_std_ratio = float(jnp.std(normalized_ranks, ddof=1)) / (
+                1.0 / math.sqrt(12.0)
+            )
             if mean_normalized_rank < 0.35 or mean_normalized_rank > 0.65:
                 warnings.append(
                     "insertion indices look non-uniform; constrained sampler may be "
@@ -309,6 +317,10 @@ class NestedSamplingResult:
 
         if nposterior < self.nlive + 10:
             warnings.append("very few dead points")
+
+        has_insertion_rank_stats = (
+            insertion_indices.size >= 20 and insertion_index_nslots > 0
+        )
 
         diagnostics: dict[str, object] = {
             "success": self.success,
@@ -328,6 +340,12 @@ class NestedSamplingResult:
             "nposterior": nposterior,
             "warnings": warnings,
             "final_delta_logz": final_delta_logz,
+            "insertion_rank_mean_z": (
+                insertion_rank_mean_z if has_insertion_rank_stats else None
+            ),
+            "insertion_rank_std_ratio": (
+                insertion_rank_std_ratio if has_insertion_rank_stats else None
+            ),
             "final_logx": metadata.get("final_logx"),
             "final_logz_dead": metadata.get("final_logz_dead"),
             "final_logl_live_max": metadata.get("final_logl_live_max"),

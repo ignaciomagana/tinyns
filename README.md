@@ -109,6 +109,15 @@ partial `NestedSamplingResult`.
 | `slice` | Fast coordinate-wise constrained slice updates | Can under-cover evidence uncertainty; validate on correlated targets |
 | `rslice` | Fast random-direction constrained slice updates | Experimental; validate before relying on evidence estimates |
 
+For local constrained samplers, step-count parameters are decorrelation lengths:
+
+- `walks`: number of reflected random-walk proposals per replacement attempt for `rwalk`
+- `slices`: number of coordinate or random-direction slice updates per replacement attempt for `slice` and `rslice`
+- `slice_steps`: shrinkage proposal budget per slice update
+- `min_accepts`: minimum number of accepted constrained moves required for the replacement to be considered valid
+
+The sampler does not return merely after the first accepted local move; it runs the requested local update length.
+
 The current recommended starting point for nontrivial low-dimensional problems is:
 
 ```python

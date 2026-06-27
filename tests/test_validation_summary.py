@@ -157,6 +157,8 @@ def test_summarize_results_includes_insertion_rank_fields() -> None:
                 "insertion_rank_std": 0.3,
                 "insertion_rank_mean_error": 0.05,
                 "insertion_rank_std_error": 0.01,
+                "insertion_rank_mean_z": 2.0,
+                "insertion_rank_std_ratio": 1.1,
                 "warnings": [],
                 "replacement_failures": 0,
             }
@@ -168,6 +170,9 @@ def test_summarize_results_includes_insertion_rank_fields() -> None:
     assert summaries[0]["mean_abs_insertion_rank_mean_error"] == 0.05
     assert summaries[0]["mean_insertion_rank_std"] == 0.3
     assert summaries[0]["mean_abs_insertion_rank_std_error"] == 0.01
+    assert summaries[0]["mean_abs_insertion_rank_mean_z"] == 2.0
+    assert summaries[0]["max_abs_insertion_rank_mean_z"] == 2.0
+    assert summaries[0]["mean_insertion_rank_std_ratio"] == 1.1
 
 
 def test_recommendation_flags_large_insertion_rank_mean_error() -> None:
@@ -256,3 +261,36 @@ def test_qualitative_posterior_summaries_work_without_expected_logz() -> None:
     assert summaries[0]["mean_logz_error"] is None
     assert summaries[0]["coverage_fraction"] is None
     assert summaries[0]["mean_posterior_std"] == 1.5
+
+
+def test_recommendation_flags_large_insertion_rank_z_bias() -> None:
+    summaries = summarize_results(
+        [
+            {
+                "target": "ring2d",
+                "sampler": "rwalk",
+                "success": True,
+                "logz_error": None,
+                "logzerr": 0.1,
+                "z_score": None,
+                "ncall": 10,
+                "posterior_ess": 100.0,
+                "live_weight_fraction": 0.01,
+                "max_weight_fraction": 0.01,
+                "insertion_rank_count": 3000,
+                "insertion_rank_mean": 0.52,
+                "insertion_rank_std": 0.29,
+                "insertion_rank_mean_error": 0.02,
+                "insertion_rank_std_error": 0.0,
+                "insertion_rank_mean_z": 4.5,
+                "insertion_rank_std_ratio": 1.0,
+                "warnings": [],
+                "replacement_failures": 0,
+            }
+        ]
+    )
+
+    assert (
+        summaries[0]["recommendation"]
+        == "statistically significant insertion-rank bias"
+    )

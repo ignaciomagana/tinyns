@@ -22,6 +22,8 @@ def test_insertion_rank_stats_missing_indices_returns_none_stats() -> None:
         "insertion_rank_std": None,
         "insertion_rank_mean_error": None,
         "insertion_rank_std_error": None,
+        "insertion_rank_mean_z": None,
+        "insertion_rank_std_ratio": None,
     }
 
 
@@ -35,3 +37,14 @@ def test_insertion_rank_stats_uniform_like_ranks_mean_near_half() -> None:
     assert abs(stats["insertion_rank_mean_error"]) < 1e-12
     assert stats["insertion_rank_std"] is not None
     assert stats["insertion_rank_std_error"] is not None
+    assert abs(stats["insertion_rank_mean_z"]) < 1e-12
+    assert stats["insertion_rank_std_ratio"] is not None
+
+
+def test_insertion_rank_stats_biased_ranks_have_large_mean_z() -> None:
+    stats = insertion_rank_stats(
+        _FakeResult([8, 9] * 50, {"insertion_index_nslots": 10})
+    )
+
+    assert stats["insertion_rank_mean_z"] is not None
+    assert stats["insertion_rank_mean_z"] > 10.0
