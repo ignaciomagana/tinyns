@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import jax.numpy as jnp
+import pytest
 from jax import random
 
 from tinyns.run import run_static_nested
@@ -239,3 +240,43 @@ def test_vectorized_prior_1d_gaussian_returns_finite_logz() -> None:
     assert jnp.isfinite(result.logz)
     assert result.samples.shape[1:] == (1,)
     assert result.metadata["batch_size"] == 6
+
+
+def test_vectorized_loglike_correct_initial_shape_passes() -> None:
+    result = run_static_nested(
+        random.PRNGKey(11),
+        lambda theta_batch: -jnp.sum(theta_batch**2, axis=1),
+        lambda u_batch: u_batch,
+        ndim=2,
+        nlive=7,
+        maxiter=0,
+        vectorized=True,
+    )
+
+    assert result.logl.shape == (7,)
+
+
+def test_vectorized_loglike_scalar_initial_shape_raises() -> None:
+    with pytest.raises(ValueError, match="one value per live point"):
+        run_static_nested(
+            random.PRNGKey(12),
+            lambda theta_batch: 0.0,
+            lambda u_batch: u_batch,
+            ndim=2,
+            nlive=7,
+            maxiter=0,
+            vectorized=True,
+        )
+
+
+def test_vectorized_loglike_wrong_initial_shape_raises() -> None:
+    with pytest.raises(ValueError, match=r"expected shape \(7,\), got \(6,\)"):
+        run_static_nested(
+            random.PRNGKey(13),
+            lambda theta_batch: jnp.zeros((theta_batch.shape[0] - 1,)),
+            lambda u_batch: u_batch,
+            ndim=2,
+            nlive=7,
+            maxiter=0,
+            vectorized=True,
+        )
