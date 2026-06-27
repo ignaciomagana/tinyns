@@ -7,6 +7,7 @@ import json
 import sys
 import time
 from collections import defaultdict
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -53,10 +54,12 @@ def _mean(values: list[float | int | None]) -> float | None:
 
 
 def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return grouped benchmark summaries by ``(target, sampler)``."""
+    """Return grouped benchmark summaries, excluding warmup rows."""
 
     grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in results:
+        if row.get("warmup", False):
+            continue
         key = (
             row["target"],
             row["sampler"],
@@ -86,7 +89,21 @@ def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     [row.get("mean_replacement_ncall") for row in rows]
                 ),
                 "mean_repl_batches": _mean(
-                    [row.get("repl_batches") for row in rows]
+                    [
+                        row.get("mean_replacement_batches", row.get("repl_batches"))
+                        for row in rows
+                    ]
+                ),
+                "max_repl_batches": max(
+                    (
+                        row.get("max_replacement_batches", row.get("max_repl_batches"))
+                        for row in rows
+                        if row.get(
+                            "max_replacement_batches", row.get("max_repl_batches")
+                        )
+                        is not None
+                    ),
+                    default=None,
                 ),
                 "mean_max_repl_batches": _mean(
                     [row.get("max_repl_batches") for row in rows]
@@ -95,6 +112,24 @@ def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 / len(rows),
             }
         )
+    baselines = {
+        (row["target"], row["sampler"], row["kernel"]): row
+        for row in summaries
+        if row["replacement_chains"] == 1
+    }
+    for row in summaries:
+        baseline = baselines.get((row["target"], row["sampler"], row["kernel"]))
+        row["relative_speedup_vs_chains1"] = None
+        row["relative_iter_s_vs_chains1"] = None
+        if baseline is not None:
+            seconds = row.get("mean_seconds")
+            base_seconds = baseline.get("mean_seconds")
+            if seconds not in (None, 0) and base_seconds is not None:
+                row["relative_speedup_vs_chains1"] = base_seconds / seconds
+            base_iter_s = baseline.get("mean_iter_per_s")
+            iter_s = row.get("mean_iter_per_s")
+            if base_iter_s not in (None, 0) and iter_s is not None:
+                row["relative_iter_s_vs_chains1"] = iter_s / base_iter_s
     return summaries
 
 
@@ -125,7 +160,12 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
 
 
 def run_one(
-    target_name: str, sampler_name: str, seed: int, args: argparse.Namespace
+    target_name: str,
+    sampler_name: str,
+    seed: int,
+    args: argparse.Namespace,
+    *,
+    warmup: bool = False,
 ) -> dict[str, Any]:
     """Run one benchmark case and return a metrics row."""
 
@@ -189,6 +229,8 @@ def run_one(
         "replacement_batch_ncall": replacement_batch_ncall,
         "repl_batches": repl_batches,
         "max_repl_batches": max_repl_batches,
+        "mean_replacement_batches": repl_batches,
+        "max_replacement_batches": max_repl_batches,
         "seconds": seconds,
         "ncall": int(result.ncall),
         "niter": niter,
@@ -204,6 +246,7 @@ def run_one(
         "message": str(result.message),
         "warning_count": len(warnings),
         "warnings": warnings,
+        "warmup": warmup,
     }
 
 
@@ -236,9 +279,10 @@ def print_results(results: list[dict[str, Any]]) -> None:
 def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print()
     print(
-        "target sampler kernel chains nruns mean_seconds mean_iter_per_s "
+        "target sampler kernel replacement_chains nruns mean_seconds mean_iter_per_s "
         "mean_ncall_per_s mean_ncall mean_repl_ncall mean_repl_batches "
-        "mean_max_repl_batches success_fraction"
+        "max_repl_batches success_fraction relative_speedup_vs_chains1 "
+        "relative_iter_s_vs_chains1"
     )
     for row in summaries:
         print(
@@ -247,7 +291,9 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             f"{_fmt(row['mean_seconds'])} {_fmt(row['mean_iter_per_s'])} "
             f"{_fmt(row['mean_ncall_per_s'])} {_fmt(row['mean_ncall'])} "
             f"{_fmt(row['mean_repl_ncall'])} {_fmt(row['mean_repl_batches'])} "
-            f"{_fmt(row['mean_max_repl_batches'])} {_fmt(row['success_fraction'])}"
+            f"{_fmt(row['max_repl_batches'])} {_fmt(row['success_fraction'])} "
+            f"{_fmt(row['relative_speedup_vs_chains1'])} "
+            f"{_fmt(row['relative_iter_s_vs_chains1'])}"
         )
 
 
@@ -267,6 +313,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--replacement-chains", type=int, default=1)
+    parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
+    parser.add_argument("--warmup-runs", type=int, default=0)
+    parser.add_argument("--discard-warmup", action="store_true")
     parser.add_argument("--max-attempts", type=int, default=10000)
     parser.add_argument("--kernel", choices=["python", "jax"], default="python")
     parser.add_argument("--output", type=str, default=None)
@@ -274,14 +323,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _args_for_replacement_chains(
+    args: argparse.Namespace, replacement_chains: int
+) -> argparse.Namespace:
+    case_args = copy(args)
+    case_args.replacement_chains = replacement_chains
+    return case_args
+
+
+def _run_benchmark_grid(args: argparse.Namespace) -> list[dict[str, Any]]:
+    replacement_chains_values = (
+        args.replacement_chains_grid
+        if args.replacement_chains_grid is not None
+        else [args.replacement_chains]
+    )
+    results: list[dict[str, Any]] = []
+    for target_name in args.targets:
+        for sampler_name in args.samplers:
+            for replacement_chains in replacement_chains_values:
+                case_args = _args_for_replacement_chains(args, replacement_chains)
+                warmup_rows = [
+                    run_one(
+                        target_name,
+                        sampler_name,
+                        -(warmup_index + 1),
+                        case_args,
+                        warmup=True,
+                    )
+                    for warmup_index in range(args.warmup_runs)
+                ]
+                if not args.discard_warmup:
+                    results.extend(warmup_rows)
+                results.extend(
+                    run_one(target_name, sampler_name, seed, case_args, warmup=False)
+                    for seed in args.seeds
+                )
+    return results
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    results = [
-        run_one(target_name, sampler_name, seed, args)
-        for target_name in args.targets
-        for sampler_name in args.samplers
-        for seed in args.seeds
-    ]
+    results = _run_benchmark_grid(args)
     summaries = summarize_results(results)
     print_results(results)
     print_summaries(summaries)
