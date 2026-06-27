@@ -119,6 +119,12 @@ def _format_progress_line(state: dict[str, object]) -> str:
     )
 
 
+def _print_progress_line(line: str, *, final: bool = False) -> None:
+    """Print one dependency-free progress line, clearing terminal residue."""
+
+    print("\r" + line + "\x1b[K", end="\n" if final else "", flush=True)
+
+
 def run_static_nested(
     key: PRNGKeyLike,
     loglike: LogLikelihood,
@@ -308,7 +314,7 @@ def run_static_nested(
                     message = "stopped by callback"
                     stopped_by_callback = True
             if progress:
-                print(_format_progress_line(state), end="\n")
+                _print_progress_line(_format_progress_line(state), final=True)
             break
 
         other_live_logl = jnp.delete(live_logl, worst)
@@ -351,7 +357,7 @@ def run_static_nested(
         if progress and (
             i + 1 == 1 or (i + 1) % progress_interval == 0 or final_iteration
         ):
-            print(_format_progress_line(state), end="\n" if final_iteration else "\r")
+            _print_progress_line(_format_progress_line(state), final=final_iteration)
         if final_iteration:
             break
     else:

@@ -452,6 +452,8 @@ def test_progress_true_does_not_crash(capsys) -> None:
     captured = capsys.readouterr()
     assert "iter=" in captured.out
     assert "logz=" in captured.out
+    assert "sample=" in captured.out
+    assert "\x1b[K" in captured.out
 
 
 def test_format_progress_line_contains_core_fields() -> None:
