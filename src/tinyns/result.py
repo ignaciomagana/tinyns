@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax.numpy as jnp
-import numpy as np
 
 from tinyns.math import (
     effective_sample_size_from_log_weights,
@@ -115,35 +114,3 @@ class NestedSamplingResult:
             "message": self.message,
             "metadata": None if self.metadata is None else dict(self.metadata),
         }
-
-
-@dataclass(frozen=True)
-class NestedSamplerResult:
-    """Backward-compatible scaffold result container."""
-
-    samples: ArrayLike
-    logl: ArrayLike
-    logwt: ArrayLike
-    logz: float
-    logzerr: float
-    niter: int
-    metadata: dict[str, Any] | None = None
-
-    def asdict(self) -> dict[str, Any]:
-        """Return a shallow dictionary representation of the result."""
-
-        return {
-            "samples": self.samples,
-            "logl": self.logl,
-            "logwt": self.logwt,
-            "logz": self.logz,
-            "logzerr": self.logzerr,
-            "niter": self.niter,
-            "metadata": {} if self.metadata is None else dict(self.metadata),
-        }
-
-    @property
-    def nsamples(self) -> int:
-        """Return the number of sample rows in ``samples``."""
-
-        return int(np.asarray(self.samples).shape[0])
