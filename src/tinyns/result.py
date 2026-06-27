@@ -70,6 +70,12 @@ class NestedSamplingResult:
 
         return float(effective_sample_size_from_log_weights(self.logwt))
 
+    def insertion_indices(self):
+        """Return recorded live-point insertion indices, if available."""
+
+        metadata = {} if self.metadata is None else self.metadata
+        return jnp.asarray(metadata.get("insertion_indices", []), dtype=int)
+
     def information(self) -> float:
         """Return the nested-sampling information from posterior weights."""
 
@@ -103,6 +109,17 @@ class NestedSamplingResult:
             and replacement_acceptance_proxy < 0.01
         ):
             warnings.append("low replacement acceptance")
+
+        insertion_indices = self.insertion_indices()
+        insertion_index_nlive = metadata.get("insertion_index_nlive", self.nlive - 1)
+        if insertion_indices.size >= 20 and insertion_index_nlive > 0:
+            normalized_ranks = (insertion_indices + 0.5) / insertion_index_nlive
+            mean_normalized_rank = float(jnp.mean(normalized_ranks))
+            if mean_normalized_rank < 0.35 or mean_normalized_rank > 0.65:
+                warnings.append(
+                    "insertion indices look non-uniform; constrained sampler may be "
+                    "biased or poorly mixed"
+                )
 
         if nposterior < self.nlive + 10:
             warnings.append("very few dead points")

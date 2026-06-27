@@ -124,3 +124,37 @@ def test_diagnostics_low_ess_triggers_warning() -> None:
     diagnostics = result.diagnostics()
 
     assert "low posterior ESS" in diagnostics["warnings"]
+
+
+def test_insertion_indices_returns_array() -> None:
+    result = make_result()
+    result.metadata = {"insertion_indices": [0, 2, 1]}
+
+    insertion_indices = result.insertion_indices()
+
+    assert isinstance(insertion_indices, jnp.ndarray)
+    assert insertion_indices.tolist() == [0, 2, 1]
+
+
+def test_insertion_indices_missing_metadata_returns_empty_array() -> None:
+    result = make_result()
+
+    insertion_indices = result.insertion_indices()
+
+    assert isinstance(insertion_indices, jnp.ndarray)
+    assert insertion_indices.shape == (0,)
+
+
+def test_diagnostics_bad_insertion_indices_triggers_warning() -> None:
+    result = make_result()
+    result.metadata = {
+        "insertion_indices": jnp.zeros(20, dtype=int),
+        "insertion_index_nlive": 10,
+    }
+
+    diagnostics = result.diagnostics()
+
+    assert (
+        "insertion indices look non-uniform; constrained sampler may be biased or "
+        "poorly mixed"
+    ) in diagnostics["warnings"]
