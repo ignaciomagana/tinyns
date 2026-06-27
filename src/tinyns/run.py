@@ -271,6 +271,7 @@ def run_static_nested(
             )
 
     initial_iteration = iteration
+    final_delta_logz = math.inf
     progress_printer = _ProgressPrinter() if progress else None
 
     def current_state() -> NestedRunState:
@@ -401,6 +402,7 @@ def run_static_nested(
             message = f"max_attempts={max_attempts} hit during constrained prior draw"
             logz_remain = logx_new + float(jnp.max(live_logl))
             delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+            final_delta_logz = delta_logz
             state = _make_run_state(
                 iteration=i + 1,
                 logz=logz_dead,
@@ -438,6 +440,7 @@ def run_static_nested(
 
         logz_remain = logx_new + float(jnp.max(live_logl))
         delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+        final_delta_logz = delta_logz
         final_iteration = delta_logz < dlogz or i + 1 == maxiter
         if i + 1 == maxiter and delta_logz >= dlogz:
             success = False
@@ -528,6 +531,10 @@ def run_static_nested(
             "ndead": niter,
             "nlive_final": nlive_final,
             "nposterior": nposterior,
+            "final_delta_logz": float(final_delta_logz),
+            "final_logx": float(logx_final),
+            "final_logz_dead": float(logz_dead),
+            "final_logl_live_max": float(jnp.max(live_logl)),
             "walks": walks,
             "step_scale": step_scale,
             "slices": slices,

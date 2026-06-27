@@ -112,6 +112,8 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "posterior_weight_entropy_fraction": diagnostics.get(
             "posterior_weight_entropy_fraction"
         ),
+        "final_delta_logz": diagnostics.get("final_delta_logz"),
+        "final_logx": diagnostics.get("final_logx"),
         "success": bool(result.success),
         "message": str(result.message),
         "warnings": diagnostics.get("warnings", []),
