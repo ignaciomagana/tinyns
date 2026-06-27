@@ -86,3 +86,33 @@ def test_cli_smoke_tiny_settings_writes_json(tmp_path) -> None:
     payload = json.loads(output.read_text())
     assert "results" in payload
     assert len(payload["results"]) == 1
+
+
+def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
+    output = tmp_path / "bench_jax.json"
+
+    main(
+        [
+            "--targets",
+            "gaussian2d",
+            "--samplers",
+            "rwalk",
+            "--kernel",
+            "jax",
+            "--seeds",
+            "0",
+            "--nlive",
+            "20",
+            "--dlogz",
+            "10",
+            "--walks",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+
+    payload = json.loads(output.read_text())
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["kernel"] == "jax"
+    assert payload["results"][0]["success"] is True

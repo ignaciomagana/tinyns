@@ -115,8 +115,7 @@ def draw_constrained_prior_vectorized(
         theta_batch = jnp.asarray(prior_transform(u_batch))
         if theta_batch.shape != (batch_size, ndim):
             raise ValueError(
-                "vectorized prior_transform must return shape "
-                f"({batch_size}, {ndim})"
+                f"vectorized prior_transform must return shape ({batch_size}, {ndim})"
             )
         logl_batch = jnp.asarray(loglike(theta_batch), dtype=float)
         try:
@@ -364,84 +363,187 @@ def draw_constrained_rslice(
     return new_key, best_u, best_theta, best_logl, ncall, False
 
 
-
 @lru_cache(maxsize=32)
 def _make_rwalk_jax_kernel(loglike, prior_transform, ndim: int, walks: int):
-    """Return a cached compiled one-chain constrained rwalk kernel."""
+    """Return a cached compiled retrying constrained rwalk kernel."""
 
     @jax.jit
-    def kernel(key, logl_min, live_u, live_logl, step_scale, min_accepts):
+    def kernel(
+        key, logl_min, live_u, live_logl, step_scale, min_accepts, max_attempt_batches
+    ):
         nlive = live_u.shape[0]
-        key, seed_key = random.split(key)
-        seed_idx = random.randint(seed_key, shape=(), minval=0, maxval=nlive)
-        current_u = live_u[seed_idx]
-        current_theta = jnp.asarray(prior_transform(current_u))
-        current_logl = live_logl[seed_idx]
+        template_u = live_u[0]
+        template_theta = jnp.asarray(prior_transform(template_u))
+        initial_best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
+        initial_ncall = jnp.asarray(0, dtype=jnp.int32)
+        initial_done = jnp.asarray(False)
+        initial_attempt_index = jnp.asarray(0, dtype=jnp.int32)
 
-        best_u = current_u
-        best_theta = current_theta
-        best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
-        accepted_moves = jnp.asarray(0, dtype=jnp.int32)
+        def cond(state):
+            (
+                _key,
+                _ncall,
+                done,
+                _accepted,
+                _out_u,
+                _out_theta,
+                _out_logl,
+                _best_u,
+                _best_theta,
+                _best_logl,
+                attempt_index,
+            ) = state
+            return (~done) & (attempt_index < max_attempt_batches)
 
-        def one_step(carry, _):
-            (key, current_u, current_theta, current_logl, best_u, best_theta,
-             best_logl, accepted_moves) = carry
-            key, proposal_key = random.split(key)
-            step = step_scale * random.normal(proposal_key, shape=(ndim,))
-            u_prop = reflect_unit_cube(current_u + step)
-            theta_prop = jnp.asarray(prior_transform(u_prop))
-            logl_prop = jnp.asarray(loglike(theta_prop))
-
-            is_best = logl_prop > best_logl
-            best_u = jnp.where(is_best, u_prop, best_u)
-            best_theta = jnp.where(is_best, theta_prop, best_theta)
-            best_logl = jnp.where(is_best, logl_prop, best_logl)
-
-            accept = logl_prop >= logl_min
-            current_u = jnp.where(accept, u_prop, current_u)
-            current_theta = jnp.where(accept, theta_prop, current_theta)
-            current_logl = jnp.where(accept, logl_prop, current_logl)
-            accepted_moves = accepted_moves + accept.astype(jnp.int32)
-            return (
+        def body(state):
+            (
                 key,
-                current_u,
-                current_theta,
-                current_logl,
+                ncall,
+                _done,
+                _accepted,
+                out_u,
+                out_theta,
+                out_logl,
                 best_u,
                 best_theta,
                 best_logl,
-                accepted_moves,
-            ), None
+                attempt_index,
+            ) = state
+
+            key, seed_key = random.split(key)
+            seed_idx = random.randint(seed_key, shape=(), minval=0, maxval=nlive)
+            current_u = live_u[seed_idx]
+            current_theta = jnp.asarray(prior_transform(current_u))
+            current_logl = live_logl[seed_idx]
+            attempt_best_u = current_u
+            attempt_best_theta = current_theta
+            attempt_best_logl = initial_best_logl
+            accepted_moves = jnp.asarray(0, dtype=jnp.int32)
+
+            def one_step(carry, _):
+                (
+                    key,
+                    current_u,
+                    current_theta,
+                    current_logl,
+                    attempt_best_u,
+                    attempt_best_theta,
+                    attempt_best_logl,
+                    accepted_moves,
+                ) = carry
+                key, proposal_key = random.split(key)
+                step = step_scale * random.normal(proposal_key, shape=(ndim,))
+                u_prop = reflect_unit_cube(current_u + step)
+                theta_prop = jnp.asarray(prior_transform(u_prop))
+                logl_prop = jnp.asarray(loglike(theta_prop))
+
+                is_best = logl_prop > attempt_best_logl
+                attempt_best_u = jnp.where(is_best, u_prop, attempt_best_u)
+                attempt_best_theta = jnp.where(is_best, theta_prop, attempt_best_theta)
+                attempt_best_logl = jnp.where(is_best, logl_prop, attempt_best_logl)
+
+                accept = logl_prop >= logl_min
+                current_u = jnp.where(accept, u_prop, current_u)
+                current_theta = jnp.where(accept, theta_prop, current_theta)
+                current_logl = jnp.where(accept, logl_prop, current_logl)
+                accepted_moves = accepted_moves + accept.astype(jnp.int32)
+                return (
+                    key,
+                    current_u,
+                    current_theta,
+                    current_logl,
+                    attempt_best_u,
+                    attempt_best_theta,
+                    attempt_best_logl,
+                    accepted_moves,
+                ), None
+
+            (
+                (
+                    key,
+                    current_u,
+                    current_theta,
+                    current_logl,
+                    attempt_best_u,
+                    attempt_best_theta,
+                    attempt_best_logl,
+                    accepted_moves,
+                ),
+                _,
+            ) = lax.scan(
+                one_step,
+                (
+                    key,
+                    current_u,
+                    current_theta,
+                    current_logl,
+                    attempt_best_u,
+                    attempt_best_theta,
+                    attempt_best_logl,
+                    accepted_moves,
+                ),
+                xs=None,
+                length=walks,
+            )
+
+            is_global_best = attempt_best_logl > best_logl
+            best_u = jnp.where(is_global_best, attempt_best_u, best_u)
+            best_theta = jnp.where(is_global_best, attempt_best_theta, best_theta)
+            best_logl = jnp.where(is_global_best, attempt_best_logl, best_logl)
+
+            accepted = accepted_moves >= min_accepts
+            out_u = jnp.where(accepted, current_u, out_u)
+            out_theta = jnp.where(accepted, current_theta, out_theta)
+            out_logl = jnp.where(accepted, current_logl, out_logl)
+            ncall = ncall + jnp.asarray(walks, dtype=jnp.int32)
+            attempt_index = attempt_index + jnp.asarray(1, dtype=jnp.int32)
+            return (
+                key,
+                ncall,
+                accepted,
+                accepted,
+                out_u,
+                out_theta,
+                out_logl,
+                best_u,
+                best_theta,
+                best_logl,
+                attempt_index,
+            )
 
         (
             key,
-            current_u,
-            current_theta,
-            current_logl,
+            ncall,
+            done,
+            accepted,
+            out_u,
+            out_theta,
+            out_logl,
             best_u,
             best_theta,
             best_logl,
-            accepted_moves,
-        ), _ = lax.scan(
-            one_step,
+            _attempt_index,
+        ) = lax.while_loop(
+            cond,
+            body,
             (
                 key,
-                current_u,
-                current_theta,
-                current_logl,
-                best_u,
-                best_theta,
-                best_logl,
-                accepted_moves,
+                initial_ncall,
+                initial_done,
+                initial_done,
+                template_u,
+                template_theta,
+                initial_best_logl,
+                template_u,
+                template_theta,
+                initial_best_logl,
+                initial_attempt_index,
             ),
-            xs=None,
-            length=walks,
         )
-        accepted = accepted_moves >= min_accepts
-        new_u = jnp.where(accepted, current_u, best_u)
-        new_theta = jnp.where(accepted, current_theta, best_theta)
-        new_logl = jnp.where(accepted, current_logl, best_logl)
-        return key, new_u, new_theta, new_logl, jnp.asarray(walks), accepted
+        new_u = jnp.where(done, out_u, best_u)
+        new_theta = jnp.where(done, out_theta, best_theta)
+        new_logl = jnp.where(done, out_logl, best_logl)
+        return key, new_u, new_theta, new_logl, ncall, accepted
 
     return kernel
 
@@ -484,6 +586,7 @@ def draw_constrained_rwalk_jax(
         raise ValueError(f"live_logl must have shape ({nlive},)")
 
     kernel = _make_rwalk_jax_kernel(loglike, prior_transform, int(ndim), int(walks))
+    max_attempt_batches = max_attempts // walks
     new_key, new_u, new_theta, new_logl, ncall, accepted = kernel(
         key,
         jnp.asarray(logl_min),
@@ -491,8 +594,10 @@ def draw_constrained_rwalk_jax(
         live_logl,
         jnp.asarray(step_scale),
         jnp.asarray(min_accepts),
+        jnp.asarray(max_attempt_batches, dtype=jnp.int32),
     )
     return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
+
 
 def draw_constrained_rwalk(
     key: PRNGKeyLike,
