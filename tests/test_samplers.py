@@ -481,6 +481,35 @@ def test_draw_constrained_rslice_rejects_invalid_parameters_and_shapes() -> None
 @pytest.mark.parametrize(
     "draw, kwargs",
     [
+        (draw_constrained_slice, {"slices": 3, "slice_steps": 4, "step_scale": 0.05}),
+        (draw_constrained_rslice, {"slices": 3, "slice_steps": 4, "step_scale": 0.05}),
+    ],
+)
+def test_slice_samplers_min_accepts_three_accept_on_easy_target(draw, kwargs) -> None:
+    ndim = 2
+    live_u = jnp.array([[0.2, 0.3], [0.4, 0.5], [0.6, 0.7]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    *_, ncall, accepted = draw(
+        random.PRNGKey(103),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        live_u,
+        live_logl,
+        ndim,
+        max_attempts=50,
+        min_accepts=3,
+        **kwargs,
+    )
+
+    assert accepted is True
+    assert ncall >= 3
+
+
+@pytest.mark.parametrize(
+    "draw, kwargs",
+    [
         (draw_constrained_rwalk, {"walks": 10, "step_scale": 0.05}),
         (draw_constrained_slice, {"slices": 4, "slice_steps": 5, "step_scale": 0.05}),
         (draw_constrained_rslice, {"slices": 4, "slice_steps": 5, "step_scale": 0.05}),
