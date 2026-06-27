@@ -40,11 +40,13 @@ def available_samplers() -> list[str]:
     """Return the sampler names supported by this tinyns version."""
 
     names = ["prior", "rwalk"]
-    try:
-        NestedSampler(loglike, prior_transform, ndim=NDIM, sample="slice")
-    except ValueError:
-        return names
-    return [*names, "slice"]
+    for sample in ("slice", "rslice"):
+        try:
+            NestedSampler(loglike, prior_transform, ndim=NDIM, sample=sample)
+        except ValueError:
+            continue
+        names.append(sample)
+    return names
 
 
 def format_warnings(warnings: list[str]) -> str:

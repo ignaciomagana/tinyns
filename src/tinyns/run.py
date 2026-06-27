@@ -13,6 +13,7 @@ from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
     draw_constrained_prior,
     draw_constrained_prior_vectorized,
+    draw_constrained_rslice,
     draw_constrained_rwalk,
     draw_constrained_slice,
 )
@@ -149,15 +150,15 @@ def run_static_nested(
 ):
     """Run a simple static nested-sampling loop.
 
-    The replacement ``sample`` strategy may be ``"prior"``, ``"rwalk"``, or
-    ``"slice"``.
+    The replacement ``sample`` strategy may be ``"prior"``, ``"rwalk"``,
+    ``"slice"``, or ``"rslice"``.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
-    if sample not in {"prior", "rwalk", "slice"}:
-        raise ValueError("sample must be one of {'prior', 'rwalk', 'slice'}")
+    if sample not in {"prior", "rwalk", "slice", "rslice"}:
+        raise ValueError("sample must be one of {'prior', 'rwalk', 'slice', 'rslice'}")
     if sample == "rwalk" and vectorized:
         raise NotImplementedError(
             "vectorized rwalk is not implemented yet; use vectorized=False "
@@ -167,6 +168,11 @@ def run_static_nested(
         raise NotImplementedError(
             "vectorized slice sampling is not implemented yet; use vectorized=False "
             'with sample="slice"'
+        )
+    if sample == "rslice" and vectorized:
+        raise NotImplementedError(
+            "vectorized rslice sampling is not implemented yet; use vectorized=False "
+            'with sample="rslice"'
         )
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
@@ -272,8 +278,22 @@ def run_static_nested(
                 step_scale=step_scale,
                 max_attempts=max_attempts,
             )
-        else:
+        elif sample == "slice":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
+                key,
+                loglike,
+                prior_transform,
+                logl_worst,
+                live_u,
+                live_logl,
+                ndim,
+                slices=slices,
+                slice_steps=slice_steps,
+                step_scale=step_scale,
+                max_attempts=max_attempts,
+            )
+        else:
+            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rslice(
                 key,
                 loglike,
                 prior_transform,
