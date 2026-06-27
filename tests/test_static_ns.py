@@ -65,6 +65,40 @@ def test_result_shapes_finite_logz_and_equal_resampling() -> None:
     assert result.resample_equal(random.PRNGKey(3), n=10).shape == (10, 3)
 
 
+def test_static_nested_result_counts_match_metadata() -> None:
+    result = run_static_nested(
+        random.PRNGKey(23),
+        lambda theta: float(-jnp.sum(theta**2)),
+        lambda u: u,
+        ndim=2,
+        nlive=12,
+        dlogz=0.0,
+        maxiter=5,
+    )
+
+    assert result.samples_u.shape[0] == (
+        result.metadata["ndead"] + result.metadata["nlive_final"]
+    )
+    assert result.logwt.shape[0] == result.samples.shape[0]
+
+
+def test_static_nested_maxiter_zero_returns_only_live_points() -> None:
+    result = run_static_nested(
+        random.PRNGKey(24),
+        lambda theta: float(-jnp.sum(theta**2)),
+        lambda u: u,
+        ndim=2,
+        nlive=7,
+        maxiter=0,
+    )
+
+    assert result.samples_u.shape == (7, 2)
+    assert result.samples.shape == (7, 2)
+    assert result.logwt.shape == (7,)
+    assert result.metadata["ndead"] == 0
+    assert result.metadata["nlive_final"] == 7
+
+
 def test_failure_to_replace_returns_result_with_live_contribution() -> None:
     result = run_static_nested(
         random.PRNGKey(4),
