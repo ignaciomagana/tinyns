@@ -663,6 +663,7 @@ def test_nested_sampler_rwalk_jax_records_replacement_chains() -> None:
 
     assert result.success is True
     assert result.metadata["replacement_chains"] == 4
+    assert result.metadata["replacement_batch_ncall"] == 5 * 4
 
 
 @pytest.mark.parametrize(

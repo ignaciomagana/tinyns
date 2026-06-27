@@ -157,6 +157,26 @@ def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     assert "final_logl_live_max" in diagnostics
 
 
+def test_diagnostics_reports_replacement_batches_for_batched_jax_payload() -> None:
+    result = make_result()
+    result.metadata = {
+        "sample": "rwalk",
+        "kernel": "jax",
+        "walks": 25,
+        "replacement_chains": 16,
+        "mean_replacement_ncall": 400.0,
+        "max_replacement_ncall": 400,
+        "replacement_acceptance_proxy": 1.0 / 400.0,
+    }
+
+    diagnostics = result.diagnostics()
+
+    assert diagnostics["replacement_batch_ncall"] == 400
+    assert diagnostics["replacement_mean_batches"] == 1.0
+    assert diagnostics["replacement_max_batches"] == 1.0
+    assert "low replacement acceptance" not in diagnostics["warnings"]
+
+
 def test_max_weight_fraction_returns_expected_value() -> None:
     result = make_result()
     result.logwt = jnp.log(jnp.array([0.2, 0.3, 0.5]))

@@ -85,6 +85,12 @@ def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "mean_repl_ncall": _mean(
                     [row.get("mean_replacement_ncall") for row in rows]
                 ),
+                "mean_repl_batches": _mean(
+                    [row.get("repl_batches") for row in rows]
+                ),
+                "mean_max_repl_batches": _mean(
+                    [row.get("max_repl_batches") for row in rows]
+                ),
                 "success_fraction": sum(bool(row.get("success")) for row in rows)
                 / len(rows),
             }
@@ -147,6 +153,23 @@ def run_one(
         niter = int(niter)
     iter_per_s, ncall_per_s = compute_rates(niter, int(result.ncall), seconds)
     warnings = diagnostics.get("warnings", [])
+    replacement_batch_ncall = int(
+        diagnostics.get("replacement_batch_ncall")
+        or metadata.get("replacement_batch_ncall")
+        or (args.walks * args.replacement_chains)
+    )
+    mean_replacement_ncall = float(metadata.get("mean_replacement_ncall", 0.0))
+    max_replacement_ncall = int(metadata.get("max_replacement_ncall", 0))
+    repl_batches = (
+        mean_replacement_ncall / replacement_batch_ncall
+        if replacement_batch_ncall > 0
+        else None
+    )
+    max_repl_batches = (
+        max_replacement_ncall / replacement_batch_ncall
+        if replacement_batch_ncall > 0
+        else None
+    )
 
     return {
         "target": target_name,
@@ -163,14 +186,17 @@ def run_one(
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
         "replacement_chains": args.replacement_chains,
+        "replacement_batch_ncall": replacement_batch_ncall,
+        "repl_batches": repl_batches,
+        "max_repl_batches": max_repl_batches,
         "seconds": seconds,
         "ncall": int(result.ncall),
         "niter": niter,
         "ndead": diagnostics.get("ndead"),
         "iterations_per_second": iter_per_s,
         "likelihood_calls_per_second": ncall_per_s,
-        "mean_replacement_ncall": float(metadata.get("mean_replacement_ncall", 0.0)),
-        "max_replacement_ncall": int(metadata.get("max_replacement_ncall", 0)),
+        "mean_replacement_ncall": mean_replacement_ncall,
+        "max_replacement_ncall": max_replacement_ncall,
         "replacement_failures": int(metadata.get("replacement_failures", 0)),
         "logz": float(result.logz),
         "logzerr": float(result.logzerr),
@@ -191,8 +217,8 @@ def _fmt(value: Any, precision: int = 3) -> str:
 
 def print_results(results: list[dict[str, Any]]) -> None:
     print(
-        "target sampler kernel chains seed seconds niter ncall iter/s "
-        "ncall/s repl_ncall logz logzerr success warnings"
+        "target sampler kernel replacement_chains seed seconds niter ncall iter/s "
+        "ncall/s repl_ncall repl_batches max_repl_batches logz logzerr success warnings"
     )
     for row in results:
         print(
@@ -201,7 +227,8 @@ def print_results(results: list[dict[str, Any]]) -> None:
             f"{_fmt(row['seconds'])} {_fmt(row['niter'])} {row['ncall']} "
             f"{_fmt(row['iterations_per_second'])} "
             f"{_fmt(row['likelihood_calls_per_second'])} "
-            f"{_fmt(row['mean_replacement_ncall'])} {_fmt(row['logz'])} "
+            f"{_fmt(row['mean_replacement_ncall'])} {_fmt(row['repl_batches'])} "
+            f"{_fmt(row['max_repl_batches'])} {_fmt(row['logz'])} "
             f"{_fmt(row['logzerr'])} {row['success']} {row['warning_count']}"
         )
 
@@ -210,7 +237,8 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print()
     print(
         "target sampler kernel chains nruns mean_seconds mean_iter_per_s "
-        "mean_ncall_per_s mean_ncall mean_repl_ncall success_fraction"
+        "mean_ncall_per_s mean_ncall mean_repl_ncall mean_repl_batches "
+        "mean_max_repl_batches success_fraction"
     )
     for row in summaries:
         print(
@@ -218,7 +246,8 @@ def print_summaries(summaries: list[dict[str, Any]]) -> None:
             f"{row['replacement_chains']} {row['nruns']} "
             f"{_fmt(row['mean_seconds'])} {_fmt(row['mean_iter_per_s'])} "
             f"{_fmt(row['mean_ncall_per_s'])} {_fmt(row['mean_ncall'])} "
-            f"{_fmt(row['mean_repl_ncall'])} {_fmt(row['success_fraction'])}"
+            f"{_fmt(row['mean_repl_ncall'])} {_fmt(row['mean_repl_batches'])} "
+            f"{_fmt(row['mean_max_repl_batches'])} {_fmt(row['success_fraction'])}"
         )
 
 

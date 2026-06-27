@@ -287,10 +287,41 @@ class NestedSamplingResult:
         if replacement_failures is not None and replacement_failures > 0:
             warnings.append("replacement failures occurred")
 
+        replacement_chains = int(metadata.get("replacement_chains", 1) or 1)
+        replacement_batch_ncall = metadata.get("replacement_batch_ncall")
+        if replacement_batch_ncall is None:
+            walks = metadata.get("walks")
+            if walks is not None:
+                replacement_batch_ncall = int(walks) * replacement_chains
+        if replacement_batch_ncall is not None:
+            replacement_batch_ncall = int(replacement_batch_ncall)
+
+        mean_replacement_ncall = metadata.get(
+            "replacement_mean_ncall", metadata.get("mean_replacement_ncall")
+        )
+        max_replacement_ncall = metadata.get("max_replacement_ncall")
+        mean_replacement_batches = None
+        max_replacement_batches = None
+        if replacement_batch_ncall is not None and replacement_batch_ncall > 0:
+            if mean_replacement_ncall is not None:
+                mean_replacement_batches = (
+                    float(mean_replacement_ncall) / replacement_batch_ncall
+                )
+            if max_replacement_ncall is not None:
+                max_replacement_batches = (
+                    float(max_replacement_ncall) / replacement_batch_ncall
+                )
+
         replacement_acceptance_proxy = metadata.get("replacement_acceptance_proxy")
-        if (
-            replacement_acceptance_proxy is not None
-            and replacement_acceptance_proxy < 0.01
+        if replacement_chains == 1:
+            if (
+                replacement_acceptance_proxy is not None
+                and replacement_acceptance_proxy < 0.01
+            ):
+                warnings.append("low replacement acceptance")
+        elif (
+            mean_replacement_batches is not None
+            and mean_replacement_batches > 2.0
         ):
             warnings.append("low replacement acceptance")
 
@@ -355,14 +386,15 @@ class NestedSamplingResult:
             diagnostics["niter"] = metadata["niter"]
         if "ndead" in metadata:
             diagnostics["ndead"] = metadata["ndead"]
-        if "replacement_mean_ncall" in metadata:
-            diagnostics["replacement_mean_ncall"] = metadata[
-                "replacement_mean_ncall"
-            ]
-        elif "mean_replacement_ncall" in metadata:
-            diagnostics["replacement_mean_ncall"] = metadata[
-                "mean_replacement_ncall"
-            ]
+        diagnostics["replacement_chains"] = replacement_chains
+        if replacement_batch_ncall is not None:
+            diagnostics["replacement_batch_ncall"] = replacement_batch_ncall
+        if mean_replacement_ncall is not None:
+            diagnostics["replacement_mean_ncall"] = mean_replacement_ncall
+        if mean_replacement_batches is not None:
+            diagnostics["replacement_mean_batches"] = mean_replacement_batches
+        if max_replacement_batches is not None:
+            diagnostics["replacement_max_batches"] = max_replacement_batches
         if replacement_failures is not None:
             diagnostics["replacement_failures"] = replacement_failures
 

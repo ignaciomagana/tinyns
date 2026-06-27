@@ -120,6 +120,11 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         progress_interval=args.progress_interval,
     )
     diagnostics = result.diagnostics()
+    metadata = {} if result.metadata is None else result.metadata
+    replacement_batch_ncall = diagnostics.get(
+        "replacement_batch_ncall", metadata.get("replacement_batch_ncall")
+    )
+    replacement_mean_batches = diagnostics.get("replacement_mean_batches")
     sample_mean, sample_cov, sample_std = _posterior_moments(result, seed)
 
     logz_error = None
@@ -186,6 +191,8 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "message": str(result.message),
         "warnings": diagnostics.get("warnings", []),
         "replacement_mean_ncall": diagnostics.get("replacement_mean_ncall", 0.0),
+        "replacement_batch_ncall": replacement_batch_ncall,
+        "replacement_mean_batches": replacement_mean_batches,
         "replacement_failures": diagnostics.get("replacement_failures", 0),
         "sample_mean": sample_mean,
         "sample_cov": sample_cov,
