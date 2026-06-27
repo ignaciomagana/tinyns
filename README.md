@@ -138,3 +138,6 @@ python validation/summarize_validation.py validation_results.json
 
 The validation harness is intended to catch calibration and reliability issues,
 not to be a formal speed benchmark.
+The validation summary includes heuristic calibration warnings such as repeated
+large evidence z-scores, high live-point weight fraction, and concentrated
+posterior weights.
