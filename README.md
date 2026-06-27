@@ -101,3 +101,15 @@ programming language.
 - `examples/gaussian_2d_rwalk.py`: reflected random-walk constrained sampling.
 - `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling.
 - `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
+
+## Validation
+
+For repeated-seed validation on analytic targets:
+
+```bash
+python validation/run_validation.py --output validation_results.json
+python validation/summarize_validation.py validation_results.json
+```
+
+The validation harness is intended to catch calibration and reliability issues,
+not to be a formal speed benchmark.
