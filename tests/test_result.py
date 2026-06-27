@@ -75,6 +75,46 @@ def test_to_dict_contains_expected_keys() -> None:
     assert data["metadata"] is not result.metadata
 
 
+def test_to_numpy_converts_arrays_and_preserves_to_dict_behavior() -> None:
+    result = make_result()
+
+    numpy_data = result.to_numpy()
+    dict_data = result.to_dict()
+
+    assert isinstance(numpy_data["samples"], np.ndarray)
+    assert isinstance(numpy_data["samples_u"], np.ndarray)
+    assert isinstance(numpy_data["logl"], np.ndarray)
+    assert isinstance(numpy_data["logwt"], np.ndarray)
+    assert isinstance(numpy_data["logz"], float)
+    assert isinstance(numpy_data["ncall"], int)
+    assert numpy_data["metadata"] == {"status": "complete"}
+    assert dict_data["samples"] is result.samples
+
+
+def test_to_dynesty_dict_contains_lightweight_compatibility_keys() -> None:
+    result = make_result()
+    result.metadata = {"replacement_acceptance_proxy": 0.25}
+
+    data = result.to_dynesty_dict()
+
+    assert {"samples", "logl", "logwt", "logz"}.issubset(data)
+    assert isinstance(data["samples"], np.ndarray)
+    assert isinstance(data["samples_u"], np.ndarray)
+    assert data["logz"] == result.logz
+    assert data["logzerr"] == result.logzerr
+    assert data["ncall"] == result.ncall
+    assert data["nlive"] == result.nlive
+    assert data["eff"] == 0.25
+
+
+def test_to_dynesty_dict_omits_eff_without_acceptance_proxy() -> None:
+    result = make_result()
+
+    data = result.to_dynesty_dict()
+
+    assert "eff" not in data
+
+
 def test_summary_contains_replacement_information_when_present() -> None:
     result = make_result()
     result.metadata = {
