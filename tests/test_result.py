@@ -86,3 +86,41 @@ def test_summary_contains_replacement_information_when_present() -> None:
 
     assert "replacement mean ncall: 2.5" in summary
     assert "replacement failures: 1" in summary
+
+
+def test_information_is_finite_and_non_negative() -> None:
+    result = make_result()
+
+    information = result.information()
+
+    assert np.isfinite(information)
+    assert information >= 0.0
+
+
+def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
+    result = make_result()
+
+    diagnostics = result.diagnostics()
+
+    assert isinstance(diagnostics, dict)
+    assert isinstance(diagnostics["warnings"], list)
+    assert diagnostics["information"] == result.information()
+    assert diagnostics["nposterior"] == 4
+
+
+def test_diagnostics_low_ess_triggers_warning() -> None:
+    result = NestedSamplingResult(
+        samples_u=jnp.zeros((101, 1)),
+        samples=jnp.zeros((101, 1)),
+        logl=jnp.zeros(101),
+        logwt=jnp.concatenate([jnp.array([0.0]), jnp.full(100, -1000.0)]),
+        logz=0.0,
+        logzerr=0.1,
+        ncall=101,
+        nlive=10,
+        ndim=1,
+    )
+
+    diagnostics = result.diagnostics()
+
+    assert "low posterior ESS" in diagnostics["warnings"]
