@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import Any
 
-from tinyns.result import NestedSamplerResult
+from tinyns.result import NestedSamplingResult
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
-@dataclass(frozen=True)
 class NestedSampler:
     """Tiny dynesty-style nested sampler facade.
 
@@ -20,9 +19,18 @@ class NestedSampler:
     prior_transform:
         Callable mapping a unit-cube point to parameter space.
     ndim:
-        Number of model dimensions.
+        Number of model dimensions. Must be positive.
     nlive:
-        Number of live points to use when the sampler is implemented.
+        Number of live points to use when the sampler is implemented. Must be
+        positive.
+    vectorized:
+        Whether ``loglike`` and ``prior_transform`` accept batches of points.
+    sample:
+        Sampling strategy. Only ``"prior"`` is accepted by this API shell.
+    max_attempts:
+        Future cap on rejection attempts per constrained prior draw.
+    **kwargs:
+        Additional sampler options reserved for future implementations.
 
     Notes
     -----
@@ -30,25 +38,47 @@ class NestedSampler:
     this scaffold. ``run`` currently raises :class:`NotImplementedError`.
     """
 
-    loglike: LogLikelihood
-    prior_transform: PriorTransform
-    ndim: int
-    nlive: int = 500
-
-    def __post_init__(self) -> None:
-        """Validate basic sampler configuration."""
-
-        if self.ndim <= 0:
+    def __init__(
+        self,
+        loglike: LogLikelihood,
+        prior_transform: PriorTransform,
+        ndim: int,
+        nlive: int = 500,
+        *,
+        vectorized: bool = False,
+        sample: str = "prior",
+        max_attempts: int = 10_000,
+        **kwargs: Any,
+    ):
+        if ndim <= 0:
             raise ValueError("ndim must be a positive integer")
-        if self.nlive <= 0:
+        if nlive <= 0:
             raise ValueError("nlive must be a positive integer")
-        if not callable(self.loglike):
+        if sample not in {"prior"}:
+            raise ValueError("sample must currently be one of {'prior'}")
+        if not callable(loglike):
             raise TypeError("loglike must be callable")
-        if not callable(self.prior_transform):
+        if not callable(prior_transform):
             raise TypeError("prior_transform must be callable")
 
-    def run(self, key: PRNGKeyLike, *, dlogz: float = 0.1) -> NestedSamplerResult:
-        """Run nested sampling and return a :class:`NestedSamplerResult`.
+        self.loglike = loglike
+        self.prior_transform = prior_transform
+        self.ndim = ndim
+        self.nlive = nlive
+        self.vectorized = vectorized
+        self.sample = sample
+        self.max_attempts = max_attempts
+        self.kwargs = dict(kwargs)
+
+    def run(
+        self,
+        key: PRNGKeyLike,
+        *,
+        dlogz: float = 0.1,
+        maxiter: int | None = None,
+        progress: bool = False,
+    ) -> NestedSamplingResult:
+        """Run nested sampling and return a :class:`NestedSamplingResult`.
 
         Parameters
         ----------
@@ -56,9 +86,11 @@ class NestedSampler:
             JAX PRNG key used to drive stochastic sampler operations.
         dlogz:
             Target remaining-evidence stopping criterion.
+        maxiter:
+            Optional maximum number of nested-sampling iterations.
+        progress:
+            Whether to display progress information when implemented.
         """
 
-        _ = key
-        if dlogz <= 0:
-            raise ValueError("dlogz must be positive")
+        _ = (key, dlogz, maxiter, progress)
         raise NotImplementedError("NestedSampler.run is not implemented yet")
