@@ -152,6 +152,8 @@ The replacement remains valid only if a successful chain is selected without fav
 
 > Warning: Increasing `replacement_chains` increases likelihood evaluations per replacement attempt. It is useful only when the likelihood benefits from batched/device parallelism.
 
+For batched JAX chains, `ncall` counts scalar likelihood evaluations, not wall-clock-equivalent work. A replacement with `walks=25` and `replacement_chains=16` costs 400 scalar likelihood evaluations, but those chains are evaluated in parallel on device. Use wall time and replacement batch counts when judging batched performance.
+
 For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python"` with `sample="rwalk"`.
 
 `kernel="jax"` currently supports `sample="rwalk"` only. The top-level nested-sampling loop remains in Python; only the constrained replacement kernel is compiled.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
-from validation.run_validation import insertion_rank_stats
+from validation.run_validation import insertion_rank_stats, main
 
 
 class _FakeResult:
@@ -56,3 +56,34 @@ def test_validation_parser_accepts_replacement_chains() -> None:
     args = parse_args(["--replacement-chains", "4"])
 
     assert args.replacement_chains == 4
+
+
+def test_validation_cli_smoke_writes_replacement_batch_fields(tmp_path) -> None:
+    output = tmp_path / "validation.json"
+
+    main([
+        "--targets",
+        "gaussian2d",
+        "--samplers",
+        "rwalk",
+        "--kernel",
+        "jax",
+        "--replacement-chains",
+        "2",
+        "--seeds",
+        "0",
+        "--nlive",
+        "20",
+        "--dlogz",
+        "10",
+        "--walks",
+        "5",
+        "--output",
+        str(output),
+    ])
+
+    payload = __import__("json").loads(output.read_text())
+    rows = payload["results"]
+    assert len(rows) == 1
+    assert "replacement_batch_ncall" in rows[0]
+    assert "replacement_mean_batches" in rows[0]

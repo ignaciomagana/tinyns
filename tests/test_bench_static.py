@@ -27,6 +27,8 @@ def test_summarize_results_groups_means_and_success_fraction() -> None:
             "likelihood_calls_per_second": 50.0,
             "ncall": 100,
             "mean_replacement_ncall": 3.0,
+            "repl_batches": 1.0,
+            "max_repl_batches": 1.5,
             "success": True,
         },
         {
@@ -37,6 +39,8 @@ def test_summarize_results_groups_means_and_success_fraction() -> None:
             "likelihood_calls_per_second": 100.0,
             "ncall": 200,
             "mean_replacement_ncall": 5.0,
+            "repl_batches": 2.0,
+            "max_repl_batches": 2.5,
             "success": False,
         },
     ]
@@ -49,6 +53,8 @@ def test_summarize_results_groups_means_and_success_fraction() -> None:
     assert summaries[0]["mean_ncall_per_s"] == 75.0
     assert summaries[0]["mean_ncall"] == 150.0
     assert summaries[0]["mean_repl_ncall"] == 4.0
+    assert summaries[0]["mean_repl_batches"] == 1.5
+    assert summaries[0]["mean_max_repl_batches"] == 2.0
     assert summaries[0]["success_fraction"] == 0.5
 
 
@@ -114,8 +120,13 @@ def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
 
     payload = json.loads(output.read_text())
     assert len(payload["results"]) == 1
-    assert payload["results"][0]["kernel"] == "jax"
-    assert payload["results"][0]["success"] is True
+    row = payload["results"][0]
+    assert row["kernel"] == "jax"
+    assert row["success"] is True
+    assert "replacement_chains" in row
+    assert "replacement_batch_ncall" in row
+    assert "repl_batches" in row
+    assert "max_repl_batches" in row
 
 
 def test_benchmark_parser_accepts_replacement_chains() -> None:

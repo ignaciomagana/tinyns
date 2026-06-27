@@ -567,6 +567,7 @@ def run_static_nested(
     niter = int(iteration)
     nlive_final = int(live_logl.size)
     nposterior = int(logwt.size)
+    replacement_batch_ncall = int(walks) * int(replacement_chains)
     if replacement_ncall:
         mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
         max_replacement_ncall = int(max(replacement_ncall))
@@ -611,6 +612,7 @@ def run_static_nested(
             "slice_steps": slice_steps,
             "min_accepts": min_accepts,
             "replacement_chains": replacement_chains,
+            "replacement_batch_ncall": replacement_batch_ncall,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),
