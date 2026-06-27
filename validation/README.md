@@ -37,6 +37,8 @@ Useful warning signs:
 The recommendation column is heuristic and should be treated as a debugging aid,
 not a formal statistical test.
 
+`ring2d` is a qualitative annulus target. It is useful for checking whether constrained-replacement samplers can move around curved shell-like likelihood regions. If no analytic evidence is provided, use posterior diagnostics, insertion-rank behavior, and repeated-run stability rather than z-scores.
+
 
 `rslice` is available in the validation harness and is a useful comparison
 against coordinate-wise `slice`, especially on correlated targets. It remains a

@@ -136,6 +136,35 @@ def banana_2d() -> ValidationTarget:
     )
 
 
+def ring_2d() -> ValidationTarget:
+    """Return a qualitative 2D annulus stress target."""
+
+    r0 = 1.0
+    sigma_r = 0.08
+
+    def prior_transform(u):
+        return -2.0 + 4.0 * jnp.asarray(u)
+
+    def loglike(theta):
+        theta = jnp.asarray(theta)
+        x, y = theta
+        r = jnp.sqrt(x * x + y * y)
+        return -0.5 * ((r - r0) / sigma_r) ** 2
+
+    return ValidationTarget(
+        name="ring2d",
+        ndim=2,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=None,
+        expected_mean=None,
+        expected_cov=None,
+        description=(
+            "2D annulus likelihood in a square prior; qualitative geometry stress test"
+        ),
+    )
+
+
 def eggbox_2d() -> ValidationTarget:
     """Return a qualitative multimodal eggbox stress target."""
 
@@ -165,6 +194,7 @@ def available_targets() -> dict[str, Callable[[], ValidationTarget]]:
         "gaussian2d": gaussian_2d,
         "correlated_gaussian2d": correlated_gaussian_2d,
         "banana2d": banana_2d,
+        "ring2d": ring_2d,
         "eggbox2d": eggbox_2d,
     }
 
