@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -76,3 +79,16 @@ def test_nested_sampler_run_returns_result() -> None:
     assert isinstance(result, NestedSamplingResult)
     assert result.ndim == 3
     assert result.nlive == 20
+
+
+def test_nested_sampler_run_constant_likelihood_gives_finite_logz() -> None:
+    sampler = NestedSampler(lambda theta: 0.0, lambda u: u, ndim=2, nlive=30)
+
+    result = sampler.run(
+        key=np.array([1, 2], dtype=np.uint32),
+        dlogz=0.05,
+        maxiter=300,
+    )
+
+    assert math.isfinite(result.logz)
+    assert jnp.isfinite(result.logz)
