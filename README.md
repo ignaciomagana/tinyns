@@ -1,37 +1,30 @@
 # tinyns
 
-`tinyns` aims to be a tiny, dynesty-style nested sampler for JAX-friendly
-likelihoods. The project is currently locking down its public API before the
-full sampling algorithm is implemented.
+`tinyns` is a tiny, dynesty-style nested sampler for JAX-friendly likelihoods.
+It provides a compact interface that transforms unit-cube samples through a user
+prior, evaluates a log likelihood, and returns a structured
+`NestedSamplingResult` containing posterior samples, weights, and evidence
+estimates.
 
-## Goal
-
-The goal is to provide a compact nested-sampling interface that can transform
-unit-cube samples through a user prior, evaluate a log likelihood, and return a
-structured `NestedSamplingResult` containing posterior samples, weights, and
-evidence estimates.
-
-## Minimal future usage
+## Minimal working example
 
 ```python
+import jax
 import jax.numpy as jnp
-from jax import random
-
 from tinyns import NestedSampler
 
 
+def prior_transform(u):
+    return -10.0 + 20.0 * u
+
+
 def loglike(theta):
-    return -0.5 * jnp.dot(theta, theta)
+    return -0.5 * theta[0] ** 2 - 0.5 * jnp.log(2 * jnp.pi)
 
 
-def prior_transform(unit):
-    return 2.0 * unit - 1.0
+key = jax.random.PRNGKey(0)
+sampler = NestedSampler(loglike, prior_transform, ndim=1, nlive=200)
+result = sampler.run(key, dlogz=0.1)
 
-
-sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=500)
-result = sampler.run(random.PRNGKey(0), dlogz=0.1, progress=True)
-print(result.logz, result.logzerr)
+print(result.summary())
 ```
-
-`NestedSampler.run` is not implemented yet; the example above documents the
-intended shape of the public API.

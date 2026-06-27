@@ -10,7 +10,7 @@ from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
 class NestedSampler:
-    """Tiny dynesty-style nested sampler facade.
+    """Tiny dynesty-style facade over the static nested sampler.
 
     Parameters
     ----------
@@ -22,21 +22,15 @@ class NestedSampler:
     ndim:
         Number of model dimensions. Must be positive.
     nlive:
-        Number of live points to use when the sampler is implemented. Must be
-        positive.
+        Number of live points to use. Must be positive.
     vectorized:
         Whether ``loglike`` and ``prior_transform`` accept batches of points.
     sample:
-        Sampling strategy. Only ``"prior"`` is accepted by this API shell.
+        Sampling strategy. Only ``"prior"`` is currently supported.
     max_attempts:
-        Future cap on rejection attempts per constrained prior draw.
+        Cap on rejection attempts per constrained prior draw.
     **kwargs:
         Additional sampler options reserved for future implementations.
-
-    Notes
-    -----
-    The actual nested-sampling algorithm is intentionally not implemented in
-    this scaffold. ``run`` currently raises :class:`NotImplementedError`.
     """
 
     def __init__(
@@ -79,19 +73,7 @@ class NestedSampler:
         maxiter: int | None = None,
         progress: bool = False,
     ) -> NestedSamplingResult:
-        """Run nested sampling and return a :class:`NestedSamplingResult`.
-
-        Parameters
-        ----------
-        key:
-            JAX PRNG key used to drive stochastic sampler operations.
-        dlogz:
-            Target remaining-evidence stopping criterion.
-        maxiter:
-            Optional maximum number of nested-sampling iterations.
-        progress:
-            Whether to display progress information when implemented.
-        """
+        """Run nested sampling and return a :class:`NestedSamplingResult`."""
 
         return run_static_nested(
             key,
