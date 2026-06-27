@@ -70,6 +70,70 @@ class NestedSamplingResult:
 
         return float(effective_sample_size_from_log_weights(self.logwt))
 
+    def information(self) -> float:
+        """Return the nested-sampling information from posterior weights."""
+
+        information = float(
+            jnp.sum(self.weights() * (jnp.asarray(self.logl) - self.logz))
+        )
+        if information < 0.0:
+            return 0.0
+        return information
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return lightweight run diagnostics as a plain dictionary."""
+
+        metadata = {} if self.metadata is None else self.metadata
+        posterior_ess = self.posterior_ess()
+        nposterior = int(jnp.asarray(self.logwt).size)
+        warnings: list[str] = []
+
+        if not self.success:
+            warnings.append(self.message)
+        if posterior_ess < 100.0:
+            warnings.append("low posterior ESS")
+
+        replacement_failures = metadata.get("replacement_failures")
+        if replacement_failures is not None and replacement_failures > 0:
+            warnings.append("replacement failures occurred")
+
+        replacement_acceptance_proxy = metadata.get("replacement_acceptance_proxy")
+        if (
+            replacement_acceptance_proxy is not None
+            and replacement_acceptance_proxy < 0.01
+        ):
+            warnings.append("low replacement acceptance")
+
+        if nposterior < self.nlive + 10:
+            warnings.append("very few dead points")
+
+        diagnostics: dict[str, object] = {
+            "success": self.success,
+            "message": self.message,
+            "logz": float(self.logz),
+            "logzerr": float(self.logzerr),
+            "information": self.information(),
+            "posterior_ess": posterior_ess,
+            "ncall": int(self.ncall),
+            "nlive": int(self.nlive),
+            "ndim": int(self.ndim),
+            "nposterior": nposterior,
+            "warnings": warnings,
+        }
+
+        if "replacement_mean_ncall" in metadata:
+            diagnostics["replacement_mean_ncall"] = metadata[
+                "replacement_mean_ncall"
+            ]
+        elif "mean_replacement_ncall" in metadata:
+            diagnostics["replacement_mean_ncall"] = metadata[
+                "mean_replacement_ncall"
+            ]
+        if replacement_failures is not None:
+            diagnostics["replacement_failures"] = replacement_failures
+
+        return diagnostics
+
     def resample_equal(self, key, n: int | None = None):
         """Return equally weighted posterior samples using systematic resampling."""
 
