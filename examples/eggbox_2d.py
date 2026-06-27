@@ -58,7 +58,8 @@ def run_sampler(sample, key):
 
 def main():
     key = jax.random.PRNGKey(72)
-    for sample, sample_key in zip(("rwalk", "slice"), jax.random.split(key, 2)):
+    sample_keys = jax.random.split(key, 2)
+    for sample, sample_key in zip(("rwalk", "slice"), sample_keys, strict=True):
         run_sampler(sample, sample_key)
 
 

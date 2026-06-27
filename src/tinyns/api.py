@@ -26,7 +26,8 @@ class NestedSampler:
     vectorized:
         Whether ``loglike`` and ``prior_transform`` accept batches of points.
     sample:
-        Sampling strategy. ``"prior"``, ``"rwalk"``, and ``"slice"`` are currently supported.
+        Sampling strategy. ``"prior"``, ``"rwalk"``, and ``"slice"`` are
+        currently supported.
     max_attempts:
         Cap on rejection attempts per constrained prior draw.
     **kwargs:
