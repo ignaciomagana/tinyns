@@ -165,10 +165,10 @@ def draw_constrained_slice(
 ):
     """Draw a constrained replacement with coordinate-wise slice updates.
 
-    A live point is chosen as the seed. The copied seed does not count as a
-    successful replacement; at least one coordinate proposal must satisfy the
-    likelihood constraint. Proposals are reflected into the unit cube before
-    evaluating ``prior_transform`` and ``loglike``.
+    A live point is chosen as the seed. The copied live seed does not count
+    toward ``min_accepts``; at least ``min_accepts`` accepted constrained moves
+    are required. Proposals are reflected into the unit cube before evaluating
+    ``prior_transform`` and ``loglike``.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -235,15 +235,16 @@ def draw_constrained_slice(
                     current_theta = theta_prop
                     current_logl = logl_prop
                     accepted_moves += 1
+                    if accepted_moves >= min_accepts:
+                        break
+                    # Continue with the next coordinate update after a
+                    # successful constrained move.
                     break
 
                 if bool(x_prop < x):
                     left = x_prop
                 else:
                     right = x_prop
-
-                if accepted_moves >= min_accepts:
-                    break
             if accepted_moves >= min_accepts:
                 break
 
@@ -270,10 +271,10 @@ def draw_constrained_rslice(
 ):
     """Draw a constrained replacement with random-direction slice updates.
 
-    A live point is chosen as the seed. The copied seed does not count as a
-    successful replacement; at least one random-direction proposal must satisfy
-    the likelihood constraint. Proposals are reflected into the unit cube before
-    evaluating ``prior_transform`` and ``loglike``.
+    A live point is chosen as the seed. The copied live seed does not count
+    toward ``min_accepts``; at least ``min_accepts`` accepted constrained moves
+    are required. Proposals are reflected into the unit cube before evaluating
+    ``prior_transform`` and ``loglike``.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -344,15 +345,16 @@ def draw_constrained_rslice(
                     current_theta = theta_prop
                     current_logl = logl_prop
                     accepted_moves += 1
+                    if accepted_moves >= min_accepts:
+                        break
+                    # Continue with the next random-direction update after a
+                    # successful constrained move.
                     break
 
                 if bool(alpha < 0):
                     left = alpha
                 else:
                     right = alpha
-
-                if accepted_moves >= min_accepts:
-                    break
             if accepted_moves >= min_accepts:
                 break
 
@@ -379,8 +381,9 @@ def draw_constrained_rwalk(
     """Draw a constrained replacement with a reflected random walk.
 
     A live point is chosen as the seed, then Gaussian proposals are reflected
-    into the unit cube. The copied seed does not count as an accepted
-    replacement; at least one proposal must satisfy the likelihood constraint.
+    into the unit cube. The copied live seed does not count toward
+    ``min_accepts``; at least ``min_accepts`` accepted constrained moves are
+    required.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
