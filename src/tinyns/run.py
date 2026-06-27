@@ -265,6 +265,10 @@ def run_static_nested(
         message = "converged"
         stopped_by_callback = False
         iteration = int(initial_state.iteration)
+        if maxiter < iteration:
+            raise ValueError(
+                f"maxiter={maxiter} is smaller than checkpoint iteration={iteration}"
+            )
 
     initial_iteration = iteration
     progress_printer = _ProgressPrinter() if progress else None

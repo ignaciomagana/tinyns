@@ -116,3 +116,49 @@ def test_checkpoint_path_out_works(tmp_path):
     make_sampler().resume(path_a, maxiter=4, checkpoint_path_out=path_b)
 
     assert path_b.exists()
+
+
+def test_resume_rejects_maxiter_smaller_than_checkpoint_iteration(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler().run(9, maxiter=4, dlogz=0.0, checkpoint_path=path)
+
+    with pytest.raises(ValueError, match="maxiter.*checkpoint iteration"):
+        make_sampler().resume(path, maxiter=2, dlogz=0.0)
+
+
+def test_resume_matches_uninterrupted_run(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    sampler = make_sampler()
+
+    full = sampler.run(10, maxiter=8, dlogz=0.0)
+    sampler.run(10, maxiter=4, dlogz=0.0, checkpoint_path=path)
+    resumed = sampler.resume(path, maxiter=8, dlogz=0.0)
+
+    np.testing.assert_allclose(resumed.samples_u, full.samples_u)
+    np.testing.assert_allclose(resumed.samples, full.samples)
+    np.testing.assert_allclose(resumed.logl, full.logl)
+    np.testing.assert_allclose(resumed.logwt, full.logwt)
+    assert resumed.ncall == full.ncall
+    assert resumed.logz == full.logz
+
+
+def test_resume_rejects_checkpoint_after_replacement_failure(tmp_path):
+    path = tmp_path / "failed.checkpoint.npz"
+
+    def increasing_loglike(theta):
+        return float(jnp.asarray(theta)[0])
+
+    failed_sampler = NestedSampler(
+        increasing_loglike,
+        prior_transform,
+        ndim=1,
+        nlive=1,
+        max_attempts=1,
+    )
+    result = failed_sampler.run(0, maxiter=10, dlogz=0.0, checkpoint_path=path)
+
+    assert path.exists()
+    assert result.success is False
+    assert "max_attempts" in result.message
+    with pytest.raises(ValueError, match="replacement failure"):
+        failed_sampler.resume(path, maxiter=10, dlogz=0.0)
