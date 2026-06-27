@@ -1,0 +1,178 @@
+"""Validation targets for repeated-seed tinyns reliability checks."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import jax.numpy as jnp
+import numpy as np
+
+
+@dataclass(frozen=True)
+class ValidationTarget:
+    """Small container describing a validation likelihood and expectations."""
+
+    name: str
+    ndim: int
+    prior_transform: Callable
+    loglike: Callable
+    expected_logz: float | None = None
+    expected_mean: np.ndarray | None = None
+    expected_cov: np.ndarray | None = None
+    description: str = ""
+
+
+def constant_cube(ndim: int = 2) -> ValidationTarget:
+    """Return a constant likelihood on the unit cube."""
+
+    def prior_transform(u):
+        return u
+
+    def loglike(theta):
+        del theta
+        return 0.0
+
+    return ValidationTarget(
+        name=f"constant{ndim}d",
+        ndim=ndim,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=0.0,
+        expected_mean=np.full(ndim, 0.5),
+        expected_cov=np.eye(ndim) / 12.0,
+        description="Constant likelihood on the unit cube.",
+    )
+
+
+def gaussian_1d(width: float = 20.0) -> ValidationTarget:
+    """Return a normalized 1D standard-normal likelihood under a wide prior."""
+
+    def prior_transform(u):
+        return -0.5 * width + width * jnp.asarray(u)
+
+    def loglike(theta):
+        x = jnp.asarray(theta)[0]
+        return -0.5 * x**2 - 0.5 * jnp.log(2.0 * jnp.pi)
+
+    return ValidationTarget(
+        name="gaussian1d",
+        ndim=1,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=-float(np.log(width)),
+        expected_mean=np.array([0.0]),
+        expected_cov=np.array([[1.0]]),
+        description="Normalized 1D Gaussian likelihood with a wide uniform prior.",
+    )
+
+
+def gaussian_2d(width: float = 20.0) -> ValidationTarget:
+    """Return a normalized 2D standard-normal likelihood under a wide prior."""
+
+    def prior_transform(u):
+        return -0.5 * width + width * jnp.asarray(u)
+
+    def loglike(theta):
+        theta = jnp.asarray(theta)
+        return -0.5 * jnp.sum(theta**2) - jnp.log(2.0 * jnp.pi)
+
+    return ValidationTarget(
+        name="gaussian2d",
+        ndim=2,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=-float(np.log(width**2)),
+        expected_mean=np.zeros(2),
+        expected_cov=np.eye(2),
+        description="Normalized 2D Gaussian likelihood with a wide uniform prior.",
+    )
+
+
+def correlated_gaussian_2d(width: float = 20.0, rho: float = 0.8) -> ValidationTarget:
+    """Return a normalized correlated 2D Gaussian likelihood."""
+
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    inv_cov = jnp.asarray(np.linalg.inv(cov))
+    log_norm = -0.5 * float(2 * np.log(2.0 * np.pi) + np.log(np.linalg.det(cov)))
+
+    def prior_transform(u):
+        return -0.5 * width + width * jnp.asarray(u)
+
+    def loglike(theta):
+        theta = jnp.asarray(theta)
+        return -0.5 * theta @ inv_cov @ theta + log_norm
+
+    return ValidationTarget(
+        name="correlated_gaussian2d",
+        ndim=2,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=-float(np.log(width**2)),
+        expected_mean=np.zeros(2),
+        expected_cov=cov,
+        description="Normalized correlated 2D Gaussian likelihood.",
+    )
+
+
+def banana_2d() -> ValidationTarget:
+    """Return a qualitative banana-shaped stress target."""
+
+    def prior_transform(u):
+        return -5.0 + 10.0 * jnp.asarray(u)
+
+    def loglike(theta):
+        x = theta[0]
+        y = theta[1]
+        banana = y - 0.2 * (x**2 - 4.0)
+        return -0.5 * (x / 1.8) ** 2 - 0.5 * (banana / 0.35) ** 2
+
+    return ValidationTarget(
+        name="banana2d",
+        ndim=2,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        description="Banana-shaped unnormalized likelihood stress target.",
+    )
+
+
+def eggbox_2d() -> ValidationTarget:
+    """Return a qualitative multimodal eggbox stress target."""
+
+    def prior_transform(u):
+        return u
+
+    def loglike(theta):
+        x = 10.0 * jnp.pi * theta[0]
+        y = 10.0 * jnp.pi * theta[1]
+        return 5.0 * jnp.log(2.0 + jnp.cos(x) * jnp.cos(y))
+
+    return ValidationTarget(
+        name="eggbox2d",
+        ndim=2,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        description="Multimodal eggbox-like unnormalized likelihood stress target.",
+    )
+
+
+def available_targets() -> dict[str, Callable[[], ValidationTarget]]:
+    """Return available named validation target constructors."""
+
+    return {
+        "constant2d": constant_cube,
+        "gaussian1d": gaussian_1d,
+        "gaussian2d": gaussian_2d,
+        "correlated_gaussian2d": correlated_gaussian_2d,
+        "banana2d": banana_2d,
+        "eggbox2d": eggbox_2d,
+    }
+
+
+def get_target(name: str) -> ValidationTarget:
+    """Return a validation target by name."""
+
+    targets = available_targets()
+    if name not in targets:
+        raise KeyError(f"unknown validation target {name!r}")
+    return targets[name]()
