@@ -37,6 +37,13 @@ Useful warning signs:
 The recommendation column is heuristic and should be treated as a debugging aid,
 not a formal statistical test.
 
+Repeated-seed validation currently supports the following practical recommendations:
+
+- `sample="rwalk", kernel="python"`: reliable baseline
+- `sample="rwalk", kernel="jax"`: reliable fast path for JAX-native likelihoods
+- `sample="slice"`: useful exploratory sampler, but validate evidence calibration
+- `sample="rslice"`: experimental
+
 `ring2d` is a qualitative annulus target. It is useful for checking whether constrained-replacement samplers can move around curved shell-like likelihood regions. If no analytic evidence is provided, use posterior diagnostics, insertion-rank behavior, and repeated-run stability rather than z-scores.
 
 
