@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import jax.numpy as jnp
 from jax import random
@@ -17,6 +18,7 @@ from tinyns.samplers import (
     draw_constrained_rwalk,
     draw_constrained_slice,
 )
+from tinyns.state import NestedRunState, save_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
@@ -154,6 +156,9 @@ def run_static_nested(
     step_scale: float = 0.1,
     slices: int = 5,
     slice_steps: int = 10,
+    initial_state: NestedRunState | None = None,
+    checkpoint_path=None,
+    checkpoint_interval: int = 100,
 ):
     """Run a simple static nested-sampling loop.
 
@@ -189,6 +194,8 @@ def run_static_nested(
         raise ValueError("callback_interval must be a positive integer")
     if callback is not None and not callable(callback):
         raise TypeError("callback must be callable")
+    if checkpoint_path is not None and checkpoint_interval <= 0:
+        raise ValueError("checkpoint_interval must be a positive integer")
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
     if slices <= 0:
@@ -200,30 +207,101 @@ def run_static_nested(
     if maxiter < 0:
         raise ValueError("maxiter must be non-negative")
 
-    key = random.PRNGKey(int(key)) if isinstance(key, int) else key
-    key, init_key = random.split(key)
-    live_u = random.uniform(init_key, shape=(nlive, ndim))
-    live_theta = _transform_live_points(
-        prior_transform, live_u, ndim, vectorized=vectorized
+    config = {
+        "ndim": int(ndim),
+        "nlive": int(nlive),
+        "sample": str(sample),
+        "vectorized": bool(vectorized),
+        "max_attempts": int(max_attempts),
+        "batch_size": int(batch_size),
+        "walks": int(walks),
+        "step_scale": float(step_scale),
+        "slices": int(slices),
+        "slice_steps": int(slice_steps),
+    }
+    checkpoint_path_str = (
+        None if checkpoint_path is None else os.fspath(checkpoint_path)
     )
-    live_logl = _evaluate_live_points(loglike, live_theta, vectorized=vectorized)
-    ncall = nlive
+    resumed_from_checkpoint = initial_state is not None
 
-    dead_u = []
-    dead_theta = []
-    dead_logl = []
-    dead_logwt = []
-    logz_dead = -math.inf
-    replacement_ncall = []
-    insertion_indices = []
-    replacement_failures = 0
-    success = True
-    message = "converged"
-    stopped_by_callback = False
-    logx_final = 0.0
+    if initial_state is None:
+        key = random.PRNGKey(int(key)) if isinstance(key, int) else key
+        key, init_key = random.split(key)
+        live_u = random.uniform(init_key, shape=(nlive, ndim))
+        live_theta = _transform_live_points(
+            prior_transform, live_u, ndim, vectorized=vectorized
+        )
+        live_logl = _evaluate_live_points(loglike, live_theta, vectorized=vectorized)
+        ncall = nlive
+        dead_u = []
+        dead_theta = []
+        dead_logl = []
+        dead_logwt = []
+        logz_dead = -math.inf
+        replacement_ncall = []
+        insertion_indices = []
+        replacement_failures = 0
+        success = True
+        message = "converged"
+        stopped_by_callback = False
+        logx_final = 0.0
+        iteration = 0
+    else:
+        key = initial_state.key
+        live_u = initial_state.live_u
+        live_theta = initial_state.live_theta
+        live_logl = initial_state.live_logl
+        dead_u = list(initial_state.dead_u)
+        dead_theta = list(initial_state.dead_theta)
+        dead_logl = list(initial_state.dead_logl)
+        dead_logwt = list(initial_state.dead_logwt)
+        logz_dead = float(initial_state.logz_dead)
+        logx_final = float(initial_state.logx_final)
+        ncall = int(initial_state.ncall)
+        replacement_ncall = list(initial_state.replacement_ncall)
+        insertion_indices = list(initial_state.insertion_indices)
+        replacement_failures = int(initial_state.replacement_failures)
+        success = True
+        message = "converged"
+        stopped_by_callback = False
+        iteration = int(initial_state.iteration)
+        if maxiter < iteration:
+            raise ValueError(
+                f"maxiter={maxiter} is smaller than checkpoint iteration={iteration}"
+            )
+
+    initial_iteration = iteration
     progress_printer = _ProgressPrinter() if progress else None
 
-    for i in range(maxiter):
+    def current_state() -> NestedRunState:
+        return NestedRunState(
+            key=key,
+            live_u=live_u,
+            live_theta=live_theta,
+            live_logl=live_logl,
+            dead_u=dead_u,
+            dead_theta=dead_theta,
+            dead_logl=dead_logl,
+            dead_logwt=dead_logwt,
+            logz_dead=logz_dead,
+            logx_final=logx_final,
+            ncall=ncall,
+            replacement_ncall=replacement_ncall,
+            insertion_indices=insertion_indices,
+            replacement_failures=replacement_failures,
+            iteration=iteration,
+            success=success,
+            message=message,
+            stopped_by_callback=stopped_by_callback,
+        )
+
+    def maybe_checkpoint(*, final: bool = False) -> None:
+        if checkpoint_path_str is None:
+            return
+        if final or iteration == 1 or iteration % checkpoint_interval == 0:
+            save_checkpoint_npz(checkpoint_path_str, current_state(), config)
+
+    for i in range(iteration, maxiter):
         worst = int(jnp.argmin(live_logl))
         logl_worst = float(live_logl[worst])
         logx_prev = -i / nlive
@@ -316,6 +394,7 @@ def run_static_nested(
             )
         ncall += calls
         replacement_ncall.append(int(calls))
+        iteration = i + 1
         if not accepted:
             replacement_failures += 1
             success = False
@@ -343,6 +422,7 @@ def run_static_nested(
                     stopped_by_callback = True
             if progress_printer is not None:
                 progress_printer.print(_format_progress_line(state), final=True)
+            maybe_checkpoint(final=True)
             break
 
         other_live_logl = jnp.delete(live_logl, worst)
@@ -354,6 +434,7 @@ def run_static_nested(
         live_u = live_u.at[worst].set(new_u)
         live_theta = live_theta.at[worst].set(new_theta)
         live_logl = live_logl.at[worst].set(new_logl)
+        maybe_checkpoint()
 
         logz_remain = logx_new + float(jnp.max(live_logl))
         delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
@@ -387,11 +468,14 @@ def run_static_nested(
         ):
             progress_printer.print(_format_progress_line(state), final=final_iteration)
         if final_iteration:
+            maybe_checkpoint(final=True)
             break
     else:
         success = False
         message = f"maxiter={maxiter} reached"
         logx_final = -maxiter / nlive
+        iteration = maxiter
+        maybe_checkpoint(final=True)
 
     live_logwt = logx_final - math.log(nlive) + live_logl
 
@@ -460,5 +544,12 @@ def run_static_nested(
             "progress_interval": progress_interval,
             "callback_interval": callback_interval,
             "stopped_by_callback": bool(stopped_by_callback),
+            "checkpoint_path": checkpoint_path_str,
+            "checkpoint_interval": (
+                checkpoint_interval if checkpoint_path_str is not None else None
+            ),
+            "resumed_from_checkpoint": bool(resumed_from_checkpoint),
+            "initial_iteration": int(initial_iteration),
+            "final_iteration": int(iteration),
         },
     )
