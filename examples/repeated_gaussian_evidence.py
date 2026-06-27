@@ -36,17 +36,17 @@ def loglike(theta):
     return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
 
 
-def available_samplers() -> list[str]:
-    """Return the sampler names supported by this tinyns version."""
+def available_configs() -> list[tuple[str, int]]:
+    """Return supported ``(sampler, min_accepts)`` validation configs."""
 
-    names = ["prior", "rwalk"]
-    for sample in ("slice", "rslice"):
+    configs = [("prior", 1), ("rwalk", 1), ("rwalk", 3)]
+    for sample in ("rslice",):
         try:
             NestedSampler(loglike, prior_transform, ndim=NDIM, sample=sample)
         except ValueError:
             continue
-        names.append(sample)
-    return names
+        configs.extend([(sample, 1), (sample, 3)])
+    return configs
 
 
 def format_warnings(warnings: list[str]) -> str:
@@ -62,12 +62,12 @@ def main() -> None:
     print(f"nlive: {NLIVE}, dlogz: {DLOGZ}")
     print()
     print(
-        f"{'sampler':<8} {'seed':>4} {'logz':>11} {'delta':>11} "
+        f"{'sampler':<8} {'min_acc':>7} {'seed':>4} {'logz':>11} {'delta':>11} "
         f"{'logzerr':>9} {'ncall':>8} {'success':>7} warnings"
     )
-    print("-" * 88)
+    print("-" * 96)
 
-    for sample in available_samplers():
+    for sample, min_accepts in available_configs():
         for seed in SEEDS:
             sampler = NestedSampler(
                 loglike,
@@ -75,13 +75,14 @@ def main() -> None:
                 ndim=NDIM,
                 nlive=NLIVE,
                 sample=sample,
+                min_accepts=min_accepts,
             )
             result = sampler.run(jax.random.PRNGKey(seed), dlogz=DLOGZ)
             diagnostics = result.diagnostics()
             warnings = diagnostics.get("warnings", [])
 
             print(
-                f"{sample:<8} {seed:4d} {result.logz:11.6f} "
+                f"{sample:<8} {min_accepts:7d} {seed:4d} {result.logz:11.6f} "
                 f"{result.logz - EXPECTED_LOGZ:11.6f} {result.logzerr:9.6f} "
                 f"{result.ncall:8d} {str(result.success):>7} "
                 f"{format_warnings(warnings)}"

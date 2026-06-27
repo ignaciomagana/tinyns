@@ -111,6 +111,25 @@ partial `NestedSamplingResult`.
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
 Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
+## Decorrelation controls
+
+For MCMC-like constrained replacement samplers (`rwalk`, `slice`, and
+`rslice`), `min_accepts` requires multiple accepted constrained moves before a
+replacement is returned:
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim=2,
+    sample="rslice",
+    min_accepts=3,
+)
+```
+
+Increasing `min_accepts` can improve decorrelation from the seed live point,
+but increases likelihood calls. It is ignored by brute-force `sample="prior"`.
+
 ## Design philosophy
 
 - **Tiny:** keep dependencies and abstractions minimal.
@@ -157,7 +176,7 @@ python validation/summarize_validation.py validation_results.json
 The validation harness is intended to catch calibration and reliability issues,
 not to be a formal speed benchmark.
 The validation summary includes heuristic calibration warnings such as repeated
-large evidence z-scores, high live-point weight fraction, and concentrated
+large evidence z-scores, high final-live weight fraction, and concentrated
 posterior weights.
 
 ## Checkpoint and resume

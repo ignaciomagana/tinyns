@@ -156,6 +156,7 @@ def run_static_nested(
     step_scale: float = 0.1,
     slices: int = 5,
     slice_steps: int = 10,
+    min_accepts: int = 1,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -202,6 +203,12 @@ def run_static_nested(
         raise ValueError("slices must be a positive integer")
     if slice_steps <= 0:
         raise ValueError("slice_steps must be a positive integer")
+    if (
+        not isinstance(min_accepts, int)
+        or isinstance(min_accepts, bool)
+        or min_accepts <= 0
+    ):
+        raise ValueError("min_accepts must be a positive integer")
     if maxiter is None:
         maxiter = 10_000 * ndim
     if maxiter < 0:
@@ -218,6 +225,7 @@ def run_static_nested(
         "step_scale": float(step_scale),
         "slices": int(slices),
         "slice_steps": int(slice_steps),
+        "min_accepts": int(min_accepts),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -271,6 +279,7 @@ def run_static_nested(
             )
 
     initial_iteration = iteration
+    final_delta_logz = math.inf
     progress_printer = _ProgressPrinter() if progress else None
 
     def current_state() -> NestedRunState:
@@ -363,6 +372,7 @@ def run_static_nested(
                 walks=walks,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
         elif sample == "slice":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
@@ -377,6 +387,7 @@ def run_static_nested(
                 slice_steps=slice_steps,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
         else:
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rslice(
@@ -391,6 +402,7 @@ def run_static_nested(
                 slice_steps=slice_steps,
                 step_scale=step_scale,
                 max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
         ncall += calls
         replacement_ncall.append(int(calls))
@@ -401,6 +413,7 @@ def run_static_nested(
             message = f"max_attempts={max_attempts} hit during constrained prior draw"
             logz_remain = logx_new + float(jnp.max(live_logl))
             delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+            final_delta_logz = delta_logz
             state = _make_run_state(
                 iteration=i + 1,
                 logz=logz_dead,
@@ -438,6 +451,7 @@ def run_static_nested(
 
         logz_remain = logx_new + float(jnp.max(live_logl))
         delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+        final_delta_logz = delta_logz
         final_iteration = delta_logz < dlogz or i + 1 == maxiter
         if i + 1 == maxiter and delta_logz >= dlogz:
             success = False
@@ -528,10 +542,15 @@ def run_static_nested(
             "ndead": niter,
             "nlive_final": nlive_final,
             "nposterior": nposterior,
+            "final_delta_logz": float(final_delta_logz),
+            "final_logx": float(logx_final),
+            "final_logz_dead": float(logz_dead),
+            "final_logl_live_max": float(jnp.max(live_logl)),
             "walks": walks,
             "step_scale": step_scale,
             "slices": slices,
             "slice_steps": slice_steps,
+            "min_accepts": min_accepts,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),

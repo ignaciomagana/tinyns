@@ -63,6 +63,7 @@ def test_resume_does_not_reinitialize(tmp_path):
         ({"nlive": 25}, "nlive"),
         ({"sample": "rwalk"}, "sample"),
         ({"step_scale": 0.2}, "step_scale"),
+        ({"min_accepts": 2}, "min_accepts"),
     ],
 )
 def test_incompatible_checkpoint_config_raises(tmp_path, kwargs, match):
@@ -140,6 +141,18 @@ def test_resume_matches_uninterrupted_run(tmp_path):
     np.testing.assert_allclose(resumed.logwt, full.logwt)
     assert resumed.ncall == full.ncall
     assert resumed.logz == full.logz
+
+
+def test_checkpoint_with_min_accepts_two_resumes_with_matching_config(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    sampler = make_sampler(sample="rwalk", walks=3, min_accepts=2)
+
+    sampler.run(11, maxiter=2, dlogz=0.0, checkpoint_path=path)
+    result = sampler.resume(path, maxiter=4, dlogz=0.0)
+
+    assert math.isfinite(result.logz)
+    assert result.metadata["min_accepts"] == 2
+    assert result.metadata["resumed_from_checkpoint"] is True
 
 
 def test_resume_rejects_checkpoint_after_replacement_failure(tmp_path):

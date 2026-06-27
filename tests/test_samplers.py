@@ -132,7 +132,7 @@ def test_draw_constrained_slice_returns_best_after_impossible_threshold() -> Non
     assert u.shape == (ndim,)
     assert theta.shape == (ndim,)
     assert math.isfinite(logl)
-    assert ncall == max_attempts * slices * slice_steps
+    assert ncall == max_attempts
 
 
 def test_draw_constrained_slice_rejects_invalid_parameters_and_shapes() -> None:
@@ -197,6 +197,18 @@ def test_draw_constrained_slice_rejects_invalid_parameters_and_shapes() -> None:
             2,
         )
 
+    with pytest.raises(ValueError, match="min_accepts"):
+        draw_constrained_slice(
+            random.PRNGKey(0),
+            gaussian_loglike,
+            identity_prior_transform,
+            -math.inf,
+            live_u,
+            live_logl,
+            2,
+            min_accepts=0,
+        )
+
 
 def test_draw_constrained_rwalk_accepts_loose_threshold() -> None:
     ndim = 3
@@ -254,7 +266,7 @@ def test_draw_constrained_rwalk_returns_best_after_impossible_threshold() -> Non
     assert u.shape == (ndim,)
     assert theta.shape == (ndim,)
     assert math.isfinite(logl)
-    assert ncall == max_attempts * walks
+    assert ncall == max_attempts
 
 
 def test_draw_constrained_rwalk_rejects_invalid_parameters_and_shapes() -> None:
@@ -305,6 +317,18 @@ def test_draw_constrained_rwalk_rejects_invalid_parameters_and_shapes() -> None:
             live_u,
             jnp.ones((2,)),
             2,
+        )
+
+    with pytest.raises(ValueError, match="min_accepts"):
+        draw_constrained_rwalk(
+            random.PRNGKey(0),
+            gaussian_loglike,
+            identity_prior_transform,
+            -math.inf,
+            live_u,
+            live_logl,
+            2,
+            min_accepts=0,
         )
 
 
@@ -404,7 +428,7 @@ def test_draw_constrained_rslice_returns_best_after_impossible_threshold() -> No
     assert u.shape == (ndim,)
     assert theta.shape == (ndim,)
     assert math.isfinite(logl)
-    assert ncall == max_attempts * slices * slice_steps
+    assert ncall == max_attempts
 
 
 def test_draw_constrained_rslice_rejects_invalid_parameters_and_shapes() -> None:
@@ -416,6 +440,7 @@ def test_draw_constrained_rslice_rejects_invalid_parameters_and_shapes() -> None
         {"slice_steps": 0},
         {"step_scale": 0.0},
         {"max_attempts": 0},
+        {"min_accepts": 0},
     ]
     for kwargs in invalid_kwargs:
         with pytest.raises(ValueError):
@@ -451,3 +476,65 @@ def test_draw_constrained_rslice_rejects_invalid_parameters_and_shapes() -> None
             jnp.ones((2,)),
             2,
         )
+
+
+@pytest.mark.parametrize(
+    "draw, kwargs",
+    [
+        (draw_constrained_rwalk, {"walks": 10, "step_scale": 0.05}),
+        (draw_constrained_slice, {"slices": 4, "slice_steps": 5, "step_scale": 0.05}),
+        (draw_constrained_rslice, {"slices": 4, "slice_steps": 5, "step_scale": 0.05}),
+    ],
+)
+def test_min_accepts_three_accepts_and_costs_at_least_one(draw, kwargs) -> None:
+    ndim = 2
+    live_u = jnp.array([[0.2, 0.3], [0.4, 0.5], [0.6, 0.7]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+    args = (
+        random.PRNGKey(101),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        live_u,
+        live_logl,
+        ndim,
+    )
+
+    *_, ncall_one, accepted_one = draw(*args, max_attempts=50, min_accepts=1, **kwargs)
+    *_, ncall_three, accepted_three = draw(
+        *args, max_attempts=50, min_accepts=3, **kwargs
+    )
+
+    assert accepted_one is True
+    assert accepted_three is True
+    assert ncall_three >= ncall_one
+
+
+@pytest.mark.parametrize(
+    "draw, kwargs",
+    [
+        (draw_constrained_rwalk, {"walks": 10, "step_scale": 0.05}),
+        (draw_constrained_slice, {"slices": 4, "slice_steps": 5, "step_scale": 0.05}),
+        (draw_constrained_rslice, {"slices": 4, "slice_steps": 5, "step_scale": 0.05}),
+    ],
+)
+def test_min_accepts_impossible_budget_returns_unaccepted(draw, kwargs) -> None:
+    ndim = 2
+    live_u = jnp.array([[0.2, 0.3], [0.4, 0.5], [0.6, 0.7]])
+    live_logl = jnp.array([gaussian_loglike(u) for u in live_u])
+
+    *_, ncall, accepted = draw(
+        random.PRNGKey(102),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        live_u,
+        live_logl,
+        ndim,
+        max_attempts=1,
+        min_accepts=3,
+        **kwargs,
+    )
+
+    assert accepted is False
+    assert ncall == 1

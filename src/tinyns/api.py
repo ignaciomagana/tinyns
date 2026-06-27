@@ -34,7 +34,8 @@ class NestedSampler:
     **kwargs:
         Additional sampler options. ``walks`` and ``step_scale`` are used by
         ``sample="rwalk"``; ``slices``, ``slice_steps``, and ``step_scale`` are
-        used by ``sample="slice"`` and ``sample="rslice"``.
+        used by ``sample="slice"`` and ``sample="rslice"``. ``min_accepts`` is
+        used by ``"rwalk"``, ``"slice"``, and ``"rslice"``.
     """
 
     def __init__(
@@ -108,6 +109,7 @@ class NestedSampler:
             batch_size=self.kwargs.get("batch_size", 128),
             slices=self.kwargs.get("slices", 5),
             slice_steps=self.kwargs.get("slice_steps", 10),
+            min_accepts=self.kwargs.get("min_accepts", 1),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -122,6 +124,7 @@ class NestedSampler:
             "step_scale": float(self.kwargs.get("step_scale", 0.1)),
             "slices": int(self.kwargs.get("slices", 5)),
             "slice_steps": int(self.kwargs.get("slice_steps", 10)),
+            "min_accepts": int(self.kwargs.get("min_accepts", 1)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -139,10 +142,16 @@ class NestedSampler:
             "step_scale",
             "slices",
             "slice_steps",
+            "min_accepts",
         ):
-            if checkpoint_config.get(name) != current[name]:
+            checkpoint_value = (
+                checkpoint_config.get(name, 1)
+                if name == "min_accepts"
+                else checkpoint_config.get(name)
+            )
+            if checkpoint_value != current[name]:
                 raise ValueError(
-                    f"checkpoint {name}={checkpoint_config.get(name)!r} is not "
+                    f"checkpoint {name}={checkpoint_value!r} is not "
                     f"compatible with sampler {name}={current[name]!r}"
                 )
 
@@ -194,4 +203,5 @@ class NestedSampler:
             batch_size=self.kwargs.get("batch_size", 128),
             slices=self.kwargs.get("slices", 5),
             slice_steps=self.kwargs.get("slice_steps", 10),
+            min_accepts=self.kwargs.get("min_accepts", 1),
         )

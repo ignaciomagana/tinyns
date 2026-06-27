@@ -184,25 +184,33 @@ class NestedSamplingResult:
         so diagnostics remain simple and conservative.
         """
 
-        metadata = {} if self.metadata is None else self.metadata
-        nlive_final = metadata.get("nlive_final")
-        nweights = int(jnp.asarray(self.logwt).size)
-        if (
-            nlive_final is None
-            or not isinstance(nlive_final, numbers.Integral)
-            or nlive_final <= 0
-            or nlive_final > nweights
-        ):
+        nlive_final = self._valid_nlive_final()
+        if nlive_final is None:
             return 0.0
         return float(jnp.sum(self.weights()[-nlive_final:]))
 
     def dead_weight_fraction(self) -> float:
         """Return posterior weight fraction in dead points."""
 
-        live_fraction = self.live_weight_fraction()
-        if live_fraction <= 0.0:
+        if self._valid_nlive_final() is None:
             return 0.0
-        return float(jnp.clip(1.0 - live_fraction, 0.0, 1.0))
+        return float(jnp.clip(1.0 - self.live_weight_fraction(), 0.0, 1.0))
+
+    def _valid_nlive_final(self) -> int | None:
+        """Return valid final-live count metadata, or ``None`` if invalid."""
+
+        metadata = {} if self.metadata is None else self.metadata
+        nlive_final = metadata.get("nlive_final")
+        nweights = int(jnp.asarray(self.logwt).size)
+        if (
+            nlive_final is None
+            or isinstance(nlive_final, bool)
+            or not isinstance(nlive_final, numbers.Integral)
+            or nlive_final <= 0
+            or nlive_final > nweights
+        ):
+            return None
+        return int(nlive_final)
 
     def insertion_indices(self):
         """Return recorded live-point insertion indices, if available."""
@@ -246,11 +254,33 @@ class NestedSamplingResult:
                 "final live points carry most posterior weight; consider tighter "
                 "dlogz or more live points"
             )
-        if live_weight_fraction > 0.25 and metadata.get("dlogz", 0.0) >= 0.1:
+        requested_dlogz = metadata.get("dlogz")
+        try:
+            requested_dlogz_float = float(requested_dlogz)
+        except (TypeError, ValueError):
+            requested_dlogz_float = None
+        if (
+            live_weight_fraction > 0.25
+            and requested_dlogz_float is not None
+            and requested_dlogz_float >= 0.1
+        ):
             warnings.append(
                 "large final-live weight fraction; evidence may be sensitive to "
                 "stopping"
             )
+
+        final_delta_logz = metadata.get("final_delta_logz")
+        try:
+            final_delta_logz_float = float(final_delta_logz)
+        except (TypeError, ValueError):
+            final_delta_logz_float = None
+        if (
+            self.success
+            and final_delta_logz_float is not None
+            and requested_dlogz_float is not None
+            and final_delta_logz_float > requested_dlogz_float
+        ):
+            warnings.append("successful run has final_delta_logz above requested dlogz")
 
         replacement_failures = metadata.get("replacement_failures")
         if replacement_failures is not None and replacement_failures > 0:
@@ -297,6 +327,10 @@ class NestedSamplingResult:
             "ndim": int(self.ndim),
             "nposterior": nposterior,
             "warnings": warnings,
+            "final_delta_logz": final_delta_logz,
+            "final_logx": metadata.get("final_logx"),
+            "final_logz_dead": metadata.get("final_logz_dead"),
+            "final_logl_live_max": metadata.get("final_logl_live_max"),
         }
 
         if "niter" in metadata:
