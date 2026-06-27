@@ -112,9 +112,12 @@ class NestedSamplingResult:
             warnings.append("low replacement acceptance")
 
         insertion_indices = self.insertion_indices()
-        insertion_index_nlive = metadata.get("insertion_index_nlive", self.nlive - 1)
-        if insertion_indices.size >= 20 and insertion_index_nlive > 0:
-            normalized_ranks = (insertion_indices + 0.5) / insertion_index_nlive
+        insertion_index_nslots = metadata.get(
+            "insertion_index_nslots",
+            metadata.get("insertion_index_nlive", self.nlive - 1),
+        )
+        if insertion_indices.size >= 20 and insertion_index_nslots > 0:
+            normalized_ranks = (insertion_indices + 0.5) / insertion_index_nslots
             mean_normalized_rank = float(jnp.mean(normalized_ranks))
             if mean_normalized_rank < 0.35 or mean_normalized_rank > 0.65:
                 warnings.append(

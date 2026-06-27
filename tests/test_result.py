@@ -184,6 +184,50 @@ def test_insertion_indices_missing_metadata_returns_empty_array() -> None:
     assert isinstance(insertion_indices, jnp.ndarray)
     assert insertion_indices.shape == (0,)
 
+def test_diagnostics_insertion_indices_use_slot_count_for_normalization() -> None:
+    result = make_result()
+    result.nlive = 2
+    result.metadata = {
+        "insertion_indices": jnp.tile(jnp.arange(2), 10),
+        "insertion_index_nslots": 2,
+        "insertion_index_nlive": 1,
+    }
+
+    diagnostics = result.diagnostics()
+
+    assert (
+        "insertion indices look non-uniform; constrained sampler may be biased or "
+        "poorly mixed"
+    ) not in diagnostics["warnings"]
+
+
+def test_diagnostics_prefers_insertion_index_nslots_when_present() -> None:
+    result = make_result()
+    result.metadata = {
+        "insertion_indices": jnp.tile(jnp.array([0, 1]), 10),
+        "insertion_index_nslots": 2,
+        "insertion_index_nlive": 100,
+    }
+
+    diagnostics = result.diagnostics()
+
+    assert (
+        "insertion indices look non-uniform; constrained sampler may be biased or "
+        "poorly mixed"
+    ) not in diagnostics["warnings"]
+
+
+def test_diagnostics_supports_legacy_insertion_index_nlive_only() -> None:
+    result = make_result()
+    result.metadata = {
+        "insertion_indices": jnp.tile(jnp.arange(2), 10),
+        "insertion_index_nlive": 1,
+    }
+
+    diagnostics = result.diagnostics()
+
+    assert isinstance(diagnostics, dict)
+    assert isinstance(diagnostics["warnings"], list)
 
 def test_diagnostics_bad_insertion_indices_triggers_warning() -> None:
     result = make_result()
