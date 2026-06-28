@@ -13,6 +13,7 @@ from tinyns.bounds import (
     JaxEllipsoidBound,
     MultiEllipsoidBound,
     as_jax_ellipsoid_bound,
+    count_containing_jax_ellipsoids,
     in_unit_cube,
     sample_jax_ellipsoid_bound,
     sample_multi_ellipsoid,
@@ -142,7 +143,6 @@ def draw_constrained_single_bound(
     return new_key, best_u, best_theta, best_logl, ncall, False, info
 
 
-
 def draw_constrained_single_bound_jax(
     key,
     loglike,
@@ -260,6 +260,154 @@ def draw_constrained_single_bound_jax(
         else 0.0,
     }
     return new_key, best_u, best_theta, float(best_logl), ncall, False, info
+
+
+def draw_constrained_multi_bound_jax(
+    key,
+    loglike,
+    prior_transform,
+    logl_min,
+    bound,
+    ndim: int,
+    *,
+    batch_size: int = 128,
+    max_batches: int = 100,
+    overlap_correction: bool = True,
+):
+    """Draw a constrained replacement from a JAX multiellipsoid bound.
+
+    Candidates are drawn from volume-weighted active ellipsoids. When requested,
+    overlap correction keeps each candidate with probability ``1 / count``, where
+    ``count`` is the number of active ellipsoids containing it. Accepted
+    likelihood-constrained candidates are selected uniformly at random within the
+    first successful batch rather than by likelihood rank.
+    """
+    if ndim <= 0:
+        raise ValueError("ndim must be a positive integer")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if max_batches <= 0:
+        raise ValueError("max_batches must be a positive integer")
+
+    jax_bound = as_jax_ellipsoid_bound(bound)
+    if jax_bound.ndim != ndim:
+        raise ValueError("bound dimensionality must match ndim")
+    if jax_bound.n_active < 1:
+        raise ValueError("bound must contain at least one active ellipsoid")
+    if (
+        not isinstance(bound, JaxEllipsoidBound)
+        and getattr(bound, "ndim", ndim) != ndim
+    ):
+        raise ValueError("bound dimensionality must match ndim")
+
+    best_u = None
+    best_theta = None
+    best_logl = -jnp.inf
+    ncall = 0
+    bound_draws = 0
+    unit_cube_survivors = 0
+    overlap_rejections = 0
+    batches = 0
+    new_key = key
+
+    for _ in range(max_batches):
+        batches += 1
+        new_key, draw_key, overlap_key, select_key = random.split(new_key, 4)
+        u_batch, _idx = sample_jax_ellipsoid_bound(draw_key, jax_bound, batch_size)
+        if u_batch.shape != (batch_size, ndim):
+            raise ValueError(f"ellipsoid draw must return shape ({batch_size}, {ndim})")
+
+        overlap_mask = jnp.ones((batch_size,), dtype=bool)
+        if overlap_correction:
+            counts = count_containing_jax_ellipsoids(jax_bound, u_batch)
+            overlap_prob = 1.0 / jnp.maximum(counts, 1)
+            overlap_mask = (
+                random.uniform(overlap_key, shape=(batch_size,)) < overlap_prob
+            )
+            overlap_rejections += int(jnp.sum(~overlap_mask))
+
+        inside = in_unit_cube(u_batch)
+        usable = overlap_mask & inside
+        theta_batch = jax.vmap(prior_transform)(u_batch)
+        theta_batch = jnp.asarray(theta_batch)
+        if theta_batch.shape != (batch_size, ndim):
+            raise ValueError(f"prior_transform must return shape ({ndim},)")
+        logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
+        if logl_batch.shape != (batch_size,):
+            raise ValueError("loglike must return a scalar")
+
+        ncall += int(batch_size)
+        bound_draws += int(batch_size)
+        unit_cube_survivors += int(jnp.sum(usable))
+        masked_logl = jnp.where(usable, logl_batch, -jnp.inf)
+
+        batch_best_idx = int(jnp.argmax(masked_logl))
+        batch_best_logl = masked_logl[batch_best_idx]
+        if best_u is None or bool(batch_best_logl > best_logl):
+            best_u = u_batch[batch_best_idx]
+            best_theta = theta_batch[batch_best_idx]
+            best_logl = batch_best_logl
+
+        accepted_mask = masked_logl >= logl_min
+        n_accepted = int(jnp.sum(accepted_mask))
+        if n_accepted > 0:
+            accepted_indices = jnp.nonzero(
+                accepted_mask, size=batch_size, fill_value=0
+            )[0]
+            chosen_rank = random.randint(select_key, (), 0, n_accepted)
+            chosen_idx = accepted_indices[chosen_rank]
+            info = _bound_seed_info(
+                bound_draws,
+                ncall,
+                batches,
+                unit_cube_survivors,
+                overlap_rejections,
+                jax_bound.n_active,
+            )
+            return (
+                new_key,
+                u_batch[chosen_idx],
+                theta_batch[chosen_idx],
+                float(logl_batch[chosen_idx]),
+                ncall,
+                True,
+                info,
+            )
+
+    if best_u is None:
+        best_u = jnp.full((ndim,), 0.5)
+        best_theta = _validate_theta_shape(prior_transform(best_u), ndim)
+        best_logl = loglike(best_theta)
+        ncall += 1
+    info = _bound_seed_info(
+        bound_draws,
+        ncall,
+        batches,
+        unit_cube_survivors,
+        overlap_rejections,
+        jax_bound.n_active,
+    )
+    return new_key, best_u, best_theta, float(best_logl), ncall, False, info
+
+
+def _bound_seed_info(
+    bound_draws,
+    ncall,
+    batches,
+    unit_cube_survivors,
+    overlap_rejections,
+    nellipsoids,
+):
+    return {
+        "bound_seed_draws": bound_draws,
+        "bound_seed_loglike_evals": ncall,
+        "bound_seed_batches": batches,
+        "bound_seed_unit_cube_acceptance": unit_cube_survivors / bound_draws
+        if bound_draws
+        else 0.0,
+        "bound_seed_overlap_rejections": overlap_rejections,
+        "bound_seed_nellipsoids": nellipsoids,
+    }
 
 
 def draw_constrained_prior(
