@@ -37,6 +37,9 @@ class NestedSampler:
         used by ``sample="slice"`` and ``sample="rslice"``. ``min_accepts`` is
         used by ``"rwalk"``, ``"slice"``, and ``"rslice"``. ``kernel`` may be
         ``"python"`` (default) or experimental ``"jax"`` for ``sample="rwalk"``.
+        ``jax_vectorized=True`` declares that JAX replacement kernels should call
+        ``prior_transform`` and ``loglike`` on explicit batches instead of using
+        ``jax.vmap`` around scalar callables.
     """
 
     def __init__(
@@ -182,6 +185,7 @@ class NestedSampler:
             bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
             fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
+            jax_vectorized=self.kwargs.get("jax_vectorized", False),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -231,6 +235,7 @@ class NestedSampler:
             ),
             "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
             "fused_bound_rwalk": bool(self.kwargs.get("fused_bound_rwalk", False)),
+            "jax_vectorized": bool(self.kwargs.get("jax_vectorized", False)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -295,6 +300,7 @@ class NestedSampler:
                 "bound_seed_kernel": "python",
                 "allow_unused_bound": False,
                 "fused_bound_rwalk": False,
+                "jax_vectorized": False,
             }
             checkpoint_value = checkpoint_config.get(name, default_values.get(name))
             if checkpoint_value != current[name]:
@@ -378,4 +384,5 @@ class NestedSampler:
             bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
             fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
+            jax_vectorized=self.kwargs.get("jax_vectorized", False),
         )

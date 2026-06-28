@@ -1324,3 +1324,65 @@ def test_draw_constrained_multi_bound_jax_impossible_threshold_returns_best() ->
     assert u.shape == (2,)
     assert theta.shape == (2,)
     assert logl <= 0.0
+
+
+def test_evaluate_jax_batch_scalar_functions_use_vmap() -> None:
+    from tinyns.samplers import _evaluate_jax_batch
+
+    u_batch = jnp.asarray([[0.1, 0.2], [0.3, 0.4]])
+    theta, logl = _evaluate_jax_batch(
+        gaussian_loglike,
+        identity_prior_transform,
+        u_batch,
+        2,
+        jax_vectorized=False,
+    )
+
+    assert theta.shape == (2, 2)
+    assert logl.shape == (2,)
+    assert jnp.allclose(theta, u_batch)
+
+
+def test_evaluate_jax_batch_vectorized_functions() -> None:
+    from tinyns.samplers import _evaluate_jax_batch
+
+    def prior_batch(u):
+        return 2.0 * u - 1.0
+
+    def loglike_batch(theta):
+        return -jnp.sum(theta**2, axis=1)
+
+    theta, logl = _evaluate_jax_batch(
+        loglike_batch,
+        prior_batch,
+        jnp.asarray([[0.25, 0.5], [0.75, 0.5]]),
+        2,
+        jax_vectorized=True,
+    )
+
+    assert theta.shape == (2, 2)
+    assert logl.shape == (2,)
+    assert jnp.allclose(logl, jnp.asarray([-0.25, -0.25]))
+
+
+def test_evaluate_jax_batch_vectorized_shape_errors() -> None:
+    from tinyns.samplers import _evaluate_jax_batch
+
+    u_batch = jnp.ones((3, 2))
+    with pytest.raises(ValueError, match="jax_vectorized prior_transform"):
+        _evaluate_jax_batch(
+            gaussian_loglike,
+            lambda u: u[0],
+            u_batch,
+            2,
+            jax_vectorized=True,
+        )
+
+    with pytest.raises(ValueError, match="jax_vectorized loglike"):
+        _evaluate_jax_batch(
+            lambda theta: theta,
+            lambda u: u,
+            u_batch,
+            2,
+            jax_vectorized=True,
+        )

@@ -33,6 +33,43 @@ def _validate_theta_shape(theta, ndim: int):
     return theta
 
 
+def _evaluate_jax_batch(
+    loglike,
+    prior_transform,
+    u_batch,
+    ndim,
+    *,
+    jax_vectorized: bool,
+):
+    """Evaluate JAX prior/likelihood functions on a unit-cube batch."""
+    u_batch = jnp.asarray(u_batch)
+    if u_batch.ndim != 2 or u_batch.shape[1] != ndim:
+        raise ValueError(f"u_batch must have shape (batch, {ndim})")
+    batch_size = int(u_batch.shape[0])
+
+    if jax_vectorized:
+        theta_batch = jnp.asarray(prior_transform(u_batch))
+        if theta_batch.shape != (batch_size, ndim):
+            raise ValueError(
+                "jax_vectorized prior_transform must return shape "
+                f"({batch_size}, {ndim}); got {theta_batch.shape}"
+            )
+        logl_batch = jnp.asarray(loglike(theta_batch))
+        if logl_batch.shape != (batch_size,):
+            raise ValueError(
+                "jax_vectorized loglike must return shape "
+                f"({batch_size},); got {logl_batch.shape}"
+            )
+        return theta_batch, logl_batch
+
+    theta_batch = jnp.asarray(jax.vmap(prior_transform)(u_batch))
+    if theta_batch.shape != (batch_size, ndim):
+        raise ValueError(f"prior_transform must return shape ({ndim},)")
+    logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
+    if logl_batch.shape != (batch_size,):
+        raise ValueError("loglike must return a scalar")
+    return theta_batch, logl_batch
+
 def _validate_min_accepts(min_accepts: int) -> None:
     if (
         not isinstance(min_accepts, int)
@@ -153,6 +190,7 @@ def draw_constrained_single_bound_jax(
     *,
     batch_size: int = 128,
     max_batches: int = 100,
+    jax_vectorized: bool = False,
 ):
     """Draw a constrained replacement from one ellipsoid using JAX batches.
 
@@ -200,13 +238,13 @@ def draw_constrained_single_bound_jax(
             raise ValueError(f"ellipsoid draw must return shape ({batch_size}, {ndim})")
 
         inside = in_unit_cube(u_batch)
-        theta_batch = jax.vmap(prior_transform)(u_batch)
-        theta_batch = jnp.asarray(theta_batch)
-        if theta_batch.shape != (batch_size, ndim):
-            raise ValueError(f"prior_transform must return shape ({ndim},)")
-        logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
-        if logl_batch.shape != (batch_size,):
-            raise ValueError("loglike must return a scalar")
+        theta_batch, logl_batch = _evaluate_jax_batch(
+            loglike,
+            prior_transform,
+            u_batch,
+            ndim,
+            jax_vectorized=jax_vectorized,
+        )
 
         ncall += int(batch_size)
         bound_draws += int(batch_size)
@@ -273,6 +311,7 @@ def draw_constrained_multi_bound_jax(
     batch_size: int = 128,
     max_batches: int = 100,
     overlap_correction: bool = True,
+    jax_vectorized: bool = False,
 ):
     """Draw a constrained replacement from a JAX multiellipsoid bound.
 
@@ -328,13 +367,13 @@ def draw_constrained_multi_bound_jax(
 
         inside = in_unit_cube(u_batch)
         usable = overlap_mask & inside
-        theta_batch = jax.vmap(prior_transform)(u_batch)
-        theta_batch = jnp.asarray(theta_batch)
-        if theta_batch.shape != (batch_size, ndim):
-            raise ValueError(f"prior_transform must return shape ({ndim},)")
-        logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
-        if logl_batch.shape != (batch_size,):
-            raise ValueError("loglike must return a scalar")
+        theta_batch, logl_batch = _evaluate_jax_batch(
+            loglike,
+            prior_transform,
+            u_batch,
+            ndim,
+            jax_vectorized=jax_vectorized,
+        )
 
         ncall += int(batch_size)
         bound_draws += int(batch_size)
@@ -745,7 +784,12 @@ def draw_constrained_rslice(
 
 @lru_cache(maxsize=32)
 def _make_rwalk_jax_kernel(
-    loglike, prior_transform, ndim: int, walks: int, replacement_chains: int
+    loglike,
+    prior_transform,
+    ndim: int,
+    walks: int,
+    replacement_chains: int,
+    jax_vectorized: bool,
 ):
     """Return a cached compiled retrying constrained rwalk kernel."""
 
@@ -792,7 +836,11 @@ def _make_rwalk_jax_kernel(
                 seed_key, shape=(replacement_chains,), minval=0, maxval=nlive
             )
             current_u = live_u[seed_idx]
-            current_theta = jax.vmap(prior_transform)(current_u)
+            current_theta = (
+                prior_transform(current_u)
+                if jax_vectorized
+                else jax.vmap(prior_transform)(current_u)
+            )
             current_logl = live_logl[seed_idx]
             attempt_best_u = current_u
             attempt_best_theta = current_theta
@@ -816,8 +864,12 @@ def _make_rwalk_jax_kernel(
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
                 step = step_scale * (z @ proposal_chol.T)
                 u_prop = reflect_unit_cube(current_u + step)
-                theta_prop = jax.vmap(prior_transform)(u_prop)
-                logl_prop = jax.vmap(loglike)(theta_prop)
+                if jax_vectorized:
+                    theta_prop = prior_transform(u_prop)
+                    logl_prop = loglike(theta_prop)
+                else:
+                    theta_prop = jax.vmap(prior_transform)(u_prop)
+                    logl_prop = jax.vmap(loglike)(theta_prop)
 
                 is_best = logl_prop > attempt_best_logl
                 attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
@@ -990,6 +1042,7 @@ def draw_constrained_rwalk_jax(
     min_accepts: int = 1,
     replacement_chains: int = 1,
     proposal_chol=None,
+    jax_vectorized: bool = False,
 ):
     """Draw a constrained replacement with a compiled JAX rwalk kernel."""
     if ndim <= 0:
@@ -1028,7 +1081,12 @@ def draw_constrained_rwalk_jax(
             raise ValueError(f"proposal_chol must have shape ({ndim}, {ndim})")
 
     kernel = _make_rwalk_jax_kernel(
-        loglike, prior_transform, int(ndim), int(walks), int(replacement_chains)
+        loglike,
+        prior_transform,
+        int(ndim),
+        int(walks),
+        int(replacement_chains),
+        bool(jax_vectorized),
     )
     max_batches = max_attempts // batch_ncall
     new_key, new_u, new_theta, new_logl, ncall, accepted = kernel(
@@ -1061,6 +1119,7 @@ def draw_constrained_single_bound_rwalk_jax(
     bound_batch_size: int = 128,
     bound_max_batches: int = 100,
     proposal_chol=None,
+    jax_vectorized: bool = False,
 ):
     """Draw a single-bound seed and run JAX rwalk chains from that seed."""
     seed_result = draw_constrained_single_bound_jax(
@@ -1072,6 +1131,7 @@ def draw_constrained_single_bound_rwalk_jax(
         ndim,
         batch_size=bound_batch_size,
         max_batches=bound_max_batches,
+        jax_vectorized=jax_vectorized,
     )
     (
         key,
@@ -1111,6 +1171,7 @@ def draw_constrained_single_bound_rwalk_jax(
             min_accepts=min_accepts,
             replacement_chains=replacement_chains,
             proposal_chol=proposal_chol,
+            jax_vectorized=jax_vectorized,
         )
         key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
         batch_ncall = int(walks) * int(replacement_chains)
@@ -1137,6 +1198,7 @@ def draw_constrained_single_bound_rwalk_jax(
             min_accepts=min_accepts,
             replacement_chain_schedule=replacement_chain_schedule,
             proposal_chol=proposal_chol,
+            jax_vectorized=jax_vectorized,
         )
         (
             key,
@@ -1182,6 +1244,7 @@ def draw_constrained_multi_bound_rwalk_jax(
     bound_max_batches: int = 100,
     overlap_correction: bool = True,
     proposal_chol=None,
+    jax_vectorized: bool = False,
 ):
     """Draw a multi-bound seed and run JAX rwalk chains from that seed.
 
@@ -1200,6 +1263,7 @@ def draw_constrained_multi_bound_rwalk_jax(
         batch_size=bound_batch_size,
         max_batches=bound_max_batches,
         overlap_correction=overlap_correction,
+        jax_vectorized=jax_vectorized,
     )
     (
         key,
@@ -1239,6 +1303,7 @@ def draw_constrained_multi_bound_rwalk_jax(
             min_accepts=min_accepts,
             replacement_chains=replacement_chains,
             proposal_chol=proposal_chol,
+            jax_vectorized=jax_vectorized,
         )
         key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
         batch_ncall = int(walks) * int(replacement_chains)
@@ -1265,6 +1330,7 @@ def draw_constrained_multi_bound_rwalk_jax(
             min_accepts=min_accepts,
             replacement_chain_schedule=replacement_chain_schedule,
             proposal_chol=proposal_chol,
+            jax_vectorized=jax_vectorized,
         )
         (
             key,
@@ -1305,6 +1371,7 @@ def draw_constrained_rwalk_jax_adaptive(
     min_accepts: int = 1,
     replacement_chain_schedule=(1, 4, 16, 64),
     proposal_chol=None,
+    jax_vectorized: bool = False,
 ):
     """Draw a constrained JAX rwalk replacement with adaptive batch retries."""
     schedule = _validate_replacement_chain_schedule(
@@ -1333,6 +1400,7 @@ def draw_constrained_rwalk_jax_adaptive(
             min_accepts=min_accepts,
             replacement_chains=int(c),
             proposal_chol=proposal_chol,
+            jax_vectorized=jax_vectorized,
         )
 
     c = schedule[-1]
@@ -1401,6 +1469,7 @@ def draw_constrained_rwalk_jax_adaptive_from_seed(
     min_accepts: int = 1,
     replacement_chain_schedule=(1, 4, 16, 64),
     proposal_chol=None,
+    jax_vectorized: bool = False,
 ):
     """Run adaptive JAX rwalk replacement batches from one fixed seed."""
     seed_u = jnp.asarray(seed_u)
@@ -1422,6 +1491,7 @@ def draw_constrained_rwalk_jax_adaptive_from_seed(
         min_accepts=min_accepts,
         replacement_chain_schedule=replacement_chain_schedule,
         proposal_chol=proposal_chol,
+        jax_vectorized=jax_vectorized,
     )
 
 def draw_constrained_rwalk(

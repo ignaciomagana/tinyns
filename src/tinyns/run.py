@@ -14,6 +14,7 @@ from tinyns.bounds import build_multi_ellipsoid_bound, build_single_ellipsoid_bo
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
+    _evaluate_jax_batch,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
     draw_constrained_prior,
@@ -299,6 +300,7 @@ def run_static_nested(
     bound_seed_kernel: str = "python",
     allow_unused_bound: bool = False,
     fused_bound_rwalk: bool = False,
+    jax_vectorized: bool = False,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -387,10 +389,6 @@ def run_static_nested(
     if kernel == "jax" and sample not in {"rwalk"}:
         raise NotImplementedError(
             'kernel="jax" is currently only supported with sample="rwalk"'
-        )
-    if kernel == "jax" and vectorized:
-        raise NotImplementedError(
-            'kernel="jax" with vectorized=True is not implemented yet'
         )
     if sample == "rwalk" and vectorized:
         raise NotImplementedError(
@@ -504,6 +502,7 @@ def run_static_nested(
         "bound_seed_kernel": "jax" if fused_bound_rwalk else str(bound_seed_kernel),
         "allow_unused_bound": bool(allow_unused_bound),
         "fused_bound_rwalk": bool(fused_bound_rwalk),
+        "jax_vectorized": bool(jax_vectorized),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -514,10 +513,21 @@ def run_static_nested(
         key = random.PRNGKey(int(key)) if isinstance(key, int) else key
         key, init_key = random.split(key)
         live_u = random.uniform(init_key, shape=(nlive, ndim))
-        live_theta = _transform_live_points(
-            prior_transform, live_u, ndim, vectorized=vectorized
-        )
-        live_logl = _evaluate_live_points(loglike, live_theta, vectorized=vectorized)
+        if kernel == "jax" and jax_vectorized:
+            live_theta, live_logl = _evaluate_jax_batch(
+                loglike,
+                prior_transform,
+                live_u,
+                ndim,
+                jax_vectorized=True,
+            )
+        else:
+            live_theta = _transform_live_points(
+                prior_transform, live_u, ndim, vectorized=vectorized
+            )
+            live_logl = _evaluate_live_points(
+                loglike, live_theta, vectorized=vectorized
+            )
         ncall = nlive
         logz_dead = -math.inf
         replacement_ncall = []
@@ -750,6 +760,7 @@ def run_static_nested(
                     bound_batch_size=batch_size,
                     bound_max_batches=int(math.ceil(seed_limit / batch_size)),
                     proposal_chol=proposal_chol,
+                    jax_vectorized=jax_vectorized,
                     **(
                         {"overlap_correction": multi_bound_overlap_correction}
                         if bound == "multi"
@@ -780,6 +791,7 @@ def run_static_nested(
                     seed_kwargs["max_batches"] = int(
                         math.ceil(seed_limit / batch_size)
                     )
+                    seed_kwargs["jax_vectorized"] = jax_vectorized
                     if bound == "multi":
                         seed_kwargs["overlap_correction"] = (
                             multi_bound_overlap_correction
@@ -850,7 +862,14 @@ def run_static_nested(
                     step_scale=step_scale,
                     max_attempts=max_attempts,
                     min_accepts=min_accepts,
-                    **({"proposal_chol": proposal_chol} if kernel == "jax" else {}),
+                    **(
+                        {
+                            "proposal_chol": proposal_chol,
+                            "jax_vectorized": jax_vectorized,
+                        }
+                        if kernel == "jax"
+                        else {}
+                    ),
                     **(
                         {"replacement_chain_schedule": replacement_chain_schedule}
                         if kernel == "jax" and replacement_chain_schedule is not None
@@ -1274,6 +1293,7 @@ def run_static_nested(
             "bound_seed_kernel": "jax" if fused_bound_rwalk else bound_seed_kernel,
             "allow_unused_bound": bool(allow_unused_bound),
             "fused_bound_rwalk": bool(fused_bound_rwalk),
+            "jax_vectorized": bool(jax_vectorized),
             "bounded_rwalk": bool(
                 sample == "rwalk" and bound != "none" and rwalk_seed == "bound"
             ),
