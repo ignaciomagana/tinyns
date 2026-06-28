@@ -15,6 +15,7 @@ from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
     draw_constrained_multi_bound_jax,
+    draw_constrained_multi_bound_rwalk_jax,
     draw_constrained_prior,
     draw_constrained_prior_vectorized,
     draw_constrained_rslice,
@@ -334,12 +335,12 @@ def run_static_nested(
     if fused_bound_rwalk and not (
         sample == "rwalk"
         and kernel == "jax"
-        and bound == "single"
+        and bound in {"single", "multi"}
         and rwalk_seed == "bound"
     ):
         raise NotImplementedError(
             "fused_bound_rwalk=True is supported only for sample='rwalk', "
-            "kernel='jax', bound='single', and rwalk_seed='bound'"
+            "kernel='jax', bound in {'single', 'multi'}, and rwalk_seed='bound'"
         )
     if fused_bound_rwalk and replacement_chain_schedule is not None:
         raise NotImplementedError(
@@ -504,7 +505,7 @@ def run_static_nested(
         "multi_bound_overlap_correction": bool(multi_bound_overlap_correction),
         "rwalk_seed": str(rwalk_seed),
         "rwalk_seed_fallback": bool(rwalk_seed_fallback),
-        "bound_seed_kernel": str(bound_seed_kernel),
+        "bound_seed_kernel": "jax" if fused_bound_rwalk else str(bound_seed_kernel),
         "allow_unused_bound": bool(allow_unused_bound),
         "fused_bound_rwalk": bool(fused_bound_rwalk),
     }
@@ -589,6 +590,7 @@ def run_static_nested(
     bound_eval_history = []
     bound_unit_cube_acceptance_history = []
     bound_nellipsoid_history = []
+    bound_overlap_rejection_history = []
     bound_seed_call_history = []
     bound_seed_batch_history = []
     rwalk_kernel_call_history = []
@@ -731,7 +733,12 @@ def run_static_nested(
             seed_live_logl = live_logl
             if fused_bound_rwalk:
                 seed_limit = bound_max_draws or max_attempts
-                draw_result = draw_constrained_single_bound_rwalk_jax(
+                fused_draw = (
+                    draw_constrained_multi_bound_rwalk_jax
+                    if bound == "multi"
+                    else draw_constrained_single_bound_rwalk_jax
+                )
+                draw_result = fused_draw(
                     key,
                     loglike,
                     prior_transform,
@@ -746,6 +753,11 @@ def run_static_nested(
                     bound_batch_size=batch_size,
                     bound_max_batches=int(math.ceil(seed_limit / batch_size)),
                     proposal_chol=proposal_chol,
+                    **(
+                        {"overlap_correction": multi_bound_overlap_correction}
+                        if bound == "multi"
+                        else {}
+                    ),
                 )
                 replacement_info = draw_result[6]
                 bound_seed_call_history.append(
@@ -970,7 +982,21 @@ def run_static_nested(
                 int(
                     replacement_info.get(
                         "bound_nellipsoids",
-                        replacement_info.get("bound_seed_bound_nellipsoids", 1),
+                        replacement_info.get(
+                            "bound_seed_bound_nellipsoids",
+                            replacement_info.get("bound_seed_nellipsoids", 1),
+                        ),
+                    )
+                )
+            )
+            bound_overlap_rejection_history.append(
+                int(
+                    replacement_info.get(
+                        "bound_overlap_rejections",
+                        replacement_info.get(
+                            "bound_seed_bound_overlap_rejections",
+                            replacement_info.get("bound_seed_overlap_rejections", 0),
+                        ),
                     )
                 )
             )
@@ -1221,6 +1247,14 @@ def run_static_nested(
             "bound_nellipsoids_max": int(max(bound_nellipsoid_history, default=0))
             if bound_nellipsoid_history
             else None,
+            "bound_seed_nellipsoids": int(max(bound_nellipsoid_history, default=0))
+            if bound_nellipsoid_history
+            else None,
+            "bound_seed_overlap_rejections": int(
+                sum(bound_overlap_rejection_history)
+            )
+            if bound_overlap_rejection_history
+            else None,
             "mean_bound_draws": float(sum(bound_draw_history) / len(bound_draw_history))
             if bound_draw_history
             else None,
@@ -1240,7 +1274,7 @@ def run_static_nested(
             else None,
             "rwalk_seed": rwalk_seed,
             "rwalk_seed_fallback": rwalk_seed_fallback,
-            "bound_seed_kernel": bound_seed_kernel,
+            "bound_seed_kernel": "jax" if fused_bound_rwalk else bound_seed_kernel,
             "allow_unused_bound": bool(allow_unused_bound),
             "fused_bound_rwalk": bool(fused_bound_rwalk),
             "bounded_rwalk": bool(

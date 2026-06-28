@@ -1030,6 +1030,8 @@ def test_static_nested_single_bound_fused_rwalk_jax_runs_and_records_metadata() 
     assert result.metadata["fused_bound_rwalk"] is True
     assert result.metadata["bounded_rwalk"] is True
     assert result.metadata["mean_bound_seed_calls"] is not None
+    assert result.metadata["bound_seed_nellipsoids"] is not None
+    assert result.metadata["bound_seed_overlap_rejections"] is not None
     assert result.metadata["mean_rwalk_kernel_calls"] is not None
     assert (
         result.metadata["mean_total_replacement_calls"]
@@ -1047,7 +1049,6 @@ def test_static_nested_single_bound_fused_rwalk_jax_runs_and_records_metadata() 
             "bound": "single",
             "rwalk_seed": "bound",
         },
-        {"sample": "rwalk", "kernel": "jax", "bound": "multi", "rwalk_seed": "bound"},
         {"sample": "rwalk", "kernel": "jax", "bound": "single", "rwalk_seed": "live"},
     ],
 )
@@ -1062,6 +1063,64 @@ def test_static_nested_fused_bound_rwalk_invalid_combinations_raise(kwargs) -> N
             fused_bound_rwalk=True,
             **kwargs,
         )
+
+
+def test_static_nested_multi_bound_fused_rwalk_jax_runs_and_records_metadata() -> None:
+    result = run_static_nested(
+        random.PRNGKey(1094),
+        lambda theta: -0.5 * jnp.sum((theta / 0.3) ** 2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="bound",
+        fused_bound_rwalk=True,
+        walks=2,
+        replacement_chains=2,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["fused_bound_rwalk"] is True
+    assert result.metadata["bound_seed_kernel"] == "jax"
+    assert result.metadata["mean_bound_seed_calls"] is not None
+    assert result.metadata["bound_seed_nellipsoids"] is not None
+    assert result.metadata["bound_seed_overlap_rejections"] is not None
+    assert result.metadata["mean_rwalk_kernel_calls"] is not None
+    assert result.metadata["mean_total_replacement_calls"] == result.metadata[
+        "mean_replacement_ncall"
+    ]
+
+
+def test_static_nested_multi_bound_fused_rwalk_jax_live_cov_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(1095),
+        lambda theta: -0.5 * jnp.sum((theta / 0.3) ** 2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="bound",
+        rwalk_proposal="live-cov",
+        fused_bound_rwalk=True,
+        walks=2,
+        replacement_chains=2,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["fused_bound_rwalk"] is True
+    assert result.metadata["mean_rwalk_kernel_calls"] is not None
 
 
 def test_static_nested_fused_bound_rwalk_rejects_adaptive_schedule() -> None:
