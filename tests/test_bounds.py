@@ -96,3 +96,32 @@ def test_invalid_enlargement_or_jitter_raise_value_error() -> None:
 def test_unit_ball_log_volume_is_finite_for_common_dimensions() -> None:
     for ndim in (1, 2, 10):
         assert math.isfinite(unit_ball_log_volume(ndim))
+
+
+def test_multi_ellipsoid_bound_geometry_smoke() -> None:
+    live_u = jnp.concatenate(
+        [
+            0.25 + 0.03 * random.normal(random.PRNGKey(10), shape=(24, 2)),
+            0.75 + 0.03 * random.normal(random.PRNGKey(11), shape=(24, 2)),
+        ],
+        axis=0,
+    )
+    from tinyns.bounds import (
+        build_multi_ellipsoid_bound,
+        contains_multi_ellipsoid,
+        count_containing_ellipsoids,
+        sample_multi_ellipsoid,
+    )
+
+    bound = build_multi_ellipsoid_bound(
+        live_u, max_ellipsoids=4, min_points=8, split_threshold=0.99
+    )
+    samples, indices = sample_multi_ellipsoid(random.PRNGKey(12), bound, 13)
+    counts = count_containing_ellipsoids(bound, live_u)
+
+    assert 1 <= len(bound.ellipsoids) <= 4
+    assert bool(jnp.all(contains_multi_ellipsoid(bound, live_u)))
+    assert samples.shape == (13, 2)
+    assert indices.shape == (13,)
+    assert bool(jnp.all(counts > 0))
+    assert math.isfinite(bound.log_total_volume)

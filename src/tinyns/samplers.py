@@ -9,7 +9,13 @@ import jax
 import jax.numpy as jnp
 from jax import lax, random
 
-from tinyns.bounds import in_unit_cube, sample_single_ellipsoid
+from tinyns.bounds import (
+    MultiEllipsoidBound,
+    in_unit_cube,
+    sample_multi_ellipsoid,
+    sample_multi_ellipsoid_corrected,
+    sample_single_ellipsoid,
+)
 from tinyns.math import reflect_unit_cube
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -32,6 +38,26 @@ def _validate_min_accepts(min_accepts: int) -> None:
         raise ValueError("min_accepts must be a positive integer")
 
 
+def _bound_info(bound, bound_draws, unit_cube_survivors, ncall, overlap_rejections):
+    log_volume = (
+        bound.log_total_volume
+        if isinstance(bound, MultiEllipsoidBound)
+        else bound.log_volume
+    )
+    return {
+        "bound_draws": bound_draws,
+        "bound_unit_cube_survivors": unit_cube_survivors,
+        "bound_loglike_evals": ncall,
+        "bound_acceptance": ncall / bound_draws if bound_draws else 0.0,
+        "bound_unit_cube_acceptance": (
+            unit_cube_survivors / bound_draws if bound_draws else 0.0
+        ),
+        "bound_nellipsoids": len(getattr(bound, "ellipsoids", (bound,))),
+        "bound_log_total_volume": log_volume,
+        "bound_overlap_rejections": overlap_rejections,
+    }
+
+
 def draw_constrained_single_bound(
     key: PRNGKeyLike,
     loglike: LogLikelihood,
@@ -42,8 +68,9 @@ def draw_constrained_single_bound(
     *,
     max_attempts: int = 10_000,
     batch_size: int = 128,
+    overlap_correction: bool = True,
 ):
-    """Draw a constrained replacement from a single ellipsoid bound.
+    """Draw a constrained replacement from an ellipsoid bound.
 
     Raw ellipsoid draws are first clipped to the unit cube. Only unit-cube
     survivors are transformed and counted as likelihood calls.
@@ -62,13 +89,25 @@ def draw_constrained_single_bound(
     best_logl = -math.inf
     ncall = 0
     bound_draws = 0
+    overlap_rejections = 0
     unit_cube_survivors = 0
     new_key = key
 
     while ncall < max_attempts:
         new_key, draw_key = random.split(new_key)
-        u_batch = sample_single_ellipsoid(draw_key, bound, batch_size)
-        bound_draws += int(batch_size)
+        if isinstance(bound, MultiEllipsoidBound):
+            if overlap_correction:
+                u_batch, _idx, draws, overlap = sample_multi_ellipsoid_corrected(
+                    draw_key, bound, batch_size
+                )
+                bound_draws += int(draws)
+                overlap_rejections += int(overlap)
+            else:
+                u_batch, _idx = sample_multi_ellipsoid(draw_key, bound, batch_size)
+                bound_draws += int(batch_size)
+        else:
+            u_batch = sample_single_ellipsoid(draw_key, bound, batch_size)
+            bound_draws += int(batch_size)
         inside = in_unit_cube(u_batch)
         for u in u_batch[inside]:
             if ncall >= max_attempts:
@@ -82,15 +121,9 @@ def draw_constrained_single_bound(
                 best_theta = theta
                 best_logl = logl
             if logl >= logl_min:
-                info = {
-                    "bound_draws": bound_draws,
-                    "bound_unit_cube_survivors": unit_cube_survivors,
-                    "bound_loglike_evals": ncall,
-                    "bound_acceptance": ncall / bound_draws if bound_draws else 0.0,
-                    "bound_unit_cube_acceptance": (
-                        unit_cube_survivors / bound_draws if bound_draws else 0.0
-                    ),
-                }
+                info = _bound_info(
+                    bound, bound_draws, unit_cube_survivors, ncall, overlap_rejections
+                )
                 return new_key, u, theta, logl, ncall, True, info
 
     if best_u is None:
@@ -99,15 +132,10 @@ def draw_constrained_single_bound(
         best_logl = float(loglike(best_theta))
         ncall += 1
         unit_cube_survivors += 1
-    info = {
-        "bound_draws": bound_draws,
-        "bound_unit_cube_survivors": unit_cube_survivors,
-        "bound_loglike_evals": ncall,
-        "bound_acceptance": 0.0,
-        "bound_unit_cube_acceptance": unit_cube_survivors / bound_draws
-        if bound_draws
-        else 0.0,
-    }
+    info = _bound_info(
+        bound, bound_draws, unit_cube_survivors, ncall, overlap_rejections
+    )
+    info["bound_acceptance"] = 0.0
     return new_key, best_u, best_theta, best_logl, ncall, False, info
 
 
