@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -185,6 +186,46 @@ def eggbox_2d() -> ValidationTarget:
     )
 
 
+def heavy_gaussian_2d(work_size: int = 100_000) -> ValidationTarget:
+    """Return a deterministic catalog-like 2D benchmark likelihood.
+
+    The target is intentionally heavier than the cheap Gaussian validation
+    targets: each scalar likelihood evaluation reduces over fixed pseudo-data of
+    length ``work_size``. It is benchmark-only and has no analytic evidence.
+    """
+
+    if work_size <= 0:
+        raise ValueError("work_size must be positive")
+
+    key = jax.random.PRNGKey(12345)
+    data = jax.random.normal(key, (int(work_size), 2))
+    log_work_size = jnp.log(jnp.asarray(work_size, dtype=data.dtype))
+
+    def prior_transform(u):
+        return -5.0 + 10.0 * jnp.asarray(u)
+
+    def loglike(theta):
+        theta = jnp.asarray(theta)
+        diff = data - theta[None, :]
+        log_terms = -0.5 * jnp.sum(diff * diff, axis=1)
+        max_log_term = jnp.max(log_terms)
+        shifted_sum = jnp.sum(jnp.exp(log_terms - max_log_term))
+        return max_log_term + jnp.log(shifted_sum) - log_work_size
+
+    return ValidationTarget(
+        name="heavy_gaussian2d",
+        ndim=2,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=None,
+        expected_mean=None,
+        expected_cov=None,
+        description=(
+            "Deterministic heavy catalog-like 2D Gaussian mixture benchmark target."
+        ),
+    )
+
+
 def available_targets() -> dict[str, Callable[[], ValidationTarget]]:
     """Return available named validation target constructors."""
 
@@ -196,6 +237,7 @@ def available_targets() -> dict[str, Callable[[], ValidationTarget]]:
         "banana2d": banana_2d,
         "ring2d": ring_2d,
         "eggbox2d": eggbox_2d,
+        "heavy_gaussian2d": heavy_gaussian_2d,
     }
 
 

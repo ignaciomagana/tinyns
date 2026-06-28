@@ -24,6 +24,12 @@ def test_parser_accepts_warmup_replacements() -> None:
     assert args.warmup_replacements == 2
 
 
+def test_parser_accepts_work_size() -> None:
+    args = parse_args(["--work-size", "100"])
+
+    assert args.work_size == 100
+
+
 def test_validate_args_rejects_too_small_max_attempts() -> None:
     args = parse_args(
         [
@@ -39,6 +45,40 @@ def test_validate_args_rejects_too_small_max_attempts() -> None:
 
     with pytest.raises(ValueError, match="required=100"):
         validate_args(args)
+
+
+def test_cli_smoke_heavy_target_tiny_settings_writes_json(tmp_path) -> None:
+    output = tmp_path / "heavy_kernel_smoke.json"
+
+    main(
+        [
+            "--targets",
+            "heavy_gaussian2d",
+            "--replacement-chains-grid",
+            "1",
+            "4",
+            "--walks",
+            "5",
+            "--nlive",
+            "20",
+            "--n-replacements",
+            "3",
+            "--warmup-replacements",
+            "1",
+            "--work-size",
+            "100",
+            "--max-attempts",
+            "100",
+            "--output",
+            str(output),
+        ]
+    )
+
+    payload = json.loads(output.read_text())
+    assert len(payload["results"]) == 2
+    assert payload["results"][0]["target"] == "heavy_gaussian2d"
+    assert payload["results"][0]["work_size"] == 100
+    assert payload["results"][1]["replacement_chains"] == 4
 
 
 def test_cli_smoke_tiny_settings_writes_json(tmp_path) -> None:

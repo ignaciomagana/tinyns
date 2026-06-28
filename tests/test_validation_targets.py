@@ -3,7 +3,12 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from validation.targets import available_targets, gaussian_1d, get_target
+from validation.targets import (
+    available_targets,
+    gaussian_1d,
+    get_target,
+    heavy_gaussian_2d,
+)
 
 
 def test_available_targets_contains_expected_names() -> None:
@@ -15,6 +20,7 @@ def test_available_targets_contains_expected_names() -> None:
         "banana2d",
         "ring2d",
         "eggbox2d",
+        "heavy_gaussian2d",
     }
 
 
@@ -57,6 +63,19 @@ def test_ring_2d_target_has_expected_geometry() -> None:
 
     assert loglike_on_ring == pytest.approx(0.0)
     assert loglike_at_center < loglike_on_ring
+
+
+def test_heavy_gaussian_2d_constructs_with_finite_scalar_loglike() -> None:
+    target = heavy_gaussian_2d(work_size=100)
+
+    theta = target.prior_transform(jnp.array([0.5, 0.5]))
+    loglike = target.loglike(jnp.zeros(2))
+
+    assert target.name == "heavy_gaussian2d"
+    assert target.ndim == 2
+    assert np.asarray(theta).shape == (2,)
+    assert np.asarray(loglike).shape == ()
+    assert np.isfinite(float(loglike))
 
 
 def test_unknown_target_raises_key_error() -> None:

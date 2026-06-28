@@ -68,4 +68,23 @@ python benchmarks/bench_rwalk_kernel.py \
   --output bench_rwalk_kernel.json
 ```
 
+### Heavy synthetic likelihood benchmark
+
+Cheap Gaussian targets are useful for correctness and overhead checks, but they do not represent heavy catalog/injection likelihoods. To test GPU batching behavior, use:
+
+```bash
+python benchmarks/bench_rwalk_kernel.py \
+  --targets heavy_gaussian2d \
+  --replacement-chains-grid 1 4 16 64 256 1024 2048 \
+  --walks 25 \
+  --nlive 200 \
+  --n-replacements 500 \
+  --warmup-replacements 50 \
+  --work-size 100000 \
+  --max-attempts 204800 \
+  --output bench_heavy_rwalk_kernel_chain_sweep.json
+```
+
+Increase `--work-size` to mimic more expensive likelihoods.
+
 Use this benchmark to understand GPU throughput scaling. Use the full `bench_static.py` benchmark to understand end-to-end nested-sampling wall time.

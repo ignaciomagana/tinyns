@@ -18,7 +18,7 @@ for path in (ROOT, SRC):
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
-from validation.targets import get_target  # noqa: E402
+from validation.targets import get_target, heavy_gaussian_2d  # noqa: E402
 
 from tinyns.samplers import draw_constrained_rwalk_jax  # noqa: E402
 
@@ -53,6 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=102400)
+    parser.add_argument("--work-size", type=int, default=100_000)
     parser.add_argument("--constraint-quantile", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=str, default="bench_rwalk_kernel.json")
@@ -74,10 +75,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--constraint-quantile must be between 0 and 1")
 
 
+def make_target(target_name: str, work_size: int):
+    if target_name == "heavy_gaussian2d":
+        return heavy_gaussian_2d(work_size=work_size)
+    return get_target(target_name)
+
+
 def build_live_state(
-    target_name: str, key: jax.Array, nlive: int, constraint_quantile: float
+    target_name: str,
+    key: jax.Array,
+    nlive: int,
+    constraint_quantile: float,
+    work_size: int,
 ):
-    target = get_target(target_name)
+    target = make_target(target_name, work_size)
     live_u = jax.random.uniform(key, (nlive, target.ndim))
     live_theta = jax.vmap(target.prior_transform)(live_u)
     live_logl = jax.vmap(target.loglike)(live_theta)
@@ -91,7 +102,7 @@ def run_one(
 ) -> dict[str, Any]:
     live_key, run_key = jax.random.split(jax.random.PRNGKey(seed))
     target, live_u, live_logl, logl_min = build_live_state(
-        target_name, live_key, args.nlive, args.constraint_quantile
+        target_name, live_key, args.nlive, args.constraint_quantile, args.work_size
     )
 
     for _ in range(args.warmup_replacements):
@@ -148,6 +159,7 @@ def run_one(
         "n_replacements": args.n_replacements,
         "warmup_replacements": args.warmup_replacements,
         "constraint_quantile": args.constraint_quantile,
+        "work_size": args.work_size if target_name == "heavy_gaussian2d" else None,
         "seconds": seconds,
         "replacements_per_second": args.n_replacements / seconds if seconds else None,
         "scalar_likelihood_calls_per_second": total_ncall / seconds
