@@ -8,7 +8,7 @@ import time
 
 import jax.numpy as jnp
 import numpy as np
-from jax import random
+from jax import lax, random
 from jax.scipy.special import logsumexp
 
 from tinyns.bounds import build_multi_ellipsoid_bound, build_single_ellipsoid_bound
@@ -16,6 +16,7 @@ from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
     _evaluate_jax_batch,
+    _make_rwalk_jax_kernel,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
     draw_constrained_prior,
@@ -79,6 +80,125 @@ def _logzerr(logwt, logl, logz: float, nlive: int) -> float:
     weights = jnp.exp(log_weights)
     information = jnp.sum(weights * (jnp.asarray(logl) - logz))
     return float(jnp.sqrt(jnp.maximum(information / nlive, 0.0)))
+
+
+def _run_static_jax_rwalk_block(
+    key,
+    live_u,
+    live_theta,
+    live_logl,
+    logz_dead,
+    start_iteration,
+    nlive,
+    loglike,
+    prior_transform,
+    ndim,
+    *,
+    block_size,
+    walks,
+    step_scale,
+    replacement_chains,
+    max_attempts,
+    min_accepts,
+):
+    """Run an experimental fixed-size block of unbounded JAX rwalk iterations.
+
+    Convergence is intentionally checked only between blocks by the Python
+    driver, so an experimental block-mode run may overshoot ``dlogz`` by up to
+    ``block_size - 1`` nested iterations.
+    """
+
+    batch_ncall = int(walks) * int(replacement_chains)
+    max_batches = int(max_attempts) // batch_ncall
+    rwalk_kernel = _make_rwalk_jax_kernel(
+        loglike,
+        prior_transform,
+        int(ndim),
+        int(walks),
+        int(replacement_chains),
+        False,
+    )
+    proposal_chol = jnp.eye(int(ndim), dtype=jnp.asarray(live_u).dtype)
+
+    def one_iteration(carry, offset):
+        key, live_u, live_theta, live_logl, logz_dead = carry
+        worst = jnp.argmin(live_logl)
+        dead_u = live_u[worst]
+        dead_theta = live_theta[worst]
+        logl_worst = live_logl[worst]
+        iteration = jnp.asarray(start_iteration, dtype=jnp.int32) + offset
+        logx_prev = -iteration / nlive
+        logx_new = -(iteration + 1) / nlive
+        logwidth = logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev))
+        logwt = logwidth + logl_worst
+        logz_dead = jnp.logaddexp(logz_dead, logwt)
+
+        (
+            key,
+            new_u,
+            new_theta,
+            new_logl,
+            replacement_ncall,
+            _accepted,
+        ) = rwalk_kernel(
+            key,
+            logl_worst,
+            live_u,
+            live_logl,
+            jnp.asarray(step_scale),
+            jnp.asarray(min_accepts),
+            jnp.asarray(max_batches, dtype=jnp.int32),
+            proposal_chol,
+        )
+        insertion_index = (
+            jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
+        ).astype(jnp.int32)
+        live_u = live_u.at[worst].set(new_u)
+        live_theta = live_theta.at[worst].set(new_theta)
+        live_logl = live_logl.at[worst].set(new_logl)
+        return (key, live_u, live_theta, live_logl, logz_dead), (
+            dead_u,
+            dead_theta,
+            logl_worst,
+            logwt,
+            replacement_ncall,
+            insertion_index,
+        )
+
+    (
+        new_key,
+        new_live_u,
+        new_live_theta,
+        new_live_logl,
+        logz_dead_new,
+    ), block = lax.scan(
+        one_iteration,
+        (key, live_u, live_theta, live_logl, jnp.asarray(logz_dead)),
+        jnp.arange(int(block_size), dtype=jnp.int32),
+    )
+    (
+        dead_u_block,
+        dead_theta_block,
+        dead_logl_block,
+        dead_logwt_block,
+        replacement_ncall_block,
+        insertion_indices_block,
+    ) = block
+    logx_final_new = -(int(start_iteration) + int(block_size)) / int(nlive)
+    return (
+        new_key,
+        new_live_u,
+        new_live_theta,
+        new_live_logl,
+        dead_u_block,
+        dead_theta_block,
+        dead_logl_block,
+        dead_logwt_block,
+        replacement_ncall_block,
+        insertion_indices_block,
+        logz_dead_new,
+        logx_final_new,
+    )
 
 
 def _make_run_state(
@@ -304,6 +424,7 @@ def run_static_nested(
     allow_unused_bound: bool = False,
     fused_bound_rwalk: bool = False,
     jax_vectorized: bool = False,
+    jax_block_size: int = 1,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -437,6 +558,28 @@ def run_static_nested(
     ):
         raise ValueError("min_accepts must be a positive integer")
     if (
+        not isinstance(jax_block_size, int)
+        or isinstance(jax_block_size, bool)
+        or jax_block_size <= 0
+    ):
+        raise ValueError("jax_block_size must be a positive integer")
+    if jax_block_size > 1:
+        if not (
+            sample == "rwalk"
+            and kernel == "jax"
+            and bound == "none"
+            and replacement_chain_schedule is None
+        ):
+            raise NotImplementedError(
+                "jax_block_size > 1 is experimental and currently supported only "
+                "for sample='rwalk', kernel='jax', bound='none', and "
+                "replacement_chain_schedule=None"
+            )
+        if jax_vectorized:
+            raise NotImplementedError(
+                "jax_block_size > 1 does not support jax_vectorized"
+            )
+    if (
         not isinstance(replacement_chains, int)
         or isinstance(replacement_chains, bool)
         or replacement_chains <= 0
@@ -447,6 +590,12 @@ def run_static_nested(
             "replacement_chains is currently supported only for "
             "sample='rwalk', kernel='jax'"
         )
+    if (
+        sample == "rwalk"
+        and kernel == "jax"
+        and int(walks) * int(replacement_chains) > int(max_attempts)
+    ):
+        raise ValueError("max_attempts must be at least walks * replacement_chains")
     if replacement_chain_schedule is not None:
         if not (sample == "rwalk" and kernel == "jax"):
             raise NotImplementedError(
@@ -514,6 +663,7 @@ def run_static_nested(
         "allow_unused_bound": bool(allow_unused_bound),
         "fused_bound_rwalk": bool(fused_bound_rwalk),
         "jax_vectorized": bool(jax_vectorized),
+        "jax_block_size": int(jax_block_size),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -645,84 +795,171 @@ def run_static_nested(
         if final or iteration == 1 or iteration % checkpoint_interval == 0:
             save_checkpoint_npz(checkpoint_path_str, current_state(), config)
 
-    for i in range(iteration, maxiter):
-        worst = int(jnp.argmin(live_logl))
-        logl_worst = float(live_logl[worst])
-        logx_prev = -i / nlive
-        logx_new = -(i + 1) / nlive
-        logwidth = logdiffexp(logx_prev, logx_new)
-        logwt = float(logwidth + logl_worst)
-
-        dead_u_storage[i] = np.asarray(live_u[worst])
-        dead_theta_storage[i] = np.asarray(live_theta[worst])
-        dead_logl_storage[i] = logl_worst
-        dead_logwt_storage[i] = logwt
-        logz_dead = float(jnp.logaddexp(logz_dead, logwt))
-        logx_final = logx_new
-
-        replacement_info = None
-        rebuild_bound = bound in {"single", "multi"} and (
-            current_bound is None
-            or i % bound_update_interval == 0
-            or force_bound_rebuild
-        )
-        if rebuild_bound:
-            build_start = time.perf_counter()
-            if bound == "multi":
-                current_bound = build_multi_ellipsoid_bound(
-                    live_u,
-                    enlargement=multi_bound_enlargement or bound_enlargement,
-                    jitter=bound_jitter,
-                    max_ellipsoids=multi_bound_max_ellipsoids,
-                    min_points=multi_bound_min_points,
-                    split_threshold=multi_bound_split_threshold,
-                )
-            else:
-                current_bound = build_single_ellipsoid_bound(
-                    live_u, enlargement=bound_enlargement, jitter=bound_jitter
-                )
-            bound_build_time_history.append(time.perf_counter() - build_start)
-            bound_log_volume_history.append(
-                float(
-                    current_bound.log_total_volume
-                    if hasattr(current_bound, "log_total_volume")
-                    else current_bound.log_volume
-                )
-            )
-            bound_nellipsoid_history.append(
-                int(getattr(current_bound, "n_ellipsoids", 1))
-            )
-            bound_updates += 1
-            if force_bound_rebuild:
-                bound_forced_rebuilds += 1
-                force_bound_rebuild = False
-
-        bound_failure = False
-        bound_success = False
-        if sample == "bound":
+    if jax_block_size > 1:
+        while iteration < maxiter:
+            block_size_now = min(int(jax_block_size), maxiter - iteration)
             (
                 key,
-                new_u,
-                new_theta,
-                new_logl,
-                calls,
-                accepted,
-                replacement_info,
-            ) = draw_constrained_single_bound(
+                live_u,
+                live_theta,
+                live_logl,
+                dead_u_block,
+                dead_theta_block,
+                dead_logl_block,
+                dead_logwt_block,
+                replacement_ncall_block,
+                insertion_indices_block,
+                logz_dead,
+                logx_final,
+            ) = _run_static_jax_rwalk_block(
                 key,
+                live_u,
+                live_theta,
+                live_logl,
+                logz_dead,
+                iteration,
+                nlive,
                 loglike,
                 prior_transform,
-                logl_worst,
-                current_bound,
                 ndim,
-                batch_size=batch_size,
-                max_attempts=bound_max_draws or max_attempts,
-                overlap_correction=multi_bound_overlap_correction,
+                block_size=block_size_now,
+                walks=walks,
+                step_scale=step_scale,
+                replacement_chains=replacement_chains,
+                max_attempts=max_attempts,
+                min_accepts=min_accepts,
             )
-            bound_success = bool(accepted)
-            bound_failure = not accepted
-        elif sample == "prior":
-            if vectorized:
+            block_start = iteration
+            block_stop = iteration + block_size_now
+            dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
+            dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
+            dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
+            dead_logwt_storage[block_start:block_stop] = np.asarray(dead_logwt_block)
+            block_ncalls = [int(x) for x in np.asarray(replacement_ncall_block)]
+            replacement_ncall.extend(block_ncalls)
+            insertion_indices.extend(
+                int(x) for x in np.asarray(insertion_indices_block)
+            )
+            ncall += int(sum(block_ncalls))
+            batch_ncall = int(walks) * int(replacement_chains)
+            for calls in block_ncalls:
+                batches_used = int(math.ceil(int(calls) / batch_ncall))
+                chains_used = int(replacement_chains) * batches_used
+                replacement_batches.append(batches_used)
+                replacement_chains_used.append(chains_used)
+                chain_count = str(int(replacement_chains))
+                replacement_chain_usage_counts[chain_count] = (
+                    replacement_chain_usage_counts.get(chain_count, 0) + batches_used
+                )
+            iteration = block_stop
+            maybe_checkpoint()
+
+            logz_remain = float(logx_final) + float(jnp.max(live_logl))
+            delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+            final_delta_logz = delta_logz
+            final_iteration = delta_logz < dlogz or iteration == maxiter
+            if iteration == maxiter and delta_logz >= dlogz:
+                success = False
+                message = f"maxiter={maxiter} reached"
+            state = _make_run_state(
+                iteration=iteration,
+                logz=logz_dead,
+                dlogz=delta_logz,
+                ncall=ncall,
+                logl_min=float(dead_logl_block[-1]),
+                logl_live_max=float(jnp.max(live_logl)),
+                sample=sample,
+                nlive=nlive,
+                ndim=ndim,
+                replacement_ncall=replacement_ncall,
+                replacement_failures=replacement_failures,
+                replacement_batches=replacement_batches,
+                replacement_chains_used=replacement_chains_used,
+                replacement_chain_usage_counts=replacement_chain_usage_counts,
+                replacement_chain_schedule=replacement_chain_schedule,
+                replacement_chains=replacement_chains,
+                kernel=kernel,
+                walks=walks,
+                bound=bound,
+                bound_draws=bound_draw_history,
+                bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
+                bound_nellipsoids=bound_nellipsoid_history,
+                rwalk_seed=rwalk_seed,
+                bound_seed_kernel=bound_seed_kernel,
+            )
+            if callback is not None and (
+                iteration == 1 or iteration % callback_interval == 0 or final_iteration
+            ):
+                if callback(state) is False:
+                    success = False
+                    message = "stopped by callback"
+                    stopped_by_callback = True
+                    final_iteration = True
+            if progress_printer is not None and (
+                iteration == 1 or iteration % progress_interval == 0 or final_iteration
+            ):
+                progress_printer.print(
+                    _format_progress_line(state), final=final_iteration
+                )
+            if final_iteration:
+                maybe_checkpoint(final=True)
+                break
+    else:
+        for i in range(iteration, maxiter):
+            worst = int(jnp.argmin(live_logl))
+            logl_worst = float(live_logl[worst])
+            logx_prev = -i / nlive
+            logx_new = -(i + 1) / nlive
+            logwidth = logdiffexp(logx_prev, logx_new)
+            logwt = float(logwidth + logl_worst)
+
+            dead_u_storage[i] = np.asarray(live_u[worst])
+            dead_theta_storage[i] = np.asarray(live_theta[worst])
+            dead_logl_storage[i] = logl_worst
+            dead_logwt_storage[i] = logwt
+            logz_dead = float(jnp.logaddexp(logz_dead, logwt))
+            logx_final = logx_new
+
+            replacement_info = None
+            rebuild_bound = bound in {"single", "multi"} and (
+                current_bound is None
+                or i % bound_update_interval == 0
+                or force_bound_rebuild
+            )
+            if rebuild_bound:
+                build_start = time.perf_counter()
+                if bound == "multi":
+                    current_bound = build_multi_ellipsoid_bound(
+                        live_u,
+                        enlargement=multi_bound_enlargement or bound_enlargement,
+                        jitter=bound_jitter,
+                        max_ellipsoids=multi_bound_max_ellipsoids,
+                        min_points=multi_bound_min_points,
+                        split_threshold=multi_bound_split_threshold,
+                    )
+                else:
+                    current_bound = build_single_ellipsoid_bound(
+                        live_u, enlargement=bound_enlargement, jitter=bound_jitter
+                    )
+                bound_build_time_history.append(time.perf_counter() - build_start)
+                bound_log_volume_history.append(
+                    float(
+                        current_bound.log_total_volume
+                        if hasattr(current_bound, "log_total_volume")
+                        else current_bound.log_volume
+                    )
+                )
+                bound_nellipsoid_history.append(
+                    int(getattr(current_bound, "n_ellipsoids", 1))
+                )
+                bound_updates += 1
+                if force_bound_rebuild:
+                    bound_forced_rebuilds += 1
+                    force_bound_rebuild = False
+
+            bound_failure = False
+            bound_success = False
+            if sample == "bound":
                 (
                     key,
                     new_u,
@@ -730,343 +967,447 @@ def run_static_nested(
                     new_logl,
                     calls,
                     accepted,
-                ) = draw_constrained_prior_vectorized(
-                    key,
-                    loglike,
-                    prior_transform,
-                    logl_worst,
-                    ndim,
-                    batch_size=batch_size,
-                    max_attempts=max_attempts,
-                )
-            else:
-                (
-                    key,
-                    new_u,
-                    new_theta,
-                    new_logl,
-                    calls,
-                    accepted,
-                ) = draw_constrained_prior(
-                    key,
-                    loglike,
-                    prior_transform,
-                    logl_worst,
-                    ndim,
-                    vectorized=False,
-                    max_attempts=max_attempts,
-                )
-        elif sample == "rwalk":
-            rwalk_draw = (
-                draw_constrained_rwalk_jax_adaptive
-                if kernel == "jax" and replacement_chain_schedule is not None
-                else draw_constrained_rwalk_jax
-                if kernel == "jax"
-                else draw_constrained_rwalk
-            )
-            proposal_chol = None
-            if kernel == "jax" and rwalk_proposal == "live-cov":
-                centered = live_u - jnp.mean(live_u, axis=0)
-                denom = max(int(live_u.shape[0]) - 1, 1)
-                cov = (centered.T @ centered) / denom
-                cov = cov + jnp.asarray(rwalk_cov_jitter, dtype=live_u.dtype) * jnp.eye(
-                    ndim, dtype=live_u.dtype
-                )
-                proposal_chol = jnp.linalg.cholesky(cov)
-            seed_live_u = live_u
-            seed_live_logl = live_logl
-            if fused_bound_rwalk:
-                seed_limit = bound_max_draws or max_attempts
-                fused_draw = (
-                    draw_constrained_multi_bound_rwalk_jax
-                    if bound == "multi"
-                    else draw_constrained_single_bound_rwalk_jax
-                )
-                draw_result = fused_draw(
+                    replacement_info,
+                ) = draw_constrained_single_bound(
                     key,
                     loglike,
                     prior_transform,
                     logl_worst,
                     current_bound,
                     ndim,
-                    walks=walks,
-                    step_scale=step_scale,
-                    max_attempts=max_attempts,
-                    min_accepts=min_accepts,
-                    replacement_chains=replacement_chains,
-                    replacement_chain_schedule=replacement_chain_schedule,
-                    bound_batch_size=batch_size,
-                    bound_max_batches=int(math.ceil(seed_limit / batch_size)),
-                    proposal_chol=proposal_chol,
-                    jax_vectorized=jax_vectorized,
-                    **(
-                        {"overlap_correction": multi_bound_overlap_correction}
-                        if bound == "multi"
-                        else {}
-                    ),
+                    batch_size=batch_size,
+                    max_attempts=bound_max_draws or max_attempts,
+                    overlap_correction=multi_bound_overlap_correction,
                 )
-                replacement_info = draw_result[6]
-                bound_success = bool(draw_result[5])
-                bound_failure = not bool(draw_result[5])
-                bound_seed_call_history.append(
-                    int(replacement_info.get("bound_seed_loglike_evals", 0))
-                )
-                bound_seed_batch_history.append(
-                    int(replacement_info.get("bound_seed_batches", 0))
-                )
-                rwalk_kernel_call_history.append(
-                    int(replacement_info.get("rwalk_kernel_calls", 0))
-                )
-            elif bound in {"single", "multi"} and rwalk_seed == "bound":
-                seed_draw = (
-                    draw_constrained_single_bound_jax
-                    if bound_seed_kernel == "jax" and bound == "single"
-                    else draw_constrained_multi_bound_jax
-                    if bound_seed_kernel == "jax"
-                    else draw_constrained_single_bound
-                )
-                seed_limit = bound_max_draws or max_attempts
-                seed_kwargs = {"batch_size": batch_size}
-                if bound_seed_kernel == "jax":
-                    seed_kwargs["max_batches"] = int(
-                        math.ceil(seed_limit / batch_size)
+                bound_success = bool(accepted)
+                bound_failure = not accepted
+            elif sample == "prior":
+                if vectorized:
+                    (
+                        key,
+                        new_u,
+                        new_theta,
+                        new_logl,
+                        calls,
+                        accepted,
+                    ) = draw_constrained_prior_vectorized(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        ndim,
+                        batch_size=batch_size,
+                        max_attempts=max_attempts,
                     )
-                    seed_kwargs["jax_vectorized"] = jax_vectorized
-                    if bound == "multi":
+                else:
+                    (
+                        key,
+                        new_u,
+                        new_theta,
+                        new_logl,
+                        calls,
+                        accepted,
+                    ) = draw_constrained_prior(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        ndim,
+                        vectorized=False,
+                        max_attempts=max_attempts,
+                    )
+            elif sample == "rwalk":
+                rwalk_draw = (
+                    draw_constrained_rwalk_jax_adaptive
+                    if kernel == "jax" and replacement_chain_schedule is not None
+                    else (
+                        draw_constrained_rwalk_jax
+                        if kernel == "jax"
+                        else draw_constrained_rwalk
+                    )
+                )
+                proposal_chol = None
+                if kernel == "jax" and rwalk_proposal == "live-cov":
+                    centered = live_u - jnp.mean(live_u, axis=0)
+                    denom = max(int(live_u.shape[0]) - 1, 1)
+                    cov = (centered.T @ centered) / denom
+                    cov = cov + jnp.asarray(
+                        rwalk_cov_jitter, dtype=live_u.dtype
+                    ) * jnp.eye(ndim, dtype=live_u.dtype)
+                    proposal_chol = jnp.linalg.cholesky(cov)
+                seed_live_u = live_u
+                seed_live_logl = live_logl
+                if fused_bound_rwalk:
+                    seed_limit = bound_max_draws or max_attempts
+                    fused_draw = (
+                        draw_constrained_multi_bound_rwalk_jax
+                        if bound == "multi"
+                        else draw_constrained_single_bound_rwalk_jax
+                    )
+                    draw_result = fused_draw(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        current_bound,
+                        ndim,
+                        walks=walks,
+                        step_scale=step_scale,
+                        max_attempts=max_attempts,
+                        min_accepts=min_accepts,
+                        replacement_chains=replacement_chains,
+                        replacement_chain_schedule=replacement_chain_schedule,
+                        bound_batch_size=batch_size,
+                        bound_max_batches=int(math.ceil(seed_limit / batch_size)),
+                        proposal_chol=proposal_chol,
+                        jax_vectorized=jax_vectorized,
+                        **(
+                            {"overlap_correction": multi_bound_overlap_correction}
+                            if bound == "multi"
+                            else {}
+                        ),
+                    )
+                    replacement_info = draw_result[6]
+                    bound_success = bool(draw_result[5])
+                    bound_failure = not bool(draw_result[5])
+                    bound_seed_call_history.append(
+                        int(replacement_info.get("bound_seed_loglike_evals", 0))
+                    )
+                    bound_seed_batch_history.append(
+                        int(replacement_info.get("bound_seed_batches", 0))
+                    )
+                    rwalk_kernel_call_history.append(
+                        int(replacement_info.get("rwalk_kernel_calls", 0))
+                    )
+                elif bound in {"single", "multi"} and rwalk_seed == "bound":
+                    seed_draw = (
+                        draw_constrained_single_bound_jax
+                        if bound_seed_kernel == "jax" and bound == "single"
+                        else (
+                            draw_constrained_multi_bound_jax
+                            if bound_seed_kernel == "jax"
+                            else draw_constrained_single_bound
+                        )
+                    )
+                    seed_limit = bound_max_draws or max_attempts
+                    seed_kwargs = {"batch_size": batch_size}
+                    if bound_seed_kernel == "jax":
+                        seed_kwargs["max_batches"] = int(
+                            math.ceil(seed_limit / batch_size)
+                        )
+                        seed_kwargs["jax_vectorized"] = jax_vectorized
+                        if bound == "multi":
+                            seed_kwargs["overlap_correction"] = (
+                                multi_bound_overlap_correction
+                            )
+                    else:
+                        seed_kwargs["max_attempts"] = seed_limit
                         seed_kwargs["overlap_correction"] = (
                             multi_bound_overlap_correction
                         )
-                else:
-                    seed_kwargs["max_attempts"] = seed_limit
-                    seed_kwargs["overlap_correction"] = multi_bound_overlap_correction
-                seed_result = seed_draw(
-                    key,
-                    loglike,
-                    prior_transform,
-                    logl_worst,
-                    current_bound,
-                    ndim,
-                    **seed_kwargs,
-                )
-                (
-                    key,
-                    seed_u,
-                    _seed_theta,
-                    seed_logl,
-                    seed_calls,
-                    seed_accepted,
-                    seed_info,
-                ) = seed_result
-                replacement_info = {
-                    f"bound_seed_{key}": value for key, value in seed_info.items()
-                }
-                if seed_accepted:
-                    bound_success = True
-                    seed_live_u = jnp.asarray(seed_u).reshape((1, ndim))
-                    seed_live_logl = jnp.asarray([seed_logl], dtype=live_logl.dtype)
-                else:
-                    bound_failure = True
-                if not seed_accepted and not rwalk_seed_fallback:
-                    new_u, new_theta, new_logl, calls, accepted = (
+                    seed_result = seed_draw(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        current_bound,
+                        ndim,
+                        **seed_kwargs,
+                    )
+                    (
+                        key,
                         seed_u,
                         _seed_theta,
                         seed_logl,
                         seed_calls,
-                        False,
-                    )
-                    draw_result = None
-                    bound_seed_call_history.append(int(seed_calls))
-                    bound_seed_batch_history.append(
-                        int(seed_info.get("bound_seed_batches", 0))
-                    )
-                elif not seed_accepted:
+                        seed_accepted,
+                        seed_info,
+                    ) = seed_result
+                    replacement_info = {
+                        f"bound_seed_{key}": value for key, value in seed_info.items()
+                    }
+                    if seed_accepted:
+                        bound_success = True
+                        seed_live_u = jnp.asarray(seed_u).reshape((1, ndim))
+                        seed_live_logl = jnp.asarray([seed_logl], dtype=live_logl.dtype)
+                    else:
+                        bound_failure = True
+                    if not seed_accepted and not rwalk_seed_fallback:
+                        new_u, new_theta, new_logl, calls, accepted = (
+                            seed_u,
+                            _seed_theta,
+                            seed_logl,
+                            seed_calls,
+                            False,
+                        )
+                        draw_result = None
+                        bound_seed_call_history.append(int(seed_calls))
+                        bound_seed_batch_history.append(
+                            int(seed_info.get("bound_seed_batches", 0))
+                        )
+                    elif not seed_accepted:
+                        seed_calls = 0
+                else:
                     seed_calls = 0
-            else:
-                seed_calls = 0
-                seed_accepted = True
-            if not (
-                fused_bound_rwalk
-                or (
-                bound in {"single", "multi"}
-                and rwalk_seed == "bound"
-                and not seed_accepted
-                and not rwalk_seed_fallback
-                )
-            ):
-                draw_result = rwalk_draw(
-                    key,
-                    loglike,
-                    prior_transform,
-                    logl_worst,
-                    seed_live_u,
-                    seed_live_logl,
-                    ndim,
-                    walks=walks,
-                    step_scale=step_scale,
-                    max_attempts=max_attempts,
-                    min_accepts=min_accepts,
-                    **(
-                        {
-                            "proposal_chol": proposal_chol,
-                            "jax_vectorized": jax_vectorized,
-                        }
-                        if kernel == "jax"
-                        else {}
-                    ),
-                    **(
-                        {"replacement_chain_schedule": replacement_chain_schedule}
-                        if kernel == "jax" and replacement_chain_schedule is not None
-                        else {"replacement_chains": replacement_chains}
-                        if kernel == "jax"
-                        else {}
-                    ),
-                )
-                if seed_calls:
-                    rwalk_kernel_calls = int(draw_result[4])
-                    rwalk_kernel_call_history.append(rwalk_kernel_calls)
-                    bound_seed_call_history.append(int(seed_calls))
-                    bound_seed_batch_history.append(
-                        int(seed_info.get("bound_seed_batches", 0))
+                    seed_accepted = True
+                if not (
+                    fused_bound_rwalk
+                    or (
+                        bound in {"single", "multi"}
+                        and rwalk_seed == "bound"
+                        and not seed_accepted
+                        and not rwalk_seed_fallback
                     )
-                    if len(draw_result) == 7:
-                        draw_result = (
-                            *draw_result[:4],
-                            draw_result[4] + seed_calls,
-                            draw_result[5],
-                            {**replacement_info, **draw_result[6]},
+                ):
+                    draw_result = rwalk_draw(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        seed_live_u,
+                        seed_live_logl,
+                        ndim,
+                        walks=walks,
+                        step_scale=step_scale,
+                        max_attempts=max_attempts,
+                        min_accepts=min_accepts,
+                        **(
+                            {
+                                "proposal_chol": proposal_chol,
+                                "jax_vectorized": jax_vectorized,
+                            }
+                            if kernel == "jax"
+                            else {}
+                        ),
+                        **(
+                            {"replacement_chain_schedule": replacement_chain_schedule}
+                            if kernel == "jax"
+                            and replacement_chain_schedule is not None
+                            else (
+                                {"replacement_chains": replacement_chains}
+                                if kernel == "jax"
+                                else {}
+                            )
+                        ),
+                    )
+                    if seed_calls:
+                        rwalk_kernel_calls = int(draw_result[4])
+                        rwalk_kernel_call_history.append(rwalk_kernel_calls)
+                        bound_seed_call_history.append(int(seed_calls))
+                        bound_seed_batch_history.append(
+                            int(seed_info.get("bound_seed_batches", 0))
+                        )
+                        if len(draw_result) == 7:
+                            draw_result = (
+                                *draw_result[:4],
+                                draw_result[4] + seed_calls,
+                                draw_result[5],
+                                {**replacement_info, **draw_result[6]},
+                            )
+                        else:
+                            draw_result = (
+                                *draw_result[:4],
+                                draw_result[4] + seed_calls,
+                                draw_result[5],
+                            )
+                if draw_result is not None and len(draw_result) == 7:
+                    (
+                        key,
+                        new_u,
+                        new_theta,
+                        new_logl,
+                        calls,
+                        accepted,
+                        replacement_info,
+                    ) = draw_result
+                    replacement_batches.append(
+                        int(replacement_info["replacement_batches"])
+                    )
+                    replacement_chains_used.append(
+                        int(replacement_info["replacement_chains_used"])
+                    )
+                    for chain_count, count in replacement_info[
+                        "replacement_chain_usage_counts"
+                    ].items():
+                        replacement_chain_usage_counts[chain_count] = (
+                            replacement_chain_usage_counts.get(chain_count, 0)
+                            + int(count)
+                        )
+                elif draw_result is not None:
+                    key, new_u, new_theta, new_logl, calls, accepted = draw_result
+                    if kernel == "jax":
+                        batch_ncall = int(walks) * int(replacement_chains)
+                        batches_used = int(math.ceil(int(calls) / batch_ncall))
+                        chains_used = int(replacement_chains) * batches_used
+                        replacement_batches.append(batches_used)
+                        replacement_chains_used.append(chains_used)
+                        chain_count = str(int(replacement_chains))
+                        replacement_chain_usage_counts[chain_count] = (
+                            replacement_chain_usage_counts.get(chain_count, 0)
+                            + batches_used
                         )
                     else:
-                        draw_result = (
-                            *draw_result[:4],
-                            draw_result[4] + seed_calls,
-                            draw_result[5],
-                        )
-            if draw_result is not None and len(draw_result) == 7:
-                key, new_u, new_theta, new_logl, calls, accepted, replacement_info = (
-                    draw_result
-                )
-                replacement_batches.append(int(replacement_info["replacement_batches"]))
-                replacement_chains_used.append(
-                    int(replacement_info["replacement_chains_used"])
-                )
-                for chain_count, count in replacement_info[
-                    "replacement_chain_usage_counts"
-                ].items():
-                    replacement_chain_usage_counts[chain_count] = (
-                        replacement_chain_usage_counts.get(chain_count, 0) + int(count)
+                        replacement_batches.append(1)
+                        replacement_chains_used.append(1)
+            elif sample == "slice":
+                key, new_u, new_theta, new_logl, calls, accepted = (
+                    draw_constrained_slice(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        live_u,
+                        live_logl,
+                        ndim,
+                        slices=slices,
+                        slice_steps=slice_steps,
+                        step_scale=step_scale,
+                        max_attempts=max_attempts,
+                        min_accepts=min_accepts,
                     )
-            elif draw_result is not None:
-                key, new_u, new_theta, new_logl, calls, accepted = draw_result
-                if kernel == "jax":
-                    batch_ncall = int(walks) * int(replacement_chains)
-                    batches_used = int(math.ceil(int(calls) / batch_ncall))
-                    chains_used = int(replacement_chains) * batches_used
-                    replacement_batches.append(batches_used)
-                    replacement_chains_used.append(chains_used)
-                    chain_count = str(int(replacement_chains))
-                    replacement_chain_usage_counts[chain_count] = (
-                        replacement_chain_usage_counts.get(chain_count, 0)
-                        + batches_used
+                )
+            else:
+                key, new_u, new_theta, new_logl, calls, accepted = (
+                    draw_constrained_rslice(
+                        key,
+                        loglike,
+                        prior_transform,
+                        logl_worst,
+                        live_u,
+                        live_logl,
+                        ndim,
+                        slices=slices,
+                        slice_steps=slice_steps,
+                        step_scale=step_scale,
+                        max_attempts=max_attempts,
+                        min_accepts=min_accepts,
                     )
-                else:
-                    replacement_batches.append(1)
-                    replacement_chains_used.append(1)
-        elif sample == "slice":
-            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
-                key,
-                loglike,
-                prior_transform,
-                logl_worst,
-                live_u,
-                live_logl,
-                ndim,
-                slices=slices,
-                slice_steps=slice_steps,
-                step_scale=step_scale,
-                max_attempts=max_attempts,
-                min_accepts=min_accepts,
-            )
-        else:
-            key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_rslice(
-                key,
-                loglike,
-                prior_transform,
-                logl_worst,
-                live_u,
-                live_logl,
-                ndim,
-                slices=slices,
-                slice_steps=slice_steps,
-                step_scale=step_scale,
-                max_attempts=max_attempts,
-                min_accepts=min_accepts,
-            )
-        if bound_rebuild_on_failure and bound in {"single", "multi"}:
-            if bound_failure:
-                consecutive_bound_failures += 1
-                if consecutive_bound_failures >= bound_failure_rebuild_threshold:
-                    force_bound_rebuild = True
+                )
+            if bound_rebuild_on_failure and bound in {"single", "multi"}:
+                if bound_failure:
+                    consecutive_bound_failures += 1
+                    if consecutive_bound_failures >= bound_failure_rebuild_threshold:
+                        force_bound_rebuild = True
+                        consecutive_bound_failures = 0
+                elif bound_success:
                     consecutive_bound_failures = 0
-            elif bound_success:
-                consecutive_bound_failures = 0
 
-        if replacement_info is not None:
-            bound_draw_history.append(
-                int(
-                    replacement_info.get(
-                        "bound_draws",
+            if replacement_info is not None:
+                bound_draw_history.append(
+                    int(
                         replacement_info.get(
-                            "bound_seed_bound_draws",
-                            replacement_info.get("bound_seed_draws", 0),
-                        ),
-                    )
-                )
-            )
-            bound_eval_history.append(
-                int(
-                    replacement_info.get(
-                        "bound_loglike_evals",
-                        replacement_info.get(
-                            "bound_seed_bound_loglike_evals",
-                            replacement_info.get("bound_seed_loglike_evals", 0),
-                        ),
-                    )
-                )
-            )
-            bound_unit_cube_acceptance_history.append(
-                float(
-                    replacement_info.get(
-                        "bound_unit_cube_acceptance",
-                        replacement_info.get(
-                            "bound_seed_bound_unit_cube_acceptance",
+                            "bound_draws",
                             replacement_info.get(
-                                "bound_seed_unit_cube_acceptance", 0.0
+                                "bound_seed_bound_draws",
+                                replacement_info.get("bound_seed_draws", 0),
                             ),
-                        ),
+                        )
                     )
                 )
-            )
-            bound_overlap_rejection_history.append(
-                int(
-                    replacement_info.get(
-                        "bound_overlap_rejections",
+                bound_eval_history.append(
+                    int(
                         replacement_info.get(
-                            "bound_seed_bound_overlap_rejections",
-                            replacement_info.get("bound_seed_overlap_rejections", 0),
-                        ),
+                            "bound_loglike_evals",
+                            replacement_info.get(
+                                "bound_seed_bound_loglike_evals",
+                                replacement_info.get("bound_seed_loglike_evals", 0),
+                            ),
+                        )
                     )
                 )
+                bound_unit_cube_acceptance_history.append(
+                    float(
+                        replacement_info.get(
+                            "bound_unit_cube_acceptance",
+                            replacement_info.get(
+                                "bound_seed_bound_unit_cube_acceptance",
+                                replacement_info.get(
+                                    "bound_seed_unit_cube_acceptance", 0.0
+                                ),
+                            ),
+                        )
+                    )
+                )
+                bound_overlap_rejection_history.append(
+                    int(
+                        replacement_info.get(
+                            "bound_overlap_rejections",
+                            replacement_info.get(
+                                "bound_seed_bound_overlap_rejections",
+                                replacement_info.get(
+                                    "bound_seed_overlap_rejections", 0
+                                ),
+                            ),
+                        )
+                    )
+                )
+            ncall += calls
+            replacement_ncall.append(int(calls))
+            iteration = i + 1
+            if not accepted:
+                replacement_failures += 1
+                success = False
+                message = (
+                    f"max_attempts={max_attempts} hit during constrained prior draw"
+                )
+                logz_remain = logx_new + float(jnp.max(live_logl))
+                delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+                final_delta_logz = delta_logz
+                state = _make_run_state(
+                    iteration=i + 1,
+                    logz=logz_dead,
+                    dlogz=delta_logz,
+                    ncall=ncall,
+                    logl_min=logl_worst,
+                    logl_live_max=float(jnp.max(live_logl)),
+                    sample=sample,
+                    nlive=nlive,
+                    ndim=ndim,
+                    replacement_ncall=replacement_ncall,
+                    replacement_failures=replacement_failures,
+                    replacement_batches=replacement_batches,
+                    replacement_chains_used=replacement_chains_used,
+                    replacement_chain_usage_counts=replacement_chain_usage_counts,
+                    replacement_chain_schedule=replacement_chain_schedule,
+                    replacement_chains=replacement_chains,
+                    kernel=kernel,
+                    walks=walks,
+                    bound=bound,
+                    bound_draws=bound_draw_history,
+                    bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
+                    bound_nellipsoids=bound_nellipsoid_history,
+                    rwalk_seed=rwalk_seed,
+                    bound_seed_kernel=bound_seed_kernel,
+                )
+                if callback is not None and (
+                    i + 1 == 1 or (i + 1) % callback_interval == 0
+                ):
+                    if callback(state) is False:
+                        message = "stopped by callback"
+                        stopped_by_callback = True
+                if progress_printer is not None:
+                    progress_printer.print(_format_progress_line(state), final=True)
+                maybe_checkpoint(final=True)
+                break
+
+            other_live_logl = jnp.delete(live_logl, worst)
+            insertion_index = int(
+                jnp.searchsorted(jnp.sort(other_live_logl), new_logl, side="right")
             )
-        ncall += calls
-        replacement_ncall.append(int(calls))
-        iteration = i + 1
-        if not accepted:
-            replacement_failures += 1
-            success = False
-            message = f"max_attempts={max_attempts} hit during constrained prior draw"
+            insertion_indices.append(insertion_index)
+
+            live_u = live_u.at[worst].set(new_u)
+            live_theta = live_theta.at[worst].set(new_theta)
+            live_logl = live_logl.at[worst].set(new_logl)
+            maybe_checkpoint()
+
             logz_remain = logx_new + float(jnp.max(live_logl))
             delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
             final_delta_logz = delta_logz
+            final_iteration = delta_logz < dlogz or i + 1 == maxiter
+            if i + 1 == maxiter and delta_logz >= dlogz:
+                success = False
+                message = f"maxiter={maxiter} reached"
             state = _make_run_state(
                 iteration=i + 1,
                 logz=logz_dead,
@@ -1094,81 +1435,28 @@ def run_static_nested(
                 bound_seed_kernel=bound_seed_kernel,
             )
             if callback is not None and (
-                i + 1 == 1 or (i + 1) % callback_interval == 0
+                i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
             ):
                 if callback(state) is False:
+                    success = False
                     message = "stopped by callback"
                     stopped_by_callback = True
-            if progress_printer is not None:
-                progress_printer.print(_format_progress_line(state), final=True)
-            maybe_checkpoint(final=True)
-            break
-
-        other_live_logl = jnp.delete(live_logl, worst)
-        insertion_index = int(
-            jnp.searchsorted(jnp.sort(other_live_logl), new_logl, side="right")
-        )
-        insertion_indices.append(insertion_index)
-
-        live_u = live_u.at[worst].set(new_u)
-        live_theta = live_theta.at[worst].set(new_theta)
-        live_logl = live_logl.at[worst].set(new_logl)
-        maybe_checkpoint()
-
-        logz_remain = logx_new + float(jnp.max(live_logl))
-        delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
-        final_delta_logz = delta_logz
-        final_iteration = delta_logz < dlogz or i + 1 == maxiter
-        if i + 1 == maxiter and delta_logz >= dlogz:
+                    final_iteration = True
+            if progress_printer is not None and (
+                i + 1 == 1 or (i + 1) % progress_interval == 0 or final_iteration
+            ):
+                progress_printer.print(
+                    _format_progress_line(state), final=final_iteration
+                )
+            if final_iteration:
+                maybe_checkpoint(final=True)
+                break
+        else:
             success = False
             message = f"maxiter={maxiter} reached"
-        state = _make_run_state(
-            iteration=i + 1,
-            logz=logz_dead,
-            dlogz=delta_logz,
-            ncall=ncall,
-            logl_min=logl_worst,
-            logl_live_max=float(jnp.max(live_logl)),
-            sample=sample,
-            nlive=nlive,
-            ndim=ndim,
-            replacement_ncall=replacement_ncall,
-            replacement_failures=replacement_failures,
-            replacement_batches=replacement_batches,
-            replacement_chains_used=replacement_chains_used,
-            replacement_chain_usage_counts=replacement_chain_usage_counts,
-            replacement_chain_schedule=replacement_chain_schedule,
-            replacement_chains=replacement_chains,
-            kernel=kernel,
-            walks=walks,
-            bound=bound,
-            bound_draws=bound_draw_history,
-            bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
-            bound_nellipsoids=bound_nellipsoid_history,
-            rwalk_seed=rwalk_seed,
-            bound_seed_kernel=bound_seed_kernel,
-        )
-        if callback is not None and (
-            i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
-        ):
-            if callback(state) is False:
-                success = False
-                message = "stopped by callback"
-                stopped_by_callback = True
-                final_iteration = True
-        if progress_printer is not None and (
-            i + 1 == 1 or (i + 1) % progress_interval == 0 or final_iteration
-        ):
-            progress_printer.print(_format_progress_line(state), final=final_iteration)
-        if final_iteration:
+            logx_final = -maxiter / nlive
+            iteration = maxiter
             maybe_checkpoint(final=True)
-            break
-    else:
-        success = False
-        message = f"maxiter={maxiter} reached"
-        logx_final = -maxiter / nlive
-        iteration = maxiter
-        maybe_checkpoint(final=True)
 
     live_logwt = logx_final - math.log(nlive) + live_logl
 
@@ -1244,6 +1532,8 @@ def run_static_nested(
         metadata={
             "sample": sample,
             "kernel": kernel,
+            "jax_block_size": int(jax_block_size),
+            "jax_block_mode": bool(jax_block_size > 1),
             "dlogz": dlogz,
             "maxiter": maxiter,
             "niter": niter,
@@ -1308,9 +1598,7 @@ def run_static_nested(
             "bound_updates": bound_updates,
             "bound_build_time_total": bound_build_time_total,
             "bound_build_time_mean": (
-                bound_build_time_total / bound_build_count
-                if bound_build_count
-                else 0.0
+                bound_build_time_total / bound_build_count if bound_build_count else 0.0
             ),
             "bound_build_time_max": (
                 float(max(bound_build_time_history))
@@ -1335,40 +1623,48 @@ def run_static_nested(
                 if bound_log_volume_history
                 else None
             ),
-            "bound_nellipsoids_mean": float(
-                sum(bound_nellipsoid_history) / len(bound_nellipsoid_history)
-            )
-            if bound_nellipsoid_history
-            else None,
-            "bound_nellipsoids_max": int(max(bound_nellipsoid_history, default=0))
-            if bound_nellipsoid_history
-            else None,
+            "bound_nellipsoids_mean": (
+                float(sum(bound_nellipsoid_history) / len(bound_nellipsoid_history))
+                if bound_nellipsoid_history
+                else None
+            ),
+            "bound_nellipsoids_max": (
+                int(max(bound_nellipsoid_history, default=0))
+                if bound_nellipsoid_history
+                else None
+            ),
             "bound_nellipsoids_final": bound_nellipsoids_final,
-            "bound_seed_nellipsoids": int(max(bound_nellipsoid_history, default=0))
-            if bound_nellipsoid_history
-            else None,
-            "bound_seed_overlap_rejections": int(
-                sum(bound_overlap_rejection_history)
-            )
-            if bound_overlap_rejection_history
-            else None,
-            "mean_bound_draws": float(sum(bound_draw_history) / len(bound_draw_history))
-            if bound_draw_history
-            else None,
-            "max_bound_draws": int(max(bound_draw_history, default=0))
-            if bound_draw_history
-            else None,
-            "mean_bound_loglike_evals": float(
-                sum(bound_eval_history) / len(bound_eval_history)
-            )
-            if bound_eval_history
-            else None,
-            "mean_bound_unit_cube_acceptance": float(
-                sum(bound_unit_cube_acceptance_history)
-                / len(bound_unit_cube_acceptance_history)
-            )
-            if bound_unit_cube_acceptance_history
-            else None,
+            "bound_seed_nellipsoids": (
+                int(max(bound_nellipsoid_history, default=0))
+                if bound_nellipsoid_history
+                else None
+            ),
+            "bound_seed_overlap_rejections": (
+                int(sum(bound_overlap_rejection_history))
+                if bound_overlap_rejection_history
+                else None
+            ),
+            "mean_bound_draws": (
+                float(sum(bound_draw_history) / len(bound_draw_history))
+                if bound_draw_history
+                else None
+            ),
+            "max_bound_draws": (
+                int(max(bound_draw_history, default=0)) if bound_draw_history else None
+            ),
+            "mean_bound_loglike_evals": (
+                float(sum(bound_eval_history) / len(bound_eval_history))
+                if bound_eval_history
+                else None
+            ),
+            "mean_bound_unit_cube_acceptance": (
+                float(
+                    sum(bound_unit_cube_acceptance_history)
+                    / len(bound_unit_cube_acceptance_history)
+                )
+                if bound_unit_cube_acceptance_history
+                else None
+            ),
             "rwalk_seed": rwalk_seed,
             "rwalk_seed_fallback": rwalk_seed_fallback,
             "bound_seed_kernel": "jax" if fused_bound_rwalk else bound_seed_kernel,
@@ -1378,27 +1674,31 @@ def run_static_nested(
             "bounded_rwalk": bool(
                 sample == "rwalk" and bound != "none" and rwalk_seed == "bound"
             ),
-            "mean_bound_seed_calls": float(
-                sum(bound_seed_call_history) / len(bound_seed_call_history)
-            )
-            if bound_seed_call_history
-            else None,
-            "max_bound_seed_calls": int(max(bound_seed_call_history, default=0))
-            if bound_seed_call_history
-            else None,
-            "mean_bound_seed_batches": float(
-                sum(bound_seed_batch_history) / len(bound_seed_batch_history)
-            )
-            if bound_seed_batch_history
-            else None,
-            "max_bound_seed_batches": int(max(bound_seed_batch_history, default=0))
-            if bound_seed_batch_history
-            else None,
-            "mean_rwalk_kernel_calls": float(
-                sum(rwalk_kernel_call_history) / len(rwalk_kernel_call_history)
-            )
-            if rwalk_kernel_call_history
-            else None,
+            "mean_bound_seed_calls": (
+                float(sum(bound_seed_call_history) / len(bound_seed_call_history))
+                if bound_seed_call_history
+                else None
+            ),
+            "max_bound_seed_calls": (
+                int(max(bound_seed_call_history, default=0))
+                if bound_seed_call_history
+                else None
+            ),
+            "mean_bound_seed_batches": (
+                float(sum(bound_seed_batch_history) / len(bound_seed_batch_history))
+                if bound_seed_batch_history
+                else None
+            ),
+            "max_bound_seed_batches": (
+                int(max(bound_seed_batch_history, default=0))
+                if bound_seed_batch_history
+                else None
+            ),
+            "mean_rwalk_kernel_calls": (
+                float(sum(rwalk_kernel_call_history) / len(rwalk_kernel_call_history))
+                if rwalk_kernel_call_history
+                else None
+            ),
             "mean_total_replacement_calls": mean_replacement_ncall,
             "progress_interval": progress_interval,
             "callback_interval": callback_interval,

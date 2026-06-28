@@ -617,6 +617,99 @@ def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
     assert result.success is True
     assert math.isfinite(result.logz)
     assert result.metadata["kernel"] == "jax"
+    assert result.metadata["jax_block_size"] == 1
+    assert result.metadata["jax_block_mode"] is False
+
+
+def test_nested_sampler_rwalk_jax_block_size_one_matches_existing_path() -> None:
+    base_kwargs = dict(
+        sample="rwalk",
+        kernel="jax",
+        walks=3,
+        step_scale=0.05,
+        maxiter=5,
+        max_attempts=60,
+    )
+    existing = run_static_nested(
+        random.PRNGKey(10),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        15,
+        **base_kwargs,
+    )
+    block_one = run_static_nested(
+        random.PRNGKey(10),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        15,
+        jax_block_size=1,
+        **base_kwargs,
+    )
+
+    assert jnp.allclose(block_one.samples_u, existing.samples_u)
+    assert jnp.allclose(block_one.logl, existing.logl)
+    assert jnp.allclose(block_one.logwt, existing.logwt)
+    assert block_one.metadata["jax_block_mode"] is False
+
+
+def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
+    result = run_static_nested(
+        random.PRNGKey(11),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        20,
+        sample="rwalk",
+        kernel="jax",
+        walks=3,
+        step_scale=0.05,
+        maxiter=10,
+        max_attempts=60,
+        jax_block_size=5,
+    )
+
+    assert result.success is False
+    assert math.isfinite(result.logz)
+    assert result.samples_u.shape == (result.metadata["nposterior"], 2)
+    assert result.samples.shape == (result.metadata["nposterior"], 2)
+    assert result.logl.shape == (result.metadata["nposterior"],)
+    assert result.logwt.shape == (result.metadata["nposterior"],)
+    assert len(result.metadata["replacement_ncall"]) == result.metadata["niter"]
+    assert result.metadata["insertion_indices"].shape == (result.metadata["niter"],)
+    assert result.metadata["jax_block_size"] == 5
+    assert result.metadata["jax_block_mode"] is True
+
+
+def test_jax_block_size_unsupported_bound_raises() -> None:
+    with pytest.raises(NotImplementedError, match="jax_block_size"):
+        run_static_nested(
+            random.PRNGKey(12),
+            _jax_loglike,
+            _jax_prior_transform,
+            2,
+            10,
+            sample="rwalk",
+            kernel="jax",
+            bound="single",
+            rwalk_seed="bound",
+            jax_block_size=5,
+        )
+
+
+def test_jax_block_size_unsupported_sampler_raises() -> None:
+    with pytest.raises(NotImplementedError, match="jax_block_size"):
+        run_static_nested(
+            random.PRNGKey(13),
+            _jax_loglike,
+            _jax_prior_transform,
+            2,
+            10,
+            sample="slice",
+            kernel="python",
+            jax_block_size=5,
+        )
 
 
 def test_kernel_python_is_default_and_invalid_kernel_raises() -> None:
@@ -812,8 +905,6 @@ def test_static_nested_bound_update_interval_must_be_positive() -> None:
         )
 
 
-
-
 def test_static_nested_bound_failure_policy_metadata_defaults() -> None:
     result = run_static_nested(
         random.PRNGKey(130),
@@ -857,12 +948,20 @@ def test_static_nested_bound_failure_policy_forces_rebuild(monkeypatch) -> None:
     ):
         u = jnp.full((ndim,), 0.5)
         theta = prior_transform(u)
-        return key, u, theta, float(logl_min), 1, False, {
-            "bound_draws": 1,
-            "bound_loglike_evals": 1,
-            "bound_unit_cube_acceptance": 1.0,
-            "bound_overlap_rejections": 0,
-        }
+        return (
+            key,
+            u,
+            theta,
+            float(logl_min),
+            1,
+            False,
+            {
+                "bound_draws": 1,
+                "bound_loglike_evals": 1,
+                "bound_unit_cube_acceptance": 1.0,
+                "bound_overlap_rejections": 0,
+            },
+        )
 
     monkeypatch.setattr(run_module, "draw_constrained_single_bound", failed_bound_seed)
     result = run_static_nested(
@@ -1189,9 +1288,10 @@ def test_static_nested_multi_bound_fused_rwalk_jax_runs_and_records_metadata() -
     assert result.metadata["bound_seed_nellipsoids"] is not None
     assert result.metadata["bound_seed_overlap_rejections"] is not None
     assert result.metadata["mean_rwalk_kernel_calls"] is not None
-    assert result.metadata["mean_total_replacement_calls"] == result.metadata[
-        "mean_replacement_ncall"
-    ]
+    assert (
+        result.metadata["mean_total_replacement_calls"]
+        == result.metadata["mean_replacement_ncall"]
+    )
 
 
 def test_static_nested_multi_bound_fused_rwalk_jax_live_cov_runs() -> None:
@@ -1295,6 +1395,7 @@ def test_static_nested_bound_seed_kernel_jax_invalid_combinations_raise() -> Non
             nlive=10,
             bound_seed_kernel="bad",
         )
+
 
 def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
     result = run_static_nested(
