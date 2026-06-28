@@ -196,6 +196,10 @@ The sampler does not return merely after the first accepted local move; it runs 
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
 Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
+### Internal ellipsoid bounds
+
+`tinyns` includes small internal utilities for constructing single ellipsoid bounds in unit-cube coordinates. These are currently used as building blocks for bounded `rwalk` development and are not enabled by default.
+
 ## Current validation status
 
 The recommended `sample="rwalk", kernel="jax"` path has been checked with repeated-seed validation on:
