@@ -146,6 +146,17 @@ def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
     assert "max_repl_batches" in row
     assert "mean_replacement_batches" in row
     assert "max_replacement_batches" in row
+    assert "bound_build_time_total" in row
+    assert "bound_build_time_mean" in row
+    assert "bound_build_time_max" in row
+    assert "bound_build_count" in row
+    assert "bound_log_volume_final" in row
+    assert "bound_log_volume_mean" in row
+    assert "bound_log_volume_min" in row
+    assert "bound_log_volume_max" in row
+    assert "bound_nellipsoids_mean" in row
+    assert "bound_nellipsoids_max" in row
+    assert "bound_nellipsoids_final" in row
 
 
 def test_benchmark_parser_accepts_allow_unused_bound() -> None:

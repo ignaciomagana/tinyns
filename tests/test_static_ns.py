@@ -830,6 +830,17 @@ def test_static_nested_single_bound_runs_and_records_metadata() -> None:
     assert result.metadata["bound_updates"] >= 1
     assert result.metadata["mean_bound_draws"] is not None
     assert result.metadata["rwalk_seed"] == "live"
+    assert result.metadata["bound_build_count"] == result.metadata["bound_updates"]
+    assert result.metadata["bound_build_time_total"] >= 0.0
+    assert result.metadata["bound_build_time_mean"] >= 0.0
+    assert result.metadata["bound_build_time_max"] >= 0.0
+    assert result.metadata["bound_log_volume_final"] is not None
+    assert result.metadata["bound_log_volume_mean"] is not None
+    assert result.metadata["bound_log_volume_min"] is not None
+    assert result.metadata["bound_log_volume_max"] is not None
+    assert result.metadata["bound_nellipsoids_mean"] == 1.0
+    assert result.metadata["bound_nellipsoids_max"] == 1
+    assert result.metadata["bound_nellipsoids_final"] == 1
 
 
 def test_static_nested_single_bound_rwalk_bound_seed_runs() -> None:
@@ -871,7 +882,17 @@ def test_static_nested_multi_bound_runs_and_records_metadata() -> None:
 
     assert jnp.isfinite(result.logz)
     assert result.metadata["bound"] == "multi"
+    assert result.metadata["bound_build_count"] == result.metadata["bound_updates"]
+    assert result.metadata["bound_build_time_total"] >= 0.0
+    assert result.metadata["bound_build_time_mean"] >= 0.0
+    assert result.metadata["bound_build_time_max"] >= 0.0
+    assert result.metadata["bound_log_volume_final"] is not None
+    assert result.metadata["bound_log_volume_mean"] is not None
+    assert result.metadata["bound_log_volume_min"] is not None
+    assert result.metadata["bound_log_volume_max"] is not None
+    assert result.metadata["bound_nellipsoids_mean"] >= 1.0
     assert result.metadata["bound_nellipsoids_max"] >= 1
+    assert result.metadata["bound_nellipsoids_final"] >= 1
 
 
 def test_static_nested_multi_bound_rwalk_jax_runs() -> None:
@@ -1215,6 +1236,17 @@ def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
 
     assert result.metadata["bound"] == "none"
     assert result.metadata["bounded_rwalk"] is False
+    assert result.metadata["bound_build_count"] == 0
+    assert result.metadata["bound_build_time_total"] == 0.0
+    assert result.metadata["bound_build_time_mean"] == 0.0
+    assert result.metadata["bound_build_time_max"] == 0.0
+    assert result.metadata["bound_log_volume_final"] is None
+    assert result.metadata["bound_log_volume_mean"] is None
+    assert result.metadata["bound_log_volume_min"] is None
+    assert result.metadata["bound_log_volume_max"] is None
+    assert result.metadata["bound_nellipsoids_mean"] is None
+    assert result.metadata["bound_nellipsoids_max"] is None
+    assert result.metadata["bound_nellipsoids_final"] is None
     assert result.metadata["mean_bound_seed_calls"] is None
 
 
