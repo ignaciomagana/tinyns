@@ -682,3 +682,36 @@ def test_unsupported_replacement_chains_raise(sample: str, kernel: str) -> None:
             kernel=kernel,
             replacement_chains=4,
         )
+
+
+def test_nested_sampler_rwalk_jax_adaptive_metadata() -> None:
+    result = run_static_nested(
+        random.PRNGKey(0),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: u,
+        2,
+        10,
+        sample="rwalk",
+        kernel="jax",
+        walks=2,
+        maxiter=2,
+        max_attempts=32,
+        replacement_chain_schedule=(1, 4, 16),
+    )
+    assert result.metadata["adaptive_replacement_chains"] is True
+    assert result.metadata["replacement_chain_schedule"] == [1, 4, 16]
+    assert result.metadata["mean_replacement_chains_used"] >= 1.0
+
+
+def test_replacement_chain_schedule_rejects_unsupported_sampler_kernel() -> None:
+    with pytest.raises(NotImplementedError, match="replacement_chain_schedule"):
+        run_static_nested(
+            random.PRNGKey(0),
+            lambda theta: -0.5 * jnp.sum(theta**2),
+            lambda u: u,
+            2,
+            10,
+            sample="rwalk",
+            kernel="python",
+            replacement_chain_schedule=(1, 4, 16),
+        )

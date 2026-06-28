@@ -154,6 +154,29 @@ The replacement remains valid only if a successful chain is selected without fav
 
 For batched JAX chains, `ncall` counts scalar likelihood evaluations, not wall-clock-equivalent work. A replacement with `walks=25` and `replacement_chains=16` costs 400 scalar likelihood evaluations, but those chains are evaluated in parallel on device. Use wall time and replacement batch counts when judging batched performance.
 
+
+### Adaptive JAX replacement-chain schedules
+
+Fixed `replacement_chains` runs the same number of independent chains for every replacement. This can waste work when most chains succeed.
+
+For JAX rwalk, `tinyns` can instead start with a small batch and escalate only if needed:
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    sample="rwalk",
+    kernel="jax",
+    walks=25,
+    replacement_chain_schedule=(1, 4, 16, 64, 256),
+)
+```
+
+Use this when replacement difficulty varies across the nested-sampling run. The sampler returns as soon as any stage succeeds and randomly selects among successful chains in that stage. This avoids always paying for large batches.
+
+> Warning: Adaptive schedules do not replace validation. Check evidence calibration and insertion-rank diagnostics on representative targets.
+
 For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python"` with `sample="rwalk"`.
 
 `kernel="jax"` currently supports `sample="rwalk"` only. The top-level nested-sampling loop remains in Python; only the constrained replacement kernel is compiled.

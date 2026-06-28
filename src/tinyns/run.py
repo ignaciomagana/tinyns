@@ -18,6 +18,7 @@ from tinyns.samplers import (
     draw_constrained_rslice,
     draw_constrained_rwalk,
     draw_constrained_rwalk_jax,
+    draw_constrained_rwalk_jax_adaptive,
     draw_constrained_slice,
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
@@ -161,6 +162,7 @@ def run_static_nested(
     slice_steps: int = 10,
     min_accepts: int = 1,
     replacement_chains: int = 1,
+    replacement_chain_schedule=None,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -234,6 +236,31 @@ def run_static_nested(
             "replacement_chains is currently supported only for "
             "sample='rwalk', kernel='jax'"
         )
+    if replacement_chain_schedule is not None:
+        if not (sample == "rwalk" and kernel == "jax"):
+            raise NotImplementedError(
+                "replacement_chain_schedule is currently supported only for "
+                "sample='rwalk', kernel='jax'"
+            )
+        try:
+            replacement_chain_schedule = tuple(replacement_chain_schedule)
+        except TypeError as exc:
+            raise ValueError(
+                "replacement_chain_schedule must be a non-empty sequence "
+                "of positive integers"
+            ) from exc
+        if not replacement_chain_schedule or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in replacement_chain_schedule
+        ):
+            raise ValueError(
+                "replacement_chain_schedule must be a non-empty sequence "
+                "of positive integers"
+            )
+        if max(replacement_chain_schedule) * int(walks) > int(max_attempts):
+            raise ValueError(
+                "max_attempts must be at least max(replacement_chain_schedule) * walks"
+            )
     if maxiter is None:
         maxiter = 10_000 * ndim
     if maxiter < 0:
@@ -253,6 +280,11 @@ def run_static_nested(
         "slice_steps": int(slice_steps),
         "min_accepts": int(min_accepts),
         "replacement_chains": int(replacement_chains),
+        "replacement_chain_schedule": (
+            None
+            if replacement_chain_schedule is None
+            else list(replacement_chain_schedule)
+        ),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -272,6 +304,9 @@ def run_static_nested(
         replacement_ncall = []
         insertion_indices = []
         replacement_failures = 0
+        replacement_batches = []
+        replacement_chains_used = []
+        replacement_chain_usage_counts = {}
         success = True
         message = "converged"
         stopped_by_callback = False
@@ -289,15 +324,16 @@ def run_static_nested(
             == checkpoint_dead_count
             == len(initial_state.dead_logwt)
         ):
-            raise ValueError(
-                "checkpoint dead point arrays have inconsistent lengths"
-            )
+            raise ValueError("checkpoint dead point arrays have inconsistent lengths")
         logz_dead = float(initial_state.logz_dead)
         logx_final = float(initial_state.logx_final)
         ncall = int(initial_state.ncall)
         replacement_ncall = list(initial_state.replacement_ncall)
         insertion_indices = list(initial_state.insertion_indices)
         replacement_failures = int(initial_state.replacement_failures)
+        replacement_batches = []
+        replacement_chains_used = []
+        replacement_chain_usage_counts = {}
         success = True
         message = "converged"
         stopped_by_callback = False
@@ -406,11 +442,13 @@ def run_static_nested(
                 )
         elif sample == "rwalk":
             rwalk_draw = (
-                draw_constrained_rwalk_jax
+                draw_constrained_rwalk_jax_adaptive
+                if kernel == "jax" and replacement_chain_schedule is not None
+                else draw_constrained_rwalk_jax
                 if kernel == "jax"
                 else draw_constrained_rwalk
             )
-            key, new_u, new_theta, new_logl, calls, accepted = rwalk_draw(
+            draw_result = rwalk_draw(
                 key,
                 loglike,
                 prior_transform,
@@ -423,11 +461,33 @@ def run_static_nested(
                 max_attempts=max_attempts,
                 min_accepts=min_accepts,
                 **(
-                    {"replacement_chains": replacement_chains}
+                    {"replacement_chain_schedule": replacement_chain_schedule}
+                    if kernel == "jax" and replacement_chain_schedule is not None
+                    else {"replacement_chains": replacement_chains}
                     if kernel == "jax"
                     else {}
                 ),
             )
+            if len(draw_result) == 7:
+                key, new_u, new_theta, new_logl, calls, accepted, replacement_info = (
+                    draw_result
+                )
+                replacement_batches.append(int(replacement_info["replacement_batches"]))
+                replacement_chains_used.append(
+                    int(replacement_info["replacement_chains_used"])
+                )
+                for chain_count, count in replacement_info[
+                    "replacement_chain_usage_counts"
+                ].items():
+                    replacement_chain_usage_counts[chain_count] = (
+                        replacement_chain_usage_counts.get(chain_count, 0) + int(count)
+                    )
+            else:
+                key, new_u, new_theta, new_logl, calls, accepted = draw_result
+                replacement_batches.append(1)
+                replacement_chains_used.append(
+                    int(replacement_chains) if kernel == "jax" else 1
+                )
         elif sample == "slice":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
                 key,
@@ -568,6 +628,8 @@ def run_static_nested(
     nlive_final = int(live_logl.size)
     nposterior = int(logwt.size)
     replacement_batch_ncall = int(walks) * int(replacement_chains)
+    if replacement_chain_schedule is not None:
+        replacement_batch_ncall = int(walks) * int(replacement_chain_schedule[-1])
     if replacement_ncall:
         mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
         max_replacement_ncall = int(max(replacement_ncall))
@@ -612,6 +674,12 @@ def run_static_nested(
             "slice_steps": slice_steps,
             "min_accepts": min_accepts,
             "replacement_chains": replacement_chains,
+            "replacement_chain_schedule": (
+                None
+                if replacement_chain_schedule is None
+                else list(replacement_chain_schedule)
+            ),
+            "adaptive_replacement_chains": replacement_chain_schedule is not None,
             "replacement_batch_ncall": replacement_batch_ncall,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
@@ -621,6 +689,19 @@ def run_static_nested(
             "replacement_failures": int(replacement_failures),
             "mean_replacement_ncall": mean_replacement_ncall,
             "max_replacement_ncall": max_replacement_ncall,
+            "mean_replacement_batches": (
+                float(sum(replacement_batches) / len(replacement_batches))
+                if replacement_batches
+                else 0.0
+            ),
+            "max_replacement_batches": int(max(replacement_batches, default=0)),
+            "mean_replacement_chains_used": (
+                float(sum(replacement_chains_used) / len(replacement_chains_used))
+                if replacement_chains_used
+                else 0.0
+            ),
+            "max_replacement_chains_used": int(max(replacement_chains_used, default=0)),
+            "replacement_chain_usage_counts": replacement_chain_usage_counts,
             "replacement_acceptance_proxy": replacement_acceptance_proxy,
             "progress_interval": progress_interval,
             "callback_interval": callback_interval,
