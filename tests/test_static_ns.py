@@ -710,6 +710,63 @@ def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> Non
     assert sum(result.metadata["replacement_chain_usage_counts"].values()) > 0
 
 
+@pytest.mark.parametrize("bound", ["single", "multi"])
+def test_nested_sampler_bounded_rwalk_jax_block_runs_and_shapes(bound) -> None:
+    result = run_static_nested(
+        random.PRNGKey(141),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        24,
+        sample="rwalk",
+        kernel="jax",
+        bound=bound,
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        fused_bound_rwalk=True,
+        walks=2,
+        step_scale=0.05,
+        batch_size=8,
+        maxiter=8,
+        max_attempts=32,
+        jax_block_size=4,
+        multi_bound_max_ellipsoids=4,
+    )
+
+    assert math.isfinite(result.logz)
+    assert result.samples_u.shape == (result.metadata["nposterior"], 2)
+    assert result.samples.shape == (result.metadata["nposterior"], 2)
+    assert result.logl.shape == (result.metadata["nposterior"],)
+    assert result.logwt.shape == (result.metadata["nposterior"],)
+    assert len(result.metadata["replacement_ncall"]) == result.metadata["niter"]
+    assert result.metadata["insertion_indices"].shape == (result.metadata["niter"],)
+    assert result.metadata["jax_block_size"] == 4
+    assert result.metadata["jax_block_mode"] is True
+    assert result.metadata["jax_block_bound_fixed"] is True
+    assert result.metadata["bound_seed_kernel"] == "jax"
+    assert result.metadata["fused_bound_rwalk"] is True
+    assert result.metadata["mean_bound_seed_calls"] is not None
+    assert result.metadata["mean_rwalk_kernel_calls"] is not None
+
+
+def test_jax_bounded_block_unsupported_bound_seed_kernel_raises() -> None:
+    with pytest.raises(NotImplementedError, match="bound_seed_kernel='jax'"):
+        run_static_nested(
+            random.PRNGKey(142),
+            _jax_loglike,
+            _jax_prior_transform,
+            2,
+            10,
+            sample="rwalk",
+            kernel="jax",
+            bound="single",
+            rwalk_seed="bound",
+            bound_seed_kernel="python",
+            fused_bound_rwalk=True,
+            jax_block_size=4,
+        )
+
+
 def test_jax_block_size_unsupported_bound_raises() -> None:
     with pytest.raises(NotImplementedError, match="jax_block_size"):
         run_static_nested(
