@@ -162,6 +162,7 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "multi_bound_split_threshold": args.multi_bound_split_threshold,
         "multi_bound_overlap_correction": args.multi_bound_overlap_correction,
         "rwalk_seed": args.rwalk_seed,
+        "allow_unused_bound": args.allow_unused_bound,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -233,6 +234,7 @@ def run_one(
         "kernel": args.kernel,
         "bound": args.bound,
         "rwalk_seed": args.rwalk_seed,
+        "allow_unused_bound": args.allow_unused_bound,
         "seed": seed,
         "nlive": args.nlive,
         "ndim": target.ndim,
@@ -370,6 +372,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--rwalk-seed", choices=["live", "bound"], default="live")
+    parser.add_argument("--allow-unused-bound", action="store_true")
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
     parser.add_argument(
         "--replacement-chain-schedule", nargs="+", type=int, default=None
@@ -407,6 +410,19 @@ def validate_benchmark_args(args: argparse.Namespace) -> None:
         else replacement_chains_values
     )
     required_max_attempts = args.walks * max_replacement_chains
+
+    if (
+        args.bound in {"single", "multi"}
+        and "rwalk" in args.samplers
+        and args.rwalk_seed == "live"
+        and not args.allow_unused_bound
+    ):
+        raise ValueError(
+            "--bound single or --bound multi with --samplers rwalk requires "
+            "--rwalk-seed bound. Otherwise the bound is built but not used. "
+            "Use --allow-unused-bound to benchmark live-seeded rwalk with "
+            "bound overhead."
+        )
 
     if args.kernel == "jax" and "rwalk" in args.samplers:
         if args.auto_max_attempts:

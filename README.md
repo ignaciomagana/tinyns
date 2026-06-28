@@ -200,9 +200,30 @@ Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
 `tinyns` supports `bound="none"` by default. Experimental single-ellipsoid bounding can be enabled with `bound="single"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
 
-The initial production target is `sample="rwalk"` with JAX, live-cov proposals, and bounds. This is intended to mirror the static nested-sampling workflow commonly used with dynesty's bounded rwalk modes, while keeping the implementation small and inspectable.
+The initial production target is `sample="rwalk"` with JAX, live-cov proposals, bound seeding, and bounds. This is intended to mirror the static nested-sampling workflow commonly used with dynesty's bounded rwalk modes, while keeping the implementation small and inspectable.
 
 Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before using it for production.
+
+### Bounded rwalk
+
+For dynesty-style bounded rwalk, use both a bound and bound seeding:
+
+```python
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    sample="rwalk",
+    kernel="jax",
+    bound="multi",
+    rwalk_seed="bound",
+    rwalk_proposal="live-cov",
+    walks=5,
+    replacement_chains=16,
+)
+```
+
+Setting `bound="multi"` alone does not define a bounded rwalk transition unless `rwalk_seed="bound"` is also enabled. `tinyns` raises a clear error for `bound != "none"` with live-seeded rwalk unless `allow_unused_bound=True`. Use `allow_unused_bound=True` only when you intentionally want to build bounds for diagnostics or overhead measurements while keeping ordinary live-seeded rwalk.
 
 ### Multiellipsoid bounding
 
@@ -218,6 +239,7 @@ NestedSampler(
     sample="rwalk",
     kernel="jax",
     bound="multi",
+    rwalk_seed="bound",
     rwalk_proposal="live-cov",
     walks=5,
     replacement_chains=16,

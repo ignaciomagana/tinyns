@@ -99,6 +99,7 @@ def _make_run_state(
     bound_draws: list[int] | None = None,
     bound_unit_cube_acceptance: list[float] | None = None,
     bound_nellipsoids: list[int] | None = None,
+    rwalk_seed: str = "live",
 ) -> dict[str, object]:
     if replacement_ncall:
         replacement_mean_ncall_so_far = float(
@@ -160,6 +161,7 @@ def _make_run_state(
         "walks": walks,
         "replacement_failures": int(replacement_failures),
         "bound": bound,
+        "rwalk_seed": rwalk_seed,
         "mean_bound_draws_so_far": mean_bound_draws_so_far,
         "mean_bound_unit_cube_acceptance_so_far": (
             mean_bound_unit_cube_acceptance_so_far
@@ -199,10 +201,15 @@ def _format_progress_line(state: dict[str, object]) -> str:
         if state.get("bound") == "multi":
             nell = state.get("mean_bound_nellipsoids_so_far")
             nell_text = "n/a" if nell is None else f"{float(nell):.1f}"
-            bound_text = f" bound=multi nell={nell_text} bacc={bacc_text}"
-        else:
+            seed_text = state.get("rwalk_seed", "live")
             bound_text = (
-                f" bound={state['bound']} bdraw={bdraw_text} bacc={bacc_text}"
+                f" bound=multi seed={seed_text} nell={nell_text} bacc={bacc_text}"
+            )
+        else:
+            seed_text = state.get("rwalk_seed", "live")
+            bound_text = (
+                f" bound={state['bound']} seed={seed_text} "
+                f"bdraw={bdraw_text} bacc={bacc_text}"
             )
     return (
         f"iter={int(state['iter']):05d} "
@@ -272,6 +279,7 @@ def run_static_nested(
     multi_bound_overlap_correction: bool = True,
     rwalk_seed: str = "live",
     rwalk_seed_fallback: bool = True,
+    allow_unused_bound: bool = False,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -305,6 +313,18 @@ def run_static_nested(
         raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
     if sample == "bound" and bound not in {"single", "multi"}:
         raise ValueError('sample="bound" requires bound="single" or bound="multi"')
+    if (
+        sample == "rwalk"
+        and bound in {"single", "multi"}
+        and rwalk_seed == "live"
+        and not allow_unused_bound
+    ):
+        raise ValueError(
+            "bound='single' or bound='multi' with sample='rwalk' requires "
+            "rwalk_seed='bound'. Otherwise the bound is built but not used. "
+            "Set rwalk_seed='bound' for bounded rwalk, or bound='none' "
+            "for ordinary live-seeded rwalk."
+        )
     if multi_bound_max_ellipsoids <= 0:
         raise ValueError("multi_bound_max_ellipsoids must be positive")
     if multi_bound_min_points is not None and multi_bound_min_points <= 0:
@@ -439,6 +459,7 @@ def run_static_nested(
         "multi_bound_overlap_correction": bool(multi_bound_overlap_correction),
         "rwalk_seed": str(rwalk_seed),
         "rwalk_seed_fallback": bool(rwalk_seed_fallback),
+        "allow_unused_bound": bool(allow_unused_bound),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -521,6 +542,8 @@ def run_static_nested(
     bound_eval_history = []
     bound_unit_cube_acceptance_history = []
     bound_nellipsoid_history = []
+    bound_seed_call_history = []
+    rwalk_kernel_call_history = []
 
     def current_state() -> NestedRunState:
         return NestedRunState(
@@ -679,7 +702,9 @@ def run_static_nested(
                     seed_accepted,
                     seed_info,
                 ) = seed_result
-                replacement_info = seed_info
+                replacement_info = {
+                    f"bound_seed_{key}": value for key, value in seed_info.items()
+                }
                 if seed_accepted:
                     seed_live_u = jnp.asarray(seed_u).reshape((1, ndim))
                     seed_live_logl = jnp.asarray([seed_logl], dtype=live_logl.dtype)
@@ -692,6 +717,7 @@ def run_static_nested(
                         False,
                     )
                     draw_result = None
+                    bound_seed_call_history.append(int(seed_calls))
                 else:
                     seed_calls = 0
             else:
@@ -725,12 +751,15 @@ def run_static_nested(
                     ),
                 )
                 if seed_calls:
+                    rwalk_kernel_calls = int(draw_result[4])
+                    rwalk_kernel_call_history.append(rwalk_kernel_calls)
+                    bound_seed_call_history.append(int(seed_calls))
                     if len(draw_result) == 7:
                         draw_result = (
                             *draw_result[:4],
                             draw_result[4] + seed_calls,
                             draw_result[5],
-                            draw_result[6],
+                            {**replacement_info, **draw_result[6]},
                         )
                     else:
                         draw_result = (
@@ -799,15 +828,38 @@ def run_static_nested(
                 min_accepts=min_accepts,
             )
         if replacement_info is not None:
-            bound_draw_history.append(int(replacement_info.get("bound_draws", 0)))
+            bound_draw_history.append(
+                int(
+                    replacement_info.get(
+                        "bound_draws", replacement_info.get("bound_seed_bound_draws", 0)
+                    )
+                )
+            )
             bound_eval_history.append(
-                int(replacement_info.get("bound_loglike_evals", 0))
+                int(
+                    replacement_info.get(
+                        "bound_loglike_evals",
+                        replacement_info.get("bound_seed_bound_loglike_evals", 0),
+                    )
+                )
             )
             bound_unit_cube_acceptance_history.append(
-                float(replacement_info.get("bound_unit_cube_acceptance", 0.0))
+                float(
+                    replacement_info.get(
+                        "bound_unit_cube_acceptance",
+                        replacement_info.get(
+                            "bound_seed_bound_unit_cube_acceptance", 0.0
+                        ),
+                    )
+                )
             )
             bound_nellipsoid_history.append(
-                int(replacement_info.get("bound_nellipsoids", 1))
+                int(
+                    replacement_info.get(
+                        "bound_nellipsoids",
+                        replacement_info.get("bound_seed_bound_nellipsoids", 1),
+                    )
+                )
             )
         ncall += calls
         replacement_ncall.append(int(calls))
@@ -842,6 +894,7 @@ def run_static_nested(
                 bound_draws=bound_draw_history,
                 bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
                 bound_nellipsoids=bound_nellipsoid_history,
+                rwalk_seed=rwalk_seed,
             )
             if callback is not None and (
                 i + 1 == 1 or (i + 1) % callback_interval == 0
@@ -895,6 +948,7 @@ def run_static_nested(
             bound_draws=bound_draw_history,
             bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
             bound_nellipsoids=bound_nellipsoid_history,
+            rwalk_seed=rwalk_seed,
         )
         if callback is not None and (
             i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
@@ -1071,6 +1125,24 @@ def run_static_nested(
             else None,
             "rwalk_seed": rwalk_seed,
             "rwalk_seed_fallback": rwalk_seed_fallback,
+            "allow_unused_bound": bool(allow_unused_bound),
+            "bounded_rwalk": bool(
+                sample == "rwalk" and bound != "none" and rwalk_seed == "bound"
+            ),
+            "mean_bound_seed_calls": float(
+                sum(bound_seed_call_history) / len(bound_seed_call_history)
+            )
+            if bound_seed_call_history
+            else None,
+            "max_bound_seed_calls": int(max(bound_seed_call_history, default=0))
+            if bound_seed_call_history
+            else None,
+            "mean_rwalk_kernel_calls": float(
+                sum(rwalk_kernel_call_history) / len(rwalk_kernel_call_history)
+            )
+            if rwalk_kernel_call_history
+            else None,
+            "mean_total_replacement_calls": mean_replacement_ncall,
             "progress_interval": progress_interval,
             "callback_interval": callback_interval,
             "stopped_by_callback": bool(stopped_by_callback),
