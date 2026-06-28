@@ -116,6 +116,58 @@ def correlated_gaussian_2d(width: float = 20.0, rho: float = 0.8) -> ValidationT
     )
 
 
+def gaussian_10d(width: float = 20.0) -> ValidationTarget:
+    """Return a normalized 10D standard-normal likelihood under a wide prior."""
+
+    ndim = 10
+
+    def prior_transform(u):
+        return -0.5 * width + width * jnp.asarray(u)
+
+    def loglike(theta):
+        theta = jnp.asarray(theta)
+        return -0.5 * jnp.sum(theta**2) - 0.5 * ndim * jnp.log(2.0 * jnp.pi)
+
+    return ValidationTarget(
+        name="gaussian10d",
+        ndim=ndim,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=-float(np.log(width**ndim)),
+        expected_mean=np.zeros(ndim),
+        expected_cov=np.eye(ndim),
+        description="Normalized 10D Gaussian likelihood with a wide uniform prior.",
+    )
+
+
+def correlated_gaussian_10d(width: float = 20.0, rho: float = 0.5) -> ValidationTarget:
+    """Return a normalized equicorrelated 10D Gaussian likelihood."""
+
+    ndim = 10
+    cov = np.full((ndim, ndim), rho)
+    np.fill_diagonal(cov, 1.0)
+    inv_cov = jnp.asarray(np.linalg.inv(cov))
+    log_norm = -0.5 * float(ndim * np.log(2.0 * np.pi) + np.log(np.linalg.det(cov)))
+
+    def prior_transform(u):
+        return -0.5 * width + width * jnp.asarray(u)
+
+    def loglike(theta):
+        theta = jnp.asarray(theta)
+        return -0.5 * theta @ inv_cov @ theta + log_norm
+
+    return ValidationTarget(
+        name="correlated_gaussian10d",
+        ndim=ndim,
+        prior_transform=prior_transform,
+        loglike=loglike,
+        expected_logz=-float(np.log(width**ndim)),
+        expected_mean=np.zeros(ndim),
+        expected_cov=cov,
+        description="Normalized equicorrelated 10D Gaussian likelihood.",
+    )
+
+
 def banana_2d() -> ValidationTarget:
     """Return a qualitative banana-shaped stress target."""
 
@@ -234,6 +286,8 @@ def available_targets() -> dict[str, Callable[[], ValidationTarget]]:
         "gaussian1d": gaussian_1d,
         "gaussian2d": gaussian_2d,
         "correlated_gaussian2d": correlated_gaussian_2d,
+        "gaussian10d": gaussian_10d,
+        "correlated_gaussian10d": correlated_gaussian_10d,
         "banana2d": banana_2d,
         "ring2d": ring_2d,
         "eggbox2d": eggbox_2d,

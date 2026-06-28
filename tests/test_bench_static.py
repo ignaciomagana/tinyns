@@ -295,3 +295,72 @@ def test_summarize_results_groups_replacement_chains_separately() -> None:
     assert by_chains[1]["relative_speedup_vs_chains1"] == 1.0
     assert by_chains[4]["relative_speedup_vs_chains1"] == 2.0
     assert by_chains[4]["relative_iter_s_vs_chains1"] == 4.0
+
+
+def test_overnight_jax_validation_parser_defaults_are_safe() -> None:
+    from benchmarks.overnight_jax_validation import parse_args
+
+    args = parse_args([])
+
+    assert args.nlive <= 25
+    assert args.maxiter <= 10
+    assert args.include_bounds is False
+    assert args.include_block is False
+
+
+def test_overnight_jax_validation_quick_writes_expected_keys(tmp_path) -> None:
+    from benchmarks.overnight_jax_validation import EXPECTED_KEYS, main
+
+    output = tmp_path / "overnight.json"
+
+    main(
+        [
+            "--quick",
+            "--targets",
+            "gaussian2d",
+            "--seeds",
+            "0",
+            "--nlive",
+            "20",
+            "--maxiter",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert output.exists()
+    rows = json.loads(output.read_text())
+    assert rows
+    for key in EXPECTED_KEYS:
+        assert key in rows[0]
+
+
+def test_summarize_overnight_jax_validation_prints_table(tmp_path, capsys) -> None:
+    from benchmarks.summarize_overnight_jax_validation import main
+
+    output = tmp_path / "overnight.json"
+    output.write_text(
+        json.dumps(
+            [
+                {
+                    "target": "gaussian2d",
+                    "config_name": "unbounded_isotropic_rwalk",
+                    "seconds": 1.0,
+                    "logz": -6.0,
+                    "expected_logz": -5.99,
+                    "replacement_failures": 0,
+                    "success": True,
+                }
+            ]
+        )
+    )
+
+    main([str(output)])
+
+    captured = capsys.readouterr()
+    assert (
+        "target config mean_seconds mean_logz std_logz "
+        "mean_abs_logz_error failures"
+    ) in captured.out
+    assert "gaussian2d unbounded_isotropic_rwalk" in captured.out
