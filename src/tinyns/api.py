@@ -108,6 +108,24 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        jax_block_size = kwargs.get("jax_block_size", 1)
+        if (
+            not isinstance(jax_block_size, int)
+            or isinstance(jax_block_size, bool)
+            or jax_block_size <= 0
+        ):
+            raise ValueError("jax_block_size must be a positive integer")
+        if jax_block_size > 1 and not (
+            sample == "rwalk"
+            and kernel == "jax"
+            and bound == "none"
+            and replacement_chain_schedule is None
+        ):
+            raise NotImplementedError(
+                "jax_block_size > 1 is experimental and currently supported only "
+                "for sample='rwalk', kernel='jax', bound='none', and "
+                "replacement_chain_schedule=None"
+            )
         fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
         if fused_bound_rwalk and not (
             sample == "rwalk"
@@ -186,6 +204,7 @@ class NestedSampler:
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
             fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
             jax_vectorized=self.kwargs.get("jax_vectorized", False),
+            jax_block_size=self.kwargs.get("jax_block_size", 1),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -236,6 +255,7 @@ class NestedSampler:
             "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
             "fused_bound_rwalk": bool(self.kwargs.get("fused_bound_rwalk", False)),
             "jax_vectorized": bool(self.kwargs.get("jax_vectorized", False)),
+            "jax_block_size": int(self.kwargs.get("jax_block_size", 1)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -279,6 +299,7 @@ class NestedSampler:
             "bound_seed_kernel",
             "allow_unused_bound",
             "fused_bound_rwalk",
+            "jax_block_size",
         ):
             default_values = {
                 "min_accepts": 1,
@@ -301,6 +322,7 @@ class NestedSampler:
                 "allow_unused_bound": False,
                 "fused_bound_rwalk": False,
                 "jax_vectorized": False,
+                "jax_block_size": 1,
             }
             checkpoint_value = checkpoint_config.get(name, default_values.get(name))
             if checkpoint_value != current[name]:
@@ -385,4 +407,5 @@ class NestedSampler:
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
             fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
             jax_vectorized=self.kwargs.get("jax_vectorized", False),
+            jax_block_size=self.kwargs.get("jax_block_size", 1),
         )
