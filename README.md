@@ -248,6 +248,10 @@ NestedSampler(
 
 This mode is experimental. Check evidence calibration, insertion-rank diagnostics, and seed stability before using it for science.
 
+### JAX bound representation
+
+`tinyns` keeps Python-friendly bound objects for readability, but also provides an internal padded `JaxEllipsoidBound` representation. The padded representation is used as a bridge toward fast JAX replacement kernels and should not change public sampler behavior.
+
 ## Current validation status
 
 The recommended `sample="rwalk", kernel="jax"` path has been checked with repeated-seed validation on:
