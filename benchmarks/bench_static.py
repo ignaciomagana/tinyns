@@ -317,10 +317,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--discard-warmup", action="store_true")
     parser.add_argument("--max-attempts", type=int, default=10000)
+    parser.add_argument(
+        "--auto-max-attempts",
+        action="store_true",
+        help=(
+            "Benchmark convenience for JAX rwalk chain sweeps: raise "
+            "--max-attempts to at least four replacement batches when needed."
+        ),
+    )
     parser.add_argument("--kernel", choices=["python", "jax"], default="python")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--progress", action="store_true")
     return parser.parse_args(argv)
+
+
+def validate_benchmark_args(args: argparse.Namespace) -> None:
+    """Validate benchmark-only argument combinations before running cases."""
+
+    replacement_chains_values = (
+        args.replacement_chains_grid
+        if args.replacement_chains_grid is not None
+        else [args.replacement_chains]
+    )
+    max_replacement_chains = max(replacement_chains_values)
+    required_max_attempts = args.walks * max_replacement_chains
+
+    if args.kernel == "jax" and "rwalk" in args.samplers:
+        if args.auto_max_attempts:
+            args.max_attempts = max(args.max_attempts, 4 * required_max_attempts)
+        elif args.max_attempts < required_max_attempts:
+            raise ValueError(
+                "--max-attempts must be at least walks * max(replacement_chains). "
+                f"Got max_attempts={args.max_attempts}, walks={args.walks}, "
+                f"max replacement_chains={max_replacement_chains}, "
+                f"required={required_max_attempts}. "
+                f"Try --max-attempts {required_max_attempts} or larger."
+            )
 
 
 def _args_for_replacement_chains(
@@ -363,6 +395,7 @@ def _run_benchmark_grid(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    validate_benchmark_args(args)
     results = _run_benchmark_grid(args)
     summaries = summarize_results(results)
     print_results(results)
