@@ -1229,3 +1229,48 @@ def test_static_nested_invalid_multi_bound_options_raise() -> None:
             bound="multi",
             multi_bound_max_ellipsoids=0,
         )
+
+
+def test_jax_vectorized_metadata_default_false() -> None:
+    result = run_static_nested(
+        random.PRNGKey(4400),
+        lambda theta: 0.0,
+        lambda u: u,
+        ndim=2,
+        nlive=12,
+        dlogz=10.0,
+        maxiter=1,
+    )
+
+    assert result.metadata["jax_vectorized"] is False
+
+
+def test_jax_bounded_seed_draw_supports_vectorized_functions() -> None:
+    def prior_batch(u):
+        return 2.0 * u - 1.0
+
+    def loglike_batch(theta):
+        return -jnp.sum(theta**2, axis=1)
+
+    result = run_static_nested(
+        random.PRNGKey(4401),
+        loglike_batch,
+        prior_batch,
+        ndim=2,
+        nlive=24,
+        dlogz=10.0,
+        maxiter=2,
+        sample="rwalk",
+        kernel="jax",
+        bound="single",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        walks=2,
+        batch_size=8,
+        max_attempts=32,
+        jax_vectorized=True,
+    )
+
+    assert result.metadata["jax_vectorized"] is True
+    assert result.metadata["bound_seed_kernel"] == "jax"
+    assert jnp.isfinite(result.logz)
