@@ -783,3 +783,71 @@ def test_nested_sampler_rwalk_jax_adaptive_live_cov_runs() -> None:
     assert result.success is True
     assert result.metadata["rwalk_proposal"] == "live-cov"
     assert result.metadata["adaptive_replacement_chains"] is True
+
+
+def test_static_nested_invalid_bound_raises() -> None:
+    with pytest.raises(ValueError, match="bound"):
+        run_static_nested(
+            random.PRNGKey(100),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=2,
+            nlive=10,
+            bound="bad",
+            maxiter=1,
+        )
+
+
+def test_static_nested_bound_update_interval_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="bound_update_interval"):
+        run_static_nested(
+            random.PRNGKey(101),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=2,
+            nlive=10,
+            bound="single",
+            bound_update_interval=0,
+            maxiter=1,
+        )
+
+
+def test_static_nested_single_bound_runs_and_records_metadata() -> None:
+    result = run_static_nested(
+        random.PRNGKey(102),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 10.0 * u - 5.0,
+        ndim=2,
+        nlive=30,
+        sample="bound",
+        bound="single",
+        maxiter=5,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["bound"] == "single"
+    assert result.metadata["bound_updates"] >= 1
+    assert result.metadata["mean_bound_draws"] is not None
+    assert result.metadata["rwalk_seed"] == "live"
+
+
+def test_static_nested_single_bound_rwalk_bound_seed_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(103),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 10.0 * u - 5.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        walks=2,
+        bound="single",
+        rwalk_seed="bound",
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["bound"] == "single"
+    assert result.metadata["rwalk_seed"] == "bound"

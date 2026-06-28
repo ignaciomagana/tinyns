@@ -281,3 +281,18 @@ def test_old_checkpoint_missing_replacement_chains_defaults_to_one(tmp_path):
     result = make_sampler(sample="rwalk", walks=3).resume(path, maxiter=2)
 
     assert result.metadata["replacement_chains"] == 1
+
+
+def test_checkpoint_config_includes_bound_settings(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(bound="single", rwalk_seed="live").run(
+        19, maxiter=1, dlogz=0.0, checkpoint_path=path
+    )
+
+    _, config = load_checkpoint_npz(path)
+    assert config["bound"] == "single"
+    assert config["bound_enlargement"] == 1.25
+    assert config["bound_update_interval"] == 1
+    assert config["bound_jitter"] == 1e-6
+    assert config["bound_max_draws"] is None
+    assert config["rwalk_seed"] == "live"
