@@ -342,10 +342,6 @@ def run_static_nested(
             "fused_bound_rwalk=True is supported only for sample='rwalk', "
             "kernel='jax', bound in {'single', 'multi'}, and rwalk_seed='bound'"
         )
-    if fused_bound_rwalk and replacement_chain_schedule is not None:
-        raise NotImplementedError(
-            "fused_bound_rwalk=True does not support replacement_chain_schedule yet"
-        )
     if bound_seed_kernel == "jax" and not (
         sample == "rwalk"
         and kernel == "jax"
@@ -750,6 +746,7 @@ def run_static_nested(
                     max_attempts=max_attempts,
                     min_accepts=min_accepts,
                     replacement_chains=replacement_chains,
+                    replacement_chain_schedule=replacement_chain_schedule,
                     bound_batch_size=batch_size,
                     bound_max_batches=int(math.ceil(seed_limit / batch_size)),
                     proposal_chol=proposal_chol,
