@@ -682,6 +682,34 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.metadata["jax_block_mode"] is True
 
 
+def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> None:
+    result = run_static_nested(
+        random.PRNGKey(14),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        20,
+        sample="rwalk",
+        kernel="jax",
+        walks=3,
+        step_scale=0.05,
+        maxiter=10,
+        max_attempts=24,
+        replacement_chain_schedule=(1, 2, 4),
+        jax_block_size=5,
+    )
+
+    assert math.isfinite(result.logz)
+    assert result.metadata["jax_block_mode"] is True
+    assert result.metadata["adaptive_replacement_chains"] is True
+    assert result.metadata["replacement_chain_schedule"] == [1, 2, 4]
+    assert len(result.metadata["replacement_ncall"]) == result.metadata["niter"]
+    assert result.metadata["mean_replacement_batches"] is not None
+    assert result.metadata["mean_replacement_chains_used"] is not None
+    assert result.metadata["max_replacement_chains_used"] >= 1
+    assert sum(result.metadata["replacement_chain_usage_counts"].values()) > 0
+
+
 def test_jax_block_size_unsupported_bound_raises() -> None:
     with pytest.raises(NotImplementedError, match="jax_block_size"):
         run_static_nested(
