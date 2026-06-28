@@ -68,6 +68,9 @@ class NestedSampler:
         rwalk_seed = kwargs.get("rwalk_seed", "live")
         if rwalk_seed not in {"live", "bound"}:
             raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
+        bound_seed_kernel = kwargs.get("bound_seed_kernel", "python")
+        if bound_seed_kernel not in {"python", "jax"}:
+            raise ValueError("bound_seed_kernel must be one of {'python', 'jax'}")
         if not callable(loglike):
             raise TypeError("loglike must be callable")
         if not callable(prior_transform):
@@ -165,6 +168,7 @@ class NestedSampler:
             ),
             rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
+            bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
         )
 
@@ -208,6 +212,7 @@ class NestedSampler:
             ),
             "rwalk_seed": str(self.kwargs.get("rwalk_seed", "live")),
             "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
+            "bound_seed_kernel": str(self.kwargs.get("bound_seed_kernel", "python")),
             "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
         }
 
@@ -249,6 +254,7 @@ class NestedSampler:
             "multi_bound_overlap_correction",
             "rwalk_seed",
             "rwalk_seed_fallback",
+            "bound_seed_kernel",
             "allow_unused_bound",
         ):
             default_values = {
@@ -268,6 +274,7 @@ class NestedSampler:
                 "multi_bound_overlap_correction": True,
                 "rwalk_seed": "live",
                 "rwalk_seed_fallback": True,
+                "bound_seed_kernel": "python",
                 "allow_unused_bound": False,
             }
             checkpoint_value = checkpoint_config.get(name, default_values.get(name))
@@ -349,5 +356,6 @@ class NestedSampler:
             ),
             rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
+            bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
         )

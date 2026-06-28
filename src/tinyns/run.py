@@ -14,6 +14,7 @@ from tinyns.bounds import build_multi_ellipsoid_bound, build_single_ellipsoid_bo
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
+    draw_constrained_multi_bound_jax,
     draw_constrained_prior,
     draw_constrained_prior_vectorized,
     draw_constrained_rslice,
@@ -21,6 +22,7 @@ from tinyns.samplers import (
     draw_constrained_rwalk_jax,
     draw_constrained_rwalk_jax_adaptive,
     draw_constrained_single_bound,
+    draw_constrained_single_bound_jax,
     draw_constrained_slice,
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
@@ -100,6 +102,7 @@ def _make_run_state(
     bound_unit_cube_acceptance: list[float] | None = None,
     bound_nellipsoids: list[int] | None = None,
     rwalk_seed: str = "live",
+    bound_seed_kernel: str = "python",
 ) -> dict[str, object]:
     if replacement_ncall:
         replacement_mean_ncall_so_far = float(
@@ -162,6 +165,7 @@ def _make_run_state(
         "replacement_failures": int(replacement_failures),
         "bound": bound,
         "rwalk_seed": rwalk_seed,
+        "bound_seed_kernel": bound_seed_kernel,
         "mean_bound_draws_so_far": mean_bound_draws_so_far,
         "mean_bound_unit_cube_acceptance_so_far": (
             mean_bound_unit_cube_acceptance_so_far
@@ -202,13 +206,24 @@ def _format_progress_line(state: dict[str, object]) -> str:
             nell = state.get("mean_bound_nellipsoids_so_far")
             nell_text = "n/a" if nell is None else f"{float(nell):.1f}"
             seed_text = state.get("rwalk_seed", "live")
+            seed_kernel_text = (
+                f" seed_kernel={state['bound_seed_kernel']}"
+                if state.get("bound_seed_kernel", "python") != "python"
+                else ""
+            )
             bound_text = (
-                f" bound=multi seed={seed_text} nell={nell_text} bacc={bacc_text}"
+                f" bound=multi seed={seed_text}{seed_kernel_text} "
+                f"nell={nell_text} bacc={bacc_text}"
             )
         else:
             seed_text = state.get("rwalk_seed", "live")
+            seed_kernel_text = (
+                f" seed_kernel={state['bound_seed_kernel']}"
+                if state.get("bound_seed_kernel", "python") != "python"
+                else ""
+            )
             bound_text = (
-                f" bound={state['bound']} seed={seed_text} "
+                f" bound={state['bound']} seed={seed_text}{seed_kernel_text} "
                 f"bdraw={bdraw_text} bacc={bacc_text}"
             )
     return (
@@ -279,6 +294,7 @@ def run_static_nested(
     multi_bound_overlap_correction: bool = True,
     rwalk_seed: str = "live",
     rwalk_seed_fallback: bool = True,
+    bound_seed_kernel: str = "python",
     allow_unused_bound: bool = False,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
@@ -311,6 +327,19 @@ def run_static_nested(
         raise ValueError("bound_max_draws must be positive or None")
     if rwalk_seed not in {"live", "bound"}:
         raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
+    if bound_seed_kernel not in {"python", "jax"}:
+        raise ValueError("bound_seed_kernel must be one of {'python', 'jax'}")
+    if bound_seed_kernel == "jax" and not (
+        sample == "rwalk"
+        and kernel == "jax"
+        and bound in {"single", "multi"}
+        and rwalk_seed == "bound"
+    ):
+        raise NotImplementedError(
+            "bound_seed_kernel='jax' is supported only for sample='rwalk', "
+            "kernel='jax', bound in {'single', 'multi'}, and "
+            "rwalk_seed='bound'"
+        )
     if sample == "bound" and bound not in {"single", "multi"}:
         raise ValueError('sample="bound" requires bound="single" or bound="multi"')
     if (
@@ -459,6 +488,7 @@ def run_static_nested(
         "multi_bound_overlap_correction": bool(multi_bound_overlap_correction),
         "rwalk_seed": str(rwalk_seed),
         "rwalk_seed_fallback": bool(rwalk_seed_fallback),
+        "bound_seed_kernel": str(bound_seed_kernel),
         "allow_unused_bound": bool(allow_unused_bound),
     }
     checkpoint_path_str = (
@@ -543,6 +573,7 @@ def run_static_nested(
     bound_unit_cube_acceptance_history = []
     bound_nellipsoid_history = []
     bound_seed_call_history = []
+    bound_seed_batch_history = []
     rwalk_kernel_call_history = []
 
     def current_state() -> NestedRunState:
@@ -682,16 +713,34 @@ def run_static_nested(
             seed_live_u = live_u
             seed_live_logl = live_logl
             if bound in {"single", "multi"} and rwalk_seed == "bound":
-                seed_result = draw_constrained_single_bound(
+                seed_draw = (
+                    draw_constrained_single_bound_jax
+                    if bound_seed_kernel == "jax" and bound == "single"
+                    else draw_constrained_multi_bound_jax
+                    if bound_seed_kernel == "jax"
+                    else draw_constrained_single_bound
+                )
+                seed_limit = bound_max_draws or max_attempts
+                seed_kwargs = {"batch_size": batch_size}
+                if bound_seed_kernel == "jax":
+                    seed_kwargs["max_batches"] = int(
+                        math.ceil(seed_limit / batch_size)
+                    )
+                    if bound == "multi":
+                        seed_kwargs["overlap_correction"] = (
+                            multi_bound_overlap_correction
+                        )
+                else:
+                    seed_kwargs["max_attempts"] = seed_limit
+                    seed_kwargs["overlap_correction"] = multi_bound_overlap_correction
+                seed_result = seed_draw(
                     key,
                     loglike,
                     prior_transform,
                     logl_worst,
                     current_bound,
                     ndim,
-                    batch_size=batch_size,
-                    max_attempts=bound_max_draws or max_attempts,
-                    overlap_correction=multi_bound_overlap_correction,
+                    **seed_kwargs,
                 )
                 (
                     key,
@@ -718,6 +767,9 @@ def run_static_nested(
                     )
                     draw_result = None
                     bound_seed_call_history.append(int(seed_calls))
+                    bound_seed_batch_history.append(
+                        int(seed_info.get("bound_seed_batches", 0))
+                    )
                 else:
                     seed_calls = 0
             else:
@@ -754,6 +806,9 @@ def run_static_nested(
                     rwalk_kernel_calls = int(draw_result[4])
                     rwalk_kernel_call_history.append(rwalk_kernel_calls)
                     bound_seed_call_history.append(int(seed_calls))
+                    bound_seed_batch_history.append(
+                        int(seed_info.get("bound_seed_batches", 0))
+                    )
                     if len(draw_result) == 7:
                         draw_result = (
                             *draw_result[:4],
@@ -895,6 +950,7 @@ def run_static_nested(
                 bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
                 bound_nellipsoids=bound_nellipsoid_history,
                 rwalk_seed=rwalk_seed,
+                bound_seed_kernel=bound_seed_kernel,
             )
             if callback is not None and (
                 i + 1 == 1 or (i + 1) % callback_interval == 0
@@ -949,6 +1005,7 @@ def run_static_nested(
             bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
             bound_nellipsoids=bound_nellipsoid_history,
             rwalk_seed=rwalk_seed,
+            bound_seed_kernel=bound_seed_kernel,
         )
         if callback is not None and (
             i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
@@ -1125,6 +1182,7 @@ def run_static_nested(
             else None,
             "rwalk_seed": rwalk_seed,
             "rwalk_seed_fallback": rwalk_seed_fallback,
+            "bound_seed_kernel": bound_seed_kernel,
             "allow_unused_bound": bool(allow_unused_bound),
             "bounded_rwalk": bool(
                 sample == "rwalk" and bound != "none" and rwalk_seed == "bound"
@@ -1136,6 +1194,14 @@ def run_static_nested(
             else None,
             "max_bound_seed_calls": int(max(bound_seed_call_history, default=0))
             if bound_seed_call_history
+            else None,
+            "mean_bound_seed_batches": float(
+                sum(bound_seed_batch_history) / len(bound_seed_batch_history)
+            )
+            if bound_seed_batch_history
+            else None,
+            "max_bound_seed_batches": int(max(bound_seed_batch_history, default=0))
+            if bound_seed_batch_history
             else None,
             "mean_rwalk_kernel_calls": float(
                 sum(rwalk_kernel_call_history) / len(rwalk_kernel_call_history)
