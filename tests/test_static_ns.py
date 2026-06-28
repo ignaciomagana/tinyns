@@ -572,6 +572,8 @@ def test_format_progress_line_contains_core_fields() -> None:
     assert "iter=" in line
     assert "logz=" in line
     assert "dlogz=" in line
+    assert "repl_batches=" in line
+    assert "repl_chains=" in line
 
 
 def test_progress_printer_pads_shorter_final_line(capsys) -> None:
@@ -664,6 +666,11 @@ def test_nested_sampler_rwalk_jax_records_replacement_chains() -> None:
     assert result.success is True
     assert result.metadata["replacement_chains"] == 4
     assert result.metadata["replacement_batch_ncall"] == 5 * 4
+    assert result.metadata["replacement_initial_batch_ncall"] == 5 * 4
+    assert result.metadata["replacement_max_batch_ncall"] == 5 * 4
+    assert result.metadata["mean_replacement_chains_used"] is not None
+    assert result.metadata["mean_replacement_chains_used"] >= 4.0
+    assert result.metadata["replacement_chain_usage_counts"]["4"] >= 1
 
 
 @pytest.mark.parametrize(
@@ -701,6 +708,9 @@ def test_nested_sampler_rwalk_jax_adaptive_metadata() -> None:
     assert result.metadata["adaptive_replacement_chains"] is True
     assert result.metadata["replacement_chain_schedule"] == [1, 4, 16]
     assert result.metadata["mean_replacement_chains_used"] >= 1.0
+    assert result.metadata["replacement_initial_batch_ncall"] == 2
+    assert result.metadata["replacement_max_batch_ncall"] == 32
+    assert sum(result.metadata["replacement_chain_usage_counts"].values()) > 0
 
 
 def test_replacement_chain_schedule_rejects_unsupported_sampler_kernel() -> None:

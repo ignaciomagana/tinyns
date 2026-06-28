@@ -173,7 +173,15 @@ def run_one(
     total_ncall = sum(ncall_values)
     mean_ncall = total_ncall / args.n_replacements if args.n_replacements else 0.0
     max_ncall = max(ncall_values, default=0)
-    replacement_batch_ncall = args.walks * replacement_chains
+    replacement_initial_batch_ncall = args.walks * replacement_chains
+    replacement_max_batch_ncall = replacement_initial_batch_ncall
+    replacement_batch_ncall = replacement_initial_batch_ncall
+    if args.replacement_chain_schedule is not None:
+        replacement_initial_batch_ncall = (
+            args.walks * args.replacement_chain_schedule[0]
+        )
+        replacement_max_batch_ncall = args.walks * args.replacement_chain_schedule[-1]
+        replacement_batch_ncall = replacement_max_batch_ncall
     return {
         "target": target_name,
         "kernel": "jax",
@@ -184,6 +192,8 @@ def run_one(
         "replacement_chain_schedule": args.replacement_chain_schedule,
         "walks": args.walks,
         "replacement_batch_ncall": replacement_batch_ncall,
+        "replacement_initial_batch_ncall": replacement_initial_batch_ncall,
+        "replacement_max_batch_ncall": replacement_max_batch_ncall,
         "nlive": args.nlive,
         "n_replacements": args.n_replacements,
         "warmup_replacements": args.warmup_replacements,
@@ -210,6 +220,7 @@ def print_results(rows: list[dict[str, Any]]) -> None:
     print(
         "target kernel replacement_chains walks nlive n_replacements seconds "
         "replacements/s scalar_ncall/s mean_ncall mean_batches max_batches "
+        "mean_chains max_chains usage adaptive initial_batch max_batch "
         "success_fraction"
     )
     for row in rows:
@@ -220,7 +231,14 @@ def print_results(rows: list[dict[str, Any]]) -> None:
             f"{row['scalar_likelihood_calls_per_second']:.3g} "
             f"{row['mean_replacement_ncall']:.3g} "
             f"{row['mean_replacement_batches']:.3g} "
-            f"{row['max_replacement_batches']:.3g} {row['success_fraction']:.3g}"
+            f"{row['max_replacement_batches']:.3g} "
+            f"{row['mean_replacement_chains_used']:.3g} "
+            f"{row['max_replacement_chains_used']:.3g} "
+            f"{row['replacement_chain_usage_counts']} "
+            f"{row['adaptive_replacement_chains']} "
+            f"{row['replacement_initial_batch_ncall']} "
+            f"{row['replacement_max_batch_ncall']} "
+            f"{row['success_fraction']:.3g}"
         )
 
 

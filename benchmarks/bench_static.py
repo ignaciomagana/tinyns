@@ -201,16 +201,20 @@ def run_one(
     )
     mean_replacement_ncall = float(metadata.get("mean_replacement_ncall", 0.0))
     max_replacement_ncall = int(metadata.get("max_replacement_ncall", 0))
-    repl_batches = (
-        mean_replacement_ncall / replacement_batch_ncall
-        if replacement_batch_ncall > 0
-        else None
-    )
-    max_repl_batches = (
-        max_replacement_ncall / replacement_batch_ncall
-        if replacement_batch_ncall > 0
-        else None
-    )
+    repl_batches = metadata.get("mean_replacement_batches")
+    if repl_batches is None:
+        repl_batches = (
+            mean_replacement_ncall / replacement_batch_ncall
+            if replacement_batch_ncall > 0
+            else None
+        )
+    max_repl_batches = metadata.get("max_replacement_batches")
+    if max_repl_batches is None:
+        max_repl_batches = (
+            max_replacement_ncall / replacement_batch_ncall
+            if replacement_batch_ncall > 0
+            else None
+        )
 
     return {
         "target": target_name,
@@ -232,6 +236,10 @@ def run_one(
         ),
         "replacement_chain_schedule": args.replacement_chain_schedule,
         "replacement_batch_ncall": replacement_batch_ncall,
+        "replacement_initial_batch_ncall": metadata.get(
+            "replacement_initial_batch_ncall"
+        ),
+        "replacement_max_batch_ncall": metadata.get("replacement_max_batch_ncall"),
         "repl_batches": repl_batches,
         "max_repl_batches": max_repl_batches,
         "mean_replacement_batches": repl_batches,
@@ -271,7 +279,9 @@ def _fmt(value: Any, precision: int = 3) -> str:
 def print_results(results: list[dict[str, Any]]) -> None:
     print(
         "target sampler kernel replacement_chains seed seconds niter ncall iter/s "
-        "ncall/s repl_ncall repl_batches max_repl_batches logz logzerr success warnings"
+        "ncall/s repl_ncall repl_batches max_repl_batches mean_repl_chains "
+        "max_repl_chains usage adaptive initial_batch max_batch logz logzerr "
+        "success warnings"
     )
     for row in results:
         print(
@@ -281,8 +291,15 @@ def print_results(results: list[dict[str, Any]]) -> None:
             f"{_fmt(row['iterations_per_second'])} "
             f"{_fmt(row['likelihood_calls_per_second'])} "
             f"{_fmt(row['mean_replacement_ncall'])} {_fmt(row['repl_batches'])} "
-            f"{_fmt(row['max_repl_batches'])} {_fmt(row['logz'])} "
-            f"{_fmt(row['logzerr'])} {row['success']} {row['warning_count']}"
+            f"{_fmt(row['max_repl_batches'])} "
+            f"{_fmt(row.get('mean_replacement_chains_used'))} "
+            f"{_fmt(row.get('max_replacement_chains_used'))} "
+            f"{row.get('replacement_chain_usage_counts')} "
+            f"{row.get('adaptive_replacement_chains')} "
+            f"{_fmt(row.get('replacement_initial_batch_ncall'))} "
+            f"{_fmt(row.get('replacement_max_batch_ncall'))} "
+            f"{_fmt(row['logz'])} {_fmt(row['logzerr'])} "
+            f"{row['success']} {row['warning_count']}"
         )
 
 
