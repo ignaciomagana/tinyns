@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from benchmarks.bench_static import (
     build_payload,
     compute_rates,
     main,
     parse_args,
     summarize_results,
+    validate_benchmark_args,
 )
 
 
@@ -163,6 +165,76 @@ def test_benchmark_parser_accepts_replacement_chains_grid() -> None:
     args = parse_args(["--replacement-chains-grid", "1", "4", "16"])
 
     assert args.replacement_chains_grid == [1, 4, 16]
+
+
+def test_validate_benchmark_args_accepts_safe_replacement_chains_grid() -> None:
+    args = parse_args(
+        [
+            "--samplers",
+            "rwalk",
+            "--kernel",
+            "jax",
+            "--replacement-chains-grid",
+            "1",
+            "4",
+            "16",
+            "--walks",
+            "25",
+            "--max-attempts",
+            "10000",
+        ]
+    )
+
+    validate_benchmark_args(args)
+
+    assert args.max_attempts == 10000
+
+
+def test_validate_benchmark_args_rejects_unsafe_replacement_chains_grid() -> None:
+    args = parse_args(
+        [
+            "--samplers",
+            "rwalk",
+            "--kernel",
+            "jax",
+            "--replacement-chains-grid",
+            "1024",
+            "--walks",
+            "25",
+            "--max-attempts",
+            "10000",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="25600") as exc_info:
+        validate_benchmark_args(args)
+
+    message = str(exc_info.value)
+    assert "--max-attempts must be at least walks * max(replacement_chains)" in message
+    assert "required=25600" in message
+    assert "Try --max-attempts 25600 or larger" in message
+
+
+def test_validate_benchmark_args_auto_max_attempts_uses_four_batches() -> None:
+    args = parse_args(
+        [
+            "--samplers",
+            "rwalk",
+            "--kernel",
+            "jax",
+            "--replacement-chains-grid",
+            "1024",
+            "--walks",
+            "25",
+            "--max-attempts",
+            "10000",
+            "--auto-max-attempts",
+        ]
+    )
+
+    validate_benchmark_args(args)
+
+    assert args.max_attempts == 102400
 
 
 def test_summarize_results_groups_replacement_chains_separately() -> None:
