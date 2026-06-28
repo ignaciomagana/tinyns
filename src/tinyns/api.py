@@ -109,12 +109,12 @@ class NestedSampler:
         if fused_bound_rwalk and not (
             sample == "rwalk"
             and kernel == "jax"
-            and bound == "single"
+            and bound in {"single", "multi"}
             and rwalk_seed == "bound"
         ):
             raise NotImplementedError(
                 "fused_bound_rwalk=True is supported only for sample='rwalk', "
-                "kernel='jax', bound='single', and rwalk_seed='bound'"
+                "kernel='jax', bound in {'single', 'multi'}, and rwalk_seed='bound'"
             )
         if fused_bound_rwalk and replacement_chain_schedule is not None:
             raise NotImplementedError(
@@ -229,7 +229,11 @@ class NestedSampler:
             ),
             "rwalk_seed": str(self.kwargs.get("rwalk_seed", "live")),
             "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
-            "bound_seed_kernel": str(self.kwargs.get("bound_seed_kernel", "python")),
+            "bound_seed_kernel": (
+                "jax"
+                if self.kwargs.get("fused_bound_rwalk", False)
+                else str(self.kwargs.get("bound_seed_kernel", "python"))
+            ),
             "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
             "fused_bound_rwalk": bool(self.kwargs.get("fused_bound_rwalk", False)),
         }

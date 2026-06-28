@@ -1208,6 +1208,32 @@ def _two_ellipsoid_bound():
     return MultiEllipsoidBound((left, right), log_volumes, log_total_volume, 2)
 
 
+def test_draw_constrained_multi_bound_rwalk_jax_shapes_and_info() -> None:
+    from tinyns.samplers import draw_constrained_multi_bound_rwalk_jax
+
+    _, u, theta, logl, ncall, accepted, info = draw_constrained_multi_bound_rwalk_jax(
+        random.PRNGKey(1100),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        _two_ellipsoid_bound(),
+        2,
+        walks=2,
+        replacement_chains=2,
+        bound_batch_size=8,
+        bound_max_batches=4,
+    )
+
+    assert accepted is True
+    assert ncall == info["bound_seed_loglike_evals"] + info["rwalk_kernel_calls"]
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert jnp.isfinite(logl)
+    assert info["bound_seed_nellipsoids"] == 2
+    assert "bound_seed_overlap_rejections" in info
+    assert "bound_seed_ellipsoid_index" in info
+
+
 def test_draw_constrained_multi_bound_jax_accepts_multi_bound() -> None:
     from tinyns.samplers import draw_constrained_multi_bound_jax
 
