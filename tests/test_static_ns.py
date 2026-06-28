@@ -967,6 +967,91 @@ def test_static_nested_bounded_rwalk_metadata_keeps_seed_and_adaptive_info() -> 
     assert result.metadata["replacement_chain_usage_counts"]
 
 
+def test_static_nested_default_bound_seed_kernel_is_python() -> None:
+    result = run_static_nested(
+        random.PRNGKey(108),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: u,
+        ndim=2,
+        nlive=20,
+        sample="rwalk",
+        kernel="jax",
+        maxiter=2,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["bound_seed_kernel"] == "python"
+
+
+def test_static_nested_single_bound_rwalk_jax_bound_seed_kernel_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(109),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        bound="single",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        walks=2,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["bound_seed_kernel"] == "jax"
+    assert result.metadata["mean_bound_seed_batches"] is not None
+    assert result.metadata["max_bound_seed_batches"] is not None
+
+
+def test_static_nested_multi_bound_rwalk_jax_bound_seed_kernel_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(110),
+        lambda theta: -0.5 * jnp.sum((theta / 0.2) ** 2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        walks=2,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["bound_seed_kernel"] == "jax"
+    assert result.metadata["mean_bound_seed_batches"] is not None
+
+
+def test_static_nested_bound_seed_kernel_jax_invalid_combinations_raise() -> None:
+    with pytest.raises(NotImplementedError, match="bound_seed_kernel='jax'"):
+        run_static_nested(
+            random.PRNGKey(111),
+            lambda theta: -0.5 * jnp.sum(theta**2),
+            lambda u: u,
+            ndim=2,
+            nlive=10,
+            sample="prior",
+            bound_seed_kernel="jax",
+        )
+
+    with pytest.raises(ValueError, match="bound_seed_kernel"):
+        run_static_nested(
+            random.PRNGKey(112),
+            lambda theta: -0.5 * jnp.sum(theta**2),
+            lambda u: u,
+            ndim=2,
+            nlive=10,
+            bound_seed_kernel="bad",
+        )
+
 def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
     result = run_static_nested(
         random.PRNGKey(107),

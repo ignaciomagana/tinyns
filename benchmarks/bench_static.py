@@ -162,6 +162,7 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "multi_bound_split_threshold": args.multi_bound_split_threshold,
         "multi_bound_overlap_correction": args.multi_bound_overlap_correction,
         "rwalk_seed": args.rwalk_seed,
+        "bound_seed_kernel": args.bound_seed_kernel,
         "allow_unused_bound": args.allow_unused_bound,
     }
     if sampler_name == "rwalk":
@@ -234,6 +235,7 @@ def run_one(
         "kernel": args.kernel,
         "bound": args.bound,
         "rwalk_seed": args.rwalk_seed,
+        "bound_seed_kernel": args.bound_seed_kernel,
         "allow_unused_bound": args.allow_unused_bound,
         "seed": seed,
         "nlive": args.nlive,
@@ -372,6 +374,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--rwalk-seed", choices=["live", "bound"], default="live")
+    parser.add_argument(
+        "--bound-seed-kernel", choices=["python", "jax"], default="python"
+    )
     parser.add_argument("--allow-unused-bound", action="store_true")
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
     parser.add_argument(
