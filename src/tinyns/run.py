@@ -291,6 +291,8 @@ def run_static_nested(
     bound_update_interval: int = 1,
     bound_jitter: float = 1e-6,
     bound_max_draws: int | None = None,
+    bound_rebuild_on_failure: bool = False,
+    bound_failure_rebuild_threshold: int = 1,
     multi_bound_max_ellipsoids: int = 32,
     multi_bound_min_points: int | None = None,
     multi_bound_split_threshold: float = 0.9,
@@ -331,6 +333,12 @@ def run_static_nested(
         raise ValueError("bound_jitter must be positive")
     if bound_max_draws is not None and bound_max_draws <= 0:
         raise ValueError("bound_max_draws must be positive or None")
+    if (
+        not isinstance(bound_failure_rebuild_threshold, int)
+        or isinstance(bound_failure_rebuild_threshold, bool)
+        or bound_failure_rebuild_threshold <= 0
+    ):
+        raise ValueError("bound_failure_rebuild_threshold must be a positive integer")
     if rwalk_seed not in {"live", "bound"}:
         raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
     if bound_seed_kernel not in {"python", "jax"}:
@@ -493,6 +501,8 @@ def run_static_nested(
         "bound_update_interval": int(bound_update_interval),
         "bound_jitter": float(bound_jitter),
         "bound_max_draws": bound_max_draws,
+        "bound_rebuild_on_failure": bool(bound_rebuild_on_failure),
+        "bound_failure_rebuild_threshold": int(bound_failure_rebuild_threshold),
         "multi_bound_max_ellipsoids": int(multi_bound_max_ellipsoids),
         "multi_bound_min_points": multi_bound_min_points,
         "multi_bound_split_threshold": float(multi_bound_split_threshold),
@@ -603,6 +613,9 @@ def run_static_nested(
     bound_seed_call_history = []
     bound_seed_batch_history = []
     rwalk_kernel_call_history = []
+    consecutive_bound_failures = 0
+    force_bound_rebuild = False
+    bound_forced_rebuilds = 0
 
     def current_state() -> NestedRunState:
         return NestedRunState(
@@ -648,9 +661,12 @@ def run_static_nested(
         logx_final = logx_new
 
         replacement_info = None
-        if bound in {"single", "multi"} and (
-            current_bound is None or i % bound_update_interval == 0
-        ):
+        rebuild_bound = bound in {"single", "multi"} and (
+            current_bound is None
+            or i % bound_update_interval == 0
+            or force_bound_rebuild
+        )
+        if rebuild_bound:
             build_start = time.perf_counter()
             if bound == "multi":
                 current_bound = build_multi_ellipsoid_bound(
@@ -677,7 +693,12 @@ def run_static_nested(
                 int(getattr(current_bound, "n_ellipsoids", 1))
             )
             bound_updates += 1
+            if force_bound_rebuild:
+                bound_forced_rebuilds += 1
+                force_bound_rebuild = False
 
+        bound_failure = False
+        bound_success = False
         if sample == "bound":
             (
                 key,
@@ -698,6 +719,8 @@ def run_static_nested(
                 max_attempts=bound_max_draws or max_attempts,
                 overlap_correction=multi_bound_overlap_correction,
             )
+            bound_success = bool(accepted)
+            bound_failure = not accepted
         elif sample == "prior":
             if vectorized:
                 (
@@ -783,6 +806,8 @@ def run_static_nested(
                     ),
                 )
                 replacement_info = draw_result[6]
+                bound_success = bool(draw_result[5])
+                bound_failure = not bool(draw_result[5])
                 bound_seed_call_history.append(
                     int(replacement_info.get("bound_seed_loglike_evals", 0))
                 )
@@ -836,9 +861,12 @@ def run_static_nested(
                     f"bound_seed_{key}": value for key, value in seed_info.items()
                 }
                 if seed_accepted:
+                    bound_success = True
                     seed_live_u = jnp.asarray(seed_u).reshape((1, ndim))
                     seed_live_logl = jnp.asarray([seed_logl], dtype=live_logl.dtype)
-                elif not rwalk_seed_fallback:
+                else:
+                    bound_failure = True
+                if not seed_accepted and not rwalk_seed_fallback:
                     new_u, new_theta, new_logl, calls, accepted = (
                         seed_u,
                         _seed_theta,
@@ -851,7 +879,7 @@ def run_static_nested(
                     bound_seed_batch_history.append(
                         int(seed_info.get("bound_seed_batches", 0))
                     )
-                else:
+                elif not seed_accepted:
                     seed_calls = 0
             else:
                 seed_calls = 0
@@ -973,6 +1001,15 @@ def run_static_nested(
                 max_attempts=max_attempts,
                 min_accepts=min_accepts,
             )
+        if bound_rebuild_on_failure and bound in {"single", "multi"}:
+            if bound_failure:
+                consecutive_bound_failures += 1
+                if consecutive_bound_failures >= bound_failure_rebuild_threshold:
+                    force_bound_rebuild = True
+                    consecutive_bound_failures = 0
+            elif bound_success:
+                consecutive_bound_failures = 0
+
         if replacement_info is not None:
             bound_draw_history.append(
                 int(
@@ -1261,6 +1298,9 @@ def run_static_nested(
             "bound_update_interval": bound_update_interval,
             "bound_jitter": bound_jitter,
             "bound_max_draws": bound_max_draws,
+            "bound_forced_rebuilds": int(bound_forced_rebuilds),
+            "bound_rebuild_on_failure": bool(bound_rebuild_on_failure),
+            "bound_failure_rebuild_threshold": int(bound_failure_rebuild_threshold),
             "multi_bound_max_ellipsoids": multi_bound_max_ellipsoids,
             "multi_bound_min_points": multi_bound_min_points,
             "multi_bound_split_threshold": multi_bound_split_threshold,
