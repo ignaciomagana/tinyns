@@ -38,6 +38,21 @@ class MultiEllipsoidBound:
     ndim: int
 
 
+@dataclass(frozen=True)
+class JaxEllipsoidBound:
+    """Padded array-backed ellipsoid union for future JAX kernels."""
+
+    centers: jnp.ndarray
+    chols: jnp.ndarray
+    inv_chols: jnp.ndarray
+    log_volumes: jnp.ndarray
+    active: jnp.ndarray
+    n_active: int
+    ndim: int
+    max_ellipsoids: int
+    log_total_volume: float
+
+
 def unit_ball_log_volume(ndim: int) -> float:
     """Return the log volume of the ``ndim``-dimensional unit ball."""
 
@@ -103,6 +118,108 @@ def contains_single_ellipsoid(bound: SingleEllipsoidBound, u: ArrayLike) -> jnp.
     delta = u - bound.center
     x = delta @ bound.inv_chol.T
     return jnp.sum(jnp.square(x), axis=-1) <= 1.0 + 1e-10
+
+
+def as_jax_ellipsoid_bound(
+    bound: SingleEllipsoidBound | MultiEllipsoidBound | JaxEllipsoidBound,
+    *,
+    max_ellipsoids: int | None = None,
+) -> JaxEllipsoidBound:
+    """Convert an ellipsoid bound to a padded array-backed representation."""
+
+    if isinstance(bound, JaxEllipsoidBound):
+        if max_ellipsoids is None or max_ellipsoids == bound.max_ellipsoids:
+            return bound
+        if max_ellipsoids < bound.n_active:
+            raise ValueError("max_ellipsoids cannot be smaller than active ellipsoids")
+        raise ValueError("max_ellipsoids is incompatible with existing padding")
+
+    if isinstance(bound, SingleEllipsoidBound):
+        ellipsoids = (bound,)
+        log_total_volume = float(bound.log_volume)
+        ndim = int(bound.ndim)
+    elif isinstance(bound, MultiEllipsoidBound):
+        ellipsoids = bound.ellipsoids
+        log_total_volume = float(bound.log_total_volume)
+        ndim = int(bound.ndim)
+    else:
+        raise TypeError("bound must be a SingleEllipsoidBound or MultiEllipsoidBound")
+
+    n_ellipsoids = len(ellipsoids)
+    if n_ellipsoids < 1:
+        raise ValueError("bound must contain at least one ellipsoid")
+    if max_ellipsoids is None:
+        max_ellipsoids = n_ellipsoids
+    max_ellipsoids = int(max_ellipsoids)
+    if max_ellipsoids < n_ellipsoids:
+        raise ValueError("max_ellipsoids cannot be smaller than number of ellipsoids")
+
+    centers = jnp.zeros((max_ellipsoids, ndim), dtype=float)
+    chols = jnp.broadcast_to(jnp.eye(ndim), (max_ellipsoids, ndim, ndim)).astype(float)
+    inv_chols = jnp.broadcast_to(
+        jnp.eye(ndim), (max_ellipsoids, ndim, ndim)
+    ).astype(float)
+    log_volumes = jnp.full((max_ellipsoids,), -jnp.inf, dtype=float)
+    active = jnp.arange(max_ellipsoids) < n_ellipsoids
+
+    active_centers = jnp.stack([ellipsoid.center for ellipsoid in ellipsoids])
+    active_chols = jnp.stack([ellipsoid.chol for ellipsoid in ellipsoids])
+    active_inv_chols = jnp.stack([ellipsoid.inv_chol for ellipsoid in ellipsoids])
+    active_log_volumes = jnp.asarray(
+        [ellipsoid.log_volume for ellipsoid in ellipsoids], dtype=float
+    )
+    centers = centers.at[:n_ellipsoids].set(active_centers)
+    chols = chols.at[:n_ellipsoids].set(active_chols)
+    inv_chols = inv_chols.at[:n_ellipsoids].set(active_inv_chols)
+    log_volumes = log_volumes.at[:n_ellipsoids].set(active_log_volumes)
+
+    return JaxEllipsoidBound(
+        centers=centers,
+        chols=chols,
+        inv_chols=inv_chols,
+        log_volumes=log_volumes,
+        active=active,
+        n_active=int(n_ellipsoids),
+        ndim=ndim,
+        max_ellipsoids=max_ellipsoids,
+        log_total_volume=log_total_volume,
+    )
+
+
+def count_containing_jax_ellipsoids(
+    bound: JaxEllipsoidBound,
+    u: ArrayLike,
+) -> jnp.ndarray:
+    """Count padded JAX ellipsoids that contain one point or a batch."""
+
+    u = jnp.asarray(u, dtype=float)
+    if u.shape[-1:] != (bound.ndim,):
+        raise ValueError("u must have shape (ndim,) or (..., ndim)")
+    delta = u[..., None, :] - bound.centers
+    x = jnp.einsum("...ed,ekd->...ek", delta, bound.inv_chols)
+    contained = jnp.sum(jnp.square(x), axis=-1) <= 1.0 + 1e-10
+    contained = contained & bound.active
+    return jnp.sum(contained.astype(int), axis=-1)
+
+
+def contains_jax_ellipsoid_bound(
+    bound: JaxEllipsoidBound,
+    u: ArrayLike,
+) -> jnp.ndarray:
+    """Return whether points lie inside at least one active JAX ellipsoid."""
+
+    return count_containing_jax_ellipsoids(bound, u) > 0
+
+
+def jax_bound_volume_probs(bound: JaxEllipsoidBound) -> jnp.ndarray:
+    """Return normalized volume probabilities over padded ellipsoid rows."""
+
+    probs = jnp.exp(bound.log_volumes - bound.log_total_volume)
+    probs = jnp.where(bound.active, probs, 0.0)
+    total = jnp.sum(probs)
+    valid_total = jnp.isfinite(total) & (total > 0.0)
+    safe_total = jnp.where(valid_total, total, 1.0)
+    return jnp.where(valid_total, probs / safe_total, jnp.zeros_like(probs))
 
 
 def sample_single_ellipsoid(key, bound: SingleEllipsoidBound, n: int):
