@@ -139,6 +139,8 @@ class NestedSampler:
             min_accepts=self.kwargs.get("min_accepts", 1),
             replacement_chains=self.kwargs.get("replacement_chains", 1),
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
+            rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
+            rwalk_cov_jitter=self.kwargs.get("rwalk_cov_jitter", 1e-6),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -156,6 +158,8 @@ class NestedSampler:
             "slice_steps": int(self.kwargs.get("slice_steps", 10)),
             "min_accepts": int(self.kwargs.get("min_accepts", 1)),
             "replacement_chains": int(self.kwargs.get("replacement_chains", 1)),
+            "rwalk_proposal": str(self.kwargs.get("rwalk_proposal", "isotropic")),
+            "rwalk_cov_jitter": float(self.kwargs.get("rwalk_cov_jitter", 1e-6)),
             "replacement_chain_schedule": (
                 None
                 if self.kwargs.get("replacement_chain_schedule") is None
@@ -186,13 +190,17 @@ class NestedSampler:
             "slice_steps",
             "min_accepts",
             "replacement_chains",
+            "rwalk_proposal",
+            "rwalk_cov_jitter",
             "replacement_chain_schedule",
         ):
-            checkpoint_value = (
-                checkpoint_config.get(name, 1)
-                if name in {"min_accepts", "replacement_chains"}
-                else checkpoint_config.get(name)
-            )
+            default_values = {
+                "min_accepts": 1,
+                "replacement_chains": 1,
+                "rwalk_proposal": "isotropic",
+                "rwalk_cov_jitter": 1e-6,
+            }
+            checkpoint_value = checkpoint_config.get(name, default_values.get(name))
             if checkpoint_value != current[name]:
                 raise ValueError(
                     f"checkpoint {name}={checkpoint_value!r} is not "
@@ -251,4 +259,6 @@ class NestedSampler:
             min_accepts=self.kwargs.get("min_accepts", 1),
             replacement_chains=self.kwargs.get("replacement_chains", 1),
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
+            rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
+            rwalk_cov_jitter=self.kwargs.get("rwalk_cov_jitter", 1e-6),
         )
