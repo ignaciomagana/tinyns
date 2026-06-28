@@ -222,6 +222,96 @@ def jax_bound_volume_probs(bound: JaxEllipsoidBound) -> jnp.ndarray:
     return jnp.where(valid_total, probs / safe_total, jnp.zeros_like(probs))
 
 
+def _sample_unit_ball(key, n: int, ndim: int) -> jnp.ndarray:
+    """Draw ``n`` points uniformly from the ``ndim``-dimensional unit ball."""
+
+    key_dir, key_r = random.split(key)
+    z = random.normal(key_dir, shape=(n, ndim))
+    norm = jnp.linalg.norm(z, axis=-1, keepdims=True)
+    direction = z / jnp.maximum(norm, jnp.finfo(z.dtype).tiny)
+    radius = random.uniform(key_r, shape=(n, 1)) ** (1.0 / ndim)
+    return radius * direction
+
+
+def sample_jax_ellipsoid_bound(key, bound: JaxEllipsoidBound, n: int):
+    """Draw raw samples from volume-weighted active JAX ellipsoids.
+
+    Returns ``(samples, indices)`` where ``indices`` identifies the active
+    padded ellipsoid row used for each sample. This low-level helper samples
+    ellipsoids by volume and does not correct for overlap between ellipsoids.
+    """
+
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    key_idx, key_x = random.split(key)
+    probs = jax_bound_volume_probs(bound)
+    indices = random.choice(key_idx, bound.max_ellipsoids, shape=(n,), p=probs)
+    x = _sample_unit_ball(key_x, n, bound.ndim)
+    center = bound.centers[indices]
+    chol = bound.chols[indices]
+    samples = center + jnp.einsum("nd,nkd->nk", x, chol)
+    return samples, indices
+
+
+def sample_jax_ellipsoid_bound_corrected(
+    key,
+    bound: JaxEllipsoidBound,
+    n: int,
+    *,
+    max_draws_multiplier: int = 10,
+):
+    """Draw approximately uniform samples from an overlapping JAX ellipsoid union.
+
+    Candidates are drawn from volume-weighted ellipsoids and accepted with
+    probability ``1 / count``, where ``count`` is the number of active
+    ellipsoids containing the candidate. If the draw budget is exhausted, this
+    returns fewer than ``n`` samples instead of failing.
+    """
+
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    if max_draws_multiplier <= 0:
+        raise ValueError("max_draws_multiplier must be positive")
+    if n == 0:
+        return jnp.empty((0, bound.ndim)), jnp.empty((0,), dtype=int), 0, 0
+
+    budget = max(n, int(n) * int(max_draws_multiplier))
+    accepted_samples = []
+    accepted_indices = []
+    draws = 0
+    overlap_rejections = 0
+    new_key = key
+    while draws < budget and sum(sample.shape[0] for sample in accepted_samples) < n:
+        batch = min(n, budget - draws)
+        new_key, draw_key, accept_key = random.split(new_key, 3)
+        candidates, indices = sample_jax_ellipsoid_bound(draw_key, bound, batch)
+        counts = count_containing_jax_ellipsoids(bound, candidates)
+        accept_prob = 1.0 / jnp.maximum(counts, 1)
+        accepted = random.uniform(accept_key, shape=(batch,)) < accept_prob
+        accepted_samples.append(candidates[accepted])
+        accepted_indices.append(indices[accepted])
+        draws += int(batch)
+        overlap_rejections += int(jnp.sum(~accepted))
+
+    if not accepted_samples:
+        return (
+            jnp.empty((0, bound.ndim)),
+            jnp.empty((0,), dtype=int),
+            draws,
+            overlap_rejections,
+        )
+
+    samples = jnp.concatenate(accepted_samples, axis=0)[:n]
+    indices = jnp.concatenate(accepted_indices, axis=0)[:n]
+    return samples, indices, draws, overlap_rejections
+
+
+def jax_in_unit_cube(u: ArrayLike) -> jnp.ndarray:
+    """JAX-native unit-cube membership helper for one point or a batch."""
+
+    return in_unit_cube(u)
+
+
 def sample_single_ellipsoid(key, bound: SingleEllipsoidBound, n: int):
     """Draw ``n`` samples uniformly from the raw ellipsoid."""
 
