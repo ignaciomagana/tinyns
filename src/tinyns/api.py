@@ -55,13 +55,19 @@ class NestedSampler:
             raise ValueError("ndim must be a positive integer")
         if nlive <= 0:
             raise ValueError("nlive must be a positive integer")
-        if sample not in {"prior", "rwalk", "slice", "rslice"}:
+        if sample not in {"prior", "rwalk", "slice", "rslice", "bound"}:
             raise ValueError(
-                "sample must be one of {'prior', 'rwalk', 'slice', 'rslice'}"
+                "sample must be one of {'prior', 'rwalk', 'slice', 'rslice', 'bound'}"
             )
         kernel = kwargs.get("kernel", "python")
         if kernel not in {"python", "jax"}:
             raise ValueError("kernel must be one of {'python', 'jax'}")
+        bound = kwargs.get("bound", "none")
+        if bound not in {"none", "single"}:
+            raise ValueError("bound must be one of {'none', 'single'}")
+        rwalk_seed = kwargs.get("rwalk_seed", "live")
+        if rwalk_seed not in {"live", "bound"}:
+            raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
         if not callable(loglike):
             raise TypeError("loglike must be callable")
         if not callable(prior_transform):
@@ -141,6 +147,13 @@ class NestedSampler:
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
             rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
             rwalk_cov_jitter=self.kwargs.get("rwalk_cov_jitter", 1e-6),
+            bound=self.kwargs.get("bound", "none"),
+            bound_enlargement=self.kwargs.get("bound_enlargement", 1.25),
+            bound_update_interval=self.kwargs.get("bound_update_interval", 1),
+            bound_jitter=self.kwargs.get("bound_jitter", 1e-6),
+            bound_max_draws=self.kwargs.get("bound_max_draws"),
+            rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
+            rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -165,6 +178,13 @@ class NestedSampler:
                 if self.kwargs.get("replacement_chain_schedule") is None
                 else list(self.kwargs.get("replacement_chain_schedule"))
             ),
+            "bound": str(self.kwargs.get("bound", "none")),
+            "bound_enlargement": float(self.kwargs.get("bound_enlargement", 1.25)),
+            "bound_update_interval": int(self.kwargs.get("bound_update_interval", 1)),
+            "bound_jitter": float(self.kwargs.get("bound_jitter", 1e-6)),
+            "bound_max_draws": self.kwargs.get("bound_max_draws"),
+            "rwalk_seed": str(self.kwargs.get("rwalk_seed", "live")),
+            "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -193,12 +213,26 @@ class NestedSampler:
             "rwalk_proposal",
             "rwalk_cov_jitter",
             "replacement_chain_schedule",
+            "bound",
+            "bound_enlargement",
+            "bound_update_interval",
+            "bound_jitter",
+            "bound_max_draws",
+            "rwalk_seed",
+            "rwalk_seed_fallback",
         ):
             default_values = {
                 "min_accepts": 1,
                 "replacement_chains": 1,
                 "rwalk_proposal": "isotropic",
                 "rwalk_cov_jitter": 1e-6,
+                "bound": "none",
+                "bound_enlargement": 1.25,
+                "bound_update_interval": 1,
+                "bound_jitter": 1e-6,
+                "bound_max_draws": None,
+                "rwalk_seed": "live",
+                "rwalk_seed_fallback": True,
             }
             checkpoint_value = checkpoint_config.get(name, default_values.get(name))
             if checkpoint_value != current[name]:
@@ -261,4 +295,11 @@ class NestedSampler:
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
             rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
             rwalk_cov_jitter=self.kwargs.get("rwalk_cov_jitter", 1e-6),
+            bound=self.kwargs.get("bound", "none"),
+            bound_enlargement=self.kwargs.get("bound_enlargement", 1.25),
+            bound_update_interval=self.kwargs.get("bound_update_interval", 1),
+            bound_jitter=self.kwargs.get("bound_jitter", 1e-6),
+            bound_max_draws=self.kwargs.get("bound_max_draws"),
+            rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
+            rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
         )

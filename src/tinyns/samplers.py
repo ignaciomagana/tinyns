@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax, random
 
+from tinyns.bounds import in_unit_cube, sample_single_ellipsoid
 from tinyns.math import reflect_unit_cube
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -29,6 +30,85 @@ def _validate_min_accepts(min_accepts: int) -> None:
         or min_accepts <= 0
     ):
         raise ValueError("min_accepts must be a positive integer")
+
+
+def draw_constrained_single_bound(
+    key: PRNGKeyLike,
+    loglike: LogLikelihood,
+    prior_transform: PriorTransform,
+    logl_min: float,
+    bound,
+    ndim: int,
+    *,
+    max_attempts: int = 10_000,
+    batch_size: int = 128,
+):
+    """Draw a constrained replacement from a single ellipsoid bound.
+
+    Raw ellipsoid draws are first clipped to the unit cube. Only unit-cube
+    survivors are transformed and counted as likelihood calls.
+    """
+    if ndim <= 0:
+        raise ValueError("ndim must be a positive integer")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be a positive integer")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if getattr(bound, "ndim", ndim) != ndim:
+        raise ValueError("bound dimensionality must match ndim")
+
+    best_u = None
+    best_theta = None
+    best_logl = -math.inf
+    ncall = 0
+    bound_draws = 0
+    unit_cube_survivors = 0
+    new_key = key
+
+    while ncall < max_attempts:
+        new_key, draw_key = random.split(new_key)
+        u_batch = sample_single_ellipsoid(draw_key, bound, batch_size)
+        bound_draws += int(batch_size)
+        inside = in_unit_cube(u_batch)
+        for u in u_batch[inside]:
+            if ncall >= max_attempts:
+                break
+            unit_cube_survivors += 1
+            theta = _validate_theta_shape(prior_transform(u), ndim)
+            logl = float(loglike(theta))
+            ncall += 1
+            if best_u is None or logl > best_logl:
+                best_u = u
+                best_theta = theta
+                best_logl = logl
+            if logl >= logl_min:
+                info = {
+                    "bound_draws": bound_draws,
+                    "bound_unit_cube_survivors": unit_cube_survivors,
+                    "bound_loglike_evals": ncall,
+                    "bound_acceptance": ncall / bound_draws if bound_draws else 0.0,
+                    "bound_unit_cube_acceptance": (
+                        unit_cube_survivors / bound_draws if bound_draws else 0.0
+                    ),
+                }
+                return new_key, u, theta, logl, ncall, True, info
+
+    if best_u is None:
+        best_u = jnp.full((ndim,), 0.5)
+        best_theta = _validate_theta_shape(prior_transform(best_u), ndim)
+        best_logl = float(loglike(best_theta))
+        ncall += 1
+        unit_cube_survivors += 1
+    info = {
+        "bound_draws": bound_draws,
+        "bound_unit_cube_survivors": unit_cube_survivors,
+        "bound_loglike_evals": ncall,
+        "bound_acceptance": 0.0,
+        "bound_unit_cube_acceptance": unit_cube_survivors / bound_draws
+        if bound_draws
+        else 0.0,
+    }
+    return new_key, best_u, best_theta, best_logl, ncall, False, info
 
 
 def draw_constrained_prior(

@@ -6,11 +6,13 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
+from tinyns.bounds import build_single_ellipsoid_bound
 from tinyns.samplers import (
     draw_constrained_prior,
     draw_constrained_prior_vectorized,
     draw_constrained_rslice,
     draw_constrained_rwalk,
+    draw_constrained_single_bound,
     draw_constrained_slice,
 )
 
@@ -946,3 +948,26 @@ def test_draw_constrained_rwalk_jax_accepts_proposal_chol() -> None:
     assert accepted is True
     assert ncall == 20
     assert math.isfinite(logl)
+
+
+def test_draw_constrained_single_bound_returns_finite_point() -> None:
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    _, u, theta, logl, ncall, accepted, info = draw_constrained_single_bound(
+        random.PRNGKey(987),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        bound,
+        2,
+        max_attempts=20,
+        batch_size=8,
+    )
+
+    assert accepted
+    assert ncall >= 1
+    assert jnp.all(jnp.isfinite(u))
+    assert jnp.all(jnp.isfinite(theta))
+    assert jnp.isfinite(logl)
+    assert info["bound_draws"] >= info["bound_loglike_evals"]
