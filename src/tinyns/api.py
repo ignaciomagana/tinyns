@@ -165,6 +165,7 @@ class NestedSampler:
             ),
             rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
+            allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -207,6 +208,7 @@ class NestedSampler:
             ),
             "rwalk_seed": str(self.kwargs.get("rwalk_seed", "live")),
             "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
+            "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -247,6 +249,7 @@ class NestedSampler:
             "multi_bound_overlap_correction",
             "rwalk_seed",
             "rwalk_seed_fallback",
+            "allow_unused_bound",
         ):
             default_values = {
                 "min_accepts": 1,
@@ -265,6 +268,7 @@ class NestedSampler:
                 "multi_bound_overlap_correction": True,
                 "rwalk_seed": "live",
                 "rwalk_seed_fallback": True,
+                "allow_unused_bound": False,
             }
             checkpoint_value = checkpoint_config.get(name, default_values.get(name))
             if checkpoint_value != current[name]:
@@ -345,4 +349,5 @@ class NestedSampler:
             ),
             rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
+            allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
         )

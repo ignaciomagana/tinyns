@@ -148,6 +148,12 @@ def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
     assert "max_replacement_batches" in row
 
 
+def test_benchmark_parser_accepts_allow_unused_bound() -> None:
+    args = parse_args(["--allow-unused-bound"])
+
+    assert args.allow_unused_bound is True
+
+
 def test_benchmark_parser_accepts_replacement_chains() -> None:
     args = parse_args(["--replacement-chains", "4"])
 

@@ -898,6 +898,94 @@ def test_static_nested_multi_bound_rwalk_jax_runs() -> None:
     assert result.metadata["bound"] == "multi"
 
 
+def test_static_nested_bounded_rwalk_live_seed_requires_opt_in() -> None:
+    with pytest.raises(ValueError, match="requires rwalk_seed='bound'"):
+        run_static_nested(
+            random.PRNGKey(104),
+            lambda theta: -0.5 * jnp.sum(theta**2),
+            lambda u: 2.0 * u - 1.0,
+            ndim=2,
+            nlive=20,
+            sample="rwalk",
+            kernel="jax",
+            bound="multi",
+            rwalk_seed="live",
+            maxiter=1,
+        )
+
+
+def test_static_nested_bounded_rwalk_live_seed_allow_unused_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(105),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=20,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="live",
+        allow_unused_bound=True,
+        maxiter=2,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["allow_unused_bound"] is True
+    assert result.metadata["bounded_rwalk"] is False
+
+
+def test_static_nested_bounded_rwalk_metadata_keeps_seed_and_adaptive_info() -> None:
+    result = run_static_nested(
+        random.PRNGKey(106),
+        lambda theta: -0.5 * jnp.sum((theta / 0.2) ** 2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="bound",
+        rwalk_proposal="live-cov",
+        walks=2,
+        replacement_chain_schedule=(1, 2),
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["bounded_rwalk"] is True
+    assert result.metadata["mean_bound_seed_calls"] is not None
+    assert result.metadata["max_bound_seed_calls"] is not None
+    assert result.metadata["mean_rwalk_kernel_calls"] is not None
+    assert (
+        result.metadata["mean_total_replacement_calls"]
+        == result.metadata["mean_replacement_ncall"]
+    )
+    assert result.metadata["mean_replacement_batches"] > 0.0
+    assert result.metadata["replacement_chain_usage_counts"]
+
+
+def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
+    result = run_static_nested(
+        random.PRNGKey(107),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=20,
+        sample="rwalk",
+        kernel="jax",
+        bound="none",
+        maxiter=2,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["bound"] == "none"
+    assert result.metadata["bounded_rwalk"] is False
+    assert result.metadata["mean_bound_seed_calls"] is None
+
+
 def test_static_nested_invalid_multi_bound_options_raise() -> None:
     with pytest.raises(ValueError, match="multi_bound_max_ellipsoids"):
         run_static_nested(
