@@ -129,6 +129,13 @@ print(result.summary())
 print(result.diagnostics())
 ```
 
+### Bound update interval
+
+For `bound="multi"`, rebuilding every iteration can be expensive. Use
+`bound_update_interval` to reuse a bound for multiple nested-sampling
+iterations. Larger intervals reduce Python/bound-building overhead but can make
+bounds stale. Validate evidence before production use.
+
 
 ### Batched JAX replacement chains
 

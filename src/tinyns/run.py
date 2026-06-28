@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 
 import jax.numpy as jnp
 import numpy as np
@@ -595,6 +596,8 @@ def run_static_nested(
     bound_draw_history = []
     bound_eval_history = []
     bound_unit_cube_acceptance_history = []
+    bound_build_time_history = []
+    bound_log_volume_history = []
     bound_nellipsoid_history = []
     bound_overlap_rejection_history = []
     bound_seed_call_history = []
@@ -648,6 +651,7 @@ def run_static_nested(
         if bound in {"single", "multi"} and (
             current_bound is None or i % bound_update_interval == 0
         ):
+            build_start = time.perf_counter()
             if bound == "multi":
                 current_bound = build_multi_ellipsoid_bound(
                     live_u,
@@ -661,6 +665,17 @@ def run_static_nested(
                 current_bound = build_single_ellipsoid_bound(
                     live_u, enlargement=bound_enlargement, jitter=bound_jitter
                 )
+            bound_build_time_history.append(time.perf_counter() - build_start)
+            bound_log_volume_history.append(
+                float(
+                    current_bound.log_total_volume
+                    if hasattr(current_bound, "log_total_volume")
+                    else current_bound.log_volume
+                )
+            )
+            bound_nellipsoid_history.append(
+                int(getattr(current_bound, "n_ellipsoids", 1))
+            )
             bound_updates += 1
 
         if sample == "bound":
@@ -994,17 +1009,6 @@ def run_static_nested(
                     )
                 )
             )
-            bound_nellipsoid_history.append(
-                int(
-                    replacement_info.get(
-                        "bound_nellipsoids",
-                        replacement_info.get(
-                            "bound_seed_bound_nellipsoids",
-                            replacement_info.get("bound_seed_nellipsoids", 1),
-                        ),
-                    )
-                )
-            )
             bound_overlap_rejection_history.append(
                 int(
                     replacement_info.get(
@@ -1174,11 +1178,19 @@ def run_static_nested(
         replacement_acceptance_proxy = 0.0
     bound_log_volume = None
     if current_bound is not None:
-        bound_log_volume = (
+        bound_log_volume = float(
             current_bound.log_total_volume
             if hasattr(current_bound, "log_total_volume")
             else current_bound.log_volume
         )
+    bound_build_count = len(bound_build_time_history)
+    bound_build_time_total = float(sum(bound_build_time_history))
+    bound_log_volume_final = (
+        float(bound_log_volume_history[-1]) if bound_log_volume_history else None
+    )
+    bound_nellipsoids_final = (
+        int(bound_nellipsoid_history[-1]) if bound_nellipsoid_history else None
+    )
 
     return NestedSamplingResult(
         samples_u=samples_u,
@@ -1254,7 +1266,35 @@ def run_static_nested(
             "multi_bound_split_threshold": multi_bound_split_threshold,
             "multi_bound_overlap_correction": multi_bound_overlap_correction,
             "bound_updates": bound_updates,
+            "bound_build_time_total": bound_build_time_total,
+            "bound_build_time_mean": (
+                bound_build_time_total / bound_build_count
+                if bound_build_count
+                else 0.0
+            ),
+            "bound_build_time_max": (
+                float(max(bound_build_time_history))
+                if bound_build_time_history
+                else 0.0
+            ),
+            "bound_build_count": bound_build_count,
             "bound_log_volume": bound_log_volume,
+            "bound_log_volume_final": bound_log_volume_final,
+            "bound_log_volume_mean": (
+                float(sum(bound_log_volume_history) / len(bound_log_volume_history))
+                if bound_log_volume_history
+                else None
+            ),
+            "bound_log_volume_min": (
+                float(min(bound_log_volume_history))
+                if bound_log_volume_history
+                else None
+            ),
+            "bound_log_volume_max": (
+                float(max(bound_log_volume_history))
+                if bound_log_volume_history
+                else None
+            ),
             "bound_nellipsoids_mean": float(
                 sum(bound_nellipsoid_history) / len(bound_nellipsoid_history)
             )
@@ -1263,6 +1303,7 @@ def run_static_nested(
             "bound_nellipsoids_max": int(max(bound_nellipsoid_history, default=0))
             if bound_nellipsoid_history
             else None,
+            "bound_nellipsoids_final": bound_nellipsoids_final,
             "bound_seed_nellipsoids": int(max(bound_nellipsoid_history, default=0))
             if bound_nellipsoid_history
             else None,
