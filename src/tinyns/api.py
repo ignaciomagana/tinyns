@@ -119,12 +119,10 @@ class NestedSampler:
             sample == "rwalk"
             and kernel == "jax"
             and bound == "none"
-            and replacement_chain_schedule is None
         ):
             raise NotImplementedError(
                 "jax_block_size > 1 is experimental and currently supported only "
-                "for sample='rwalk', kernel='jax', bound='none', and "
-                "replacement_chain_schedule=None"
+                "for sample='rwalk', kernel='jax', and bound='none'"
             )
         fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
         if fused_bound_rwalk and not (
