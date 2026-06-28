@@ -295,6 +295,8 @@ def test_checkpoint_config_includes_bound_settings(tmp_path):
     assert config["bound_update_interval"] == 1
     assert config["bound_jitter"] == 1e-6
     assert config["bound_max_draws"] is None
+    assert config["bound_rebuild_on_failure"] is False
+    assert config["bound_failure_rebuild_threshold"] == 1
     assert config["multi_bound_max_ellipsoids"] == 32
     assert config["multi_bound_min_points"] is None
     assert config["multi_bound_split_threshold"] == 0.9

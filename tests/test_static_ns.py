@@ -812,6 +812,82 @@ def test_static_nested_bound_update_interval_must_be_positive() -> None:
         )
 
 
+
+
+def test_static_nested_bound_failure_policy_metadata_defaults() -> None:
+    result = run_static_nested(
+        random.PRNGKey(130),
+        lambda theta: float(-jnp.sum(theta**2)),
+        lambda u: u,
+        ndim=2,
+        nlive=12,
+        maxiter=2,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["bound_forced_rebuilds"] == 0
+    assert result.metadata["bound_rebuild_on_failure"] is False
+    assert result.metadata["bound_failure_rebuild_threshold"] == 1
+
+
+def test_static_nested_bound_failure_rebuild_threshold_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="bound_failure_rebuild_threshold"):
+        run_static_nested(
+            random.PRNGKey(131),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=2,
+            nlive=10,
+            bound_failure_rebuild_threshold=0,
+            maxiter=1,
+        )
+
+
+def test_static_nested_bound_failure_policy_forces_rebuild(monkeypatch) -> None:
+    import tinyns.run as run_module
+
+    def failed_bound_seed(
+        key,
+        loglike,
+        prior_transform,
+        logl_min,
+        bound,
+        ndim,
+        **kwargs,
+    ):
+        u = jnp.full((ndim,), 0.5)
+        theta = prior_transform(u)
+        return key, u, theta, float(logl_min), 1, False, {
+            "bound_draws": 1,
+            "bound_loglike_evals": 1,
+            "bound_unit_cube_acceptance": 1.0,
+            "bound_overlap_rejections": 0,
+        }
+
+    monkeypatch.setattr(run_module, "draw_constrained_single_bound", failed_bound_seed)
+    result = run_static_nested(
+        random.PRNGKey(132),
+        lambda theta: -jnp.sum(theta**2),
+        lambda u: u,
+        ndim=2,
+        nlive=20,
+        sample="rwalk",
+        kernel="jax",
+        walks=2,
+        bound="single",
+        bound_update_interval=100,
+        bound_rebuild_on_failure=True,
+        bound_failure_rebuild_threshold=1,
+        rwalk_seed="bound",
+        rwalk_seed_fallback=True,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["bound_forced_rebuilds"] >= 1
+    assert result.metadata["bound_build_count"] > 1
+
+
 def test_static_nested_single_bound_runs_and_records_metadata() -> None:
     result = run_static_nested(
         random.PRNGKey(102),
