@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import jax
 import jax.numpy as jnp
 import pytest
 from jax import random
@@ -971,3 +972,156 @@ def test_draw_constrained_single_bound_returns_finite_point() -> None:
     assert jnp.all(jnp.isfinite(theta))
     assert jnp.isfinite(logl)
     assert info["bound_draws"] >= info["bound_loglike_evals"]
+
+
+def test_draw_constrained_single_bound_jax_accepts_single_bound() -> None:
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    _, u, theta, logl, ncall, accepted, info = draw_constrained_single_bound_jax(
+        random.PRNGKey(1001),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        bound,
+        2,
+        batch_size=16,
+        max_batches=4,
+    )
+
+    assert accepted is True
+    assert ncall == info["bound_seed_loglike_evals"]
+    assert ncall % 16 == 0
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert jnp.isfinite(logl)
+    assert set(info) == {
+        "bound_seed_draws",
+        "bound_seed_loglike_evals",
+        "bound_seed_batches",
+        "bound_seed_unit_cube_acceptance",
+    }
+
+
+def test_draw_constrained_single_bound_jax_accepts_jax_bound() -> None:
+    from tinyns.bounds import as_jax_ellipsoid_bound
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = as_jax_ellipsoid_bound(build_single_ellipsoid_bound(live_u))
+
+    _, _u, _theta, logl, ncall, accepted, info = draw_constrained_single_bound_jax(
+        random.PRNGKey(1002),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        bound,
+        2,
+        batch_size=8,
+        max_batches=4,
+    )
+
+    assert accepted is True
+    assert ncall == info["bound_seed_loglike_evals"]
+    assert jnp.isfinite(logl)
+
+
+def test_draw_constrained_single_bound_jax_impossible_threshold_returns_best() -> None:
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    _, u, theta, logl, ncall, accepted, info = draw_constrained_single_bound_jax(
+        random.PRNGKey(1003),
+        gaussian_loglike,
+        identity_prior_transform,
+        1.0,
+        bound,
+        2,
+        batch_size=8,
+        max_batches=3,
+    )
+
+    assert accepted is False
+    assert ncall == 24
+    assert info["bound_seed_batches"] == 3
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert logl <= 0.0
+
+
+def test_draw_constrained_single_bound_jax_random_selection_not_argmax_only() -> None:
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    argmax_count = 0
+    runs = 16
+    for seed in range(runs):
+        _, u, _theta, logl, _ncall, accepted, _info = draw_constrained_single_bound_jax(
+            random.PRNGKey(seed),
+            gaussian_loglike,
+            identity_prior_transform,
+            -10.0,
+            bound,
+            2,
+            batch_size=32,
+            max_batches=1,
+        )
+        assert accepted is True
+        # If the implementation always chose the argmax accepted point, the
+        # returned point would equal the best log likelihood in the same batch.
+        _, replay_key, _select_key = random.split(random.PRNGKey(seed), 3)
+        from tinyns.bounds import (
+            as_jax_ellipsoid_bound,
+            in_unit_cube,
+            sample_jax_ellipsoid_bound,
+        )
+
+        batch, _ = sample_jax_ellipsoid_bound(
+            replay_key, as_jax_ellipsoid_bound(bound), 32
+        )
+        masked = jnp.where(
+            in_unit_cube(batch), jax.vmap(gaussian_loglike)(batch), -jnp.inf
+        )
+        is_argmax = jnp.allclose(u, batch[jnp.argmax(masked)]) and jnp.isclose(
+            logl, jnp.max(masked)
+        )
+        argmax_count += bool(is_argmax)
+
+    assert argmax_count < runs
+
+
+def test_draw_constrained_single_bound_jax_rejects_bad_shapes() -> None:
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    with pytest.raises(ValueError, match="prior_transform"):
+        draw_constrained_single_bound_jax(
+            random.PRNGKey(1004),
+            gaussian_loglike,
+            lambda u: u[0],
+            -10.0,
+            bound,
+            2,
+            batch_size=4,
+            max_batches=1,
+        )
+
+    with pytest.raises(ValueError, match="loglike"):
+        draw_constrained_single_bound_jax(
+            random.PRNGKey(1005),
+            lambda theta: theta,
+            identity_prior_transform,
+            -10.0,
+            bound,
+            2,
+            batch_size=4,
+            max_batches=1,
+        )
