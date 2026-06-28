@@ -108,6 +108,7 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
         jax_block_size = kwargs.get("jax_block_size", 1)
         if (
             not isinstance(jax_block_size, int)
@@ -115,16 +116,24 @@ class NestedSampler:
             or jax_block_size <= 0
         ):
             raise ValueError("jax_block_size must be a positive integer")
-        if jax_block_size > 1 and not (
-            sample == "rwalk"
-            and kernel == "jax"
-            and bound == "none"
-        ):
-            raise NotImplementedError(
-                "jax_block_size > 1 is experimental and currently supported only "
-                "for sample='rwalk', kernel='jax', and bound='none'"
+        if jax_block_size > 1:
+            unbounded_block = sample == "rwalk" and kernel == "jax" and bound == "none"
+            bounded_block = (
+                sample == "rwalk"
+                and kernel == "jax"
+                and bound in {"single", "multi"}
+                and rwalk_seed == "bound"
+                and bound_seed_kernel == "jax"
+                and fused_bound_rwalk
             )
-        fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
+            if not (unbounded_block or bounded_block):
+                raise NotImplementedError(
+                    "jax_block_size > 1 is experimental and currently supported only "
+                    "for unbounded sample='rwalk', kernel='jax' or fixed-bound "
+                    "block mode with bound in {'single', 'multi'}, "
+                    "rwalk_seed='bound', bound_seed_kernel='jax', and "
+                    "fused_bound_rwalk=True"
+                )
         if fused_bound_rwalk and not (
             sample == "rwalk"
             and kernel == "jax"
