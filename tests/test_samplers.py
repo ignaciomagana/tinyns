@@ -1028,6 +1028,70 @@ def test_draw_constrained_single_bound_jax_accepts_jax_bound() -> None:
     assert jnp.isfinite(logl)
 
 
+def test_draw_constrained_single_bound_rwalk_jax_shapes_and_info() -> None:
+    from tinyns.samplers import draw_constrained_single_bound_rwalk_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    _, u, theta, logl, ncall, accepted, info = (
+        draw_constrained_single_bound_rwalk_jax(
+            random.PRNGKey(10021),
+            gaussian_loglike,
+            identity_prior_transform,
+            -10.0,
+            bound,
+            2,
+            walks=3,
+            step_scale=0.01,
+            replacement_chains=2,
+            max_attempts=30,
+            bound_batch_size=8,
+            bound_max_batches=4,
+        )
+    )
+
+    assert accepted is True
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert jnp.isfinite(logl)
+    assert ncall == info["bound_seed_loglike_evals"] + info["rwalk_kernel_calls"]
+    assert info["replacement_batches"] >= 1
+    assert info["replacement_chains_used"] >= 2
+    assert info["replacement_chain_usage_counts"]["2"] >= 1
+
+
+def test_draw_single_bound_rwalk_jax_impossible_seed_fails_cleanly() -> None:
+    from tinyns.samplers import draw_constrained_single_bound_rwalk_jax
+
+    live_u = jnp.asarray([[0.2, 0.3], [0.4, 0.7], [0.8, 0.6], [0.5, 0.5]])
+    bound = build_single_ellipsoid_bound(live_u)
+
+    _, u, theta, logl, ncall, accepted, info = (
+        draw_constrained_single_bound_rwalk_jax(
+            random.PRNGKey(10022),
+            gaussian_loglike,
+            identity_prior_transform,
+            1.0,
+            bound,
+            2,
+            walks=3,
+            max_attempts=30,
+            replacement_chains=2,
+            bound_batch_size=8,
+            bound_max_batches=2,
+        )
+    )
+
+    assert accepted is False
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert jnp.isfinite(logl)
+    assert ncall == info["bound_seed_loglike_evals"]
+    assert info["rwalk_kernel_calls"] == 0
+    assert info["replacement_batches"] == 0
+
+
 def test_draw_constrained_single_bound_jax_impossible_threshold_returns_best() -> None:
     from tinyns.samplers import draw_constrained_single_bound_jax
 

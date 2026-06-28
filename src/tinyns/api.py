@@ -105,6 +105,22 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
+        if fused_bound_rwalk and not (
+            sample == "rwalk"
+            and kernel == "jax"
+            and bound == "single"
+            and rwalk_seed == "bound"
+        ):
+            raise NotImplementedError(
+                "fused_bound_rwalk=True is supported only for sample='rwalk', "
+                "kernel='jax', bound='single', and rwalk_seed='bound'"
+            )
+        if fused_bound_rwalk and replacement_chain_schedule is not None:
+            raise NotImplementedError(
+                "fused_bound_rwalk=True does not support "
+                "replacement_chain_schedule yet"
+            )
         self.kwargs = dict(kwargs)
 
     def run(
@@ -170,6 +186,7 @@ class NestedSampler:
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
             bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
+            fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -214,6 +231,7 @@ class NestedSampler:
             "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
             "bound_seed_kernel": str(self.kwargs.get("bound_seed_kernel", "python")),
             "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
+            "fused_bound_rwalk": bool(self.kwargs.get("fused_bound_rwalk", False)),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -256,6 +274,7 @@ class NestedSampler:
             "rwalk_seed_fallback",
             "bound_seed_kernel",
             "allow_unused_bound",
+            "fused_bound_rwalk",
         ):
             default_values = {
                 "min_accepts": 1,
@@ -276,6 +295,7 @@ class NestedSampler:
                 "rwalk_seed_fallback": True,
                 "bound_seed_kernel": "python",
                 "allow_unused_bound": False,
+                "fused_bound_rwalk": False,
             }
             checkpoint_value = checkpoint_config.get(name, default_values.get(name))
             if checkpoint_value != current[name]:
@@ -358,4 +378,5 @@ class NestedSampler:
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
             bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
+            fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
         )

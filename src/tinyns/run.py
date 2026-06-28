@@ -23,6 +23,7 @@ from tinyns.samplers import (
     draw_constrained_rwalk_jax_adaptive,
     draw_constrained_single_bound,
     draw_constrained_single_bound_jax,
+    draw_constrained_single_bound_rwalk_jax,
     draw_constrained_slice,
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
@@ -296,6 +297,7 @@ def run_static_nested(
     rwalk_seed_fallback: bool = True,
     bound_seed_kernel: str = "python",
     allow_unused_bound: bool = False,
+    fused_bound_rwalk: bool = False,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -329,6 +331,20 @@ def run_static_nested(
         raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
     if bound_seed_kernel not in {"python", "jax"}:
         raise ValueError("bound_seed_kernel must be one of {'python', 'jax'}")
+    if fused_bound_rwalk and not (
+        sample == "rwalk"
+        and kernel == "jax"
+        and bound == "single"
+        and rwalk_seed == "bound"
+    ):
+        raise NotImplementedError(
+            "fused_bound_rwalk=True is supported only for sample='rwalk', "
+            "kernel='jax', bound='single', and rwalk_seed='bound'"
+        )
+    if fused_bound_rwalk and replacement_chain_schedule is not None:
+        raise NotImplementedError(
+            "fused_bound_rwalk=True does not support replacement_chain_schedule yet"
+        )
     if bound_seed_kernel == "jax" and not (
         sample == "rwalk"
         and kernel == "jax"
@@ -490,6 +506,7 @@ def run_static_nested(
         "rwalk_seed_fallback": bool(rwalk_seed_fallback),
         "bound_seed_kernel": str(bound_seed_kernel),
         "allow_unused_bound": bool(allow_unused_bound),
+        "fused_bound_rwalk": bool(fused_bound_rwalk),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -712,7 +729,35 @@ def run_static_nested(
                 proposal_chol = jnp.linalg.cholesky(cov)
             seed_live_u = live_u
             seed_live_logl = live_logl
-            if bound in {"single", "multi"} and rwalk_seed == "bound":
+            if fused_bound_rwalk:
+                seed_limit = bound_max_draws or max_attempts
+                draw_result = draw_constrained_single_bound_rwalk_jax(
+                    key,
+                    loglike,
+                    prior_transform,
+                    logl_worst,
+                    current_bound,
+                    ndim,
+                    walks=walks,
+                    step_scale=step_scale,
+                    max_attempts=max_attempts,
+                    min_accepts=min_accepts,
+                    replacement_chains=replacement_chains,
+                    bound_batch_size=batch_size,
+                    bound_max_batches=int(math.ceil(seed_limit / batch_size)),
+                    proposal_chol=proposal_chol,
+                )
+                replacement_info = draw_result[6]
+                bound_seed_call_history.append(
+                    int(replacement_info.get("bound_seed_loglike_evals", 0))
+                )
+                bound_seed_batch_history.append(
+                    int(replacement_info.get("bound_seed_batches", 0))
+                )
+                rwalk_kernel_call_history.append(
+                    int(replacement_info.get("rwalk_kernel_calls", 0))
+                )
+            elif bound in {"single", "multi"} and rwalk_seed == "bound":
                 seed_draw = (
                     draw_constrained_single_bound_jax
                     if bound_seed_kernel == "jax" and bound == "single"
@@ -776,10 +821,13 @@ def run_static_nested(
                 seed_calls = 0
                 seed_accepted = True
             if not (
+                fused_bound_rwalk
+                or (
                 bound in {"single", "multi"}
                 and rwalk_seed == "bound"
                 and not seed_accepted
                 and not rwalk_seed_fallback
+                )
             ):
                 draw_result = rwalk_draw(
                     key,
@@ -886,7 +934,11 @@ def run_static_nested(
             bound_draw_history.append(
                 int(
                     replacement_info.get(
-                        "bound_draws", replacement_info.get("bound_seed_bound_draws", 0)
+                        "bound_draws",
+                        replacement_info.get(
+                            "bound_seed_bound_draws",
+                            replacement_info.get("bound_seed_draws", 0),
+                        ),
                     )
                 )
             )
@@ -894,7 +946,10 @@ def run_static_nested(
                 int(
                     replacement_info.get(
                         "bound_loglike_evals",
-                        replacement_info.get("bound_seed_bound_loglike_evals", 0),
+                        replacement_info.get(
+                            "bound_seed_bound_loglike_evals",
+                            replacement_info.get("bound_seed_loglike_evals", 0),
+                        ),
                     )
                 )
             )
@@ -903,7 +958,10 @@ def run_static_nested(
                     replacement_info.get(
                         "bound_unit_cube_acceptance",
                         replacement_info.get(
-                            "bound_seed_bound_unit_cube_acceptance", 0.0
+                            "bound_seed_bound_unit_cube_acceptance",
+                            replacement_info.get(
+                                "bound_seed_unit_cube_acceptance", 0.0
+                            ),
                         ),
                     )
                 )
@@ -1184,6 +1242,7 @@ def run_static_nested(
             "rwalk_seed_fallback": rwalk_seed_fallback,
             "bound_seed_kernel": bound_seed_kernel,
             "allow_unused_bound": bool(allow_unused_bound),
+            "fused_bound_rwalk": bool(fused_bound_rwalk),
             "bounded_rwalk": bool(
                 sample == "rwalk" and bound != "none" and rwalk_seed == "bound"
             ),
