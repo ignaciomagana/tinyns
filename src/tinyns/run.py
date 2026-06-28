@@ -86,6 +86,13 @@ def _make_run_state(
     ndim: int,
     replacement_ncall: list[int],
     replacement_failures: int,
+    replacement_batches: list[int] | None = None,
+    replacement_chains_used: list[int] | None = None,
+    replacement_chain_usage_counts: dict[str, int] | None = None,
+    replacement_chain_schedule=None,
+    replacement_chains: int | None = None,
+    kernel: str | None = None,
+    walks: int | None = None,
 ) -> dict[str, object]:
     if replacement_ncall:
         replacement_mean_ncall_so_far = float(
@@ -93,6 +100,24 @@ def _make_run_state(
         )
     else:
         replacement_mean_ncall_so_far = None
+    if replacement_batches:
+        replacement_mean_batches_so_far = float(
+            sum(replacement_batches) / len(replacement_batches)
+        )
+        replacement_max_batches_so_far = int(max(replacement_batches))
+    else:
+        replacement_mean_batches_so_far = None
+        replacement_max_batches_so_far = None
+    if replacement_chains_used:
+        replacement_mean_chains_used_so_far = float(
+            sum(replacement_chains_used) / len(replacement_chains_used)
+        )
+        replacement_max_chains_used_so_far = int(max(replacement_chains_used))
+    else:
+        replacement_mean_chains_used_so_far = None
+        replacement_max_chains_used_so_far = None
+    replacement_chain_usage_counts_so_far = dict(replacement_chain_usage_counts or {})
+    adaptive_replacement_chains = replacement_chain_schedule is not None
     return {
         "iter": int(iteration),
         "logz": float(logz),
@@ -104,6 +129,16 @@ def _make_run_state(
         "nlive": int(nlive),
         "ndim": int(ndim),
         "replacement_mean_ncall_so_far": replacement_mean_ncall_so_far,
+        "replacement_mean_batches_so_far": replacement_mean_batches_so_far,
+        "replacement_max_batches_so_far": replacement_max_batches_so_far,
+        "replacement_mean_chains_used_so_far": replacement_mean_chains_used_so_far,
+        "replacement_max_chains_used_so_far": replacement_max_chains_used_so_far,
+        "replacement_chain_usage_counts_so_far": replacement_chain_usage_counts_so_far,
+        "adaptive_replacement_chains": adaptive_replacement_chains,
+        "replacement_chains": replacement_chains,
+        "replacement_chain_schedule": replacement_chain_schedule,
+        "kernel": kernel,
+        "walks": walks,
         "replacement_failures": int(replacement_failures),
     }
 
@@ -113,6 +148,23 @@ def _format_progress_line(state: dict[str, object]) -> str:
 
     repl = state.get("replacement_mean_ncall_so_far")
     repl_text = "n/a" if repl is None else f"{float(repl):.1f}"
+    batches = state.get("replacement_mean_batches_so_far")
+    batches_text = "n/a" if batches is None else f"{float(batches):.2f}"
+    chains = state.get("replacement_mean_chains_used_so_far")
+    chains_text = "n/a" if chains is None else f"{float(chains):.1f}"
+    usage_counts = state.get("replacement_chain_usage_counts_so_far") or {}
+    usage_text = ""
+    if state.get("adaptive_replacement_chains") and usage_counts:
+        nonzero = [
+            (str(chain_count), int(count))
+            for chain_count, count in usage_counts.items()
+            if int(count) > 0
+        ]
+        nonzero.sort(key=lambda item: int(item[0]))
+        usage = ",".join(f"{chain_count}:{count}" for chain_count, count in nonzero[:4])
+        if len(nonzero) > 4:
+            usage += ",..."
+        usage_text = f" usage={usage}" if usage else ""
     return (
         f"iter={int(state['iter']):05d} "
         f"logz={float(state['logz']):.3f} "
@@ -121,6 +173,9 @@ def _format_progress_line(state: dict[str, object]) -> str:
         f"logl_min={float(state['logl_min']):.3g} "
         f"logl_live_max={float(state['logl_live_max']):.3g} "
         f"repl_ncall={repl_text} "
+        f"repl_batches={batches_text} "
+        f"repl_chains={chains_text}"
+        f"{usage_text} "
         f"sample={state['sample']}"
     )
 
@@ -484,10 +539,20 @@ def run_static_nested(
                     )
             else:
                 key, new_u, new_theta, new_logl, calls, accepted = draw_result
-                replacement_batches.append(1)
-                replacement_chains_used.append(
-                    int(replacement_chains) if kernel == "jax" else 1
-                )
+                if kernel == "jax":
+                    batch_ncall = int(walks) * int(replacement_chains)
+                    batches_used = int(math.ceil(int(calls) / batch_ncall))
+                    chains_used = int(replacement_chains) * batches_used
+                    replacement_batches.append(batches_used)
+                    replacement_chains_used.append(chains_used)
+                    chain_count = str(int(replacement_chains))
+                    replacement_chain_usage_counts[chain_count] = (
+                        replacement_chain_usage_counts.get(chain_count, 0)
+                        + batches_used
+                    )
+                else:
+                    replacement_batches.append(1)
+                    replacement_chains_used.append(1)
         elif sample == "slice":
             key, new_u, new_theta, new_logl, calls, accepted = draw_constrained_slice(
                 key,
@@ -540,6 +605,13 @@ def run_static_nested(
                 ndim=ndim,
                 replacement_ncall=replacement_ncall,
                 replacement_failures=replacement_failures,
+                replacement_batches=replacement_batches,
+                replacement_chains_used=replacement_chains_used,
+                replacement_chain_usage_counts=replacement_chain_usage_counts,
+                replacement_chain_schedule=replacement_chain_schedule,
+                replacement_chains=replacement_chains,
+                kernel=kernel,
+                walks=walks,
             )
             if callback is not None and (
                 i + 1 == 1 or (i + 1) % callback_interval == 0
@@ -582,6 +654,13 @@ def run_static_nested(
             ndim=ndim,
             replacement_ncall=replacement_ncall,
             replacement_failures=replacement_failures,
+            replacement_batches=replacement_batches,
+            replacement_chains_used=replacement_chains_used,
+            replacement_chain_usage_counts=replacement_chain_usage_counts,
+            replacement_chain_schedule=replacement_chain_schedule,
+            replacement_chains=replacement_chains,
+            kernel=kernel,
+            walks=walks,
         )
         if callback is not None and (
             i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
@@ -627,9 +706,15 @@ def run_static_nested(
     niter = int(iteration)
     nlive_final = int(live_logl.size)
     nposterior = int(logwt.size)
-    replacement_batch_ncall = int(walks) * int(replacement_chains)
+    replacement_initial_batch_ncall = int(walks) * int(replacement_chains)
+    replacement_max_batch_ncall = replacement_initial_batch_ncall
+    replacement_batch_ncall = replacement_initial_batch_ncall
     if replacement_chain_schedule is not None:
-        replacement_batch_ncall = int(walks) * int(replacement_chain_schedule[-1])
+        replacement_initial_batch_ncall = int(walks) * int(
+            replacement_chain_schedule[0]
+        )
+        replacement_max_batch_ncall = int(walks) * int(replacement_chain_schedule[-1])
+        replacement_batch_ncall = replacement_max_batch_ncall
     if replacement_ncall:
         mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
         max_replacement_ncall = int(max(replacement_ncall))
@@ -681,6 +766,8 @@ def run_static_nested(
             ),
             "adaptive_replacement_chains": replacement_chain_schedule is not None,
             "replacement_batch_ncall": replacement_batch_ncall,
+            "replacement_initial_batch_ncall": replacement_initial_batch_ncall,
+            "replacement_max_batch_ncall": replacement_max_batch_ncall,
             "batch_size": batch_size,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),

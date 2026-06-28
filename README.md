@@ -154,6 +154,8 @@ The replacement remains valid only if a successful chain is selected without fav
 
 For batched JAX chains, `ncall` counts scalar likelihood evaluations, not wall-clock-equivalent work. A replacement with `walks=25` and `replacement_chains=16` costs 400 scalar likelihood evaluations, but those chains are evaluated in parallel on device. Use wall time and replacement batch counts when judging batched performance.
 
+For JAX rwalk, `repl_ncall` is scalar likelihood calls per replacement. In fixed chain mode, `repl_chains` reports the effective number of parallel chains used per replacement. In adaptive mode, `usage=...` reports how often each stage in the replacement chain schedule was used. Use these diagnostics to choose the smallest chain count or schedule that avoids retry tails.
+
 
 ### Adaptive JAX replacement-chain schedules
 
