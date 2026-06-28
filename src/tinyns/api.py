@@ -116,11 +116,6 @@ class NestedSampler:
                 "fused_bound_rwalk=True is supported only for sample='rwalk', "
                 "kernel='jax', bound in {'single', 'multi'}, and rwalk_seed='bound'"
             )
-        if fused_bound_rwalk and replacement_chain_schedule is not None:
-            raise NotImplementedError(
-                "fused_bound_rwalk=True does not support "
-                "replacement_chain_schedule yet"
-            )
         self.kwargs = dict(kwargs)
 
     def run(

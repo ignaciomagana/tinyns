@@ -1123,21 +1123,34 @@ def test_static_nested_multi_bound_fused_rwalk_jax_live_cov_runs() -> None:
     assert result.metadata["mean_rwalk_kernel_calls"] is not None
 
 
-def test_static_nested_fused_bound_rwalk_rejects_adaptive_schedule() -> None:
-    with pytest.raises(NotImplementedError, match="replacement_chain_schedule"):
-        run_static_nested(
-            random.PRNGKey(1093),
-            lambda theta: -0.5 * jnp.sum(theta**2),
-            lambda u: u,
-            ndim=2,
-            nlive=10,
-            sample="rwalk",
-            kernel="jax",
-            bound="single",
-            rwalk_seed="bound",
-            fused_bound_rwalk=True,
-            replacement_chain_schedule=(1, 2),
-        )
+@pytest.mark.parametrize("bound", ["single", "multi"])
+def test_static_nested_fused_bound_rwalk_adaptive_schedule_runs(bound) -> None:
+    result = run_static_nested(
+        random.PRNGKey(1093),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        sample="rwalk",
+        kernel="jax",
+        bound=bound,
+        rwalk_seed="bound",
+        fused_bound_rwalk=True,
+        walks=2,
+        replacement_chain_schedule=(1, 2),
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["fused_bound_rwalk"] is True
+    assert result.metadata["adaptive_replacement_chains"] is True
+    assert result.metadata["replacement_chain_schedule"] == [1, 2]
+    assert result.metadata["replacement_chain_usage_counts"]
+    assert result.metadata["mean_bound_seed_calls"] is not None
+    assert result.metadata["mean_rwalk_kernel_calls"] is not None
 
 
 def test_static_nested_multi_bound_rwalk_jax_bound_seed_kernel_runs() -> None:

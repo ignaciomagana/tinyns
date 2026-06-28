@@ -1057,6 +1057,7 @@ def draw_constrained_single_bound_rwalk_jax(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chains: int = 1,
+    replacement_chain_schedule=None,
     bound_batch_size: int = 128,
     bound_max_batches: int = 100,
     proposal_chol=None,
@@ -1087,38 +1088,69 @@ def draw_constrained_single_bound_rwalk_jax(
             "rwalk_kernel_calls": 0,
             "replacement_batches": 0,
             "replacement_chains_used": 0,
-            "replacement_chain_usage_counts": {str(int(replacement_chains)): 0},
+            "replacement_chain_usage_counts": (
+                {str(int(c)): 0 for c in replacement_chain_schedule}
+                if replacement_chain_schedule is not None
+                else {str(int(replacement_chains)): 0}
+            ),
         }
         return key, seed_u, seed_theta, seed_logl, int(seed_ncall), False, info
 
-    live_u = jnp.asarray(seed_u).reshape((1, ndim))
-    live_logl = jnp.asarray([seed_logl])
-    rwalk_result = draw_constrained_rwalk_jax(
-        key,
-        loglike,
-        prior_transform,
-        logl_min,
-        live_u,
-        live_logl,
-        ndim,
-        walks=walks,
-        step_scale=step_scale,
-        max_attempts=max_attempts,
-        min_accepts=min_accepts,
-        replacement_chains=replacement_chains,
-        proposal_chol=proposal_chol,
-    )
-    key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
-    batch_ncall = int(walks) * int(replacement_chains)
-    replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
+    if replacement_chain_schedule is None:
+        rwalk_result = draw_constrained_rwalk_jax(
+            key,
+            loglike,
+            prior_transform,
+            logl_min,
+            jnp.asarray(seed_u).reshape((1, ndim)),
+            jnp.asarray([seed_logl]),
+            ndim,
+            walks=walks,
+            step_scale=step_scale,
+            max_attempts=max_attempts,
+            min_accepts=min_accepts,
+            replacement_chains=replacement_chains,
+            proposal_chol=proposal_chol,
+        )
+        key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
+        batch_ncall = int(walks) * int(replacement_chains)
+        replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
+        rwalk_info = {
+            "replacement_batches": replacement_batches,
+            "replacement_chains_used": int(replacement_chains) * replacement_batches,
+            "replacement_chain_usage_counts": {
+                str(int(replacement_chains)): replacement_batches
+            },
+        }
+    else:
+        rwalk_result = draw_constrained_rwalk_jax_adaptive_from_seed(
+            key,
+            loglike,
+            prior_transform,
+            logl_min,
+            seed_u,
+            seed_logl,
+            ndim,
+            walks=walks,
+            step_scale=step_scale,
+            max_attempts=max_attempts,
+            min_accepts=min_accepts,
+            replacement_chain_schedule=replacement_chain_schedule,
+            proposal_chol=proposal_chol,
+        )
+        (
+            key,
+            new_u,
+            new_theta,
+            new_logl,
+            rwalk_ncall,
+            accepted,
+            rwalk_info,
+        ) = rwalk_result
     info = {
         **seed_info,
         "rwalk_kernel_calls": int(rwalk_ncall),
-        "replacement_batches": replacement_batches,
-        "replacement_chains_used": int(replacement_chains) * replacement_batches,
-        "replacement_chain_usage_counts": {
-            str(int(replacement_chains)): replacement_batches
-        },
+        **rwalk_info,
     }
     return (
         key,
@@ -1145,6 +1177,7 @@ def draw_constrained_multi_bound_rwalk_jax(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chains: int = 1,
+    replacement_chain_schedule=None,
     bound_batch_size: int = 128,
     bound_max_batches: int = 100,
     overlap_correction: bool = True,
@@ -1183,38 +1216,69 @@ def draw_constrained_multi_bound_rwalk_jax(
             "rwalk_kernel_calls": 0,
             "replacement_batches": 0,
             "replacement_chains_used": 0,
-            "replacement_chain_usage_counts": {str(int(replacement_chains)): 0},
+            "replacement_chain_usage_counts": (
+                {str(int(c)): 0 for c in replacement_chain_schedule}
+                if replacement_chain_schedule is not None
+                else {str(int(replacement_chains)): 0}
+            ),
         }
         return key, seed_u, seed_theta, seed_logl, int(seed_ncall), False, info
 
-    live_u = jnp.asarray(seed_u).reshape((1, ndim))
-    live_logl = jnp.asarray([seed_logl])
-    rwalk_result = draw_constrained_rwalk_jax(
-        key,
-        loglike,
-        prior_transform,
-        logl_min,
-        live_u,
-        live_logl,
-        ndim,
-        walks=walks,
-        step_scale=step_scale,
-        max_attempts=max_attempts,
-        min_accepts=min_accepts,
-        replacement_chains=replacement_chains,
-        proposal_chol=proposal_chol,
-    )
-    key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
-    batch_ncall = int(walks) * int(replacement_chains)
-    replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
+    if replacement_chain_schedule is None:
+        rwalk_result = draw_constrained_rwalk_jax(
+            key,
+            loglike,
+            prior_transform,
+            logl_min,
+            jnp.asarray(seed_u).reshape((1, ndim)),
+            jnp.asarray([seed_logl]),
+            ndim,
+            walks=walks,
+            step_scale=step_scale,
+            max_attempts=max_attempts,
+            min_accepts=min_accepts,
+            replacement_chains=replacement_chains,
+            proposal_chol=proposal_chol,
+        )
+        key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
+        batch_ncall = int(walks) * int(replacement_chains)
+        replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
+        rwalk_info = {
+            "replacement_batches": replacement_batches,
+            "replacement_chains_used": int(replacement_chains) * replacement_batches,
+            "replacement_chain_usage_counts": {
+                str(int(replacement_chains)): replacement_batches
+            },
+        }
+    else:
+        rwalk_result = draw_constrained_rwalk_jax_adaptive_from_seed(
+            key,
+            loglike,
+            prior_transform,
+            logl_min,
+            seed_u,
+            seed_logl,
+            ndim,
+            walks=walks,
+            step_scale=step_scale,
+            max_attempts=max_attempts,
+            min_accepts=min_accepts,
+            replacement_chain_schedule=replacement_chain_schedule,
+            proposal_chol=proposal_chol,
+        )
+        (
+            key,
+            new_u,
+            new_theta,
+            new_logl,
+            rwalk_ncall,
+            accepted,
+            rwalk_info,
+        ) = rwalk_result
     info = {
         **seed_info,
         "rwalk_kernel_calls": int(rwalk_ncall),
-        "replacement_batches": replacement_batches,
-        "replacement_chains_used": int(replacement_chains) * replacement_batches,
-        "replacement_chain_usage_counts": {
-            str(int(replacement_chains)): replacement_batches
-        },
+        **rwalk_info,
     }
     return (
         key,
@@ -1320,6 +1384,45 @@ def draw_constrained_rwalk_jax_adaptive(
     }
     return key, best_u, best_theta, best_logl, total_ncall, False, info
 
+
+
+def draw_constrained_rwalk_jax_adaptive_from_seed(
+    key: PRNGKeyLike,
+    loglike: LogLikelihood,
+    prior_transform: PriorTransform,
+    logl_min: float,
+    seed_u,
+    seed_logl,
+    ndim: int,
+    *,
+    walks: int = 25,
+    step_scale: float = 0.1,
+    max_attempts: int = 10_000,
+    min_accepts: int = 1,
+    replacement_chain_schedule=(1, 4, 16, 64),
+    proposal_chol=None,
+):
+    """Run adaptive JAX rwalk replacement batches from one fixed seed."""
+    seed_u = jnp.asarray(seed_u)
+    if seed_u.shape != (ndim,):
+        raise ValueError(f"seed_u must have shape ({ndim},)")
+    live_u = seed_u.reshape((1, ndim))
+    live_logl = jnp.asarray([seed_logl])
+    return draw_constrained_rwalk_jax_adaptive(
+        key,
+        loglike,
+        prior_transform,
+        logl_min,
+        live_u,
+        live_logl,
+        ndim,
+        walks=walks,
+        step_scale=step_scale,
+        max_attempts=max_attempts,
+        min_accepts=min_accepts,
+        replacement_chain_schedule=replacement_chain_schedule,
+        proposal_chol=proposal_chol,
+    )
 
 def draw_constrained_rwalk(
     key: PRNGKeyLike,
