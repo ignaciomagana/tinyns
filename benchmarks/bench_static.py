@@ -150,6 +150,7 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "min_accepts": args.min_accepts,
         "kernel": args.kernel,
         "replacement_chains": args.replacement_chains,
+        "replacement_chain_schedule": args.replacement_chain_schedule,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -226,6 +227,10 @@ def run_one(
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
         "replacement_chains": args.replacement_chains,
+        "adaptive_replacement_chains": bool(
+            args.replacement_chain_schedule is not None
+        ),
+        "replacement_chain_schedule": args.replacement_chain_schedule,
         "replacement_batch_ncall": replacement_batch_ncall,
         "repl_batches": repl_batches,
         "max_repl_batches": max_repl_batches,
@@ -239,6 +244,11 @@ def run_one(
         "likelihood_calls_per_second": ncall_per_s,
         "mean_replacement_ncall": mean_replacement_ncall,
         "max_replacement_ncall": max_replacement_ncall,
+        "mean_replacement_chains_used": metadata.get("mean_replacement_chains_used"),
+        "max_replacement_chains_used": metadata.get("max_replacement_chains_used"),
+        "replacement_chain_usage_counts": metadata.get(
+            "replacement_chain_usage_counts"
+        ),
         "replacement_failures": int(metadata.get("replacement_failures", 0)),
         "logz": float(result.logz),
         "logzerr": float(result.logzerr),
@@ -314,6 +324,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--replacement-chains", type=int, default=1)
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
+    parser.add_argument(
+        "--replacement-chain-schedule", nargs="+", type=int, default=None
+    )
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--discard-warmup", action="store_true")
     parser.add_argument("--max-attempts", type=int, default=10000)
@@ -335,11 +348,17 @@ def validate_benchmark_args(args: argparse.Namespace) -> None:
     """Validate benchmark-only argument combinations before running cases."""
 
     replacement_chains_values = (
-        args.replacement_chains_grid
+        [args.replacement_chains]
+        if args.replacement_chain_schedule is not None
+        else args.replacement_chains_grid
         if args.replacement_chains_grid is not None
         else [args.replacement_chains]
     )
-    max_replacement_chains = max(replacement_chains_values)
+    max_replacement_chains = max(
+        args.replacement_chain_schedule
+        if args.replacement_chain_schedule is not None
+        else replacement_chains_values
+    )
     required_max_attempts = args.walks * max_replacement_chains
 
     if args.kernel == "jax" and "rwalk" in args.samplers:
@@ -365,7 +384,9 @@ def _args_for_replacement_chains(
 
 def _run_benchmark_grid(args: argparse.Namespace) -> list[dict[str, Any]]:
     replacement_chains_values = (
-        args.replacement_chains_grid
+        [args.replacement_chains]
+        if args.replacement_chain_schedule is not None
+        else args.replacement_chains_grid
         if args.replacement_chains_grid is not None
         else [args.replacement_chains]
     )

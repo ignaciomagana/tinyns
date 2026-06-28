@@ -88,6 +88,14 @@ class NestedSampler:
                 "replacement_chains is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        replacement_chain_schedule = kwargs.get("replacement_chain_schedule")
+        if replacement_chain_schedule is not None and not (
+            sample == "rwalk" and kernel == "jax"
+        ):
+            raise NotImplementedError(
+                "replacement_chain_schedule is currently supported only for "
+                "sample='rwalk', kernel='jax'"
+            )
         self.kwargs = dict(kwargs)
 
     def run(
@@ -130,6 +138,7 @@ class NestedSampler:
             slice_steps=self.kwargs.get("slice_steps", 10),
             min_accepts=self.kwargs.get("min_accepts", 1),
             replacement_chains=self.kwargs.get("replacement_chains", 1),
+            replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -147,6 +156,11 @@ class NestedSampler:
             "slice_steps": int(self.kwargs.get("slice_steps", 10)),
             "min_accepts": int(self.kwargs.get("min_accepts", 1)),
             "replacement_chains": int(self.kwargs.get("replacement_chains", 1)),
+            "replacement_chain_schedule": (
+                None
+                if self.kwargs.get("replacement_chain_schedule") is None
+                else list(self.kwargs.get("replacement_chain_schedule"))
+            ),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -172,6 +186,7 @@ class NestedSampler:
             "slice_steps",
             "min_accepts",
             "replacement_chains",
+            "replacement_chain_schedule",
         ):
             checkpoint_value = (
                 checkpoint_config.get(name, 1)
@@ -235,4 +250,5 @@ class NestedSampler:
             slice_steps=self.kwargs.get("slice_steps", 10),
             min_accepts=self.kwargs.get("min_accepts", 1),
             replacement_chains=self.kwargs.get("replacement_chains", 1),
+            replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
         )

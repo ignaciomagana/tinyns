@@ -863,3 +863,62 @@ def test_draw_constrained_rwalk_jax_rejects_batch_larger_than_max_attempts() -> 
             replacement_chains=4,
             max_attempts=19,
         )
+
+
+def test_draw_constrained_rwalk_jax_adaptive_accepts_schedule() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax_adaptive
+
+    _, _, _, _logl, ncall, accepted, info = draw_constrained_rwalk_jax_adaptive(
+        random.PRNGKey(0),
+        gaussian_loglike,
+        identity_prior_transform,
+        -1.0,
+        jnp.array([[0.5]]),
+        jnp.array([0.0]),
+        1,
+        walks=2,
+        max_attempts=32,
+        replacement_chain_schedule=(1, 4, 16),
+    )
+    assert accepted
+    assert ncall == 2
+    assert info["replacement_chains_used"] == 1
+
+
+@pytest.mark.parametrize("schedule", [(), (0,), (-1,), (True,)])
+def test_draw_constrained_rwalk_jax_adaptive_rejects_invalid_schedule(schedule) -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax_adaptive
+
+    with pytest.raises(ValueError, match="replacement_chain_schedule"):
+        draw_constrained_rwalk_jax_adaptive(
+            random.PRNGKey(0),
+            gaussian_loglike,
+            identity_prior_transform,
+            -1.0,
+            jnp.array([[0.5]]),
+            jnp.array([0.0]),
+            1,
+            walks=2,
+            max_attempts=32,
+            replacement_chain_schedule=schedule,
+        )
+
+
+def test_draw_constrained_rwalk_jax_adaptive_exhausts_schedule_budget() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax_adaptive
+
+    _, _, _, _logl, ncall, accepted, info = draw_constrained_rwalk_jax_adaptive(
+        random.PRNGKey(0),
+        gaussian_loglike,
+        identity_prior_transform,
+        1.0,
+        jnp.array([[0.5]]),
+        jnp.array([0.0]),
+        1,
+        walks=2,
+        max_attempts=10,
+        replacement_chain_schedule=(1, 4),
+    )
+    assert not accepted
+    assert ncall == 10
+    assert info["replacement_chains_used"] == 5

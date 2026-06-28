@@ -554,6 +554,39 @@ def _make_rwalk_jax_kernel(
     return kernel
 
 
+def _validate_replacement_chain_schedule(
+    replacement_chain_schedule, walks: int, max_attempts: int
+) -> tuple[int, ...]:
+    """Validate and normalize an adaptive replacement-chain schedule."""
+    if replacement_chain_schedule is None:
+        raise ValueError("replacement_chain_schedule must not be None here")
+    try:
+        schedule = tuple(replacement_chain_schedule)
+    except TypeError as exc:
+        raise ValueError(
+            "replacement_chain_schedule must be a non-empty sequence "
+            "of positive integers"
+        ) from exc
+    if not schedule:
+        raise ValueError(
+            "replacement_chain_schedule must be a non-empty sequence "
+            "of positive integers"
+        )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in schedule
+    ):
+        raise ValueError(
+            "replacement_chain_schedule must be a non-empty sequence "
+            "of positive integers"
+        )
+    if max(schedule) * int(walks) > int(max_attempts):
+        raise ValueError(
+            "max_attempts must be at least max(replacement_chain_schedule) * walks"
+        )
+    return schedule
+
+
 def draw_constrained_rwalk_jax(
     key: PRNGKeyLike,
     loglike: LogLikelihood,
@@ -613,6 +646,99 @@ def draw_constrained_rwalk_jax(
         jnp.asarray(max_batches, dtype=jnp.int32),
     )
     return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
+
+
+def draw_constrained_rwalk_jax_adaptive(
+    key: PRNGKeyLike,
+    loglike: LogLikelihood,
+    prior_transform: PriorTransform,
+    logl_min: float,
+    live_u,
+    live_logl,
+    ndim: int,
+    *,
+    walks: int = 25,
+    step_scale: float = 0.1,
+    max_attempts: int = 10_000,
+    min_accepts: int = 1,
+    replacement_chain_schedule=(1, 4, 16, 64),
+):
+    """Draw a constrained JAX rwalk replacement with adaptive batch retries."""
+    schedule = _validate_replacement_chain_schedule(
+        replacement_chain_schedule, walks, max_attempts
+    )
+    total_ncall = 0
+    best_u = None
+    best_theta = None
+    best_logl = -float("inf")
+    batches = 0
+    chains_used = 0
+    usage_counts = {int(c): 0 for c in schedule}
+
+    def try_batch(key, c):
+        return draw_constrained_rwalk_jax(
+            key,
+            loglike,
+            prior_transform,
+            logl_min,
+            live_u,
+            live_logl,
+            ndim,
+            walks=walks,
+            step_scale=step_scale,
+            max_attempts=int(walks) * int(c),
+            min_accepts=min_accepts,
+            replacement_chains=int(c),
+        )
+
+    c = schedule[-1]
+    stage_index = 0
+    while True:
+        if stage_index < len(schedule):
+            c = schedule[stage_index]
+            stage_index += 1
+        batch_budget = int(walks) * int(c)
+        if total_ncall + batch_budget > int(max_attempts):
+            break
+        key, candidate_u, candidate_theta, candidate_logl, ncall, accepted = try_batch(
+            key, c
+        )
+        total_ncall += int(ncall)
+        batches += 1
+        chains_used += int(c)
+        usage_counts[int(c)] = usage_counts.get(int(c), 0) + 1
+        if float(candidate_logl) > best_logl or best_u is None:
+            best_u = candidate_u
+            best_theta = candidate_theta
+            best_logl = float(candidate_logl)
+        info = {
+            "replacement_batches": batches,
+            "replacement_chains_used": chains_used,
+            "replacement_last_chain_count": int(c),
+            "replacement_chain_usage_counts": {
+                str(k): v for k, v in usage_counts.items()
+            },
+        }
+        if accepted:
+            return (
+                key,
+                candidate_u,
+                candidate_theta,
+                candidate_logl,
+                total_ncall,
+                True,
+                info,
+            )
+
+    if best_u is None:
+        raise RuntimeError("adaptive replacement schedule made no attempts")
+    info = {
+        "replacement_batches": batches,
+        "replacement_chains_used": chains_used,
+        "replacement_last_chain_count": int(c),
+        "replacement_chain_usage_counts": {str(k): v for k, v in usage_counts.items()},
+    }
+    return key, best_u, best_theta, best_logl, total_ncall, False, info
 
 
 def draw_constrained_rwalk(

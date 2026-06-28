@@ -20,7 +20,10 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 from validation.targets import get_target, heavy_gaussian_2d  # noqa: E402
 
-from tinyns.samplers import draw_constrained_rwalk_jax  # noqa: E402
+from tinyns.samplers import (  # noqa: E402
+    draw_constrained_rwalk_jax,
+    draw_constrained_rwalk_jax_adaptive,
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -46,6 +49,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=[1, 4, 16, 64, 256, 1024],
     )
+    parser.add_argument(
+        "--replacement-chain-schedule", nargs="+", type=int, default=None
+    )
     parser.add_argument("--walks", type=int, default=25)
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--n-replacements", type=int, default=1000)
@@ -61,7 +67,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    max_replacement_chains = max(args.replacement_chains_grid)
+    max_replacement_chains = max(
+        args.replacement_chain_schedule
+        if args.replacement_chain_schedule is not None
+        else args.replacement_chains_grid
+    )
     required_max_attempts = args.walks * max_replacement_chains
     if args.max_attempts < required_max_attempts:
         raise ValueError(
@@ -106,7 +116,11 @@ def run_one(
     )
 
     for _ in range(args.warmup_replacements):
-        run_key, *_ = draw_constrained_rwalk_jax(
+        run_key, *_ = (
+            draw_constrained_rwalk_jax_adaptive
+            if args.replacement_chain_schedule is not None
+            else draw_constrained_rwalk_jax
+        )(
             run_key,
             target.loglike,
             target.prior_transform,
@@ -118,29 +132,40 @@ def run_one(
             step_scale=args.step_scale,
             max_attempts=args.max_attempts,
             min_accepts=args.min_accepts,
-            replacement_chains=replacement_chains,
+            **(
+                {"replacement_chain_schedule": args.replacement_chain_schedule}
+                if args.replacement_chain_schedule is not None
+                else {"replacement_chains": replacement_chains}
+            ),
         )
 
     ncall_values: list[int] = []
     success_count = 0
     start = time.perf_counter()
     for _ in range(args.n_replacements):
-        run_key, _new_u, _new_theta, _new_logl, ncall, accepted = (
-            draw_constrained_rwalk_jax(
-                run_key,
-                target.loglike,
-                target.prior_transform,
-                logl_min,
-                live_u,
-                live_logl,
-                target.ndim,
-                walks=args.walks,
-                step_scale=args.step_scale,
-                max_attempts=args.max_attempts,
-                min_accepts=args.min_accepts,
-                replacement_chains=replacement_chains,
-            )
+        draw_result = (
+            draw_constrained_rwalk_jax_adaptive
+            if args.replacement_chain_schedule is not None
+            else draw_constrained_rwalk_jax
+        )(
+            run_key,
+            target.loglike,
+            target.prior_transform,
+            logl_min,
+            live_u,
+            live_logl,
+            target.ndim,
+            walks=args.walks,
+            step_scale=args.step_scale,
+            max_attempts=args.max_attempts,
+            min_accepts=args.min_accepts,
+            **(
+                {"replacement_chain_schedule": args.replacement_chain_schedule}
+                if args.replacement_chain_schedule is not None
+                else {"replacement_chains": replacement_chains}
+            ),
         )
+        run_key, _new_u, _new_theta, _new_logl, ncall, accepted = draw_result[:6]
         ncall_values.append(ncall)
         success_count += int(accepted)
     seconds = time.perf_counter() - start
@@ -153,6 +178,10 @@ def run_one(
         "target": target_name,
         "kernel": "jax",
         "replacement_chains": replacement_chains,
+        "adaptive_replacement_chains": bool(
+            args.replacement_chain_schedule is not None
+        ),
+        "replacement_chain_schedule": args.replacement_chain_schedule,
         "walks": args.walks,
         "replacement_batch_ncall": replacement_batch_ncall,
         "nlive": args.nlive,
@@ -168,6 +197,9 @@ def run_one(
         "mean_replacement_ncall": mean_ncall,
         "mean_replacement_batches": mean_ncall / replacement_batch_ncall,
         "max_replacement_batches": max_ncall / replacement_batch_ncall,
+        "mean_replacement_chains_used": mean_ncall / args.walks if args.walks else None,
+        "max_replacement_chains_used": max_ncall / args.walks if args.walks else None,
+        "replacement_chain_usage_counts": None,
         "success_fraction": success_count / args.n_replacements
         if args.n_replacements
         else 0.0,
@@ -198,7 +230,11 @@ def main(argv: list[str] | None = None) -> None:
     rows = [
         run_one(target_name, replacement_chains, args.seed, args)
         for target_name in args.targets
-        for replacement_chains in args.replacement_chains_grid
+        for replacement_chains in (
+            [args.replacement_chains_grid[0]]
+            if args.replacement_chain_schedule is not None
+            else args.replacement_chains_grid
+        )
     ]
     print_results(rows)
     if args.output is not None:

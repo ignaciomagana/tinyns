@@ -112,3 +112,8 @@ def test_cli_smoke_tiny_settings_writes_json(tmp_path) -> None:
     assert payload["results"][0]["kernel"] == "jax"
     assert payload["results"][0]["n_replacements"] == 3
     assert payload["results"][1]["replacement_chains"] == 4
+
+
+def test_parser_accepts_replacement_chain_schedule() -> None:
+    args = parse_args(["--replacement-chain-schedule", "1", "4", "16"])
+    assert args.replacement_chain_schedule == [1, 4, 16]
