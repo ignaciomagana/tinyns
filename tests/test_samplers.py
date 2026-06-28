@@ -1125,3 +1125,112 @@ def test_draw_constrained_single_bound_jax_rejects_bad_shapes() -> None:
             batch_size=4,
             max_batches=1,
         )
+
+
+def _two_ellipsoid_bound():
+    from tinyns.bounds import MultiEllipsoidBound
+
+    left = build_single_ellipsoid_bound(
+        jnp.asarray([[0.15, 0.20], [0.20, 0.25], [0.25, 0.20], [0.20, 0.15]])
+    )
+    right = build_single_ellipsoid_bound(
+        jnp.asarray([[0.70, 0.75], [0.75, 0.80], [0.80, 0.75], [0.75, 0.70]])
+    )
+    log_volumes = jnp.asarray([left.log_volume, right.log_volume])
+    log_total_volume = float(
+        jnp.max(log_volumes)
+        + jnp.log(jnp.sum(jnp.exp(log_volumes - jnp.max(log_volumes))))
+    )
+    return MultiEllipsoidBound((left, right), log_volumes, log_total_volume, 2)
+
+
+def test_draw_constrained_multi_bound_jax_accepts_multi_bound() -> None:
+    from tinyns.samplers import draw_constrained_multi_bound_jax
+
+    bound = _two_ellipsoid_bound()
+
+    _, u, theta, logl, ncall, accepted, info = draw_constrained_multi_bound_jax(
+        random.PRNGKey(1101),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        bound,
+        2,
+        batch_size=16,
+        max_batches=4,
+    )
+
+    assert accepted is True
+    assert ncall == info["bound_seed_loglike_evals"]
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert jnp.isfinite(logl)
+    assert info["bound_seed_nellipsoids"] == 2
+    assert "bound_seed_overlap_rejections" in info
+
+
+def test_draw_constrained_multi_bound_jax_accepts_jax_bound() -> None:
+    from tinyns.bounds import as_jax_ellipsoid_bound
+    from tinyns.samplers import draw_constrained_multi_bound_jax
+
+    bound = as_jax_ellipsoid_bound(_two_ellipsoid_bound())
+
+    _, _u, _theta, logl, ncall, accepted, info = draw_constrained_multi_bound_jax(
+        random.PRNGKey(1102),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        bound,
+        2,
+        batch_size=8,
+        max_batches=4,
+    )
+
+    assert accepted is True
+    assert ncall == info["bound_seed_loglike_evals"]
+    assert jnp.isfinite(logl)
+    assert info["bound_seed_nellipsoids"] == 2
+
+
+@pytest.mark.parametrize("overlap_correction", [True, False])
+def test_draw_constrained_multi_bound_jax_overlap_modes_run(overlap_correction) -> None:
+    from tinyns.samplers import draw_constrained_multi_bound_jax
+
+    _, _, _, logl, _, accepted, info = draw_constrained_multi_bound_jax(
+        random.PRNGKey(1103),
+        gaussian_loglike,
+        identity_prior_transform,
+        -10.0,
+        _two_ellipsoid_bound(),
+        2,
+        batch_size=8,
+        max_batches=4,
+        overlap_correction=overlap_correction,
+    )
+
+    assert accepted is True
+    assert jnp.isfinite(logl)
+    assert info["bound_seed_overlap_rejections"] >= 0
+    assert info["bound_seed_nellipsoids"] == 2
+
+
+def test_draw_constrained_multi_bound_jax_impossible_threshold_returns_best() -> None:
+    from tinyns.samplers import draw_constrained_multi_bound_jax
+
+    _, u, theta, logl, ncall, accepted, info = draw_constrained_multi_bound_jax(
+        random.PRNGKey(1104),
+        gaussian_loglike,
+        identity_prior_transform,
+        1.0,
+        _two_ellipsoid_bound(),
+        2,
+        batch_size=8,
+        max_batches=3,
+    )
+
+    assert accepted is False
+    assert ncall == 24
+    assert info["bound_seed_batches"] == 3
+    assert u.shape == (2,)
+    assert theta.shape == (2,)
+    assert logl <= 0.0
