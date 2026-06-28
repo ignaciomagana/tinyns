@@ -151,6 +151,8 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "kernel": args.kernel,
         "replacement_chains": args.replacement_chains,
         "replacement_chain_schedule": args.replacement_chain_schedule,
+        "rwalk_proposal": args.rwalk_proposal,
+        "rwalk_cov_jitter": args.rwalk_cov_jitter,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -340,6 +342,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--replacement-chains", type=int, default=1)
+    parser.add_argument(
+        "--rwalk-proposal", choices=["isotropic", "live-cov"], default="isotropic"
+    )
+    parser.add_argument("--rwalk-cov-jitter", type=float, default=1e-6)
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
     parser.add_argument(
         "--replacement-chain-schedule", nargs="+", type=int, default=None

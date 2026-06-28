@@ -218,6 +218,8 @@ def run_static_nested(
     min_accepts: int = 1,
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
+    rwalk_proposal: str = "isotropic",
+    rwalk_cov_jitter: float = 1e-6,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -235,6 +237,15 @@ def run_static_nested(
         raise ValueError("sample must be one of {'prior', 'rwalk', 'slice', 'rslice'}")
     if kernel not in {"python", "jax"}:
         raise ValueError("kernel must be one of {'python', 'jax'}")
+    if rwalk_proposal not in {"isotropic", "live-cov"}:
+        raise ValueError("rwalk_proposal must be one of {'isotropic', 'live-cov'}")
+    if rwalk_cov_jitter <= 0:
+        raise ValueError("rwalk_cov_jitter must be positive")
+    if rwalk_proposal == "live-cov" and not (sample == "rwalk" and kernel == "jax"):
+        raise NotImplementedError(
+            'rwalk_proposal="live-cov" is currently supported only with '
+            'sample="rwalk", kernel="jax"'
+        )
     if kernel == "jax" and sample != "rwalk":
         raise NotImplementedError(
             'kernel="jax" is currently only supported with sample="rwalk"'
@@ -503,6 +514,15 @@ def run_static_nested(
                 if kernel == "jax"
                 else draw_constrained_rwalk
             )
+            proposal_chol = None
+            if kernel == "jax" and rwalk_proposal == "live-cov":
+                centered = live_u - jnp.mean(live_u, axis=0)
+                denom = max(int(live_u.shape[0]) - 1, 1)
+                cov = (centered.T @ centered) / denom
+                cov = cov + jnp.asarray(rwalk_cov_jitter, dtype=live_u.dtype) * jnp.eye(
+                    ndim, dtype=live_u.dtype
+                )
+                proposal_chol = jnp.linalg.cholesky(cov)
             draw_result = rwalk_draw(
                 key,
                 loglike,
@@ -515,6 +535,7 @@ def run_static_nested(
                 step_scale=step_scale,
                 max_attempts=max_attempts,
                 min_accepts=min_accepts,
+                **({"proposal_chol": proposal_chol} if kernel == "jax" else {}),
                 **(
                     {"replacement_chain_schedule": replacement_chain_schedule}
                     if kernel == "jax" and replacement_chain_schedule is not None
@@ -758,6 +779,8 @@ def run_static_nested(
             "slices": slices,
             "slice_steps": slice_steps,
             "min_accepts": min_accepts,
+            "rwalk_proposal": rwalk_proposal,
+            "rwalk_cov_jitter": rwalk_cov_jitter,
             "replacement_chains": replacement_chains,
             "replacement_chain_schedule": (
                 None

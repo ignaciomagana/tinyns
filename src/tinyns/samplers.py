@@ -370,7 +370,16 @@ def _make_rwalk_jax_kernel(
     """Return a cached compiled retrying constrained rwalk kernel."""
 
     @jax.jit
-    def kernel(key, logl_min, live_u, live_logl, step_scale, min_accepts, max_batches):
+    def kernel(
+        key,
+        logl_min,
+        live_u,
+        live_logl,
+        step_scale,
+        min_accepts,
+        max_batches,
+        proposal_chol,
+    ):
         nlive = live_u.shape[0]
         template_u = live_u[0]
         template_theta = jnp.asarray(prior_transform(template_u))
@@ -424,9 +433,8 @@ def _make_rwalk_jax_kernel(
                     accepted_moves,
                 ) = carry
                 key, proposal_key = random.split(key)
-                step = step_scale * random.normal(
-                    proposal_key, shape=(replacement_chains, ndim)
-                )
+                z = random.normal(proposal_key, shape=(replacement_chains, ndim))
+                step = step_scale * (z @ proposal_chol.T)
                 u_prop = reflect_unit_cube(current_u + step)
                 theta_prop = jax.vmap(prior_transform)(u_prop)
                 logl_prop = jax.vmap(loglike)(theta_prop)
@@ -601,6 +609,7 @@ def draw_constrained_rwalk_jax(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chains: int = 1,
+    proposal_chol=None,
 ):
     """Draw a constrained replacement with a compiled JAX rwalk kernel."""
     if ndim <= 0:
@@ -631,6 +640,12 @@ def draw_constrained_rwalk_jax(
         raise ValueError("live_u must contain at least one live point")
     if live_logl.shape != (nlive,):
         raise ValueError(f"live_logl must have shape ({nlive},)")
+    if proposal_chol is None:
+        proposal_chol = jnp.eye(ndim, dtype=live_u.dtype)
+    else:
+        proposal_chol = jnp.asarray(proposal_chol, dtype=live_u.dtype)
+        if proposal_chol.shape != (ndim, ndim):
+            raise ValueError(f"proposal_chol must have shape ({ndim}, {ndim})")
 
     kernel = _make_rwalk_jax_kernel(
         loglike, prior_transform, int(ndim), int(walks), int(replacement_chains)
@@ -644,6 +659,7 @@ def draw_constrained_rwalk_jax(
         jnp.asarray(step_scale),
         jnp.asarray(min_accepts),
         jnp.asarray(max_batches, dtype=jnp.int32),
+        proposal_chol,
     )
     return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
 
@@ -662,6 +678,7 @@ def draw_constrained_rwalk_jax_adaptive(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chain_schedule=(1, 4, 16, 64),
+    proposal_chol=None,
 ):
     """Draw a constrained JAX rwalk replacement with adaptive batch retries."""
     schedule = _validate_replacement_chain_schedule(
@@ -689,6 +706,7 @@ def draw_constrained_rwalk_jax_adaptive(
             max_attempts=int(walks) * int(c),
             min_accepts=min_accepts,
             replacement_chains=int(c),
+            proposal_chol=proposal_chol,
         )
 
     c = schedule[-1]

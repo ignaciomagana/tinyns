@@ -62,6 +62,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--work-size", type=int, default=100_000)
     parser.add_argument("--constraint-quantile", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--rwalk-proposal", choices=["isotropic", "live-cov"], default="isotropic"
+    )
+    parser.add_argument("--rwalk-cov-jitter", type=float, default=1e-6)
     parser.add_argument("--output", type=str, default="bench_rwalk_kernel.json")
     return parser.parse_args(argv)
 
@@ -81,6 +85,8 @@ def validate_args(args: argparse.Namespace) -> None:
             f"required={required_max_attempts}. "
             f"Try --max-attempts {required_max_attempts} or larger."
         )
+    if args.rwalk_cov_jitter <= 0:
+        raise ValueError("--rwalk-cov-jitter must be positive")
     if not 0.0 <= args.constraint_quantile <= 1.0:
         raise ValueError("--constraint-quantile must be between 0 and 1")
 
@@ -107,6 +113,16 @@ def build_live_state(
     return target, live_u, live_logl, float(logl_min)
 
 
+def _proposal_chol(live_u, args: argparse.Namespace):
+    if args.rwalk_proposal == "isotropic":
+        return None
+    centered = live_u - jnp.mean(live_u, axis=0)
+    denom = max(int(live_u.shape[0]) - 1, 1)
+    cov = (centered.T @ centered) / denom
+    cov = cov + args.rwalk_cov_jitter * jnp.eye(live_u.shape[1], dtype=live_u.dtype)
+    return jnp.linalg.cholesky(cov)
+
+
 def run_one(
     target_name: str, replacement_chains: int, seed: int, args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -114,6 +130,7 @@ def run_one(
     target, live_u, live_logl, logl_min = build_live_state(
         target_name, live_key, args.nlive, args.constraint_quantile, args.work_size
     )
+    proposal_chol = _proposal_chol(live_u, args)
 
     for _ in range(args.warmup_replacements):
         run_key, *_ = (
@@ -132,6 +149,7 @@ def run_one(
             step_scale=args.step_scale,
             max_attempts=args.max_attempts,
             min_accepts=args.min_accepts,
+            proposal_chol=proposal_chol,
             **(
                 {"replacement_chain_schedule": args.replacement_chain_schedule}
                 if args.replacement_chain_schedule is not None
@@ -159,6 +177,7 @@ def run_one(
             step_scale=args.step_scale,
             max_attempts=args.max_attempts,
             min_accepts=args.min_accepts,
+            proposal_chol=proposal_chol,
             **(
                 {"replacement_chain_schedule": args.replacement_chain_schedule}
                 if args.replacement_chain_schedule is not None
@@ -190,6 +209,8 @@ def run_one(
             args.replacement_chain_schedule is not None
         ),
         "replacement_chain_schedule": args.replacement_chain_schedule,
+        "rwalk_proposal": args.rwalk_proposal,
+        "rwalk_cov_jitter": args.rwalk_cov_jitter,
         "walks": args.walks,
         "replacement_batch_ncall": replacement_batch_ncall,
         "replacement_initial_batch_ncall": replacement_initial_batch_ncall,

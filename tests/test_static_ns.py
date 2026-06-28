@@ -725,3 +725,61 @@ def test_replacement_chain_schedule_rejects_unsupported_sampler_kernel() -> None
             kernel="python",
             replacement_chain_schedule=(1, 4, 16),
         )
+
+
+def test_nested_sampler_rwalk_jax_live_cov_runs_and_records_metadata() -> None:
+    result = run_static_nested(
+        random.PRNGKey(2),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        25,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.05,
+        dlogz=10.0,
+        rwalk_proposal="live-cov",
+        rwalk_cov_jitter=1e-6,
+    )
+
+    assert result.success is True
+    assert math.isfinite(result.logz)
+    assert result.metadata["rwalk_proposal"] == "live-cov"
+    assert result.metadata["rwalk_cov_jitter"] == 1e-6
+
+
+def test_invalid_rwalk_proposal_raises() -> None:
+    with pytest.raises(ValueError, match="rwalk_proposal"):
+        run_static_nested(
+            random.PRNGKey(0),
+            _jax_loglike,
+            _jax_prior_transform,
+            2,
+            10,
+            sample="rwalk",
+            kernel="jax",
+            rwalk_proposal="bad",
+            maxiter=1,
+        )
+
+
+def test_nested_sampler_rwalk_jax_adaptive_live_cov_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(3),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        walks=2,
+        dlogz=10.0,
+        max_attempts=16,
+        replacement_chain_schedule=(1, 4),
+        rwalk_proposal="live-cov",
+    )
+
+    assert result.success is True
+    assert result.metadata["rwalk_proposal"] == "live-cov"
+    assert result.metadata["adaptive_replacement_chains"] is True
