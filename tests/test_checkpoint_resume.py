@@ -295,4 +295,27 @@ def test_checkpoint_config_includes_bound_settings(tmp_path):
     assert config["bound_update_interval"] == 1
     assert config["bound_jitter"] == 1e-6
     assert config["bound_max_draws"] is None
+    assert config["multi_bound_max_ellipsoids"] == 32
+    assert config["multi_bound_min_points"] is None
+    assert config["multi_bound_split_threshold"] == 0.9
+    assert config["multi_bound_overlap_correction"] is True
     assert config["rwalk_seed"] == "live"
+
+
+def test_checkpoint_config_includes_multi_bound_settings(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(
+        bound="multi",
+        sample="bound",
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        multi_bound_split_threshold=0.95,
+        multi_bound_overlap_correction=True,
+    ).run(20, maxiter=1, dlogz=0.0, checkpoint_path=path)
+
+    _, config = load_checkpoint_npz(path)
+    assert config["bound"] == "multi"
+    assert config["multi_bound_max_ellipsoids"] == 4
+    assert config["multi_bound_min_points"] == 8
+    assert config["multi_bound_split_threshold"] == 0.95
+    assert config["multi_bound_overlap_correction"] is True

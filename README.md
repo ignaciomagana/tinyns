@@ -204,6 +204,28 @@ The initial production target is `sample="rwalk"` with JAX, live-cov proposals, 
 
 Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before using it for production.
 
+### Multiellipsoid bounding
+
+`bound="multi"` is an experimental dynesty-style union-of-ellipsoids bound. It recursively splits the live points using a dependency-free PCA/median split and samples from the volume-weighted union of ellipsoids with overlap correction.
+
+The intended production-like configuration is:
+
+```python
+NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    sample="rwalk",
+    kernel="jax",
+    bound="multi",
+    rwalk_proposal="live-cov",
+    walks=5,
+    replacement_chains=16,
+)
+```
+
+This mode is experimental. Check evidence calibration, insertion-rank diagnostics, and seed stability before using it for science.
+
 ## Current validation status
 
 The recommended `sample="rwalk", kernel="jax"` path has been checked with repeated-seed validation on:
@@ -246,7 +268,7 @@ programming language.
 
 - Static nested sampling only.
 - No dynamic nested sampling.
-- No full ellipsoidal bounding.
+- Multiellipsoid bounding is experimental.
 - No full vectorized `rwalk`, `slice`, or `rslice` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
 - Replacement attempts are capped by `max_attempts`; hitting the cap returns

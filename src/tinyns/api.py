@@ -63,8 +63,8 @@ class NestedSampler:
         if kernel not in {"python", "jax"}:
             raise ValueError("kernel must be one of {'python', 'jax'}")
         bound = kwargs.get("bound", "none")
-        if bound not in {"none", "single"}:
-            raise ValueError("bound must be one of {'none', 'single'}")
+        if bound not in {"none", "single", "multi"}:
+            raise ValueError("bound must be one of {'none', 'single', 'multi'}")
         rwalk_seed = kwargs.get("rwalk_seed", "live")
         if rwalk_seed not in {"live", "bound"}:
             raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
@@ -152,6 +152,17 @@ class NestedSampler:
             bound_update_interval=self.kwargs.get("bound_update_interval", 1),
             bound_jitter=self.kwargs.get("bound_jitter", 1e-6),
             bound_max_draws=self.kwargs.get("bound_max_draws"),
+            multi_bound_max_ellipsoids=self.kwargs.get(
+                "multi_bound_max_ellipsoids", 32
+            ),
+            multi_bound_min_points=self.kwargs.get("multi_bound_min_points"),
+            multi_bound_split_threshold=self.kwargs.get(
+                "multi_bound_split_threshold", 0.9
+            ),
+            multi_bound_enlargement=self.kwargs.get("multi_bound_enlargement"),
+            multi_bound_overlap_correction=self.kwargs.get(
+                "multi_bound_overlap_correction", True
+            ),
             rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
         )
@@ -183,6 +194,17 @@ class NestedSampler:
             "bound_update_interval": int(self.kwargs.get("bound_update_interval", 1)),
             "bound_jitter": float(self.kwargs.get("bound_jitter", 1e-6)),
             "bound_max_draws": self.kwargs.get("bound_max_draws"),
+            "multi_bound_max_ellipsoids": int(
+                self.kwargs.get("multi_bound_max_ellipsoids", 32)
+            ),
+            "multi_bound_min_points": self.kwargs.get("multi_bound_min_points"),
+            "multi_bound_split_threshold": float(
+                self.kwargs.get("multi_bound_split_threshold", 0.9)
+            ),
+            "multi_bound_enlargement": self.kwargs.get("multi_bound_enlargement"),
+            "multi_bound_overlap_correction": bool(
+                self.kwargs.get("multi_bound_overlap_correction", True)
+            ),
             "rwalk_seed": str(self.kwargs.get("rwalk_seed", "live")),
             "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
         }
@@ -218,6 +240,11 @@ class NestedSampler:
             "bound_update_interval",
             "bound_jitter",
             "bound_max_draws",
+            "multi_bound_max_ellipsoids",
+            "multi_bound_min_points",
+            "multi_bound_split_threshold",
+            "multi_bound_enlargement",
+            "multi_bound_overlap_correction",
             "rwalk_seed",
             "rwalk_seed_fallback",
         ):
@@ -231,6 +258,11 @@ class NestedSampler:
                 "bound_update_interval": 1,
                 "bound_jitter": 1e-6,
                 "bound_max_draws": None,
+                "multi_bound_max_ellipsoids": 32,
+                "multi_bound_min_points": None,
+                "multi_bound_split_threshold": 0.9,
+                "multi_bound_enlargement": None,
+                "multi_bound_overlap_correction": True,
                 "rwalk_seed": "live",
                 "rwalk_seed_fallback": True,
             }
@@ -300,6 +332,17 @@ class NestedSampler:
             bound_update_interval=self.kwargs.get("bound_update_interval", 1),
             bound_jitter=self.kwargs.get("bound_jitter", 1e-6),
             bound_max_draws=self.kwargs.get("bound_max_draws"),
+            multi_bound_max_ellipsoids=self.kwargs.get(
+                "multi_bound_max_ellipsoids", 32
+            ),
+            multi_bound_min_points=self.kwargs.get("multi_bound_min_points"),
+            multi_bound_split_threshold=self.kwargs.get(
+                "multi_bound_split_threshold", 0.9
+            ),
+            multi_bound_enlargement=self.kwargs.get("multi_bound_enlargement"),
+            multi_bound_overlap_correction=self.kwargs.get(
+                "multi_bound_overlap_correction", True
+            ),
             rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
             rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
         )

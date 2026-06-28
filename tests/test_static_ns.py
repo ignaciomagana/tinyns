@@ -851,3 +851,61 @@ def test_static_nested_single_bound_rwalk_bound_seed_runs() -> None:
     assert jnp.isfinite(result.logz)
     assert result.metadata["bound"] == "single"
     assert result.metadata["rwalk_seed"] == "bound"
+
+
+def test_static_nested_multi_bound_runs_and_records_metadata() -> None:
+    result = run_static_nested(
+        random.PRNGKey(30),
+        lambda theta: float(-0.5 * jnp.sum((theta / 0.2) ** 2)),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        dlogz=0.5,
+        maxiter=40,
+        sample="bound",
+        bound="multi",
+        batch_size=16,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["bound"] == "multi"
+    assert result.metadata["bound_nellipsoids_max"] >= 1
+
+
+def test_static_nested_multi_bound_rwalk_jax_runs() -> None:
+    result = run_static_nested(
+        random.PRNGKey(31),
+        lambda theta: -0.5 * jnp.sum((theta / 0.2) ** 2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=30,
+        dlogz=0.5,
+        maxiter=20,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="bound",
+        rwalk_proposal="live-cov",
+        walks=3,
+        replacement_chains=2,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+    )
+
+    assert jnp.isfinite(result.logz)
+    assert result.metadata["bound"] == "multi"
+
+
+def test_static_nested_invalid_multi_bound_options_raise() -> None:
+    with pytest.raises(ValueError, match="multi_bound_max_ellipsoids"):
+        run_static_nested(
+            random.PRNGKey(32),
+            lambda theta: 0.0,
+            lambda u: u,
+            ndim=2,
+            nlive=10,
+            bound="multi",
+            multi_bound_max_ellipsoids=0,
+        )

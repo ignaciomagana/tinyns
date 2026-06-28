@@ -10,7 +10,7 @@ import numpy as np
 from jax import random
 from jax.scipy.special import logsumexp
 
-from tinyns.bounds import build_single_ellipsoid_bound
+from tinyns.bounds import build_multi_ellipsoid_bound, build_single_ellipsoid_bound
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
@@ -98,6 +98,7 @@ def _make_run_state(
     bound: str = "none",
     bound_draws: list[int] | None = None,
     bound_unit_cube_acceptance: list[float] | None = None,
+    bound_nellipsoids: list[int] | None = None,
 ) -> dict[str, object]:
     if replacement_ncall:
         replacement_mean_ncall_so_far = float(
@@ -130,6 +131,11 @@ def _make_run_state(
         if bound_unit_cube_acceptance
         else None
     )
+    mean_bound_nellipsoids_so_far = (
+        float(sum(bound_nellipsoids) / len(bound_nellipsoids))
+        if bound_nellipsoids
+        else None
+    )
     adaptive_replacement_chains = replacement_chain_schedule is not None
     return {
         "iter": int(iteration),
@@ -158,6 +164,7 @@ def _make_run_state(
         "mean_bound_unit_cube_acceptance_so_far": (
             mean_bound_unit_cube_acceptance_so_far
         ),
+        "mean_bound_nellipsoids_so_far": mean_bound_nellipsoids_so_far,
     }
 
 
@@ -184,12 +191,19 @@ def _format_progress_line(state: dict[str, object]) -> str:
             usage += ",..."
         usage_text = f" usage={usage}" if usage else ""
     bound_text = ""
-    if state.get("bound") != "none":
+    if state.get("bound", "none") != "none":
         bdraw = state.get("mean_bound_draws_so_far")
         bacc = state.get("mean_bound_unit_cube_acceptance_so_far")
         bdraw_text = "n/a" if bdraw is None else f"{float(bdraw):.1f}"
         bacc_text = "n/a" if bacc is None else f"{float(bacc):.3f}"
-        bound_text = f" bound={state['bound']} bdraw={bdraw_text} bacc={bacc_text}"
+        if state.get("bound") == "multi":
+            nell = state.get("mean_bound_nellipsoids_so_far")
+            nell_text = "n/a" if nell is None else f"{float(nell):.1f}"
+            bound_text = f" bound=multi nell={nell_text} bacc={bacc_text}"
+        else:
+            bound_text = (
+                f" bound={state['bound']} bdraw={bdraw_text} bacc={bacc_text}"
+            )
     return (
         f"iter={int(state['iter']):05d} "
         f"logz={float(state['logz']):.3f} "
@@ -251,6 +265,11 @@ def run_static_nested(
     bound_update_interval: int = 1,
     bound_jitter: float = 1e-6,
     bound_max_draws: int | None = None,
+    multi_bound_max_ellipsoids: int = 32,
+    multi_bound_min_points: int | None = None,
+    multi_bound_split_threshold: float = 0.9,
+    multi_bound_enlargement: float | None = None,
+    multi_bound_overlap_correction: bool = True,
     rwalk_seed: str = "live",
     rwalk_seed_fallback: bool = True,
     initial_state: NestedRunState | None = None,
@@ -272,8 +291,8 @@ def run_static_nested(
         )
     if kernel not in {"python", "jax"}:
         raise ValueError("kernel must be one of {'python', 'jax'}")
-    if bound not in {"none", "single"}:
-        raise ValueError("bound must be one of {'none', 'single'}")
+    if bound not in {"none", "single", "multi"}:
+        raise ValueError("bound must be one of {'none', 'single', 'multi'}")
     if bound_update_interval <= 0:
         raise ValueError("bound_update_interval must be a positive integer")
     if bound_enlargement <= 0:
@@ -284,8 +303,16 @@ def run_static_nested(
         raise ValueError("bound_max_draws must be positive or None")
     if rwalk_seed not in {"live", "bound"}:
         raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
-    if sample == "bound" and bound != "single":
-        raise ValueError('sample="bound" requires bound="single"')
+    if sample == "bound" and bound not in {"single", "multi"}:
+        raise ValueError('sample="bound" requires bound="single" or bound="multi"')
+    if multi_bound_max_ellipsoids <= 0:
+        raise ValueError("multi_bound_max_ellipsoids must be positive")
+    if multi_bound_min_points is not None and multi_bound_min_points <= 0:
+        raise ValueError("multi_bound_min_points must be positive or None")
+    if multi_bound_split_threshold <= 0.0:
+        raise ValueError("multi_bound_split_threshold must be positive")
+    if multi_bound_enlargement is not None and multi_bound_enlargement <= 0.0:
+        raise ValueError("multi_bound_enlargement must be positive or None")
     if rwalk_proposal not in {"isotropic", "live-cov"}:
         raise ValueError("rwalk_proposal must be one of {'isotropic', 'live-cov'}")
     if rwalk_cov_jitter <= 0:
@@ -405,6 +432,11 @@ def run_static_nested(
         "bound_update_interval": int(bound_update_interval),
         "bound_jitter": float(bound_jitter),
         "bound_max_draws": bound_max_draws,
+        "multi_bound_max_ellipsoids": int(multi_bound_max_ellipsoids),
+        "multi_bound_min_points": multi_bound_min_points,
+        "multi_bound_split_threshold": float(multi_bound_split_threshold),
+        "multi_bound_enlargement": multi_bound_enlargement,
+        "multi_bound_overlap_correction": bool(multi_bound_overlap_correction),
         "rwalk_seed": str(rwalk_seed),
         "rwalk_seed_fallback": bool(rwalk_seed_fallback),
     }
@@ -488,6 +520,7 @@ def run_static_nested(
     bound_draw_history = []
     bound_eval_history = []
     bound_unit_cube_acceptance_history = []
+    bound_nellipsoid_history = []
 
     def current_state() -> NestedRunState:
         return NestedRunState(
@@ -533,12 +566,22 @@ def run_static_nested(
         logx_final = logx_new
 
         replacement_info = None
-        if bound == "single" and (
+        if bound in {"single", "multi"} and (
             current_bound is None or i % bound_update_interval == 0
         ):
-            current_bound = build_single_ellipsoid_bound(
-                live_u, enlargement=bound_enlargement, jitter=bound_jitter
-            )
+            if bound == "multi":
+                current_bound = build_multi_ellipsoid_bound(
+                    live_u,
+                    enlargement=multi_bound_enlargement or bound_enlargement,
+                    jitter=bound_jitter,
+                    max_ellipsoids=multi_bound_max_ellipsoids,
+                    min_points=multi_bound_min_points,
+                    split_threshold=multi_bound_split_threshold,
+                )
+            else:
+                current_bound = build_single_ellipsoid_bound(
+                    live_u, enlargement=bound_enlargement, jitter=bound_jitter
+                )
             bound_updates += 1
 
         if sample == "bound":
@@ -559,6 +602,7 @@ def run_static_nested(
                 ndim,
                 batch_size=batch_size,
                 max_attempts=bound_max_draws or max_attempts,
+                overlap_correction=multi_bound_overlap_correction,
             )
         elif sample == "prior":
             if vectorized:
@@ -614,7 +658,7 @@ def run_static_nested(
                 proposal_chol = jnp.linalg.cholesky(cov)
             seed_live_u = live_u
             seed_live_logl = live_logl
-            if bound == "single" and rwalk_seed == "bound":
+            if bound in {"single", "multi"} and rwalk_seed == "bound":
                 seed_result = draw_constrained_single_bound(
                     key,
                     loglike,
@@ -624,6 +668,7 @@ def run_static_nested(
                     ndim,
                     batch_size=batch_size,
                     max_attempts=bound_max_draws or max_attempts,
+                    overlap_correction=multi_bound_overlap_correction,
                 )
                 (
                     key,
@@ -653,7 +698,7 @@ def run_static_nested(
                 seed_calls = 0
                 seed_accepted = True
             if not (
-                bound == "single"
+                bound in {"single", "multi"}
                 and rwalk_seed == "bound"
                 and not seed_accepted
                 and not rwalk_seed_fallback
@@ -761,6 +806,9 @@ def run_static_nested(
             bound_unit_cube_acceptance_history.append(
                 float(replacement_info.get("bound_unit_cube_acceptance", 0.0))
             )
+            bound_nellipsoid_history.append(
+                int(replacement_info.get("bound_nellipsoids", 1))
+            )
         ncall += calls
         replacement_ncall.append(int(calls))
         iteration = i + 1
@@ -793,6 +841,7 @@ def run_static_nested(
                 bound=bound,
                 bound_draws=bound_draw_history,
                 bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
+                bound_nellipsoids=bound_nellipsoid_history,
             )
             if callback is not None and (
                 i + 1 == 1 or (i + 1) % callback_interval == 0
@@ -845,6 +894,7 @@ def run_static_nested(
             bound=bound,
             bound_draws=bound_draw_history,
             bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
+            bound_nellipsoids=bound_nellipsoid_history,
         )
         if callback is not None and (
             i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
@@ -911,6 +961,13 @@ def run_static_nested(
         mean_replacement_ncall = 0.0
         max_replacement_ncall = 0
         replacement_acceptance_proxy = 0.0
+    bound_log_volume = None
+    if current_bound is not None:
+        bound_log_volume = (
+            current_bound.log_total_volume
+            if hasattr(current_bound, "log_total_volume")
+            else current_bound.log_volume
+        )
 
     return NestedSamplingResult(
         samples_u=samples_u,
@@ -981,10 +1038,20 @@ def run_static_nested(
             "bound_update_interval": bound_update_interval,
             "bound_jitter": bound_jitter,
             "bound_max_draws": bound_max_draws,
+            "multi_bound_max_ellipsoids": multi_bound_max_ellipsoids,
+            "multi_bound_min_points": multi_bound_min_points,
+            "multi_bound_split_threshold": multi_bound_split_threshold,
+            "multi_bound_overlap_correction": multi_bound_overlap_correction,
             "bound_updates": bound_updates,
-            "bound_log_volume": None
-            if current_bound is None
-            else current_bound.log_volume,
+            "bound_log_volume": bound_log_volume,
+            "bound_nellipsoids_mean": float(
+                sum(bound_nellipsoid_history) / len(bound_nellipsoid_history)
+            )
+            if bound_nellipsoid_history
+            else None,
+            "bound_nellipsoids_max": int(max(bound_nellipsoid_history, default=0))
+            if bound_nellipsoid_history
+            else None,
             "mean_bound_draws": float(sum(bound_draw_history) / len(bound_draw_history))
             if bound_draw_history
             else None,

@@ -157,6 +157,10 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "bound_enlargement": args.bound_enlargement,
         "bound_update_interval": args.bound_update_interval,
         "bound_jitter": args.bound_jitter,
+        "multi_bound_max_ellipsoids": args.multi_bound_max_ellipsoids,
+        "multi_bound_min_points": args.multi_bound_min_points,
+        "multi_bound_split_threshold": args.multi_bound_split_threshold,
+        "multi_bound_overlap_correction": args.multi_bound_overlap_correction,
         "rwalk_seed": args.rwalk_seed,
     }
     if sampler_name == "rwalk":
@@ -353,10 +357,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rwalk-proposal", choices=["isotropic", "live-cov"], default="isotropic"
     )
     parser.add_argument("--rwalk-cov-jitter", type=float, default=1e-6)
-    parser.add_argument("--bound", choices=["none", "single"], default="none")
+    parser.add_argument("--bound", choices=["none", "single", "multi"], default="none")
     parser.add_argument("--bound-enlargement", type=float, default=1.25)
     parser.add_argument("--bound-update-interval", type=int, default=1)
     parser.add_argument("--bound-jitter", type=float, default=1e-6)
+    parser.add_argument("--multi-bound-max-ellipsoids", type=int, default=32)
+    parser.add_argument("--multi-bound-min-points", type=int, default=None)
+    parser.add_argument("--multi-bound-split-threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--multi-bound-overlap-correction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--rwalk-seed", choices=["live", "bound"], default="live")
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
     parser.add_argument(
