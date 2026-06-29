@@ -89,6 +89,17 @@ Increase `--work-size` to mimic more expensive likelihoods.
 
 Use this benchmark to understand GPU throughput scaling. Use the full `bench_static.py` benchmark to understand end-to-end nested-sampling wall time.
 
+
+### Overnight JAX validation wrapper
+
+For opt-in local or overnight validation runs, use the shell wrapper:
+
+```bash
+benchmarks/run_overnight_jax_validation.sh
+```
+
+By default, the wrapper writes timestamped JSON results under `benchmarks/results/` and then prints a summary table. Override `NLIVE`, `DLOGZ`, `SEEDS`, `TARGETS`, `MAXITER`, or `OUTPUT` in the environment to customize a run. This script is opt-in and intended for local/overnight runs. It is not part of CI.
+
 ### External expensive-likelihood benchmarks
 
 Some users may want to benchmark `tinyns` on external, user-provided expensive JAX likelihoods, such as catalog or dark-siren likelihoods. Keep those benchmarks outside the core package: do not add the external likelihood package as a `tinyns` dependency, do not add domain-specific code to `tinyns`, and do not put overnight benchmark runs in CI.
