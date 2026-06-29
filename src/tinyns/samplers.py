@@ -238,10 +238,11 @@ def draw_constrained_single_bound_jax(
             raise ValueError(f"ellipsoid draw must return shape ({batch_size}, {ndim})")
 
         inside = in_unit_cube(u_batch)
+        safe_u_batch = jnp.where(inside[:, None], u_batch, 0.5)
         theta_batch, logl_batch = _evaluate_jax_batch(
             loglike,
             prior_transform,
-            u_batch,
+            safe_u_batch,
             ndim,
             jax_vectorized=jax_vectorized,
         )
@@ -251,12 +252,13 @@ def draw_constrained_single_bound_jax(
         unit_cube_survivors += int(jnp.sum(inside))
         masked_logl = jnp.where(inside, logl_batch, -jnp.inf)
 
-        batch_best_idx = int(jnp.argmax(masked_logl))
-        batch_best_logl = masked_logl[batch_best_idx]
-        if best_u is None or bool(batch_best_logl > best_logl):
-            best_u = u_batch[batch_best_idx]
-            best_theta = theta_batch[batch_best_idx]
-            best_logl = batch_best_logl
+        if bool(jnp.any(inside)):
+            batch_best_idx = int(jnp.argmax(masked_logl))
+            batch_best_logl = masked_logl[batch_best_idx]
+            if best_u is None or bool(batch_best_logl > best_logl):
+                best_u = u_batch[batch_best_idx]
+                best_theta = theta_batch[batch_best_idx]
+                best_logl = batch_best_logl
 
         accepted_mask = masked_logl >= logl_min
         n_accepted = int(jnp.sum(accepted_mask))
@@ -367,10 +369,11 @@ def draw_constrained_multi_bound_jax(
 
         inside = in_unit_cube(u_batch)
         usable = overlap_mask & inside
+        safe_u_batch = jnp.where(usable[:, None], u_batch, 0.5)
         theta_batch, logl_batch = _evaluate_jax_batch(
             loglike,
             prior_transform,
-            u_batch,
+            safe_u_batch,
             ndim,
             jax_vectorized=jax_vectorized,
         )
@@ -380,12 +383,13 @@ def draw_constrained_multi_bound_jax(
         unit_cube_survivors += int(jnp.sum(usable))
         masked_logl = jnp.where(usable, logl_batch, -jnp.inf)
 
-        batch_best_idx = int(jnp.argmax(masked_logl))
-        batch_best_logl = masked_logl[batch_best_idx]
-        if best_u is None or bool(batch_best_logl > best_logl):
-            best_u = u_batch[batch_best_idx]
-            best_theta = theta_batch[batch_best_idx]
-            best_logl = batch_best_logl
+        if bool(jnp.any(usable)):
+            batch_best_idx = int(jnp.argmax(masked_logl))
+            batch_best_logl = masked_logl[batch_best_idx]
+            if best_u is None or bool(batch_best_logl > best_logl):
+                best_u = u_batch[batch_best_idx]
+                best_theta = theta_batch[batch_best_idx]
+                best_logl = batch_best_logl
 
         accepted_mask = masked_logl >= logl_min
         n_accepted = int(jnp.sum(accepted_mask))

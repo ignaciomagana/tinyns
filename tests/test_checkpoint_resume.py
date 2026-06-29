@@ -321,3 +321,38 @@ def test_checkpoint_config_includes_multi_bound_settings(tmp_path):
     assert config["multi_bound_min_points"] == 8
     assert config["multi_bound_split_threshold"] == 0.95
     assert config["multi_bound_overlap_correction"] is True
+
+
+def test_checkpoint_config_validates_jax_vectorized(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(sample="rwalk", kernel="jax", jax_vectorized=False).run(
+        101, maxiter=1, dlogz=0.0, checkpoint_path=path
+    )
+
+    with pytest.raises(ValueError, match="jax_vectorized"):
+        make_sampler(sample="rwalk", kernel="jax", jax_vectorized=True).resume(
+            path, maxiter=2
+        )
+
+
+def test_checkpoint_config_validates_bound_rebuild_policy(tmp_path):
+    path = tmp_path / "run.checkpoint.npz"
+    make_sampler(
+        bound="single",
+        bound_rebuild_on_failure=True,
+        bound_failure_rebuild_threshold=2,
+    ).run(102, maxiter=1, dlogz=0.0, checkpoint_path=path)
+
+    _, config = load_checkpoint_npz(path)
+    assert config["bound_rebuild_on_failure"] is True
+    assert config["bound_failure_rebuild_threshold"] == 2
+    with pytest.raises(ValueError, match="bound_rebuild_on_failure"):
+        make_sampler(bound="single", bound_rebuild_on_failure=False).resume(
+            path, maxiter=2
+        )
+    with pytest.raises(ValueError, match="bound_failure_rebuild_threshold"):
+        make_sampler(
+            bound="single",
+            bound_rebuild_on_failure=True,
+            bound_failure_rebuild_threshold=1,
+        ).resume(path, maxiter=2)
