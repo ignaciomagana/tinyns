@@ -129,6 +129,49 @@ print(result.summary())
 print(result.diagnostics())
 ```
 
+### Recommended fast JAX rwalk path
+
+For unbounded JAX rwalk on the included validation targets, the recommended
+fast path is the cached block kernel with isotropic proposals:
+
+```python
+from tinyns import NestedSampler
+
+sampler = NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    sample="rwalk",
+    kernel="jax",
+    walks=5,
+    replacement_chains=1,
+    rwalk_proposal="isotropic",
+    jax_block_size=32,
+)
+
+result = sampler.run(key, dlogz=0.1)
+```
+
+`jax_block_size > 1` batches several nested-sampling replacement iterations
+into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,
+which usually gives a large speedup for cheap or moderately expensive JAX
+likelihoods. For very expensive likelihoods, the speedup may be smaller because
+likelihood cost dominates dispatch overhead. Convergence is checked between
+blocks, not after every individual nested iteration, so a run may overshoot the
+requested `dlogz` threshold by up to roughly `jax_block_size - 1` iterations.
+
+Use `jax_block_size=32` for the fastest validated unbounded JAX rwalk path. Use
+`jax_block_size=16` if you want a more conservative block size with slightly
+less convergence overshoot. Leave `jax_block_size=1` for the most conservative
+behavior, which disables block mode. This recommendation is based on current
+validation on the included benchmark targets; it is not a proof for all
+likelihoods.
+
+| status | options |
+|---|---|
+| Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` |
+| Still experimental / not recommended as default | `rwalk_proposal="live-cov"`, `bound="single"` or `bound="multi"`, `fused_bound_rwalk=True`, bounded block mode |
+
 ### Bound update interval
 
 For `bound="multi"`, rebuilding every iteration can be expensive. Use
@@ -234,7 +277,7 @@ Setting `bound="multi"` alone does not define a bounded rwalk transition unless 
 
 `fused_bound_rwalk=True` currently means the bounded seed draw and rwalk transition are exposed as one replacement path and share accounting. It is not yet a single compiled seed+rwalk kernel. A future implementation may replace this wrapper fusion with a true single-dispatch JAX kernel.
 
-`jax_block_size > 1` is experimental. For `bound="none"`, block mode uses a JAX `lax.scan` over several nested-sampling iterations. For bounded rwalk, the current block mode reuses a fixed bound across a Python-level block and is mainly a stepping stone toward a fully compiled bounded block kernel.
+For `bound="none"`, `jax_block_size > 1` uses a JAX `lax.scan` over several nested-sampling iterations and is the recommended fast path described above. For bounded rwalk, block mode remains experimental: the current mode reuses a fixed bound across a Python-level block and is mainly a stepping stone toward a fully compiled bounded block kernel.
 
 ### Multiellipsoid bounding
 

@@ -100,6 +100,21 @@ benchmarks/run_overnight_jax_validation.sh
 
 By default, the wrapper writes timestamped JSON results under `benchmarks/results/` and then prints a summary table. Override `NLIVE`, `DLOGZ`, `SEEDS`, `TARGETS`, `MAXITER`, or `OUTPUT` in the environment to customize a run. This script is opt-in and intended for local/overnight runs. It is not part of CI.
 
+To reproduce the recommended fast unbounded JAX rwalk validation with the
+current fastest validated block size, run:
+
+```bash
+python benchmarks/overnight_jax_validation.py \
+  --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
+  --seeds 0 1 2 3 4 5 6 7 8 9 \
+  --nlive 500 \
+  --dlogz 0.1 \
+  --maxiter 10000 \
+  --include-block \
+  --jax-block-size 32 \
+  --output overnight_jax_validation_block_B32.json
+```
+
 ### External expensive-likelihood benchmarks
 
 Some users may want to benchmark `tinyns` on external, user-provided expensive JAX likelihoods, such as catalog or dark-siren likelihoods. Keep those benchmarks outside the core package: do not add the external likelihood package as a `tinyns` dependency, do not add domain-specific code to `tinyns`, and do not put overnight benchmark runs in CI.
