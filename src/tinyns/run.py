@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import time
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax, random
@@ -258,6 +260,152 @@ def _run_static_jax_rwalk_block(
         logz_dead_new,
         logx_final_new,
     )
+
+
+@functools.cache
+def _make_static_jax_rwalk_block_kernel(
+    loglike,
+    prior_transform,
+    ndim: int,
+    walks: int,
+    replacement_chains: int,
+    block_size: int,
+):
+    """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel."""
+
+    ndim = int(ndim)
+    walks = int(walks)
+    replacement_chains = int(replacement_chains)
+    block_size = int(block_size)
+    batch_ncall = walks * replacement_chains
+    rwalk_kernel = _make_rwalk_jax_kernel(
+        loglike,
+        prior_transform,
+        ndim,
+        walks,
+        replacement_chains,
+        False,
+    )
+
+    def block_kernel(
+        key,
+        live_u,
+        live_theta,
+        live_logl,
+        logz_dead,
+        start_iteration,
+        nlive,
+        step_scale,
+        min_accepts,
+        max_batches,
+        proposal_chol,
+    ):
+        proposal_chol = jnp.asarray(proposal_chol, dtype=jnp.asarray(live_u).dtype)
+
+        def one_iteration(carry, offset):
+            key, live_u, live_theta, live_logl, logz_dead = carry
+            worst = jnp.argmin(live_logl)
+            dead_u = live_u[worst]
+            dead_theta = live_theta[worst]
+            logl_worst = live_logl[worst]
+            iteration = jnp.asarray(start_iteration, dtype=jnp.int32) + offset
+            logx_prev = -iteration / nlive
+            logx_new = -(iteration + 1) / nlive
+            logwidth = logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev))
+            logwt = logwidth + logl_worst
+            logz_dead = jnp.logaddexp(logz_dead, logwt)
+
+            (
+                key,
+                new_u,
+                new_theta,
+                new_logl,
+                replacement_ncall,
+                accepted,
+            ) = rwalk_kernel(
+                key,
+                logl_worst,
+                live_u,
+                live_logl,
+                jnp.asarray(step_scale),
+                jnp.asarray(min_accepts),
+                jnp.asarray(max_batches, dtype=jnp.int32),
+                proposal_chol,
+            )
+            replacement_batches_used = (
+                replacement_ncall + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
+            ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
+            replacement_chains_used = (
+                replacement_batches_used
+                * jnp.asarray(replacement_chains, dtype=jnp.int32)
+            )
+            insertion_index = (
+                jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
+            ).astype(jnp.int32)
+            live_u = jnp.where(accepted, live_u.at[worst].set(new_u), live_u)
+            live_theta = jnp.where(
+                accepted, live_theta.at[worst].set(new_theta), live_theta
+            )
+            live_logl = jnp.where(
+                accepted, live_logl.at[worst].set(new_logl), live_logl
+            )
+            return (key, live_u, live_theta, live_logl, logz_dead), (
+                dead_u,
+                dead_theta,
+                logl_worst,
+                logwt,
+                replacement_ncall,
+                insertion_index,
+                replacement_batches_used,
+                replacement_chains_used,
+                accepted,
+            )
+
+        (
+            new_key,
+            new_live_u,
+            new_live_theta,
+            new_live_logl,
+            logz_dead_new,
+        ), block = lax.scan(
+            one_iteration,
+            (key, live_u, live_theta, live_logl, jnp.asarray(logz_dead)),
+            jnp.arange(block_size, dtype=jnp.int32),
+        )
+        (
+            dead_u_block,
+            dead_theta_block,
+            dead_logl_block,
+            dead_logwt_block,
+            replacement_ncall_block,
+            insertion_indices_block,
+            replacement_batches_block,
+            replacement_chains_used_block,
+            accepted_block,
+        ) = block
+        logx_final_new = -(
+            jnp.asarray(start_iteration, dtype=jnp.float32)
+            + jnp.asarray(block_size, dtype=jnp.float32)
+        ) / jnp.asarray(nlive, dtype=jnp.float32)
+        return (
+            new_key,
+            new_live_u,
+            new_live_theta,
+            new_live_logl,
+            dead_u_block,
+            dead_theta_block,
+            dead_logl_block,
+            dead_logwt_block,
+            replacement_ncall_block,
+            insertion_indices_block,
+            replacement_batches_block,
+            replacement_chains_used_block,
+            accepted_block,
+            logz_dead_new,
+            logx_final_new,
+        )
+
+    return jax.jit(block_kernel)
 
 
 def _rwalk_proposal_chol(
@@ -922,6 +1070,20 @@ def run_static_nested(
         "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
         "jax_vectorized": bool(jax_vectorized),
         "jax_block_size": int(jax_block_size),
+        "jax_block_cached": bool(
+            jax_block_size > 1
+            and bound == "none"
+            and replacement_chain_schedule is None
+        ),
+        "jax_block_kernel": (
+            "bounded-python-loop-fixed-bound"
+            if jax_block_size > 1 and bound != "none"
+            else (
+                "fixed-rwalk-cached"
+                if jax_block_size > 1 and replacement_chain_schedule is None
+                else "adaptive-rwalk-uncached" if jax_block_size > 1 else None
+            )
+        ),
         "jax_block_impl": (
             "python-loop-fixed-bound"
             if jax_block_size > 1 and bound != "none"
@@ -1150,6 +1312,51 @@ def run_static_nested(
                     *block_extra,
                 ) = result
             else:
+                if replacement_chain_schedule is None:
+                    batch_ncall = int(walks) * int(replacement_chains)
+                    max_batches = int(max_attempts) // batch_ncall
+                    block_kernel = _make_static_jax_rwalk_block_kernel(
+                        loglike,
+                        prior_transform,
+                        int(ndim),
+                        int(walks),
+                        int(replacement_chains),
+                        int(block_size_now),
+                    )
+                    result = block_kernel(
+                        key,
+                        live_u,
+                        live_theta,
+                        live_logl,
+                        jnp.asarray(logz_dead),
+                        jnp.asarray(iteration, dtype=jnp.int32),
+                        jnp.asarray(nlive, dtype=jnp.int32),
+                        jnp.asarray(step_scale),
+                        jnp.asarray(min_accepts),
+                        jnp.asarray(max_batches, dtype=jnp.int32),
+                        proposal_chol,
+                    )
+                else:
+                    result = _run_static_jax_rwalk_block(
+                        key,
+                        live_u,
+                        live_theta,
+                        live_logl,
+                        logz_dead,
+                        iteration,
+                        nlive,
+                        loglike,
+                        prior_transform,
+                        ndim,
+                        proposal_chol=proposal_chol,
+                        block_size=block_size_now,
+                        walks=walks,
+                        step_scale=step_scale,
+                        replacement_chains=replacement_chains,
+                        replacement_chain_schedule=replacement_chain_schedule,
+                        max_attempts=max_attempts,
+                        min_accepts=min_accepts,
+                    )
                 (
                     key,
                     live_u,
@@ -1166,26 +1373,7 @@ def run_static_nested(
                     accepted_block,
                     logz_dead,
                     logx_final,
-                ) = _run_static_jax_rwalk_block(
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    logz_dead,
-                    iteration,
-                    nlive,
-                    loglike,
-                    prior_transform,
-                    ndim,
-                    proposal_chol=proposal_chol,
-                    block_size=block_size_now,
-                    walks=walks,
-                    step_scale=step_scale,
-                    replacement_chains=replacement_chains,
-                    replacement_chain_schedule=replacement_chain_schedule,
-                    max_attempts=max_attempts,
-                    min_accepts=min_accepts,
-                )
+                ) = result
             block_start = iteration
             block_accepted = [bool(x) for x in np.asarray(accepted_block)]
             failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
@@ -1968,6 +2156,20 @@ def run_static_nested(
             "jax_block_size": int(jax_block_size),
             "jax_block_mode": bool(jax_block_size > 1),
             "jax_block_bound_fixed": bool(jax_block_size > 1 and bound != "none"),
+            "jax_block_cached": bool(
+                jax_block_size > 1
+                and bound == "none"
+                and replacement_chain_schedule is None
+            ),
+            "jax_block_kernel": (
+                "bounded-python-loop-fixed-bound"
+                if jax_block_size > 1 and bound != "none"
+                else (
+                    "fixed-rwalk-cached"
+                    if jax_block_size > 1 and replacement_chain_schedule is None
+                    else "adaptive-rwalk-uncached" if jax_block_size > 1 else None
+                )
+            ),
             "jax_block_impl": (
                 "python-loop-fixed-bound"
                 if jax_block_size > 1 and bound != "none"
