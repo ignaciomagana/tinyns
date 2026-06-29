@@ -1569,6 +1569,7 @@ def run_static_nested(
                 else:
                     seed_calls = 0
                     seed_accepted = True
+                rwalk_only_calls_for_telemetry = None
                 if not (
                     fused_bound_rwalk
                     or (
@@ -1611,6 +1612,7 @@ def run_static_nested(
                     )
                     if seed_calls:
                         rwalk_kernel_calls = int(draw_result[4])
+                        rwalk_only_calls_for_telemetry = rwalk_kernel_calls
                         rwalk_kernel_call_history.append(rwalk_kernel_calls)
                         bound_seed_call_history.append(int(seed_calls))
                         bound_seed_batch_history.append(
@@ -1621,7 +1623,14 @@ def run_static_nested(
                                 *draw_result[:4],
                                 draw_result[4] + seed_calls,
                                 draw_result[5],
-                                {**replacement_info, **draw_result[6]},
+                                {
+                                    **replacement_info,
+                                    **draw_result[6],
+                                    "bound_seed_loglike_evals": int(seed_calls),
+                                    "rwalk_kernel_loglike_evals": rwalk_kernel_calls,
+                                    "total_replacement_loglike_evals": int(seed_calls)
+                                    + rwalk_kernel_calls,
+                                },
                             )
                         else:
                             draw_result = (
@@ -1656,7 +1665,12 @@ def run_static_nested(
                     key, new_u, new_theta, new_logl, calls, accepted = draw_result
                     if kernel == "jax":
                         batch_ncall = int(walks) * int(replacement_chains)
-                        batches_used = int(math.ceil(int(calls) / batch_ncall))
+                        telemetry_calls = (
+                            int(rwalk_only_calls_for_telemetry)
+                            if rwalk_only_calls_for_telemetry is not None
+                            else int(calls)
+                        )
+                        batches_used = int(math.ceil(telemetry_calls / batch_ncall))
                         chains_used = int(replacement_chains) * batches_used
                         replacement_batches.append(batches_used)
                         replacement_chains_used.append(chains_used)
