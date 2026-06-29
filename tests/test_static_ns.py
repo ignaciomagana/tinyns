@@ -745,7 +745,6 @@ def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> Non
     assert result.metadata["max_replacement_chains_used"] >= 1
     assert sum(result.metadata["replacement_chain_usage_counts"].values()) > 0
 
-
 @pytest.mark.parametrize("bound", ["single", "multi"])
 def test_nested_sampler_bounded_rwalk_jax_block_runs_and_shapes(bound) -> None:
     result = run_static_nested(
@@ -1473,7 +1472,6 @@ def test_static_nested_multi_bound_fused_rwalk_jax_live_cov_runs() -> None:
     assert result.metadata["fused_bound_rwalk"] is True
     assert result.metadata["mean_rwalk_kernel_calls"] is not None
 
-
 @pytest.mark.parametrize("bound", ["single", "multi"])
 def test_static_nested_fused_bound_rwalk_adaptive_schedule_runs(bound) -> None:
     result = run_static_nested(
@@ -1526,6 +1524,65 @@ def test_static_nested_multi_bound_rwalk_jax_bound_seed_kernel_runs() -> None:
     assert jnp.isfinite(result.logz)
     assert result.metadata["bound_seed_kernel"] == "jax"
     assert result.metadata["mean_bound_seed_batches"] is not None
+
+
+@pytest.mark.parametrize("bound", ["single", "multi"])
+def test_static_nested_bounded_rwalk_separate_jax_seed_chain_telemetry(bound) -> None:
+    result = run_static_nested(
+        random.PRNGKey(2100 if bound == "single" else 2101),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=20,
+        sample="rwalk",
+        kernel="jax",
+        bound=bound,
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        walks=5,
+        replacement_chains=1,
+        batch_size=128,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=5,
+        dlogz=10.0,
+    )
+
+    metadata = result.metadata
+    assert metadata["mean_replacement_ncall"] == pytest.approx(133.0)
+    assert metadata["mean_total_replacement_calls"] == pytest.approx(133.0)
+    assert metadata["mean_bound_seed_calls"] == pytest.approx(128.0)
+    assert metadata["mean_rwalk_kernel_calls"] == pytest.approx(5.0)
+    assert metadata["mean_replacement_batches"] == pytest.approx(1.0)
+    assert metadata["mean_replacement_chains_used"] == pytest.approx(1.0)
+
+
+def test_static_nested_multi_bound_fused_rwalk_chain_telemetry_regression() -> None:
+    result = run_static_nested(
+        random.PRNGKey(2102),
+        lambda theta: -0.5 * jnp.sum(theta**2),
+        lambda u: 2.0 * u - 1.0,
+        ndim=2,
+        nlive=20,
+        sample="rwalk",
+        kernel="jax",
+        bound="multi",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        fused_bound_rwalk=True,
+        walks=5,
+        replacement_chains=1,
+        batch_size=128,
+        multi_bound_max_ellipsoids=4,
+        multi_bound_min_points=8,
+        maxiter=5,
+        dlogz=10.0,
+    )
+
+    metadata = result.metadata
+    assert metadata["mean_replacement_chains_used"] == pytest.approx(1.0)
+    assert metadata["mean_bound_seed_calls"] == pytest.approx(128.0)
+    assert metadata["mean_rwalk_kernel_calls"] == pytest.approx(5.0)
 
 
 def test_static_nested_bound_seed_kernel_jax_invalid_combinations_raise() -> None:
