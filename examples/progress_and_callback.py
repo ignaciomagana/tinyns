@@ -29,9 +29,8 @@ def main() -> None:
         prior_transform,
         ndim=2,
         nlive=40,
-        sample="slice",
-        slices=3,
-        slice_steps=5,
+        sample="rwalk",
+        walks=5,
         step_scale=0.2,
     )
 

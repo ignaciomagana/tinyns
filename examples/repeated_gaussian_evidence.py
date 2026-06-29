@@ -39,14 +39,7 @@ def loglike(theta):
 def available_configs() -> list[tuple[str, int]]:
     """Return supported ``(sampler, min_accepts)`` validation configs."""
 
-    configs = [("prior", 1), ("rwalk", 1), ("rwalk", 3)]
-    for sample in ("rslice",):
-        try:
-            NestedSampler(loglike, prior_transform, ndim=NDIM, sample=sample)
-        except ValueError:
-            continue
-        configs.extend([(sample, 1), (sample, 3)])
-    return configs
+    return [("prior", 1), ("rwalk", 1), ("rwalk", 3)]
 
 
 def format_warnings(warnings: list[str]) -> str:

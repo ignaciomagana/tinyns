@@ -116,8 +116,7 @@ benchmark targets; it should still be revalidated for new target geometries.
 | Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` | Best validated path on included benchmarks |
 | Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
 | Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
-| Reference-only / frozen | `sample="slice"` | Kept for comparison/debugging; not optimized |
-| Reference-only / frozen | `sample="rslice"` | Kept for comparison/debugging; not optimized |
+| Removed | slice/random-slice samplers | Use dynesty for slice-based external comparisons |
 | Experimental | `rwalk_proposal="live-cov"` | Not promoted due to concerning validation pulls |
 | Experimental | bounds / fused bounds / bounded block | Useful research direction; not production-ready |
 
@@ -244,15 +243,13 @@ For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python
 For local constrained samplers, step-count parameters are decorrelation lengths:
 
 - `walks`: number of reflected random-walk proposals per replacement attempt for `rwalk`
-- `slices`: number of coordinate or random-direction slice updates per replacement attempt for `slice` and `rslice`
-- `slice_steps`: shrinkage proposal budget per slice update
-- `min_accepts`: minimum number of accepted constrained moves required for the replacement to be considered valid
+- `min_accepts`: minimum number of accepted constrained rwalk moves required for the replacement to be considered valid
 
 The sampler does not return merely after the first accepted local move; it runs the requested local update length.
 
 `sample="prior"` supports vectorized replacement proposals with
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
-Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
+Vectorized `rwalk` replacement sampling is not implemented yet.
 
 ### Bounding
 
@@ -324,11 +321,11 @@ The recommended fast path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="is
 - `banana2d`
 - `eggbox2d`
 
-The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. `sample="slice"` and `sample="rslice"` are reference-only, frozen, not optimized, and not part of the current optimized validation target; they are retained for debugging and comparison. Bounds and `rwalk_proposal="live-cov"` are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
+The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS intentionally no longer carries slice or random-slice replacement samplers. The package focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. For slice-based comparisons, use dynesty as an external baseline. Bounds and `rwalk_proposal="live-cov"` are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
 
 ### `min_accepts`
 
-For `rwalk`, `slice`, and `rslice`, `min_accepts` requires multiple accepted
+For `rwalk`, `min_accepts` requires multiple accepted
 constrained moves before returning a replacement. The default is
 `min_accepts=1`.
 
@@ -357,7 +354,7 @@ programming language.
 - Static nested sampling only.
 - No dynamic nested sampling.
 - Multiellipsoid bounding is experimental.
-- No full vectorized `rwalk`, `slice`, or `rslice` replacement sampler; `slice` and `rslice` are reference-only/frozen and not optimized.
+- No full vectorized `rwalk` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
 - Replacement attempts are capped by `max_attempts`; hitting the cap returns
   `success=False` with a partial result rather than raising during the run.
@@ -380,16 +377,12 @@ programming language.
 
 - `examples/progress_and_callback.py`: dependency-free progress and callbacks.
 - `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
-
-### Reference-only / frozen
-
-- `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling retained for comparison/debugging, not the recommended fast path.
-- `examples/gaussian_2d_rslice.py`: random-direction constrained slice sampling retained for comparison/debugging, not the recommended fast path.
+- `examples/checkpoint_resume.py`: checkpoint and resume with the rwalk baseline.
 
 ### Experimental
 
 - `examples/banana_2d.py` and `examples/eggbox_2d.py`: qualitative target demos that can exercise non-primary sampler options for experimentation.
-- `examples/checkpoint_resume.py`, `examples/repeated_gaussian_evidence.py`, and `examples/save_load_result.py`: workflow/diagnostic demos that may use reference-only samplers for coverage or reproducibility checks.
+- `examples/repeated_gaussian_evidence.py` and `examples/save_load_result.py`: workflow/diagnostic demos for coverage or reproducibility checks.
 
 ## Validation
 

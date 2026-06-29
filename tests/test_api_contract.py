@@ -68,18 +68,14 @@ def test_nested_sampler_validates_configuration() -> None:
         NestedSampler(None, prior_transform, ndim=3)  # type: ignore[arg-type]
 
 
-def test_nested_sampler_accepts_slice_configuration() -> None:
-    sampler = NestedSampler(
-        loglike,
-        prior_transform,
-        ndim=3,
-        sample="slice",
-        slices=7,
-        slice_steps=11,
-    )
 
-    assert sampler.sample == "slice"
-    assert sampler.kwargs == {"slices": 7, "slice_steps": 11}
+
+@pytest.mark.parametrize("sample", ["slice", "rslice"])
+def test_nested_sampler_rejects_removed_slice_samplers(sample: str) -> None:
+    with pytest.raises(
+        ValueError, match=r"sample must be one of \{'prior', 'rwalk', 'bound'\}"
+    ):
+        NestedSampler(loglike, prior_transform, ndim=3, sample=sample)
 
 
 def test_nested_sampler_vectorized_rwalk_raises_on_run() -> None:
@@ -100,34 +96,6 @@ def test_nested_sampler_vectorized_rwalk_raises_on_run() -> None:
         sampler.run(key=np.array([4, 5], dtype=np.uint32), maxiter=1)
 
 
-def test_nested_sampler_accepts_rslice_configuration() -> None:
-    sampler = NestedSampler(
-        loglike,
-        prior_transform,
-        ndim=3,
-        sample="rslice",
-        slices=7,
-        slice_steps=11,
-    )
-
-    assert sampler.sample == "rslice"
-    assert sampler.kwargs == {"slices": 7, "slice_steps": 11}
-
-
-def test_nested_sampler_vectorized_slice_raises_on_run() -> None:
-    sampler = NestedSampler(
-        lambda theta_batch: -0.5 * jnp.sum(theta_batch**2, axis=1),
-        lambda u_batch: 2.0 * u_batch - 1.0,
-        ndim=2,
-        nlive=10,
-        vectorized=True,
-        sample="slice",
-    )
-
-    with pytest.raises(
-        NotImplementedError, match="vectorized slice sampling is not implemented yet"
-    ):
-        sampler.run(key=np.array([4, 6], dtype=np.uint32), maxiter=1)
 
 
 def test_nested_sampler_run_returns_result() -> None:
@@ -184,72 +152,7 @@ def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
     assert result.metadata["min_accepts"] == 2
 
 
-def test_nested_sampler_slice_gaussian_returns_finite_logz() -> None:
-    sampler = NestedSampler(
-        lambda theta: float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi)),
-        lambda u: 20.0 * u - 10.0,
-        ndim=1,
-        nlive=40,
-        sample="slice",
-        slices=3,
-        slice_steps=5,
-        step_scale=0.2,
-        min_accepts=2,
-    )
 
-    result = sampler.run(
-        key=np.array([2, 4], dtype=np.uint32),
-        dlogz=0.1,
-        maxiter=300,
-    )
-
-    assert math.isfinite(result.logz)
-    assert jnp.isfinite(result.logz)
-    assert result.metadata["sample"] == "slice"
-    assert result.metadata["slices"] == 3
-    assert result.metadata["slice_steps"] == 5
-    assert result.metadata["min_accepts"] == 2
-
-
-def test_nested_sampler_vectorized_rslice_raises_on_run() -> None:
-    sampler = NestedSampler(
-        loglike,
-        prior_transform,
-        ndim=3,
-        nlive=20,
-        vectorized=True,
-        sample="rslice",
-    )
-
-    with pytest.raises(
-        NotImplementedError, match="vectorized rslice sampling is not implemented yet"
-    ):
-        sampler.run(key=np.array([4, 7], dtype=np.uint32), maxiter=1)
-
-
-def test_nested_sampler_rslice_gaussian_returns_finite_logz() -> None:
-    sampler = NestedSampler(
-        lambda theta: float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi)),
-        lambda u: 20.0 * u - 10.0,
-        ndim=1,
-        nlive=40,
-        sample="rslice",
-        slices=3,
-        slice_steps=5,
-        step_scale=0.2,
-        min_accepts=2,
-    )
-
-    result = sampler.run(
-        key=np.array([2, 5], dtype=np.uint32),
-        dlogz=0.1,
-        maxiter=300,
-    )
-
-    assert math.isfinite(result.logz)
-    assert jnp.isfinite(result.logz)
-    assert result.metadata["sample"] == "rslice"
-    assert result.metadata["min_accepts"] == 2
 
 
 def test_nested_sampler_rejects_invalid_min_accepts_on_run() -> None:
