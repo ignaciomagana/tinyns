@@ -684,17 +684,83 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.metadata["jax_block_size"] == 5
     assert result.metadata["jax_block_mode"] is True
     assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
+    assert result.metadata["jax_block_cached"] is True
+    assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
+
+
+def test_nested_sampler_rwalk_jax_cached_block_records_metadata() -> None:
+    from tinyns import NestedSampler
+
+    sampler = NestedSampler(
+        _jax_loglike,
+        _jax_prior_transform,
+        ndim=2,
+        nlive=50,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        replacement_chains=1,
+        jax_block_size=4,
+    )
+    result = sampler.run(random.PRNGKey(112), dlogz=0.5, maxiter=200)
+
+    assert result.metadata["jax_block_mode"] is True
+    assert result.metadata["jax_block_cached"] is True
+    assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
+    assert result.metadata["replacement_failures"] == 0
+    assert math.isfinite(result.logz)
+    assert result.ncall > 0
+
+
+def test_nested_sampler_rwalk_jax_cached_block_close_to_non_block() -> None:
+    base_kwargs = dict(
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        replacement_chains=1,
+        nlive=50,
+        dlogz=0.5,
+        maxiter=200,
+    )
+    non_block = run_static_nested(
+        random.PRNGKey(113),
+        _jax_loglike,
+        _jax_prior_transform,
+        ndim=2,
+        jax_block_size=1,
+        **base_kwargs,
+    )
+    block = run_static_nested(
+        random.PRNGKey(113),
+        _jax_loglike,
+        _jax_prior_transform,
+        ndim=2,
+        jax_block_size=4,
+        **base_kwargs,
+    )
+
+    assert math.isfinite(non_block.logz)
+    assert math.isfinite(block.logz)
+    assert non_block.metadata["replacement_failures"] == 0
+    assert block.metadata["replacement_failures"] == 0
+    assert abs(float(block.logz) - float(non_block.logz)) < 1.0
+    assert abs(block.metadata["niter"] - non_block.metadata["niter"]) <= 8
 
 
 def test_jax_block_live_cov_passes_covariance(monkeypatch) -> None:
     seen = {}
-    original = run_mod._run_static_jax_rwalk_block
+    original = run_mod._make_static_jax_rwalk_block_kernel
 
-    def wrapped(*args, proposal_chol, **kwargs):
-        seen["proposal_chol"] = proposal_chol
-        return original(*args, proposal_chol=proposal_chol, **kwargs)
+    def wrapped(*args, **kwargs):
+        kernel = original(*args, **kwargs)
 
-    monkeypatch.setattr(run_mod, "_run_static_jax_rwalk_block", wrapped)
+        def wrapped_kernel(*kernel_args):
+            seen["proposal_chol"] = kernel_args[-1]
+            return kernel(*kernel_args)
+
+        return wrapped_kernel
+
+    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", wrapped)
     result = run_static_nested(
         random.PRNGKey(111),
         _jax_loglike,
@@ -713,6 +779,7 @@ def test_jax_block_live_cov_passes_covariance(monkeypatch) -> None:
 
     assert result.metadata["rwalk_proposal"] == "live-cov"
     assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
+    assert result.metadata["jax_block_cached"] is True
     proposal_chol = seen["proposal_chol"]
     assert proposal_chol.shape == (2, 2)
     assert not jnp.allclose(proposal_chol, jnp.eye(2, dtype=proposal_chol.dtype))
@@ -737,6 +804,8 @@ def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> Non
 
     assert math.isfinite(result.logz)
     assert result.metadata["jax_block_mode"] is True
+    assert result.metadata["jax_block_cached"] is False
+    assert result.metadata["jax_block_kernel"] == "adaptive-rwalk-uncached"
     assert result.metadata["adaptive_replacement_chains"] is True
     assert result.metadata["replacement_chain_schedule"] == [1, 2, 4]
     assert len(result.metadata["replacement_ncall"]) == result.metadata["niter"]
@@ -779,6 +848,8 @@ def test_nested_sampler_bounded_rwalk_jax_block_runs_and_shapes(bound) -> None:
     assert result.metadata["jax_block_mode"] is True
     assert result.metadata["jax_block_bound_fixed"] is True
     assert result.metadata["jax_block_impl"] == "python-loop-fixed-bound"
+    assert result.metadata["jax_block_cached"] is False
+    assert result.metadata["jax_block_kernel"] == "bounded-python-loop-fixed-bound"
     assert result.metadata["bound_seed_kernel"] == "jax"
     assert result.metadata["fused_bound_rwalk"] is True
     assert result.metadata["fused_bound_rwalk_impl"] == "wrapper"
