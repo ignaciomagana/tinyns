@@ -1,3 +1,7 @@
+# Reference-only example.
+# slice/rslice are retained for debugging and comparison, but are not part of
+# the recommended fast path. Prefer JAX rwalk with cached block mode for
+# performance-sensitive use.
 """Run tinyns on a 2D Gaussian using the reference-only slice sampler.
 
 This sampler is frozen, not optimized, and retained for comparison/debugging;

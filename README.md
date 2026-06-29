@@ -366,12 +366,30 @@ programming language.
 
 ## Additional examples
 
+### Primary
+
+- `examples/gaussian_2d_rwalk_jax_block.py`: recommended validated fast path using JAX `rwalk`, isotropic proposals, one replacement chain, and cached block mode with `jax_block_size=32`.
+
+### Reference
+
 - `examples/gaussian_2d.py`: 2D Gaussian with prior rejection.
-- `examples/gaussian_2d_rwalk.py`: reflected random-walk constrained sampling.
-- `examples/gaussian_2d_rwalk_jax.py`: recommended JAX-native random-walk replacement path.
-- `examples/gaussian_2d_slice.py`: reference-only/frozen coordinate-wise constrained slice sampling for comparison/debugging.
+- `examples/gaussian_2d_rwalk.py`: reflected Python random-walk constrained sampling.
+- `examples/gaussian_2d_rwalk_jax.py`: simple JAX-native random-walk replacement path without the full cached block configuration.
+
+### Utility
+
 - `examples/progress_and_callback.py`: dependency-free progress and callbacks.
 - `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
+
+### Reference-only / frozen
+
+- `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling retained for comparison/debugging, not the recommended fast path.
+- `examples/gaussian_2d_rslice.py`: random-direction constrained slice sampling retained for comparison/debugging, not the recommended fast path.
+
+### Experimental
+
+- `examples/banana_2d.py` and `examples/eggbox_2d.py`: qualitative target demos that can exercise non-primary sampler options for experimentation.
+- `examples/checkpoint_resume.py`, `examples/repeated_gaussian_evidence.py`, and `examples/save_load_result.py`: workflow/diagnostic demos that may use reference-only samplers for coverage or reproducibility checks.
 
 ## Validation
 
