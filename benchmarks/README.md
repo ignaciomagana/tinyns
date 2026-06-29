@@ -153,9 +153,9 @@ done
 
 This validates the success/failure rate, replacement failures, wall time, `ncall`/`niter` growth from block overshoot, logZ accuracy on analytic targets, and `final_delta_logz` overshoot as block size increases. Larger block sizes can reduce wall time, but they may increase `ncall`/`niter` because convergence is checked between blocks.
 
-#### No-block and bounded comparison
+#### No-block and bounded comparison / experimental candidates
 
-Use this baseline comparison command when comparing B16/B32 against no-block and bounded configurations:
+Use this comparison command when comparing the recommended B32 block mode against no-block and bounded configurations. This is not the primary validation command:
 
 ```bash
 python benchmarks/overnight_jax_validation.py \
@@ -168,7 +168,7 @@ python benchmarks/overnight_jax_validation.py \
   --output overnight_jax_validation_no_block.json
 ```
 
-This gives comparison against ordinary unbounded isotropic `rwalk`, unbounded live-cov `rwalk`, adaptive `rwalk`, and bounded single/multi/fused paths. Treat live-cov and bounded/fused bounded results as experimental unless they are separately validated for the intended workload.
+This gives comparison against ordinary unbounded isotropic `rwalk`, unbounded live-cov `rwalk`, adaptive `rwalk`, and bounded single/multi/fused paths. Treat no-block as a comparison baseline, and treat live-cov and bounded/fused bounded results as experimental unless they are separately validated for the intended workload.
 
 #### How to read the results
 
@@ -222,7 +222,11 @@ When benchmarking the optimized path, hold the sampling problem fixed across run
 
 Starting configurations for external expensive JAX likelihoods should distinguish the recommended unbounded isotropic path from experimental candidates:
 
-Recommended unbounded isotropic baseline to validate first:
+- Start with the recommended unbounded cached block mode below.
+- Test live-cov, bounds, fused bounds, or bounded block mode only as experimental candidates after the primary path is calibrated.
+- Compare evidence calibration and replacement failures before treating wall-time speedups as meaningful.
+
+Recommended unbounded isotropic cached block baseline to validate first:
 
 ```bash
 --sample rwalk \
