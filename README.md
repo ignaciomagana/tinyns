@@ -250,13 +250,13 @@ Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
 `tinyns` supports `bound="none"` by default. Experimental single-ellipsoid bounding can be enabled with `bound="single"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
 
-The initial production target is `sample="rwalk"` with JAX, live-cov proposals, bound seeding, and bounds. This is intended to mirror the static nested-sampling workflow commonly used with dynesty's bounded rwalk modes, while keeping the implementation small and inspectable.
+The recommended fast path is unbounded cached-block JAX rwalk with `jax_block_size=32`, isotropic proposals, and `bound="none"`. Live-cov proposals, bounds, fused bounded rwalk, and bounded block mode are experimental candidates and need separate validation on the intended workload before production use.
 
 Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before using it for production.
 
 ### Bounded rwalk
 
-For dynesty-style bounded rwalk, use both a bound and bound seeding:
+For experimental dynesty-style bounded rwalk, use both a bound and bound seeding:
 
 ```python
 sampler = NestedSampler(
@@ -277,13 +277,13 @@ Setting `bound="multi"` alone does not define a bounded rwalk transition unless 
 
 `fused_bound_rwalk=True` currently means the bounded seed draw and rwalk transition are exposed as one replacement path and share accounting. It is not yet a single compiled seed+rwalk kernel. A future implementation may replace this wrapper fusion with a true single-dispatch JAX kernel.
 
-For `bound="none"`, `jax_block_size > 1` uses a JAX `lax.scan` over several nested-sampling iterations and is the recommended fast path described above. For bounded rwalk, block mode remains experimental: the current mode reuses a fixed bound across a Python-level block and is mainly a stepping stone toward a fully compiled bounded block kernel.
+For `bound="none"`, `jax_block_size=32` uses a cached JAX `lax.scan` over several nested-sampling iterations and is the recommended fast path described above. For bounded rwalk, block mode remains experimental: the current mode reuses a fixed bound across a Python-level block and is mainly a stepping stone toward a fully compiled bounded block kernel.
 
 ### Multiellipsoid bounding
 
 `bound="multi"` is an experimental dynesty-style union-of-ellipsoids bound. It recursively splits the live points using a dependency-free PCA/median split and samples from the volume-weighted union of ellipsoids with overlap correction.
 
-The intended production-like configuration is:
+An experimental production-like candidate configuration is:
 
 ```python
 NestedSampler(
@@ -300,7 +300,7 @@ NestedSampler(
 )
 ```
 
-This mode is experimental. Check evidence calibration, insertion-rank diagnostics, and seed stability before using it for science.
+This mode is experimental and is not the recommended fast path. Check evidence calibration, insertion-rank diagnostics, and seed stability before using it for science.
 
 ### JAX bound representation
 
