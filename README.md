@@ -4,6 +4,12 @@
 The core public API is deliberately small: provide `loglike`,
 `prior_transform`, and `ndim`, then call `NestedSampler(...).run(key)`.
 
+TinyNS is not many samplers; it is one excellent tiny static nested sampler,
+plus reference baselines. TinyNS deliberately keeps the sampler surface small.
+The main optimized path is static nested sampling with JAX random-walk
+replacement. Other samplers are kept as reference baselines or experimental
+research knobs, not as equally supported production paths.
+
 ## Install
 
 From source:
@@ -100,15 +106,22 @@ partial `NestedSamplingResult`.
 
 ## Sampler recommendations
 
-| sampler | kernel | recommendation | notes |
-|---|---|---|---|
-| `prior` | `python` | Conceptual baseline | Brute-force constrained rejection; can become very expensive |
-| `rwalk` | `python` | Reliable baseline | Calibrated on repeated Gaussian validation; CPU/Python local kernel |
-| `rwalk` | `jax` | Recommended fast path for JAX-native likelihoods | Runs constrained random-walk replacements on device; currently the best validated fast path |
-| `slice` | `python` | Exploratory / problem-dependent | Fast, but validate evidence calibration on your target geometry |
-| `rslice` | `python` | Experimental | Not currently recommended as the default evidence sampler |
+TinyNS is intentionally organized around one recommended fast path, with
+reference baselines and experimental research knobs separated from that primary
+route. The currently recommended fast path was validated on the included
+benchmark targets; it should still be revalidated for new target geometries.
 
-For JAX-native likelihoods, the recommended reliable fast path is:
+| Tier | Options | Status |
+| --- | --- | --- |
+| Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` | Best validated path on included benchmarks |
+| Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
+| Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
+| Reference-only / frozen | `sample="slice"` | Kept for comparison/debugging; not optimized |
+| Reference-only / frozen | `sample="rslice"` | Kept for comparison/debugging; not optimized |
+| Experimental | `rwalk_proposal="live-cov"` | Not promoted due to concerning validation pulls |
+| Experimental | bounds / fused bounds / bounded block | Useful research direction; not production-ready |
+
+For JAX-native likelihoods, the recommended fast path is:
 
 ```python
 from tinyns import NestedSampler
@@ -117,16 +130,15 @@ sampler = NestedSampler(
     loglike,
     prior_transform,
     ndim,
-    nlive=200,
     sample="rwalk",
     kernel="jax",
-    walks=25,
-    step_scale=0.1,
+    walks=5,
+    replacement_chains=1,
+    rwalk_proposal="isotropic",
+    jax_block_size=32,
 )
 
 result = sampler.run(key, dlogz=0.1)
-print(result.summary())
-print(result.diagnostics())
 ```
 
 ### Recommended fast JAX rwalk path
@@ -167,17 +179,13 @@ behavior, which disables block mode. This recommendation is based on current
 validation on the included benchmark targets; it is not a proof for all
 likelihoods.
 
-| status | options |
-|---|---|
-| Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` |
-| Still experimental / not recommended as default | `rwalk_proposal="live-cov"`, `bound="single"` or `bound="multi"`, `fused_bound_rwalk=True`, bounded block mode |
 
 ### Bound update interval
 
 For `bound="multi"`, rebuilding every iteration can be expensive. Use
 `bound_update_interval` to reuse a bound for multiple nested-sampling
 iterations. Larger intervals reduce Python/bound-building overhead but can make
-bounds stale. Validate evidence before production use.
+bounds stale. Validate evidence before relying on results.
 
 
 ### Batched JAX replacement chains
@@ -250,9 +258,9 @@ Vectorized `rwalk`, `slice`, and `rslice` are not implemented yet.
 
 `tinyns` supports `bound="none"` by default. Experimental single-ellipsoid bounding can be enabled with `bound="single"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
 
-The recommended fast path is unbounded cached-block JAX rwalk with `jax_block_size=32`, isotropic proposals, and `bound="none"`. Live-cov proposals, bounds, fused bounded rwalk, and bounded block mode are experimental candidates and need separate validation on the intended workload before production use.
+The only currently recommended fast path is unbounded JAX rwalk with isotropic proposals and cached block mode. Live-cov proposals and bounded/fused-bounded paths remain experimental and require target-specific validation.
 
-Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before using it for production.
+Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before relying on it for scientific results.
 
 ### Bounded rwalk
 
@@ -283,7 +291,7 @@ For `bound="none"`, `jax_block_size=32` uses a cached JAX `lax.scan` over severa
 
 `bound="multi"` is an experimental dynesty-style union-of-ellipsoids bound. It recursively splits the live points using a dependency-free PCA/median split and samples from the volume-weighted union of ellipsoids with overlap correction.
 
-An experimental production-like candidate configuration is:
+An experimental bounded/fused candidate configuration for separate validation is:
 
 ```python
 NestedSampler(
@@ -308,7 +316,7 @@ This mode is experimental and is not the recommended fast path. Check evidence c
 
 ## Current validation status
 
-The recommended `sample="rwalk", kernel="jax"` path has been checked with repeated-seed validation on:
+The recommended fast path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32`) has been checked with repeated-seed validation on the included benchmark targets:
 
 - `gaussian2d`
 - `correlated_gaussian2d`
@@ -316,7 +324,7 @@ The recommended `sample="rwalk", kernel="jax"` path has been checked with repeat
 - `banana2d`
 - `eggbox2d`
 
-The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. Users should still validate on their own target geometry before relying on evidence values.
+The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. `sample="slice"` and `sample="rslice"` are reference-only, frozen, not optimized, and not part of the current optimized validation target; they are retained for debugging and comparison. Bounds and `rwalk_proposal="live-cov"` are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
 
 ### `min_accepts`
 
@@ -349,7 +357,7 @@ programming language.
 - Static nested sampling only.
 - No dynamic nested sampling.
 - Multiellipsoid bounding is experimental.
-- No full vectorized `rwalk`, `slice`, or `rslice` replacement sampler.
+- No full vectorized `rwalk`, `slice`, or `rslice` replacement sampler; `slice` and `rslice` are reference-only/frozen and not optimized.
 - Not a PPL; users provide functions, not model objects.
 - Replacement attempts are capped by `max_attempts`; hitting the cap returns
   `success=False` with a partial result rather than raising during the run.
@@ -360,8 +368,8 @@ programming language.
 
 - `examples/gaussian_2d.py`: 2D Gaussian with prior rejection.
 - `examples/gaussian_2d_rwalk.py`: reflected random-walk constrained sampling.
-- `examples/gaussian_2d_rwalk_jax.py`: JAX-native random-walk replacement kernel.
-- `examples/gaussian_2d_slice.py`: coordinate-wise constrained slice sampling.
+- `examples/gaussian_2d_rwalk_jax.py`: recommended JAX-native random-walk replacement path.
+- `examples/gaussian_2d_slice.py`: reference-only/frozen coordinate-wise constrained slice sampling for comparison/debugging.
 - `examples/progress_and_callback.py`: dependency-free progress and callbacks.
 - `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
 

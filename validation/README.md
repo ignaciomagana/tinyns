@@ -52,7 +52,7 @@ python validation/run_validation.py \
 ```
 
 
-`slice` and `rslice` remain available, but repeated-seed validation should be run before relying on their evidence estimates.
+`slice` and `rslice` remain available as reference-only, frozen samplers retained for debugging and comparison. They are not optimized and are not part of the recommended fast path.
 
 ## Interpreting validation summaries
 
@@ -72,20 +72,22 @@ Useful warning signs:
 The recommendation column is heuristic and should be treated as a debugging aid,
 not a formal statistical test.
 
-Repeated-seed validation currently supports the following practical recommendations:
+Repeated-seed validation currently separates the recommended path from baselines and reference-only samplers:
 
-- `sample="rwalk", kernel="python"`: reliable baseline
-- `sample="rwalk", kernel="jax"`: reliable fast path for JAX-native likelihoods
-- `sample="slice"`: useful exploratory sampler, but validate evidence calibration
-- `sample="rslice"`: experimental
+- `sample="rwalk", kernel="jax"`: recommended fast path for JAX-native likelihoods when used with isotropic proposals, `walks=5`, `replacement_chains=1`, and cached block mode validated on included benchmark targets
+- `sample="rwalk", kernel="python"`: simple CPU/Python correctness/debug baseline
+- `sample="prior"`: conceptual brute-force constrained-prior baseline
+- `sample="slice"`: reference-only/frozen, retained for comparison/debugging, not optimized
+- `sample="rslice"`: reference-only/frozen, retained for comparison/debugging, not optimized
 
 `ring2d` is a qualitative annulus target. It is useful for checking whether constrained-replacement samplers can move around curved shell-like likelihood regions. If no analytic evidence is provided, use posterior diagnostics, insertion-rank behavior, and repeated-run stability rather than z-scores.
 
 
-`rslice` is available in the validation harness and is a useful comparison
-against coordinate-wise `slice`, especially on correlated targets. It remains a
-local, simple random-direction constrained slice sampler in the unit cube, not a
-full PolyChord-style slice sampler.
+`rslice` is available in the validation harness as a reference-only/frozen
+comparison against coordinate-wise `slice`, especially on correlated targets. It
+remains a local, simple random-direction constrained slice sampler in the unit
+cube, not a full PolyChord-style slice sampler, and is not part of the
+recommended fast path.
 
 ## Insertion-rank diagnostics
 
