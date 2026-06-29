@@ -416,7 +416,7 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
     main([str(no_block), str(block), "--csv", str(csv_path)])
 
     captured = capsys.readouterr()
-    assert "Overall by file/config" in captured.out
+    assert "Overall by file/target/config" in captured.out
     assert "Accuracy on analytic targets" in captured.out
     assert "Per-target fastest passing config" in captured.out
     assert "no_block" in captured.out

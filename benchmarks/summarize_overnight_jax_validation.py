@@ -218,7 +218,7 @@ def _print_table(columns: list[str], rows: list[dict[str, Any]]) -> None:
 
 
 def print_summary(summaries: list[dict[str, Any]]) -> None:
-    print("Overall by file/config")
+    print("Overall by file/target/config")
     _print_table(
         [
             "run_label",
