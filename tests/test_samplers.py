@@ -1386,3 +1386,123 @@ def test_evaluate_jax_batch_vectorized_shape_errors() -> None:
             2,
             jax_vectorized=True,
         )
+
+
+def _nan_outside_prior_transform(u):
+    u = jnp.asarray(u)
+    outside = jnp.any((u < 0.0) | (u > 1.0))
+    return jnp.where(outside, jnp.full_like(u, jnp.nan), u)
+
+
+def _large_test_bound(ndim=2):
+    from tinyns.bounds import SingleEllipsoidBound
+
+    center = jnp.full((ndim,), 0.5)
+    chol = jnp.eye(ndim) * 5.0
+    inv_chol = jnp.linalg.inv(chol)
+    return SingleEllipsoidBound(
+        center=center,
+        chol=chol,
+        inv_chol=inv_chol,
+        enlargement=1.0,
+        log_volume=0.0,
+        ndim=ndim,
+    )
+
+
+def test_draw_constrained_single_bound_jax_masks_outside_before_prior_transform():
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    _, u, theta, logl, _ncall, accepted, _info = draw_constrained_single_bound_jax(
+        random.PRNGKey(5001),
+        gaussian_loglike,
+        _nan_outside_prior_transform,
+        -10.0,
+        _large_test_bound(),
+        2,
+        batch_size=64,
+        max_batches=8,
+    )
+
+    assert accepted is True
+    assert bool(jnp.all((u >= 0.0) & (u <= 1.0)))
+    assert bool(jnp.all((theta >= 0.0) & (theta <= 1.0)))
+    assert jnp.isfinite(logl)
+
+
+def test_draw_constrained_single_bound_jax_failure_fallback_is_finite_and_safe():
+    from tinyns.samplers import draw_constrained_single_bound_jax
+
+    _, u, theta, logl, _ncall, accepted, _info = draw_constrained_single_bound_jax(
+        random.PRNGKey(5002),
+        gaussian_loglike,
+        _nan_outside_prior_transform,
+        jnp.inf,
+        _large_test_bound(),
+        2,
+        batch_size=1,
+        max_batches=1,
+    )
+
+    assert accepted is False
+    assert bool(jnp.all((u >= 0.0) & (u <= 1.0)))
+    assert bool(jnp.all((theta >= 0.0) & (theta <= 1.0)))
+    assert jnp.isfinite(logl)
+
+
+def test_draw_constrained_multi_bound_jax_masks_outside_before_prior_transform():
+    from tinyns.bounds import MultiEllipsoidBound
+    from tinyns.samplers import draw_constrained_multi_bound_jax
+
+    ellipsoid = _large_test_bound()
+    bound = MultiEllipsoidBound(
+        ellipsoids=(ellipsoid, ellipsoid),
+        log_volumes=jnp.asarray([0.0, 0.0]),
+        log_total_volume=float(jnp.log(2.0)),
+        ndim=2,
+    )
+
+    _, u, theta, logl, _ncall, accepted, _info = draw_constrained_multi_bound_jax(
+        random.PRNGKey(5003),
+        gaussian_loglike,
+        _nan_outside_prior_transform,
+        -10.0,
+        bound,
+        2,
+        batch_size=64,
+        max_batches=8,
+    )
+
+    assert accepted is True
+    assert bool(jnp.all((u >= 0.0) & (u <= 1.0)))
+    assert bool(jnp.all((theta >= 0.0) & (theta <= 1.0)))
+    assert jnp.isfinite(logl)
+
+
+def test_draw_constrained_multi_bound_jax_failure_fallback_is_finite_and_safe():
+    from tinyns.bounds import MultiEllipsoidBound
+    from tinyns.samplers import draw_constrained_multi_bound_jax
+
+    ellipsoid = _large_test_bound()
+    bound = MultiEllipsoidBound(
+        ellipsoids=(ellipsoid, ellipsoid),
+        log_volumes=jnp.asarray([0.0, 0.0]),
+        log_total_volume=float(jnp.log(2.0)),
+        ndim=2,
+    )
+
+    _, u, theta, logl, _ncall, accepted, _info = draw_constrained_multi_bound_jax(
+        random.PRNGKey(5004),
+        gaussian_loglike,
+        _nan_outside_prior_transform,
+        jnp.inf,
+        bound,
+        2,
+        batch_size=1,
+        max_batches=1,
+    )
+
+    assert accepted is False
+    assert bool(jnp.all((u >= 0.0) & (u <= 1.0)))
+    assert bool(jnp.all((theta >= 0.0) & (theta <= 1.0)))
+    assert jnp.isfinite(logl)

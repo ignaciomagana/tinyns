@@ -210,6 +210,10 @@ class NestedSampler:
             bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
             fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
+            bound_rebuild_on_failure=self.kwargs.get("bound_rebuild_on_failure", False),
+            bound_failure_rebuild_threshold=self.kwargs.get(
+                "bound_failure_rebuild_threshold", 1
+            ),
             jax_vectorized=self.kwargs.get("jax_vectorized", False),
             jax_block_size=self.kwargs.get("jax_block_size", 1),
         )
@@ -261,6 +265,12 @@ class NestedSampler:
             ),
             "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
             "fused_bound_rwalk": bool(self.kwargs.get("fused_bound_rwalk", False)),
+            "bound_rebuild_on_failure": bool(
+                self.kwargs.get("bound_rebuild_on_failure", False)
+            ),
+            "bound_failure_rebuild_threshold": int(
+                self.kwargs.get("bound_failure_rebuild_threshold", 1)
+            ),
             "jax_vectorized": bool(self.kwargs.get("jax_vectorized", False)),
             "jax_block_size": int(self.kwargs.get("jax_block_size", 1)),
         }
@@ -306,6 +316,9 @@ class NestedSampler:
             "bound_seed_kernel",
             "allow_unused_bound",
             "fused_bound_rwalk",
+            "bound_rebuild_on_failure",
+            "bound_failure_rebuild_threshold",
+            "jax_vectorized",
             "jax_block_size",
         ):
             default_values = {
@@ -328,6 +341,8 @@ class NestedSampler:
                 "bound_seed_kernel": "python",
                 "allow_unused_bound": False,
                 "fused_bound_rwalk": False,
+                "bound_rebuild_on_failure": False,
+                "bound_failure_rebuild_threshold": 1,
                 "jax_vectorized": False,
                 "jax_block_size": 1,
             }
@@ -413,6 +428,10 @@ class NestedSampler:
             bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
             allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
             fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
+            bound_rebuild_on_failure=self.kwargs.get("bound_rebuild_on_failure", False),
+            bound_failure_rebuild_threshold=self.kwargs.get(
+                "bound_failure_rebuild_threshold", 1
+            ),
             jax_vectorized=self.kwargs.get("jax_vectorized", False),
             jax_block_size=self.kwargs.get("jax_block_size", 1),
         )

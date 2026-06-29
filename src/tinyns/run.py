@@ -158,7 +158,7 @@ def _run_static_jax_rwalk_block(
                 new_theta,
                 new_logl,
                 replacement_ncall,
-                _accepted,
+                accepted,
             ) = rwalk_kernel(
                 key,
                 logl_worst,
@@ -183,7 +183,7 @@ def _run_static_jax_rwalk_block(
                 new_theta,
                 new_logl,
                 replacement_ncall,
-                _accepted,
+                accepted,
                 replacement_batches_used,
                 replacement_chains_used,
                 _last_chain_count,
@@ -200,9 +200,11 @@ def _run_static_jax_rwalk_block(
         insertion_index = (
             jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
         ).astype(jnp.int32)
-        live_u = live_u.at[worst].set(new_u)
-        live_theta = live_theta.at[worst].set(new_theta)
-        live_logl = live_logl.at[worst].set(new_logl)
+        live_u = jnp.where(accepted, live_u.at[worst].set(new_u), live_u)
+        live_theta = jnp.where(
+            accepted, live_theta.at[worst].set(new_theta), live_theta
+        )
+        live_logl = jnp.where(accepted, live_logl.at[worst].set(new_logl), live_logl)
         return (key, live_u, live_theta, live_logl, logz_dead), (
             dead_u,
             dead_theta,
@@ -212,6 +214,7 @@ def _run_static_jax_rwalk_block(
             insertion_index,
             replacement_batches_used,
             replacement_chains_used,
+            accepted,
         )
 
     (
@@ -234,6 +237,7 @@ def _run_static_jax_rwalk_block(
         insertion_indices_block,
         replacement_batches_block,
         replacement_chains_used_block,
+        accepted_block,
     ) = block
     logx_final_new = -(int(start_iteration) + int(block_size)) / int(nlive)
     return (
@@ -249,6 +253,7 @@ def _run_static_jax_rwalk_block(
         insertion_indices_block,
         replacement_batches_block,
         replacement_chains_used_block,
+        accepted_block,
         logz_dead_new,
         logx_final_new,
     )
@@ -390,6 +395,7 @@ def _run_static_jax_bounded_rwalk_block(
         jnp.asarray(insertion_index_values, dtype=int),
         jnp.asarray(replacement_batch_values, dtype=int),
         jnp.asarray(replacement_chain_values, dtype=int),
+        jnp.ones((int(block_size),), dtype=bool),
         float(logz_dead),
         float(logx_final_new),
         bound_seed_call_values,
@@ -1004,6 +1010,7 @@ def run_static_nested(
     if jax_block_size > 1:
         while iteration < maxiter:
             block_size_now = min(int(jax_block_size), maxiter - iteration)
+            logz_dead_before_block = logz_dead
             block_extra = None
             if bound in {"single", "multi"}:
                 if (
@@ -1082,6 +1089,7 @@ def run_static_nested(
                     insertion_indices_block,
                     replacement_batches_block,
                     replacement_chains_used_block,
+                    accepted_block,
                     logz_dead,
                     logx_final,
                     *block_extra,
@@ -1100,6 +1108,7 @@ def run_static_nested(
                     insertion_indices_block,
                     replacement_batches_block,
                     replacement_chains_used_block,
+                    accepted_block,
                     logz_dead,
                     logx_final,
                 ) = _run_static_jax_rwalk_block(
@@ -1122,7 +1131,31 @@ def run_static_nested(
                     min_accepts=min_accepts,
                 )
             block_start = iteration
+            block_accepted = [bool(x) for x in np.asarray(accepted_block)]
+            failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
+            if failed_offsets:
+                replacement_failures += 1
+                success = False
+                message = (
+                    f"max_attempts={max_attempts} hit during constrained rwalk draw"
+                )
+                block_size_now = failed_offsets[0]
             block_stop = iteration + block_size_now
+            if failed_offsets:
+                logz_dead = float(logz_dead_before_block)
+                for logwt_value in np.asarray(dead_logwt_block[:block_size_now]):
+                    logz_dead = float(jnp.logaddexp(logz_dead, float(logwt_value)))
+                logx_final = -block_stop / int(nlive)
+            dead_u_block = dead_u_block[:block_size_now]
+            dead_theta_block = dead_theta_block[:block_size_now]
+            dead_logl_block = dead_logl_block[:block_size_now]
+            dead_logwt_block = dead_logwt_block[:block_size_now]
+            replacement_ncall_block = replacement_ncall_block[:block_size_now]
+            insertion_indices_block = insertion_indices_block[:block_size_now]
+            replacement_batches_block = replacement_batches_block[:block_size_now]
+            replacement_chains_used_block = replacement_chains_used_block[
+                :block_size_now
+            ]
             dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
             dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
             dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
@@ -1180,6 +1213,8 @@ def run_static_nested(
                         )
             iteration = block_stop
             maybe_checkpoint()
+            if failed_offsets:
+                break
 
             logz_remain = float(logx_final) + float(jnp.max(live_logl))
             delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
@@ -1277,7 +1312,7 @@ def run_static_nested(
                     )
                 )
                 bound_nellipsoid_history.append(
-                    int(getattr(current_bound, "n_ellipsoids", 1))
+                    int(len(getattr(current_bound, "ellipsoids", (current_bound,))))
                 )
                 bound_updates += 1
                 if force_bound_rebuild:

@@ -1568,3 +1568,26 @@ def test_jax_bounded_seed_draw_supports_vectorized_functions() -> None:
     assert result.metadata["jax_vectorized"] is True
     assert result.metadata["bound_seed_kernel"] == "jax"
     assert jnp.isfinite(result.logz)
+
+
+def test_jax_block_rwalk_failure_propagates_replacement_failure() -> None:
+    result = run_static_nested(
+        random.PRNGKey(1234),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        walks=1,
+        min_accepts=2,
+        replacement_chains=1,
+        max_attempts=1,
+        maxiter=4,
+        dlogz=0.0,
+        jax_block_size=4,
+    )
+
+    assert result.success is False
+    assert result.metadata["replacement_failures"] == 1
+    assert "max_attempts=1" in result.message
