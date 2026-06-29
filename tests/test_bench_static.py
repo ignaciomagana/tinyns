@@ -336,31 +336,96 @@ def test_overnight_jax_validation_quick_writes_expected_keys(tmp_path) -> None:
         assert key in rows[0]
 
 
-def test_summarize_overnight_jax_validation_prints_table(tmp_path, capsys) -> None:
+def test_summarize_overnight_jax_validation_prints_tables_and_csv(
+    tmp_path, capsys
+) -> None:
     from benchmarks.summarize_overnight_jax_validation import main
 
-    output = tmp_path / "overnight.json"
-    output.write_text(
+    no_block = tmp_path / "overnight_jax_validation_no_block.json"
+    block = tmp_path / "overnight_jax_validation_block_B16.json"
+    csv_path = tmp_path / "summary.csv"
+    no_block.write_text(
         json.dumps(
             [
                 {
                     "target": "gaussian2d",
                     "config_name": "unbounded_isotropic_rwalk",
-                    "seconds": 1.0,
-                    "logz": -6.0,
-                    "expected_logz": -5.99,
+                    "seconds": 4.0,
+                    "ncall": 40,
+                    "niter": 10,
+                    "logz": -5.0,
+                    "logzerr": 0.5,
+                    "expected_logz": -6.0,
+                    "final_delta_logz": 0.2,
+                    "dlogz": 10.0,
                     "replacement_failures": 0,
                     "success": True,
-                }
+                },
+                {
+                    "target": "gaussian2d",
+                    "config_name": "unbounded_isotropic_rwalk",
+                    "seconds": 2.0,
+                    "ncall": 20,
+                    "niter": 8,
+                    "logz": -6.5,
+                    "logzerr": 0.5,
+                    "expected_logz": -6.0,
+                    "final_delta_logz": 0.2,
+                    "dlogz": 10.0,
+                    "replacement_failures": 0,
+                    "success": False,
+                },
+                {
+                    "target": "ring2d",
+                    "config_name": "unbounded_isotropic_rwalk",
+                    "seconds": 1.0,
+                    "ncall": 10,
+                    "niter": 4,
+                    "logz": -1.0,
+                    "logzerr": 0.0,
+                    "expected_logz": None,
+                    "replacement_failures": 0,
+                    "success": True,
+                },
             ]
         )
     )
+    block.write_text(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "target": "gaussian2d",
+                        "config_name": "block_jax_rwalk_unbounded",
+                        "seconds": 1.0,
+                        "ncall": 10,
+                        "niter": 6,
+                        "logz": -6.0,
+                        "logzerr": 0.25,
+                        "expected_logz": -6.0,
+                        "final_delta_logz": 2.0,
+                        "dlogz": 10.0,
+                        "replacement_failures": 1,
+                        "success": True,
+                    }
+                ]
+            }
+        )
+    )
 
-    main([str(output)])
+    main([str(no_block), str(block), "--csv", str(csv_path)])
 
     captured = capsys.readouterr()
-    assert (
-        "target config mean_seconds mean_logz std_logz "
-        "mean_abs_logz_error failures"
-    ) in captured.out
-    assert "gaussian2d unbounded_isotropic_rwalk" in captured.out
+    assert "Overall by file/config" in captured.out
+    assert "Accuracy on analytic targets" in captured.out
+    assert "Per-target fastest passing config" in captured.out
+    assert "no_block" in captured.out
+    assert "block_B16" in captured.out
+    assert "success_rate" in captured.out
+    assert "0.5" in captured.out
+    assert "replacement_failures_total=1" in captured.out
+    assert "rms_pull" in captured.out
+    assert "ring2d" in captured.out
+    csv_text = csv_path.read_text()
+    assert "run_label,target,config_name" in csv_text
+    assert "no_block,gaussian2d,unbounded_isotropic_rwalk" in csv_text
