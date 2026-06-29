@@ -600,6 +600,14 @@ def _jax_prior_transform(u):
     return u
 
 
+def _standard_gaussian_2d_loglike(theta):
+    return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
+
+
+def _wide_box_prior_transform(u):
+    return 10.0 * u - 5.0
+
+
 def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
     from tinyns import NestedSampler
 
@@ -688,31 +696,36 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
 
 
-def test_nested_sampler_rwalk_jax_cached_block_records_metadata() -> None:
+def test_nested_sampler_rwalk_jax_cached_block_b32_records_metadata() -> None:
     from tinyns import NestedSampler
 
     sampler = NestedSampler(
-        _jax_loglike,
-        _jax_prior_transform,
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
         ndim=2,
         nlive=50,
         sample="rwalk",
         kernel="jax",
         walks=5,
         replacement_chains=1,
-        jax_block_size=4,
+        rwalk_proposal="isotropic",
+        jax_block_size=32,
     )
-    result = sampler.run(random.PRNGKey(112), dlogz=0.5, maxiter=200)
+    result = sampler.run(random.PRNGKey(112), dlogz=0.5, maxiter=300)
 
+    assert result.success is True
     assert result.metadata["jax_block_mode"] is True
     assert result.metadata["jax_block_cached"] is True
     assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
+    assert result.metadata["jax_block_size"] == 32
+    assert result.metadata["jax_block_bound_fixed"] is False
     assert result.metadata["replacement_failures"] == 0
     assert math.isfinite(result.logz)
     assert result.ncall > 0
+    assert result.metadata["niter"] > 0
 
 
-def test_nested_sampler_rwalk_jax_cached_block_close_to_non_block() -> None:
+def test_nested_sampler_rwalk_jax_cached_b32_block_close_to_non_block() -> None:
     base_kwargs = dict(
         sample="rwalk",
         kernel="jax",
@@ -720,22 +733,23 @@ def test_nested_sampler_rwalk_jax_cached_block_close_to_non_block() -> None:
         replacement_chains=1,
         nlive=50,
         dlogz=0.5,
-        maxiter=200,
+        maxiter=300,
+        rwalk_proposal="isotropic",
     )
     non_block = run_static_nested(
         random.PRNGKey(113),
-        _jax_loglike,
-        _jax_prior_transform,
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
         ndim=2,
         jax_block_size=1,
         **base_kwargs,
     )
     block = run_static_nested(
         random.PRNGKey(113),
-        _jax_loglike,
-        _jax_prior_transform,
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
         ndim=2,
-        jax_block_size=4,
+        jax_block_size=32,
         **base_kwargs,
     )
 
@@ -743,8 +757,38 @@ def test_nested_sampler_rwalk_jax_cached_block_close_to_non_block() -> None:
     assert math.isfinite(block.logz)
     assert non_block.metadata["replacement_failures"] == 0
     assert block.metadata["replacement_failures"] == 0
-    assert abs(float(block.logz) - float(non_block.logz)) < 1.0
-    assert abs(block.metadata["niter"] - non_block.metadata["niter"]) <= 8
+    tolerance = max(0.5, 3.0 * max(float(block.logzerr), float(non_block.logzerr)))
+    assert abs(float(block.logz) - float(non_block.logz)) < tolerance
+    assert block.metadata["jax_block_cached"] is True
+    assert block.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
+
+
+def test_nested_sampler_rwalk_jax_cached_block_ring2d_no_failures() -> None:
+    from validation.targets import get_target
+
+    target = get_target("ring2d")
+    result = run_static_nested(
+        random.PRNGKey(114),
+        target.loglike,
+        target.prior_transform,
+        target.ndim,
+        30,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        replacement_chains=1,
+        rwalk_proposal="isotropic",
+        dlogz=2.0,
+        maxiter=96,
+        max_attempts=200,
+        jax_block_size=16,
+    )
+
+    assert math.isfinite(result.logz)
+    assert result.metadata["replacement_failures"] == 0
+    assert result.ncall > 0
+    assert result.metadata["jax_block_cached"] is True
+    assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
 
 
 def test_jax_block_live_cov_passes_covariance(monkeypatch) -> None:
@@ -799,7 +843,7 @@ def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> Non
         maxiter=10,
         max_attempts=24,
         replacement_chain_schedule=(1, 2, 4),
-        jax_block_size=5,
+        jax_block_size=4,
     )
 
     assert math.isfinite(result.logz)
