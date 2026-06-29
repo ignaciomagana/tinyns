@@ -6,9 +6,11 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
+from tinyns import NestedSampler
 from tinyns.bounds import (
     JaxEllipsoidBound,
     MultiEllipsoidBound,
+    _principal_axis,
     as_jax_ellipsoid_bound,
     build_multi_ellipsoid_bound,
     build_single_ellipsoid_bound,
@@ -61,6 +63,105 @@ def test_build_single_ellipsoid_bound_contains_live_points() -> None:
     bound = build_single_ellipsoid_bound(live_u)
 
     assert bool(jnp.all(contains_single_ellipsoid(bound, live_u)))
+
+
+def test_build_single_ellipsoid_bound_handles_rank_deficient_live_points() -> None:
+    live_u = jnp.ones((20, 3)) * 0.5
+
+    bound = build_single_ellipsoid_bound(live_u)
+
+    assert bound.chol.shape == (3, 3)
+    assert bound.inv_chol.shape == (3, 3)
+    assert bool(jnp.all(jnp.isfinite(bound.chol)))
+    assert bool(jnp.all(jnp.isfinite(bound.inv_chol)))
+    assert bool(jnp.all(contains_single_ellipsoid(bound, live_u)))
+
+
+def test_build_single_ellipsoid_bound_contains_live_points_common_dimensions() -> None:
+    for ndim in (1, 2, 10):
+        live_u = _live_points(32, ndim)
+
+        bound = build_single_ellipsoid_bound(live_u)
+
+        assert bool(jnp.all(contains_single_ellipsoid(bound, live_u)))
+
+
+def test_principal_axis_handles_rank_deficient_points() -> None:
+    ndim = 5
+    points = jnp.ones((12, ndim)) * 0.25
+
+    axis = _principal_axis(points, jitter=1e-6)
+
+    assert axis.shape == (ndim,)
+    assert bool(jnp.all(jnp.isfinite(axis)))
+    assert float(jnp.linalg.norm(axis)) == pytest.approx(1.0)
+
+
+def test_multi_ellipsoid_bound_handles_nearly_rank_deficient_clusters() -> None:
+    x = jnp.linspace(0.0, 1.0, 24)[:, None]
+    first = jnp.concatenate([0.2 + 0.02 * x, 0.2 + 1e-8 * x], axis=1)
+    second = jnp.concatenate([0.7 + 0.02 * x, 0.7 + 1e-8 * x], axis=1)
+    live_u = jnp.concatenate([first, second], axis=0)
+
+    bound = build_multi_ellipsoid_bound(
+        live_u, max_ellipsoids=4, min_points=8, split_threshold=0.99
+    )
+
+    assert 1 <= len(bound.ellipsoids) <= 4
+    assert bool(jnp.all(count_containing_ellipsoids(bound, live_u) > 0))
+    assert math.isfinite(bound.log_total_volume)
+
+
+def test_nested_sampler_jax_single_bound_smoke() -> None:
+    def loglike(theta):
+        return -0.5 * jnp.sum(theta**2)
+
+    def prior_transform(u):
+        return 2.0 * u - 1.0
+
+    result = NestedSampler(
+        loglike,
+        prior_transform,
+        ndim=2,
+        sample="rwalk",
+        kernel="jax",
+        bound="single",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        nlive=20,
+        walks=3,
+        max_attempts=200,
+    ).run(random.PRNGKey(40), maxiter=4, dlogz=0.0)
+
+    assert jnp.isfinite(result.logz)
+    assert result.samples.shape[1:] == (2,)
+
+
+def test_nested_sampler_jax_single_bound_block_smoke() -> None:
+    def loglike(theta):
+        return -0.5 * jnp.sum(theta**2)
+
+    def prior_transform(u):
+        return 2.0 * u - 1.0
+
+    result = NestedSampler(
+        loglike,
+        prior_transform,
+        ndim=2,
+        sample="rwalk",
+        kernel="jax",
+        bound="single",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        fused_bound_rwalk=True,
+        jax_block_size=2,
+        nlive=20,
+        walks=3,
+        max_attempts=200,
+    ).run(random.PRNGKey(41), maxiter=4, dlogz=0.0)
+
+    assert jnp.isfinite(result.logz)
+    assert result.samples.shape[1:] == (2,)
 
 
 def test_contains_single_ellipsoid_accepts_single_point_and_batch() -> None:

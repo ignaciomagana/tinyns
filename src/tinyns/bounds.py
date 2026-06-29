@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass
 
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 
 from tinyns.types import ArrayLike
@@ -62,6 +63,47 @@ def unit_ball_log_volume(ndim: int) -> float:
     return half_dim * math.log(math.pi) - math.lgamma(half_dim + 1.0)
 
 
+def _host_covariance_factor(points, *, jitter: float):
+    """Return robust NumPy covariance geometry for host-side bound builders."""
+
+    points_np = np.asarray(points, dtype=float)
+    if points_np.ndim != 2:
+        raise ValueError("points must have shape (npoints, ndim)")
+    npoints, ndim = points_np.shape
+    if npoints < 1 or ndim < 1:
+        raise ValueError("points must have positive shape")
+
+    center = np.mean(points_np, axis=0)
+    centered = points_np - center
+    denom = max(npoints - 1, 1)
+    cov = (centered.T @ centered) / denom
+    cov = 0.5 * (cov + cov.T)
+
+    eye = np.eye(ndim, dtype=cov.dtype)
+    base_jitter = float(jitter)
+    chol = None
+    for scale in (1.0, 10.0, 100.0, 1000.0, 1.0e4, 1.0e5, 1.0e6):
+        try:
+            cov_jittered = cov + base_jitter * scale * eye
+            chol = np.linalg.cholesky(cov_jittered)
+            break
+        except np.linalg.LinAlgError:
+            continue
+    if chol is None:
+        evals, evecs = np.linalg.eigh(cov)
+        evals = np.maximum(evals, base_jitter)
+        chol = evecs @ np.diag(np.sqrt(evals))
+
+    inv_chol = np.linalg.pinv(chol)
+    whitened = centered @ inv_chol.T
+    r2 = np.sum(whitened * whitened, axis=-1)
+    rmax = float(np.sqrt(np.max(r2))) if r2.size else 0.0
+    singular_values = np.linalg.svd(chol, compute_uv=False)
+    singular_values = np.maximum(singular_values, np.finfo(float).tiny)
+    logabsdet = float(np.sum(np.log(singular_values)))
+    return center, chol, inv_chol, logabsdet, whitened, rmax
+
+
 def build_single_ellipsoid_bound(
     live_u: ArrayLike,
     *,
@@ -75,36 +117,30 @@ def build_single_ellipsoid_bound(
     if jitter <= 0.0:
         raise ValueError("jitter must be positive")
 
-    live_u = jnp.asarray(live_u, dtype=float)
-    if live_u.ndim != 2:
+    live_np = np.asarray(live_u, dtype=float)
+    if live_np.ndim != 2:
         raise ValueError("live_u must have shape (nlive, ndim)")
 
-    nlive, ndim = live_u.shape
+    nlive, ndim = live_np.shape
     if nlive < 1 or ndim < 1:
         raise ValueError("live_u must have shape (nlive, ndim) with positive sizes")
 
-    center = jnp.mean(live_u, axis=0)
-    centered = live_u - center
-    cov = centered.T @ centered / max(nlive - 1, 1)
-    cov = cov + jitter * jnp.eye(ndim)
-    cov_chol = jnp.linalg.cholesky(cov)
-    inv_cov_chol = jnp.linalg.inv(cov_chol)
-    whitened = centered @ inv_cov_chol.T
-    r2 = jnp.sum(jnp.square(whitened), axis=-1)
-    rmax = jnp.sqrt(jnp.max(r2))
-    scale = enlargement * jnp.maximum(rmax, 1.0)
-    chol = scale * cov_chol
-    inv_chol = jnp.linalg.inv(chol)
-    sign, logabsdet = jnp.linalg.slogdet(chol)
-    if not bool(sign > 0):
-        raise ValueError("ellipsoid transform must have positive determinant")
-    log_volume = unit_ball_log_volume(ndim) + float(logabsdet)
+    center, cov_chol, _inv_cov_chol, _logabsdet, _whitened, rmax = (
+        _host_covariance_factor(live_np, jitter=jitter)
+    )
+    scale = float(enlargement) * max(float(rmax), 1.0)
+    chol_np = scale * cov_chol
+    inv_chol_np = np.linalg.pinv(chol_np)
+    singular_values = np.linalg.svd(chol_np, compute_uv=False)
+    singular_values = np.maximum(singular_values, np.finfo(float).tiny)
+    logabsdet = float(np.sum(np.log(singular_values)))
+    log_volume = unit_ball_log_volume(ndim) + logabsdet
     return SingleEllipsoidBound(
-        center=center,
-        chol=chol,
-        inv_chol=inv_chol,
+        center=jnp.asarray(center),
+        chol=jnp.asarray(chol_np),
+        inv_chol=jnp.asarray(inv_chol_np),
         enlargement=float(enlargement),
-        log_volume=log_volume,
+        log_volume=float(log_volume),
         ndim=int(ndim),
     )
 
@@ -156,9 +192,9 @@ def as_jax_ellipsoid_bound(
 
     centers = jnp.zeros((max_ellipsoids, ndim), dtype=float)
     chols = jnp.broadcast_to(jnp.eye(ndim), (max_ellipsoids, ndim, ndim)).astype(float)
-    inv_chols = jnp.broadcast_to(
-        jnp.eye(ndim), (max_ellipsoids, ndim, ndim)
-    ).astype(float)
+    inv_chols = jnp.broadcast_to(jnp.eye(ndim), (max_ellipsoids, ndim, ndim)).astype(
+        float
+    )
     log_volumes = jnp.full((max_ellipsoids,), -jnp.inf, dtype=float)
     active = jnp.arange(max_ellipsoids) < n_ellipsoids
 
@@ -332,12 +368,20 @@ def _logsumexp_pair(a: float, b: float) -> float:
 
 
 def _principal_axis(points: jnp.ndarray, jitter: float) -> jnp.ndarray:
-    centered = points - jnp.mean(points, axis=0)
-    denom = max(int(points.shape[0]) - 1, 1)
+    points_np = np.asarray(points, dtype=float)
+    centered = points_np - np.mean(points_np, axis=0)
+    denom = max(points_np.shape[0] - 1, 1)
     cov = (centered.T @ centered) / denom
-    cov = cov + jitter * jnp.eye(points.shape[1])
-    _evals, evecs = jnp.linalg.eigh(cov)
-    return evecs[:, -1]
+    cov = 0.5 * (cov + cov.T)
+    cov = cov + float(jitter) * np.eye(points_np.shape[1])
+    try:
+        _evals, evecs = np.linalg.eigh(cov)
+        axis = evecs[:, -1]
+    except np.linalg.LinAlgError:
+        axis = np.zeros(points_np.shape[1])
+        axis[0] = 1.0
+    axis = axis / max(np.linalg.norm(axis), np.finfo(float).tiny)
+    return jnp.asarray(axis)
 
 
 def _split_cluster(points: jnp.ndarray, *, min_points: int, jitter: float):
