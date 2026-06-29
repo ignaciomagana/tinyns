@@ -232,6 +232,10 @@ sampler = NestedSampler(
 
 Setting `bound="multi"` alone does not define a bounded rwalk transition unless `rwalk_seed="bound"` is also enabled. `tinyns` raises a clear error for `bound != "none"` with live-seeded rwalk unless `allow_unused_bound=True`. Use `allow_unused_bound=True` only when you intentionally want to build bounds for diagnostics or overhead measurements while keeping ordinary live-seeded rwalk.
 
+`fused_bound_rwalk=True` currently means the bounded seed draw and rwalk transition are exposed as one replacement path and share accounting. It is not yet a single compiled seed+rwalk kernel. A future implementation may replace this wrapper fusion with a true single-dispatch JAX kernel.
+
+`jax_block_size > 1` is experimental. For `bound="none"`, block mode uses a JAX `lax.scan` over several nested-sampling iterations. For bounded rwalk, the current block mode reuses a fixed bound across a Python-level block and is mainly a stepping stone toward a fully compiled bounded block kernel.
+
 ### Multiellipsoid bounding
 
 `bound="multi"` is an experimental dynesty-style union-of-ellipsoids bound. It recursively splits the live points using a dependency-free PCA/median split and samples from the volume-weighted union of ellipsoids with overlap correction.
