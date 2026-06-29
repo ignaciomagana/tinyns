@@ -1,4 +1,7 @@
-"""Run tinyns on a 2D Gaussian using the slice constrained sampler.
+"""Run tinyns on a 2D Gaussian using the reference-only slice sampler.
+
+This sampler is frozen, not optimized, and retained for comparison/debugging;
+it is not part of the recommended fast path.
 
 The prior is uniform on [-10, 10]^2. Since nearly all likelihood mass is inside
 that square, the expected log evidence is approximately -log(400).

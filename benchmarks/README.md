@@ -14,7 +14,7 @@ python benchmarks/bench_static.py \
   --output bench.json
 ```
 
-For the recommended JAX random-walk fast path, run:
+For the recommended JAX random-walk fast path on the included benchmark targets, run:
 
 ```bash
 python benchmarks/bench_static.py \
@@ -131,7 +131,7 @@ python benchmarks/overnight_jax_validation.py \
   --output overnight_jax_validation_block_B32.json
 ```
 
-`jax_block_size=32` is the currently recommended validated fast setting for unbounded JAX `rwalk` on the included benchmark targets. `jax_block_size=16` is a conservative alternative. `jax_block_size=1` disables block mode.
+`jax_block_size=32` is the currently recommended validated fast setting for unbounded JAX `rwalk` on the included benchmark targets, not a universal optimum. `jax_block_size=16` is a conservative alternative. `jax_block_size=1` disables block mode.
 
 #### Block-size sweep
 
@@ -220,18 +220,20 @@ When benchmarking the optimized path, hold the sampling problem fixed across run
 - set the progress interval high enough that terminal output is not a material part of the timing;
 - compare wall time, scalar `ncall`, `logZ`, and replacement metadata such as replacement batches, per-replacement calls, chain usage, and success/failure counts.
 
-Recommended starting configurations for external expensive JAX likelihoods are:
+Starting configurations for external expensive JAX likelihoods should distinguish the recommended unbounded isotropic path from experimental candidates:
 
-Unbounded 2D baseline:
+Recommended unbounded isotropic baseline to validate first:
 
 ```bash
 --sample rwalk \
 --kernel jax \
---walks 1 \
---replacement-chains 16
+--walks 5 \
+--replacement-chains 1 \
+--rwalk-proposal isotropic \
+--jax-block-size 32
 ```
 
-10D baseline:
+Experimental 10D live-cov candidate for separate validation:
 
 ```bash
 --sample rwalk \
@@ -241,7 +243,7 @@ Unbounded 2D baseline:
 --rwalk-proposal live-cov
 ```
 
-Bounded 10D candidate:
+Experimental bounded 10D candidate for separate validation:
 
 ```bash
 --sample rwalk \

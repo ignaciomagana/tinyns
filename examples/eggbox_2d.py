@@ -2,7 +2,7 @@
 
 This example uses the unit-cube prior directly and an eggbox-like likelihood
 with many separated modes. It is intended as a lightweight pathological stress
-test for constrained samplers, not as a guaranteed production benchmark.
+test for constrained samplers, not as a recommendation benchmark.
 """
 
 import jax
