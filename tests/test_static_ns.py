@@ -696,7 +696,7 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
 
 
-def test_nested_sampler_rwalk_jax_cached_block_b32_records_metadata() -> None:
+def test_recommended_rwalk_jax_isotropic_cached_block_b32_records_metadata() -> None:
     from tinyns import NestedSampler
 
     sampler = NestedSampler(
@@ -714,6 +714,9 @@ def test_nested_sampler_rwalk_jax_cached_block_b32_records_metadata() -> None:
     result = sampler.run(random.PRNGKey(112), dlogz=0.5, maxiter=300)
 
     assert result.success is True
+    assert result.metadata["sample"] == "rwalk"
+    assert result.metadata["kernel"] == "jax"
+    assert result.metadata["rwalk_proposal"] == "isotropic"
     assert result.metadata["jax_block_mode"] is True
     assert result.metadata["jax_block_cached"] is True
     assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
