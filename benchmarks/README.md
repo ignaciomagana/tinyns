@@ -100,8 +100,24 @@ benchmarks/run_overnight_jax_validation.sh
 
 By default, the wrapper writes timestamped JSON results under `benchmarks/results/` and then prints a summary table. Override `NLIVE`, `DLOGZ`, `SEEDS`, `TARGETS`, `MAXITER`, or `OUTPUT` in the environment to customize a run. This script is opt-in and intended for local/overnight runs. It is not part of CI.
 
-To reproduce the recommended fast unbounded JAX rwalk validation with the
-current fastest validated block size, run:
+### Cached JAX block rwalk validation recipes
+
+These recipes are documentation-only validation workflows for the unbounded JAX `rwalk` path. They do not change sampler defaults and should be run manually, not in CI. The currently validated fast path on the included benchmark targets is:
+
+```text
+sample="rwalk"
+kernel="jax"
+rwalk_proposal="isotropic"
+walks=5
+replacement_chains=1
+jax_block_size=32
+```
+
+Recent validation found `jax_block_size=32` fastest overall among the validated unbounded cached JAX block runs, with `jax_block_size=16` slightly more conservative. Ordinary no-block isotropic `rwalk` was much slower in that validation. Live-cov and bounded/fused bounded paths remain experimental and should not be promoted from these results.
+
+#### Recommended fast-path validation
+
+To reproduce the recommended fast unbounded JAX `rwalk` validation with the current fastest validated block size, run:
 
 ```bash
 python benchmarks/overnight_jax_validation.py \
@@ -114,6 +130,82 @@ python benchmarks/overnight_jax_validation.py \
   --jax-block-size 32 \
   --output overnight_jax_validation_block_B32.json
 ```
+
+`jax_block_size=32` is the currently recommended validated fast setting for unbounded JAX `rwalk` on the included benchmark targets. `jax_block_size=16` is a conservative alternative. `jax_block_size=1` disables block mode.
+
+#### Block-size sweep
+
+Use this copy-paste sweep to compare convergence and timing as the cached JAX block size changes:
+
+```bash
+for B in 2 4 8 16 32; do
+  python benchmarks/overnight_jax_validation.py \
+    --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
+    --seeds 0 1 2 3 4 5 6 7 8 9 \
+    --nlive 500 \
+    --dlogz 0.1 \
+    --maxiter 10000 \
+    --include-block \
+    --jax-block-size "$B" \
+    --output "overnight_jax_validation_block_B${B}.json"
+done
+```
+
+This validates the success/failure rate, replacement failures, wall time, `ncall`/`niter` growth from block overshoot, logZ accuracy on analytic targets, and `final_delta_logz` overshoot as block size increases. Larger block sizes can reduce wall time, but they may increase `ncall`/`niter` because convergence is checked between blocks.
+
+#### No-block and bounded comparison
+
+Use this baseline comparison command when comparing B16/B32 against no-block and bounded configurations:
+
+```bash
+python benchmarks/overnight_jax_validation.py \
+  --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
+  --seeds 0 1 2 3 4 5 6 7 8 9 \
+  --nlive 500 \
+  --dlogz 0.1 \
+  --maxiter 10000 \
+  --include-bounds \
+  --output overnight_jax_validation_no_block.json
+```
+
+This gives comparison against ordinary unbounded isotropic `rwalk`, unbounded live-cov `rwalk`, adaptive `rwalk`, and bounded single/multi/fused paths. Treat live-cov and bounded/fused bounded results as experimental unless they are separately validated for the intended workload.
+
+#### How to read the results
+
+Prefer configurations with 100% success and zero replacement failures. For analytic targets, check `pull = (logz - expected_logz) / logzerr`: RMS pull around 1 is good, while large `max_abs_pull` or RMS pull greater than 2 means the configuration needs investigation. Lower wall time is only useful if logZ behavior remains sane.
+
+When comparing block sizes, inspect `seconds`, `ncall`, `niter`, `final_delta_logz`, success counts, replacement failures, RMS pull, and maximum absolute pull together. B32 was fastest in the recent validation with only mild extra `ncall`; B16 is safer if you want less convergence overshoot.
+
+#### Summarizing overnight validation files
+
+The overnight summarizer supports multiple input files. After running the no-block baseline and selected block-size validations, summarize them with:
+
+```bash
+python benchmarks/summarize_overnight_jax_validation.py \
+  overnight_jax_validation_no_block.json \
+  overnight_jax_validation_block_B16.json \
+  overnight_jax_validation_block_B32.json
+```
+
+### Expensive-likelihood validation guidance
+
+Block mode helps most when Python/JAX dispatch overhead is a meaningful part of runtime. If the likelihood is extremely expensive, the speedup may shrink because likelihood evaluation dominates. The `bench_rwalk_kernel.py` heavy synthetic likelihood benchmark above is the best in-repository tool for testing GPU batching and artificial likelihood cost; increase `--work-size` there to mimic more expensive likelihoods.
+
+For a quick end-to-end block-mode smoke run, use:
+
+```bash
+python benchmarks/overnight_jax_validation.py \
+  --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
+  --seeds 0 1 2 \
+  --nlive 200 \
+  --dlogz 0.5 \
+  --maxiter 3000 \
+  --include-block \
+  --jax-block-size 32 \
+  --output expensive_like_block_smoke.json
+```
+
+This is only a smoke recipe unless the benchmark targets include artificial likelihood cost; it is not a true expensive-likelihood benchmark by itself.
 
 ### External expensive-likelihood benchmarks
 
@@ -162,7 +254,7 @@ Bounded 10D candidate:
 --bound-update-interval 25
 ```
 
-Fast JAX candidate once fused or block modes are available:
+Experimental bounded/fused candidate for separate validation (do not treat this as production-ready from the overnight block results alone):
 
 ```bash
 --sample rwalk \
