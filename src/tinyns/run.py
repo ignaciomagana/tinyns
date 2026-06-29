@@ -265,15 +265,38 @@ def _rwalk_proposal_chol(
 ):
     """Return the JAX rwalk proposal factor for the current live set."""
 
-    if rwalk_proposal == "live-cov":
-        centered = live_u - jnp.mean(live_u, axis=0)
-        denom = max(int(live_u.shape[0]) - 1, 1)
-        cov = (centered.T @ centered) / denom
-        cov = cov + jnp.asarray(rwalk_cov_jitter, dtype=live_u.dtype) * jnp.eye(
-            ndim, dtype=live_u.dtype
-        )
-        return jnp.linalg.cholesky(cov)
-    return jnp.eye(ndim, dtype=live_u.dtype)
+    live_u_arr = jnp.asarray(live_u)
+    dtype = live_u_arr.dtype
+
+    if rwalk_proposal != "live-cov":
+        return jnp.eye(ndim, dtype=dtype)
+
+    live_np = np.asarray(live_u_arr, dtype=float)
+    if live_np.ndim != 2 or live_np.shape[1] != ndim:
+        raise ValueError(f"live_u must have shape (nlive, {ndim})")
+
+    centered = live_np - np.mean(live_np, axis=0)
+    denom = max(live_np.shape[0] - 1, 1)
+    cov = (centered.T @ centered) / denom
+    cov = 0.5 * (cov + cov.T)
+
+    # The live-cov factor is a tiny ndim x ndim proposal preconditioner
+    # computed outside the jitted replacement kernel. Using NumPy avoids
+    # GPU/cuSolver Cholesky fragility on small or nearly singular covariance
+    # matrices.
+    eye = np.eye(ndim, dtype=cov.dtype)
+    base_jitter = float(rwalk_cov_jitter)
+    for scale in (1.0, 10.0, 100.0, 1000.0, 1.0e4, 1.0e5):
+        try:
+            chol = np.linalg.cholesky(cov + base_jitter * scale * eye)
+            return jnp.asarray(chol, dtype=dtype)
+        except np.linalg.LinAlgError:
+            continue
+
+    evals, evecs = np.linalg.eigh(cov)
+    evals = np.maximum(evals, base_jitter)
+    factor = evecs @ np.diag(np.sqrt(evals))
+    return jnp.asarray(factor, dtype=dtype)
 
 
 def _run_static_jax_bounded_rwalk_block(

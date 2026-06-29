@@ -943,6 +943,37 @@ def test_replacement_chain_schedule_rejects_unsupported_sampler_kernel() -> None
         )
 
 
+def test_rwalk_proposal_chol_isotropic_returns_identity() -> None:
+    live_u = jnp.arange(12, dtype=float).reshape((4, 3))
+
+    chol = run_mod._rwalk_proposal_chol(live_u, 3, "isotropic", 1e-6)
+
+    assert chol.shape == (3, 3)
+    assert chol.dtype == live_u.dtype
+    assert jnp.allclose(chol, jnp.eye(3, dtype=live_u.dtype))
+
+
+def test_rwalk_proposal_chol_live_cov_rank_deficient_is_finite() -> None:
+    live_u = jnp.ones((20, 3)) * 0.5
+
+    chol = run_mod._rwalk_proposal_chol(live_u, 3, "live-cov", 1e-6)
+
+    assert chol.shape == (3, 3)
+    assert chol.dtype == live_u.dtype
+    assert jnp.all(jnp.isfinite(chol))
+
+
+@pytest.mark.parametrize("ndim", [1, 2, 10])
+def test_rwalk_proposal_chol_live_cov_shapes_for_dimensions(ndim: int) -> None:
+    live_u = jnp.linspace(0.1, 0.9, 5 * ndim).reshape((5, ndim))
+
+    chol = run_mod._rwalk_proposal_chol(live_u, ndim, "live-cov", 1e-6)
+
+    assert chol.shape == (ndim, ndim)
+    assert chol.dtype == live_u.dtype
+    assert jnp.all(jnp.isfinite(chol))
+
+
 def test_nested_sampler_rwalk_jax_live_cov_runs_and_records_metadata() -> None:
     result = run_static_nested(
         random.PRNGKey(2),
