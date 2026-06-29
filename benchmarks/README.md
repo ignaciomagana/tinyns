@@ -88,3 +88,64 @@ python benchmarks/bench_rwalk_kernel.py \
 Increase `--work-size` to mimic more expensive likelihoods.
 
 Use this benchmark to understand GPU throughput scaling. Use the full `bench_static.py` benchmark to understand end-to-end nested-sampling wall time.
+
+### External expensive-likelihood benchmarks
+
+Some users may want to benchmark `tinyns` on external, user-provided expensive JAX likelihoods, such as catalog or dark-siren likelihoods. Keep those benchmarks outside the core package: do not add the external likelihood package as a `tinyns` dependency, do not add domain-specific code to `tinyns`, and do not put overnight benchmark runs in CI.
+
+When benchmarking the optimized path, hold the sampling problem fixed across runs:
+
+- use a fixed random seed, or a documented fixed seed list;
+- use the same `nlive`;
+- use the same `dlogz` stopping threshold;
+- use exactly the same data files, injections, masks, and likelihood settings;
+- set the progress interval high enough that terminal output is not a material part of the timing;
+- compare wall time, scalar `ncall`, `logZ`, and replacement metadata such as replacement batches, per-replacement calls, chain usage, and success/failure counts.
+
+Recommended starting configurations for external expensive JAX likelihoods are:
+
+Unbounded 2D baseline:
+
+```bash
+--sample rwalk \
+--kernel jax \
+--walks 1 \
+--replacement-chains 16
+```
+
+10D baseline:
+
+```bash
+--sample rwalk \
+--kernel jax \
+--walks 5 \
+--replacement-chains 16 \
+--rwalk-proposal live-cov
+```
+
+Bounded 10D candidate:
+
+```bash
+--sample rwalk \
+--kernel jax \
+--bound multi \
+--rwalk-seed bound \
+--rwalk-proposal live-cov \
+--walks 5 \
+--replacement-chains 16 \
+--bound-update-interval 25
+```
+
+Fast JAX candidate once fused or block modes are available:
+
+```bash
+--sample rwalk \
+--kernel jax \
+--bound multi \
+--rwalk-seed bound \
+--rwalk-proposal live-cov \
+--fused-bound-rwalk \
+--jax-block-size 10
+```
+
+Do not compare wall time between runs that print progress every iteration; progress output can dominate timings for otherwise fast runs. When comparing against dynesty, use the same likelihood, the same seed family, the same `nlive`, and the same stopping threshold. For tiny or cheap likelihoods, Python dispatch and JAX launch overhead can dominate, so fewer scalar likelihood calls do not necessarily imply faster wall time. For expensive JAX likelihoods, prefer batched or vectorized candidate evaluation when it is available, and judge performance primarily with wall time together with replacement metadata rather than scalar `ncall` alone.
