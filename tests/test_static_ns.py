@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
+import tinyns.run as run_mod
 from tinyns.run import run_static_nested
 
 
@@ -619,6 +620,8 @@ def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
     assert result.metadata["kernel"] == "jax"
     assert result.metadata["jax_block_size"] == 1
     assert result.metadata["jax_block_mode"] is False
+    assert result.metadata["jax_block_impl"] is None
+    assert result.metadata["fused_bound_rwalk_impl"] is None
 
 
 def test_nested_sampler_rwalk_jax_block_size_one_matches_existing_path() -> None:
@@ -680,6 +683,39 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.metadata["insertion_indices"].shape == (result.metadata["niter"],)
     assert result.metadata["jax_block_size"] == 5
     assert result.metadata["jax_block_mode"] is True
+    assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
+
+
+def test_jax_block_live_cov_passes_covariance(monkeypatch) -> None:
+    seen = {}
+    original = run_mod._run_static_jax_rwalk_block
+
+    def wrapped(*args, proposal_chol, **kwargs):
+        seen["proposal_chol"] = proposal_chol
+        return original(*args, proposal_chol=proposal_chol, **kwargs)
+
+    monkeypatch.setattr(run_mod, "_run_static_jax_rwalk_block", wrapped)
+    result = run_static_nested(
+        random.PRNGKey(111),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        20,
+        sample="rwalk",
+        kernel="jax",
+        walks=3,
+        step_scale=0.05,
+        maxiter=5,
+        max_attempts=60,
+        jax_block_size=5,
+        rwalk_proposal="live-cov",
+    )
+
+    assert result.metadata["rwalk_proposal"] == "live-cov"
+    assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
+    proposal_chol = seen["proposal_chol"]
+    assert proposal_chol.shape == (2, 2)
+    assert not jnp.allclose(proposal_chol, jnp.eye(2, dtype=proposal_chol.dtype))
 
 
 def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> None:
@@ -743,8 +779,10 @@ def test_nested_sampler_bounded_rwalk_jax_block_runs_and_shapes(bound) -> None:
     assert result.metadata["jax_block_size"] == 4
     assert result.metadata["jax_block_mode"] is True
     assert result.metadata["jax_block_bound_fixed"] is True
+    assert result.metadata["jax_block_impl"] == "python-loop-fixed-bound"
     assert result.metadata["bound_seed_kernel"] == "jax"
     assert result.metadata["fused_bound_rwalk"] is True
+    assert result.metadata["fused_bound_rwalk_impl"] == "wrapper"
     assert result.metadata["mean_bound_seed_calls"] is not None
     assert result.metadata["mean_rwalk_kernel_calls"] is not None
 
@@ -1591,3 +1629,33 @@ def test_jax_block_rwalk_failure_propagates_replacement_failure() -> None:
     assert result.success is False
     assert result.metadata["replacement_failures"] == 1
     assert "max_attempts=1" in result.message
+
+
+def test_jax_bounded_block_rwalk_failure_returns_failed_result() -> None:
+    result = run_static_nested(
+        random.PRNGKey(1235),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        bound="single",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        fused_bound_rwalk=True,
+        walks=1,
+        min_accepts=2,
+        replacement_chains=1,
+        max_attempts=1,
+        maxiter=4,
+        dlogz=0.0,
+        jax_block_size=4,
+        batch_size=2,
+    )
+
+    assert result.success is False
+    assert result.metadata["replacement_failures"] > 0
+    assert "bounded JAX rwalk" in result.message
+    assert "max_attempts=1" in result.message
+    assert result.metadata["jax_block_impl"] == "python-loop-fixed-bound"

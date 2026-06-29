@@ -99,6 +99,7 @@ def _run_static_jax_rwalk_block(
     prior_transform,
     ndim,
     *,
+    proposal_chol,
     block_size,
     walks,
     step_scale,
@@ -136,7 +137,7 @@ def _run_static_jax_rwalk_block(
             int(walks),
             replacement_chain_schedule,
         )
-    proposal_chol = jnp.eye(int(ndim), dtype=jnp.asarray(live_u).dtype)
+    proposal_chol = jnp.asarray(proposal_chol, dtype=jnp.asarray(live_u).dtype)
 
     def one_iteration(carry, offset):
         key, live_u, live_theta, live_logl, logz_dead = carry
@@ -259,6 +260,22 @@ def _run_static_jax_rwalk_block(
     )
 
 
+def _rwalk_proposal_chol(
+    live_u, ndim: int, rwalk_proposal: str, rwalk_cov_jitter: float
+):
+    """Return the JAX rwalk proposal factor for the current live set."""
+
+    if rwalk_proposal == "live-cov":
+        centered = live_u - jnp.mean(live_u, axis=0)
+        denom = max(int(live_u.shape[0]) - 1, 1)
+        cov = (centered.T @ centered) / denom
+        cov = cov + jnp.asarray(rwalk_cov_jitter, dtype=live_u.dtype) * jnp.eye(
+            ndim, dtype=live_u.dtype
+        )
+        return jnp.linalg.cholesky(cov)
+    return jnp.eye(ndim, dtype=live_u.dtype)
+
+
 def _run_static_jax_bounded_rwalk_block(
     key,
     live_u,
@@ -313,6 +330,7 @@ def _run_static_jax_bounded_rwalk_block(
     rwalk_kernel_call_values = []
     bound_draw_values = []
     bound_eval_values = []
+    accepted_values = []
     bound_unit_cube_acceptance_values = []
     bound_overlap_rejection_values = []
 
@@ -352,14 +370,16 @@ def _run_static_jax_bounded_rwalk_block(
             ),
         )
         carry_key, new_u, new_theta, new_logl, calls, accepted, info = result
-        if not bool(accepted):
-            raise RuntimeError("bounded JAX rwalk block failed to draw a replacement")
-        insertion_index = int(
-            jnp.sum(live_logl <= new_logl) - (live_logl[worst] <= new_logl)
-        )
-        live_u = live_u.at[worst].set(new_u)
-        live_theta = live_theta.at[worst].set(new_theta)
-        live_logl = live_logl.at[worst].set(new_logl)
+        accepted_bool = bool(accepted)
+        accepted_values.append(accepted_bool)
+        insertion_index = 0
+        if accepted_bool:
+            insertion_index = int(
+                jnp.sum(live_logl <= new_logl) - (live_logl[worst] <= new_logl)
+            )
+            live_u = live_u.at[worst].set(new_u)
+            live_theta = live_theta.at[worst].set(new_theta)
+            live_logl = live_logl.at[worst].set(new_logl)
 
         dead_u_values.append(dead_u)
         dead_theta_values.append(dead_theta)
@@ -380,8 +400,10 @@ def _run_static_jax_bounded_rwalk_block(
         bound_overlap_rejection_values.append(
             int(info.get("bound_seed_overlap_rejections", 0))
         )
+        if not accepted_bool:
+            break
 
-    logx_final_new = -(int(start_iteration) + int(block_size)) / int(nlive)
+    logx_final_new = -(int(start_iteration) + len(dead_u_values)) / int(nlive)
     return (
         carry_key,
         live_u,
@@ -395,7 +417,7 @@ def _run_static_jax_bounded_rwalk_block(
         jnp.asarray(insertion_index_values, dtype=int),
         jnp.asarray(replacement_batch_values, dtype=int),
         jnp.asarray(replacement_chain_values, dtype=int),
-        jnp.ones((int(block_size),), dtype=bool),
+        jnp.asarray(accepted_values, dtype=bool),
         float(logz_dead),
         float(logx_final_new),
         bound_seed_call_values,
@@ -874,8 +896,14 @@ def run_static_nested(
         "bound_seed_kernel": "jax" if fused_bound_rwalk else str(bound_seed_kernel),
         "allow_unused_bound": bool(allow_unused_bound),
         "fused_bound_rwalk": bool(fused_bound_rwalk),
+        "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
         "jax_vectorized": bool(jax_vectorized),
         "jax_block_size": int(jax_block_size),
+        "jax_block_impl": (
+            "python-loop-fixed-bound"
+            if jax_block_size > 1 and bound != "none"
+            else "lax-scan-unbounded" if jax_block_size > 1 else None
+        ),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -1010,6 +1038,9 @@ def run_static_nested(
     if jax_block_size > 1:
         while iteration < maxiter:
             block_size_now = min(int(jax_block_size), maxiter - iteration)
+            proposal_chol = _rwalk_proposal_chol(
+                live_u, ndim, rwalk_proposal, rwalk_cov_jitter
+            )
             logz_dead_before_block = logz_dead
             block_extra = None
             if bound in {"single", "multi"}:
@@ -1074,6 +1105,7 @@ def run_static_nested(
                     bound_batch_size=batch_size,
                     bound_max_batches=int(math.ceil(seed_limit / batch_size)),
                     overlap_correction=multi_bound_overlap_correction,
+                    proposal_chol=proposal_chol,
                     jax_vectorized=jax_vectorized,
                 )
                 (
@@ -1122,6 +1154,7 @@ def run_static_nested(
                     loglike,
                     prior_transform,
                     ndim,
+                    proposal_chol=proposal_chol,
                     block_size=block_size_now,
                     walks=walks,
                     step_scale=step_scale,
@@ -1136,9 +1169,14 @@ def run_static_nested(
             if failed_offsets:
                 replacement_failures += 1
                 success = False
-                message = (
-                    f"max_attempts={max_attempts} hit during constrained rwalk draw"
-                )
+                if bound in {"single", "multi"}:
+                    message = (
+                        f"max_attempts={max_attempts} hit during bounded JAX rwalk draw"
+                    )
+                else:
+                    message = (
+                        f"max_attempts={max_attempts} hit during constrained rwalk draw"
+                    )
                 block_size_now = failed_offsets[0]
             block_stop = iteration + block_size_now
             if failed_offsets:
@@ -1389,14 +1427,10 @@ def run_static_nested(
                     )
                 )
                 proposal_chol = None
-                if kernel == "jax" and rwalk_proposal == "live-cov":
-                    centered = live_u - jnp.mean(live_u, axis=0)
-                    denom = max(int(live_u.shape[0]) - 1, 1)
-                    cov = (centered.T @ centered) / denom
-                    cov = cov + jnp.asarray(
-                        rwalk_cov_jitter, dtype=live_u.dtype
-                    ) * jnp.eye(ndim, dtype=live_u.dtype)
-                    proposal_chol = jnp.linalg.cholesky(cov)
+                if kernel == "jax":
+                    proposal_chol = _rwalk_proposal_chol(
+                        live_u, ndim, rwalk_proposal, rwalk_cov_jitter
+                    )
                 seed_live_u = live_u
                 seed_live_logl = live_logl
                 if fused_bound_rwalk:
@@ -1897,6 +1931,11 @@ def run_static_nested(
             "jax_block_size": int(jax_block_size),
             "jax_block_mode": bool(jax_block_size > 1),
             "jax_block_bound_fixed": bool(jax_block_size > 1 and bound != "none"),
+            "jax_block_impl": (
+                "python-loop-fixed-bound"
+                if jax_block_size > 1 and bound != "none"
+                else "lax-scan-unbounded" if jax_block_size > 1 else None
+            ),
             "dlogz": dlogz,
             "maxiter": maxiter,
             "niter": niter,
@@ -2033,6 +2072,7 @@ def run_static_nested(
             "bound_seed_kernel": "jax" if fused_bound_rwalk else bound_seed_kernel,
             "allow_unused_bound": bool(allow_unused_bound),
             "fused_bound_rwalk": bool(fused_bound_rwalk),
+            "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
             "jax_vectorized": bool(jax_vectorized),
             "bounded_rwalk": bool(
                 sample == "rwalk" and bound != "none" and rwalk_seed == "bound"

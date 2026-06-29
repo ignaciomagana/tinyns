@@ -119,7 +119,6 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
             **common,
             "rwalk_seed": "bound",
             "bound_seed_kernel": "jax",
-            "allow_unused_bound": True,
         }
         configs.extend(
             [
@@ -134,7 +133,7 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
                     True,
                 ),
                 Config(
-                    "fused_bounded_rwalk",
+                    "fused_bounded_rwalk_wrapper",
                     {**bounded, "bound": "multi", "fused_bound_rwalk": True},
                     True,
                 ),
@@ -143,7 +142,7 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
     if args.include_block:
         configs.append(
             Config(
-                "block_jax_rwalk",
+                "block_jax_rwalk_unbounded",
                 {**common, "bound": "none", "jax_block_size": args.jax_block_size},
                 needs_block=True,
             )
