@@ -102,9 +102,6 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
-    elif sampler_name in {"slice", "rslice"}:
-        kwargs["slices"] = args.slices
-        kwargs["slice_steps"] = args.slice_steps
 
     sampler = NestedSampler(
         target.loglike,
@@ -161,8 +158,6 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "sample": sampler_name,
         "kernel": args.kernel,
         "walks": args.walks,
-        "slices": args.slices,
-        "slice_steps": args.slice_steps,
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
         "replacement_chains": args.replacement_chains,
@@ -213,15 +208,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=["gaussian1d", "gaussian2d", "correlated_gaussian2d"],
     )
     parser.add_argument(
-        "--samplers", nargs="+", default=["prior", "rwalk", "slice", "rslice"]
+        "--samplers", nargs="+", default=["prior", "rwalk"]
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--dlogz", type=float, default=0.1)
     parser.add_argument("--maxiter", type=int, default=None)
     parser.add_argument("--walks", type=int, default=25)
-    parser.add_argument("--slices", type=int, default=5)
-    parser.add_argument("--slice-steps", type=int, default=10)
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--max-attempts", type=int, default=10000)
     parser.add_argument("--min-accepts", type=int, default=1)

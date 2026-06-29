@@ -41,10 +41,6 @@ def run_sampler(sample, key):
     }
     if sample == "rwalk":
         kwargs["walks"] = 15
-    elif sample == "slice":
-        kwargs["slices"] = 4
-        kwargs["slice_steps"] = 6
-
     try:
         sampler = NestedSampler(loglike, prior_transform, ndim=NDIM, **kwargs)
     except ValueError as exc:
@@ -61,8 +57,8 @@ def run_sampler(sample, key):
 
 def main():
     key = jax.random.PRNGKey(73)
-    sample_keys = jax.random.split(key, 2)
-    for sample, sample_key in zip(("rwalk", "slice"), sample_keys, strict=True):
+    sample_keys = jax.random.split(key, 1)
+    for sample, sample_key in zip(("rwalk",), sample_keys, strict=True):
         run_sampler(sample, sample_key)
 
 

@@ -167,9 +167,6 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
-    elif sampler_name in {"slice", "rslice"}:
-        kwargs["slices"] = args.slices
-        kwargs["slice_steps"] = args.slice_steps
     return kwargs
 
 
@@ -257,8 +254,6 @@ def run_one(
         "dlogz": args.dlogz,
         "maxiter": args.maxiter,
         "walks": args.walks,
-        "slices": args.slices,
-        "slice_steps": args.slice_steps,
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
         "replacement_chains": args.replacement_chains,
@@ -360,14 +355,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--targets", nargs="+", default=["gaussian2d", "correlated_gaussian2d"]
     )
-    parser.add_argument("--samplers", nargs="+", default=["rwalk", "slice", "rslice"])
+    parser.add_argument("--samplers", nargs="+", default=["prior", "rwalk"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--dlogz", type=float, default=0.1)
     parser.add_argument("--maxiter", type=int, default=None)
     parser.add_argument("--walks", type=int, default=25)
-    parser.add_argument("--slices", type=int, default=5)
-    parser.add_argument("--slice-steps", type=int, default=10)
     parser.add_argument("--step-scale", type=float, default=0.1)
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--replacement-chains", type=int, default=1)

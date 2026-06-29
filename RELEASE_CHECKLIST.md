@@ -69,5 +69,17 @@ python benchmarks/bench_static.py \
 - no ellipsoidal bounding
 - no full-Python-free compiled nested-sampling loop
 - `kernel="jax"` currently supports only `sample="rwalk"`
-- `slice` and `rslice` require target-specific validation before evidence use
 - not a probabilistic programming framework
+
+- Recommended path release gate:
+  ```bash
+  python benchmarks/overnight_jax_validation.py \
+    --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
+    --seeds 0 1 2 3 4 5 6 7 8 9 \
+    --nlive 500 \
+    --dlogz 0.1 \
+    --maxiter 10000 \
+    --include-block \
+    --jax-block-size 32 \
+    --output overnight_jax_validation_block_B32.json
+  ```

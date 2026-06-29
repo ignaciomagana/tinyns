@@ -22,7 +22,9 @@ def prior_transform(u):
 
 def main():
     checkpoint_path = Path("run.checkpoint.npz")
-    sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=50, sample="rslice")
+    sampler = NestedSampler(
+        loglike, prior_transform, ndim=2, nlive=50, sample="rwalk", walks=5
+    )
 
     partial = sampler.run(
         random.PRNGKey(123),
@@ -34,7 +36,7 @@ def main():
     print(partial.summary())
 
     resumed_sampler = NestedSampler(
-        loglike, prior_transform, ndim=2, nlive=50, sample="rslice"
+        loglike, prior_transform, ndim=2, nlive=50, sample="rwalk", walks=5
     )
     resumed = resumed_sampler.resume(checkpoint_path, maxiter=20)
     print("\nResumed result:")

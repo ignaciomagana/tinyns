@@ -27,15 +27,12 @@ class NestedSampler:
     vectorized:
         Whether ``loglike`` and ``prior_transform`` accept batches of points.
     sample:
-        Sampling strategy. ``"prior"``, ``"rwalk"``, ``"slice"``, and ``"rslice"`` are
-        currently supported.
+        Sampling strategy. ``"prior"`` and ``"rwalk"`` are currently supported.
     max_attempts:
         Cap on rejection attempts per constrained prior draw.
     **kwargs:
-        Additional sampler options. ``walks`` and ``step_scale`` are used by
-        ``sample="rwalk"``; ``slices``, ``slice_steps``, and ``step_scale`` are
-        used by ``sample="slice"`` and ``sample="rslice"``. ``min_accepts`` is
-        used by ``"rwalk"``, ``"slice"``, and ``"rslice"``. ``kernel`` may be
+        Additional sampler options. ``walks``, ``step_scale``, and
+        ``min_accepts`` are used by ``sample="rwalk"``. ``kernel`` may be
         ``"python"`` (default) or experimental ``"jax"`` for ``sample="rwalk"``.
         ``jax_vectorized=True`` declares that JAX replacement kernels should call
         ``prior_transform`` and ``loglike`` on explicit batches instead of using
@@ -58,10 +55,8 @@ class NestedSampler:
             raise ValueError("ndim must be a positive integer")
         if nlive <= 0:
             raise ValueError("nlive must be a positive integer")
-        if sample not in {"prior", "rwalk", "slice", "rslice", "bound"}:
-            raise ValueError(
-                "sample must be one of {'prior', 'rwalk', 'slice', 'rslice', 'bound'}"
-            )
+        if sample not in {"prior", "rwalk", "bound"}:
+            raise ValueError("sample must be one of {'prior', 'rwalk', 'bound'}")
         kernel = kwargs.get("kernel", "python")
         if kernel not in {"python", "jax"}:
             raise ValueError("kernel must be one of {'python', 'jax'}")
@@ -182,8 +177,6 @@ class NestedSampler:
             walks=self.kwargs.get("walks", 25),
             step_scale=self.kwargs.get("step_scale", 0.1),
             batch_size=self.kwargs.get("batch_size", 128),
-            slices=self.kwargs.get("slices", 5),
-            slice_steps=self.kwargs.get("slice_steps", 10),
             min_accepts=self.kwargs.get("min_accepts", 1),
             replacement_chains=self.kwargs.get("replacement_chains", 1),
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
@@ -229,8 +222,6 @@ class NestedSampler:
             "batch_size": int(self.kwargs.get("batch_size", 128)),
             "walks": int(self.kwargs.get("walks", 25)),
             "step_scale": float(self.kwargs.get("step_scale", 0.1)),
-            "slices": int(self.kwargs.get("slices", 5)),
-            "slice_steps": int(self.kwargs.get("slice_steps", 10)),
             "min_accepts": int(self.kwargs.get("min_accepts", 1)),
             "replacement_chains": int(self.kwargs.get("replacement_chains", 1)),
             "rwalk_proposal": str(self.kwargs.get("rwalk_proposal", "isotropic")),
@@ -294,8 +285,6 @@ class NestedSampler:
             "batch_size",
             "walks",
             "step_scale",
-            "slices",
-            "slice_steps",
             "min_accepts",
             "replacement_chains",
             "rwalk_proposal",
@@ -400,8 +389,6 @@ class NestedSampler:
             walks=self.kwargs.get("walks", 25),
             step_scale=self.kwargs.get("step_scale", 0.1),
             batch_size=self.kwargs.get("batch_size", 128),
-            slices=self.kwargs.get("slices", 5),
-            slice_steps=self.kwargs.get("slice_steps", 10),
             min_accepts=self.kwargs.get("min_accepts", 1),
             replacement_chains=self.kwargs.get("replacement_chains", 1),
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),

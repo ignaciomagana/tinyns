@@ -7,7 +7,7 @@ A lightweight benchmark harness is available:
 ```bash
 python benchmarks/bench_static.py \
   --targets gaussian2d correlated_gaussian2d \
-  --samplers rwalk slice rslice \
+  --samplers prior rwalk \
   --seeds 0 1 2 \
   --nlive 200 \
   --dlogz 0.1 \

@@ -15,9 +15,8 @@ def test_readme_support_tiers_keep_key_paths() -> None:
     assert 'kernel="jax"' in text
     assert "jax_block_size=32" in text
 
-    assert "Reference-only" in text or "frozen" in lowered
-    assert 'sample="slice"' in text
-    assert 'sample="rslice"' in text
+    assert "Reference baseline" in text
+    assert "slice or random-slice" in lowered
 
     assert "experimental" in lowered
     assert 'rwalk_proposal="live-cov"' in text
