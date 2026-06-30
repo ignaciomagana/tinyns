@@ -50,14 +50,16 @@ python benchmarks/bench_static.py \
 - [ ] Run examples:
 
   - [ ] `python examples/gaussian_2d.py`
+  - [ ] `python examples/gaussian_2d_rwalk.py`
   - [ ] `python examples/gaussian_2d_rwalk_jax.py`
+  - [ ] `python examples/gaussian_2d_rwalk_jax_block.py`
   - [ ] checkpoint/resume example, if present
   - [ ] progress/callback example, if present
 
 
 ## Repeatable release validation
 
-Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands:
+Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16 and no-block/bounds comparison runs are optional diagnostics. Failures isolated to experimental live-cov/bounded/fused-bounded paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:
 
 1. [ ] Run `make test`.
 2. [ ] Run `make quick-validation`.
@@ -81,7 +83,7 @@ The overnight Makefile targets are opt-in local validation commands and must not
 
 - static nested sampling only
 - no dynamic nested sampling
-- no ellipsoidal bounding
+- ellipsoidal bounding is experimental and not part of the recommended fast path
 - no full-Python-free compiled nested-sampling loop
 - `kernel="jax"` currently supports only `sample="rwalk"`
 - not a probabilistic programming framework
