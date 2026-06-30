@@ -115,6 +115,36 @@ jax_block_size=32
 
 Recent validation found `jax_block_size=32` fastest overall among the validated unbounded cached JAX block runs, with `jax_block_size=16` slightly more conservative. Ordinary no-block isotropic `rwalk` was much slower in that validation. Live-cov and bounded/fused bounded paths remain experimental and should not be promoted from these results.
 
+
+#### Post-cleanup overnight validation
+
+After removing slice/rslice and the legacy `sample="bound"` mode, the recommended unbounded cached-block JAX rwalk path was rerun on the included validation targets. The B32 path remained fully successful across 50 runs, with zero replacement failures and evidence diagnostics consistent with the no-block isotropic baseline. Timing means exclude first-run compile/warmup outliers. Success and replacement-failure counts include all runs.
+
+| Config | Success | Replacement failures | Mean sec | Mean ncall | Analytic RMS pull | Max abs pull | Status |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| B32 cached block | 50/50 | 0 | ~4.14 | ~35,501 | ~1.23 | ~2.56 | Recommended fast path |
+| B16 cached block | 50/50 | 0 | ~4.42 | ~35,023 | ~1.23 | ~2.56 | Conservative fallback |
+| No-block isotropic | 50/50 | 0 | ~20.66 | ~34,636 | ~1.23 | ~2.56 | Clean but slower |
+| Live-cov | 50/50 | 0 | ~19.82 | ~15,582 | ~3.27 | ~7.97 | Experimental; do not promote |
+| Adaptive rwalk | 50/50 | 0 | ~24.28 | ~40,187 | ~1.35 | ~2.24 | Experimental |
+| Single bound | 50/50 | 0 | ~72.33 | ~392,211 | ~1.36 | ~2.90 | Experimental; slow |
+| Multi bound | 50/50 | 0 | ~83.62 | ~392,554 | ~1.37 | ~2.97 | Experimental; slow |
+| Fused bounded | 49/50 | 1 | ~95.72 | ~392,229 | ~1.37 | ~2.97 | Experimental; one known failure |
+
+B32 was about 5x faster than the no-block isotropic JAX rwalk baseline while preserving the same analytic evidence behavior. B32 was also about 6–7% faster than B16, at the cost of only about 1.4% more scalar likelihood calls.
+
+| Target | B32 speedup over no-block isotropic |
+| --- | ---: |
+| gaussian2d | ~5.78x |
+| correlated_gaussian2d | ~5.71x |
+| ring2d | ~4.63x |
+| banana2d | ~5.05x |
+| eggbox2d | ~3.82x |
+
+These results support keeping `jax_block_size=32` as the recommended fast path for unbounded JAX rwalk on the included benchmark targets. `jax_block_size=16` remains a conservative fallback. `jax_block_size=1` disables block mode.
+
+These results do not promote live-cov, bounds, fused bounds, or bounded block mode. Live-cov had concerning analytic pull behavior, and fused bounded still had one eggbox replacement failure. Experimental settings still require target-specific validation.
+
 #### Recommended fast-path validation
 
 To reproduce the recommended fast unbounded JAX `rwalk` validation with the current fastest validated block size, run:
