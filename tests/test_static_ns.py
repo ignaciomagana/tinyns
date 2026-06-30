@@ -906,6 +906,124 @@ def test_jax_block_rwalk_failure_propagates_replacement_failure() -> None:
     assert "max_attempts=1" in result.message
 
 
+def _partial_failure_block_kernel(*, accepted_prefix: int):
+    def make_kernel(*_args, **_kwargs):
+        def kernel(
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            logz_dead,
+            start_iteration,
+            nlive,
+            _step_scale,
+            _min_accepts,
+            _max_batches,
+            _proposal_chol,
+        ):
+            block_size = 4
+            worst = int(jnp.argmin(live_logl))
+            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
+            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
+            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
+            offsets = jnp.arange(block_size)
+            iterations = start_iteration + offsets
+            logx_prev = -iterations / nlive
+            logx_new = -(iterations + 1) / nlive
+            logwidth = logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev))
+            dead_logwt = logwidth + live_logl[worst]
+            accepted = offsets < accepted_prefix
+            return (
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                dead_u,
+                dead_theta,
+                dead_logl,
+                dead_logwt,
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.zeros((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                accepted,
+                logz_dead,
+                -(start_iteration + block_size) / nlive,
+            )
+
+        return kernel
+
+    return make_kernel
+
+
+def test_jax_block_partial_failure_after_convergence_reports_success(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        run_mod,
+        "_make_static_jax_rwalk_block_kernel",
+        _partial_failure_block_kernel(accepted_prefix=1),
+    )
+
+    result = run_static_nested(
+        random.PRNGKey(1236),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        maxiter=4,
+        dlogz=10.0,
+        jax_block_size=4,
+    )
+
+    assert result.success is True
+    assert "converged" in result.message
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["terminated_after_partial_block_failure"] is True
+    assert result.metadata["partial_block_failure_offset"] == 1
+    assert (
+        result.metadata["partial_block_failure_delta_logz"]
+        < result.metadata["dlogz"]
+    )
+    assert result.metadata["final_delta_logz"] < result.metadata["dlogz"]
+
+
+def test_jax_block_partial_failure_before_convergence_remains_failure(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        run_mod,
+        "_make_static_jax_rwalk_block_kernel",
+        _partial_failure_block_kernel(accepted_prefix=1),
+    )
+
+    result = run_static_nested(
+        random.PRNGKey(1237),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        maxiter=4,
+        dlogz=0.0,
+        jax_block_size=4,
+    )
+
+    assert result.success is False
+    assert "max_attempts" in result.message
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["terminated_after_partial_block_failure"] is False
+    assert result.metadata["partial_block_failure_offset"] == 1
+    assert (
+        result.metadata["partial_block_failure_delta_logz"]
+        >= result.metadata["dlogz"]
+    )
+    assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
+
+
 def test_jax_bounded_block_rwalk_failure_returns_failed_result() -> None:
     result = run_static_nested(
         random.PRNGKey(1235),
