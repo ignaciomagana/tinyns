@@ -54,6 +54,21 @@ python benchmarks/bench_static.py \
   - [ ] checkpoint/resume example, if present
   - [ ] progress/callback example, if present
 
+
+## Repeatable release validation
+
+Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands:
+
+1. [ ] Run `make test`.
+2. [ ] Run `make quick-validation`.
+3. [ ] For release validation, run `make overnight-b32`.
+4. [ ] Optional comparison: run `make overnight-b16` and `make overnight-comparison`.
+5. [ ] Run `make summarize-overnight`.
+6. [ ] Confirm B32 has 100% success, zero replacement failures, and sane analytic pulls.
+7. [ ] Confirm experimental failures do not affect the core release path.
+
+The overnight Makefile targets are opt-in local validation commands and must not be added to CI. Generated JSON outputs are local artifacts and should not be committed.
+
 ## Documentation checks
 
 - [ ] README quickstart works
