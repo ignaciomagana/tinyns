@@ -16,7 +16,15 @@ def test_readme_support_tiers_keep_key_paths() -> None:
     assert "jax_block_size=32" in text
 
     assert "Reference baseline" in text
-    assert "slice or random-slice" in lowered
+    assert 'sample="prior"' in text
+    assert "dynesty" in lowered
+    assert "slice/random-slice samplers were removed" in lowered
+    removed_slice = 'sample="' + 'slice"'
+    removed_rslice = 'sample="' + 'rslice"'
+    removed_steps = 'slice' + '_steps'
+    assert removed_slice not in text
+    assert removed_rslice not in text
+    assert removed_steps not in text
 
     assert "experimental" in lowered
     assert 'rwalk_proposal="live-cov"' in text

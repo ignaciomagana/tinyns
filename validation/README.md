@@ -79,9 +79,6 @@ Repeated-seed validation currently separates the recommended path from baselines
 `ring2d` is a qualitative annulus target. It is useful for checking whether constrained-replacement samplers can move around curved shell-like likelihood regions. If no analytic evidence is provided, use posterior diagnostics, insertion-rank behavior, and repeated-run stability rather than z-scores.
 
 
-Slice/random-slice samplers have been removed from TinyNS. Use dynesty for slice-based external comparisons.
-recommended fast path.
-
 ## Insertion-rank diagnostics
 
 Insertion ranks test whether new constrained replacements are distributed like draws from the constrained prior. For normalized ranks, the expected mean is about 0.5 and the expected standard deviation is about 1/sqrt(12).
