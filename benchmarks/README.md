@@ -334,3 +334,69 @@ Experimental bounded/fused candidate for separate validation (do not treat this 
 ```
 
 Do not compare wall time between runs that print progress every iteration; progress output can dominate timings for otherwise fast runs. When comparing against dynesty, use the same likelihood, the same seed family, the same `nlive`, and the same stopping threshold. For tiny or cheap likelihoods, Python dispatch and JAX launch overhead can dominate, so fewer scalar likelihood calls do not necessarily imply faster wall time. For expensive JAX likelihoods, prefer batched or vectorized candidate evaluation when it is available, and judge performance primarily with wall time together with replacement metadata rather than scalar `ncall` alone.
+
+### 10D GW-like stress-target findings
+
+`benchmarks/templates/gw_like_10d_tinyns_b32_figures.py` is a self-contained synthetic 10D GW-like stress target for the recommended unbounded B32 JAX `rwalk` path. It includes mass-ratio/chirp-mass curvature, hard bounded `q` and `chi_p` priors, distance/inclination amplitude degeneracy, a sky banana plus mirror mode, wrapped phase/polarization structure, and spin/mass-ratio coupling.
+
+The 10D GW-like template is intentionally harder than the included low-dimensional validation targets. It should be treated as a constrained-replacement mixing stress test, not as a new default configuration. It is not a production gravitational-wave parameter-estimation likelihood, and mechanically clean behavior on this target should not be presented as evidence that TinyNS is production-ready for arbitrary GW parameter estimation.
+
+Local runs found that weak `rwalk` settings can reach high posterior ESS and apparent convergence while still showing badly biased insertion ranks. Increasing target-specific local `rwalk` mixing fixes that insertion-rank pathology, but the stronger settings are expensive and should remain a hard-target diagnostic recipe. They are not new defaults, are not part of the release gate, and do not change the recommended fast path for the included low-dimensional validation suite:
+
+```text
+sample="rwalk"
+kernel="jax"
+rwalk_proposal="isotropic"
+walks=5
+replacement_chains=1
+jax_block_size=32
+```
+
+| Setting | nlive | walks | step_scale | min_accepts | seeds | Success | Replacement failures | logZ behavior | Insertion-rank behavior | Interpretation |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- |
+| Weak | 2000 | 40 | 0.02 | 5 | 0 | 1/1 | 0 | logZ≈-21.84 | z≈7.6 | under-mixed |
+| Medium | 2000 | 80 | 0.015 | 8 | 0 | 1/1 | 0 | logZ≈-22.70 | z≈4.2 | improved but still biased |
+| Strong | 2000 | 160 | 0.01 | 12 | 0,1,2 | 3/3 | 0 | mean logZ≈-22.66, scatter≈0.17 | z≈-0.21,-0.19,0.69 | first healthy stress setting |
+| Strong nlive check | 4000 | 160 | 0.01 | 12 | 0 | 1/1 | 0 | logZ≈-22.31 | z≈-0.30 | mechanically clean; evidence still live-point sensitive |
+
+The `nlive=4000` check was mechanically excellent, with `replacement_failures=0`, `insertion_rank_mean_z≈-0.30`, and `insertion_rank_std_ratio≈1`, but its logZ shift relative to the `nlive=2000` seed mean shows that this benchmark is best read as a stress/mixing diagnostic rather than as a final calibrated evidence benchmark.
+
+For a hard-target diagnostic run, use the strong-mixing recipe below:
+
+```bash
+python benchmarks/templates/gw_like_10d_tinyns_b32_figures.py \
+  --seeds 0 1 2 \
+  --nlive 2000 \
+  --dlogz 0.11 \
+  --maxiter 150000 \
+  --walks 160 \
+  --replacement-chains 16 \
+  --step-scale 0.01 \
+  --min-accepts 12 \
+  --max-attempts 300000 \
+  --jax-block-size 32 \
+  --output-dir gw_like_10d_b32_walks160_scale001_seeds012 \
+  --progress
+```
+
+This command is intentionally expensive and is not part of the release gate.
+
+When reading 10D GW-like output, healthy signs include:
+
+- `success=True`;
+- `replacement_failures=0`;
+- no warnings;
+- `insertion_rank_mean_z` close to 0;
+- `insertion_rank_std_ratio` close to 1;
+- small `live_weight_fraction`;
+- large posterior ESS;
+- logZ stable across seeds/configurations.
+
+Bad signs include:
+
+- `insertion_rank_mean_z` several sigma from 0;
+- large logZ shifts as `walks` or `step_scale` change;
+- large `replacement_max_batches`;
+- replacement failures;
+- low posterior ESS;
+- large `live_weight_fraction`.

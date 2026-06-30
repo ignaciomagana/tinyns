@@ -58,3 +58,17 @@ def test_benchmark_readme_post_cleanup_validation_summary() -> None:
     assert "B32 remains the recommended" in text
     assert "B64 is the default" not in text
     assert "B128 is the default" not in text
+
+
+def test_benchmark_readme_gw_like_stress_target_guidance() -> None:
+    """Keep the GW-like stress-target docs focused on diagnostics, not defaults."""
+    text = (Path(__file__).resolve().parents[1] / "benchmarks" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    lowered = text.lower()
+
+    assert "10D GW-like" in text
+    assert "insertion-rank" in text
+    assert "--walks 160" in text
+    assert "not as a new default configuration" in lowered
+    assert "not part of the release gate" in lowered
