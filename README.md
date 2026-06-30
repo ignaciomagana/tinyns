@@ -235,7 +235,7 @@ Vectorized `rwalk` replacement sampling is not implemented yet.
 
 ### Bounding
 
-`tinyns` supports `bound="none"` by default. Experimental single-ellipsoid bounding can be enabled with `bound="single"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
+`tinyns` supports `bound="none"` by default. Bounds are experimental modifiers for rwalk, not a separate public sampler mode. Use `sample="rwalk"` with `bound="single"` or `bound="multi"` and `rwalk_seed="bound"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
 
 The only currently recommended fast path is unbounded JAX rwalk with isotropic proposals and cached block mode. Live-cov proposals and bounded/fused-bounded paths remain experimental and require target-specific validation.
 
@@ -291,7 +291,7 @@ This mode is experimental and is not the recommended fast path. Check evidence c
 
 ### JAX bound representation
 
-`tinyns` keeps Python-friendly bound objects for readability, but also provides an internal padded `JaxEllipsoidBound` representation. The padded representation is used as a bridge toward fast JAX replacement kernels and should not change public sampler behavior.
+`tinyns` keeps Python-friendly bound objects for readability, but also provides an internal padded `JaxEllipsoidBound` representation. The padded representation is used as a bridge toward fast JAX replacement kernels and should not change public sampling behavior.
 
 ## Current validation status
 

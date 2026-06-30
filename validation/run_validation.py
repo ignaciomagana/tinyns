@@ -208,7 +208,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=["gaussian1d", "gaussian2d", "correlated_gaussian2d"],
     )
     parser.add_argument(
-        "--samplers", nargs="+", default=["prior", "rwalk"]
+        "--samplers", nargs="+", choices=["prior", "rwalk"], default=["prior", "rwalk"]
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--nlive", type=int, default=200)

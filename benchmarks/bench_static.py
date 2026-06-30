@@ -355,7 +355,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--targets", nargs="+", default=["gaussian2d", "correlated_gaussian2d"]
     )
-    parser.add_argument("--samplers", nargs="+", default=["prior", "rwalk"])
+    parser.add_argument(
+        "--samplers", nargs="+", choices=["prior", "rwalk"], default=["prior", "rwalk"]
+    )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--dlogz", type=float, default=0.1)

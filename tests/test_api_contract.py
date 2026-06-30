@@ -70,12 +70,23 @@ def test_nested_sampler_validates_configuration() -> None:
 
 
 
-@pytest.mark.parametrize("sample", ["slice", "rslice"])
-def test_nested_sampler_rejects_removed_slice_samplers(sample: str) -> None:
-    with pytest.raises(
-        ValueError, match=r"sample must be one of \{'prior', 'rwalk', 'bound'\}"
-    ):
+@pytest.mark.parametrize("sample", ["slice", "rslice", "bound"])
+def test_nested_sampler_rejects_removed_samplers(sample: str) -> None:
+    with pytest.raises(ValueError, match=r"sample must be one of"):
         NestedSampler(loglike, prior_transform, ndim=3, sample=sample)
+
+
+def test_run_static_nested_rejects_bound_sampler_mode() -> None:
+    with pytest.raises(ValueError, match=r"sample must be one of"):
+        run_static_nested(
+            0,
+            loglike,
+            prior_transform,
+            ndim=2,
+            nlive=10,
+            sample="bound",
+            maxiter=1,
+        )
 
 
 def test_nested_sampler_vectorized_rwalk_raises_on_run() -> None:
