@@ -73,6 +73,8 @@ The overnight Makefile targets are opt-in local validation commands and must not
 
 The primary release gate remains B32. B64/B128 sweeps are optional performance diagnostics for cheap likelihoods or external target-specific benchmarking. They should not replace the B32 gate unless future validation shows a clear robustness and efficiency advantage.
 
+JAX block mode checks convergence before launching a new block and after truncating a partially failed block. If the accepted prefix has already reached the requested `dlogz`, the run terminates successfully while recording the late replacement failure in metadata.
+
 ## Documentation checks
 
 - [ ] README quickstart works

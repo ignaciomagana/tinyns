@@ -74,6 +74,15 @@ def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
     return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
 
 
+def _remaining_delta_logz(logz_dead, logx_final, live_logl):
+    """Return the live-evidence remainder in log-evidence units."""
+
+    if math.isinf(float(logz_dead)) and float(logz_dead) < 0.0:
+        return math.inf
+    logz_remain = float(logx_final) + float(jnp.max(live_logl))
+    return float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+
+
 def _transform_live_points(prior_transform, u_live, ndim: int, *, vectorized: bool):
     if vectorized:
         return _as_points(prior_transform(u_live), ndim)
@@ -1150,6 +1159,10 @@ def run_static_nested(
 
     initial_iteration = iteration
     final_delta_logz = math.inf
+    terminated_after_partial_block_failure = False
+    partial_block_failure_delta_logz = None
+    partial_block_failure_offset = None
+    partial_block_failure_message = None
     progress_printer = _ProgressPrinter() if progress else None
     current_bound = None
     bound_updates = 0
@@ -1197,6 +1210,14 @@ def run_static_nested(
 
     if jax_block_size > 1:
         while iteration < maxiter:
+            if iteration > 0:
+                delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+                final_delta_logz = delta_logz
+                if delta_logz < dlogz:
+                    success = True
+                    message = "converged"
+                    maybe_checkpoint(final=True)
+                    break
             block_size_now = min(int(jax_block_size), maxiter - iteration)
             proposal_chol = _rwalk_proposal_chol(
                 live_u, ndim, rwalk_proposal, rwalk_cov_jitter
@@ -1363,6 +1384,8 @@ def run_static_nested(
                     message = (
                         f"max_attempts={max_attempts} hit during constrained rwalk draw"
                     )
+                partial_block_failure_offset = int(failed_offsets[0])
+                partial_block_failure_message = message
                 block_size_now = failed_offsets[0]
             block_stop = iteration + block_size_now
             if failed_offsets:
@@ -1438,10 +1461,17 @@ def run_static_nested(
             iteration = block_stop
             maybe_checkpoint()
             if failed_offsets:
+                delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+                final_delta_logz = delta_logz
+                partial_block_failure_delta_logz = float(delta_logz)
+                if iteration > 0 and delta_logz < dlogz:
+                    success = True
+                    message = "converged after partial block before replacement failure"
+                    terminated_after_partial_block_failure = True
+                    maybe_checkpoint(final=True)
                 break
 
-            logz_remain = float(logx_final) + float(jnp.max(live_logl))
-            delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+            delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
             final_delta_logz = delta_logz
             final_iteration = delta_logz < dlogz or iteration == maxiter
             if iteration == maxiter and delta_logz >= dlogz:
@@ -2125,6 +2155,12 @@ def run_static_nested(
             "insertion_index_nslots": nlive,
             "insertion_index_nlive": nlive - 1,
             "replacement_failures": int(replacement_failures),
+            "terminated_after_partial_block_failure": bool(
+                terminated_after_partial_block_failure
+            ),
+            "partial_block_failure_delta_logz": partial_block_failure_delta_logz,
+            "partial_block_failure_offset": partial_block_failure_offset,
+            "partial_block_failure_message": partial_block_failure_message,
             "mean_replacement_ncall": mean_replacement_ncall,
             "max_replacement_ncall": max_replacement_ncall,
             "mean_replacement_batches": (
