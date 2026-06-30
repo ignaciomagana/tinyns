@@ -102,7 +102,7 @@ By default, the wrapper writes timestamped JSON results under `benchmarks/result
 
 ### Cached JAX block rwalk validation recipes
 
-These recipes are documentation-only validation workflows for the unbounded JAX `rwalk` path. They do not change sampler defaults and should be run manually, not in CI. The currently validated fast path on the included benchmark targets is:
+These recipes are documentation-only validation workflows for the unbounded JAX `rwalk` path. They do not change sampler defaults and should be run manually, not in CI. Optional Makefile shortcuts are available for the common workflows: `make quick-validation`, `make overnight-b32`, `make overnight-b16`, `make overnight-comparison`, and `make summarize-overnight`. The explicit commands remain below for transparency and copy-paste use. The currently validated fast path on the included benchmark targets is:
 
 ```text
 sample="rwalk"

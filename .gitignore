@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TinyNS local validation outputs
+quick_validation.json
+overnight_jax_validation_*.json
+overnight_after_*.json
+benchmarks/results/*.json
