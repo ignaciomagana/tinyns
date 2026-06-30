@@ -53,3 +53,8 @@ def test_benchmark_readme_post_cleanup_validation_summary() -> None:
     assert "B32 cached block" in text
     assert "Live-cov" in text
     assert "do not promote" in text
+    assert "jax_block_size=64" in text
+    assert "jax_block_size=128" in text
+    assert "B32 remains the recommended" in text
+    assert "B64 is the default" not in text
+    assert "B128 is the default" not in text

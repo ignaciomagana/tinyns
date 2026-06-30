@@ -145,9 +145,26 @@ These results support keeping `jax_block_size=32` as the recommended fast path f
 
 These results do not promote live-cov, bounds, fused bounds, or bounded block mode. Live-cov had concerning analytic pull behavior, and fused bounded still had one eggbox replacement failure. Experimental settings still require target-specific validation.
 
+#### Extended block-size smoke: B64 and B128
+
+An extended unbounded JAX rwalk block-size smoke run also tested `jax_block_size=64` and `jax_block_size=128` on the included validation targets. B16, B32, B64, and B128 all completed with 50/50 success and zero replacement failures. B64 and B128 were faster on these cheap toy targets, with B128 giving the fastest wall time, but larger block sizes increased ncall/niter overshoot. B32 remains the recommended default because it captures most of the speedup with a smaller overshoot cost.
+
+`jax_block_size=32` remains the recommended validated fast path. `jax_block_size=16` is the conservative fallback. `jax_block_size=64` and `jax_block_size=128` are experimental performance knobs for cheap likelihoods or target-specific benchmarking, not new defaults.
+
+| Block | Success | Replacement failures | Mean sec | Mean ncall | Mean niter | Mean final dlogz | RMS pull | Max abs pull | Status |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 16 | 50/50 | 0 | ~4.46 | ~35,023 | ~2,770 | ~0.098 | ~1.23 | ~2.56 | Conservative fallback |
+| 32 | 50/50 | 0 | ~4.15 | ~35,501 | ~2,779 | ~0.097 | ~1.23 | ~2.56 | Recommended default |
+| 64 | 50/50 | 0 | ~4.01 | ~36,414 | ~2,796 | ~0.094 | ~1.23 | ~2.56 | Experimental faster option |
+| 128 | 50/50 | 0 | ~3.92 | ~38,804 | ~2,834 | ~0.087 | ~1.23 | ~2.56 | Fastest toy wall time; more overshoot |
+
+Timing means exclude seed 0 compile/warmup noise. Success and replacement-failure counts include all seeds.
+
+Relative to B32, B64 was about 3.5% faster while using about 2.6% more scalar likelihood calls. B128 was about 6.0% faster while using about 9.3% more scalar likelihood calls. This makes B128 the fastest option on the cheap included toy targets, but not the best default.
+
 #### Recommended fast-path validation
 
-To reproduce the recommended fast unbounded JAX `rwalk` validation with the current fastest validated block size, run:
+To reproduce the recommended fast unbounded JAX `rwalk` validation with the recommended validated block size, run:
 
 ```bash
 python benchmarks/overnight_jax_validation.py \
@@ -168,7 +185,7 @@ python benchmarks/overnight_jax_validation.py \
 Use this copy-paste sweep to compare convergence and timing as the cached JAX block size changes:
 
 ```bash
-for B in 2 4 8 16 32; do
+for B in 16 32 64 128; do
   python benchmarks/overnight_jax_validation.py \
     --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
     --seeds 0 1 2 3 4 5 6 7 8 9 \
@@ -179,6 +196,16 @@ for B in 2 4 8 16 32; do
     --jax-block-size "$B" \
     --output "overnight_jax_validation_block_B${B}.json"
 done
+```
+
+Then:
+
+```bash
+python benchmarks/summarize_overnight_jax_validation.py \
+  overnight_jax_validation_block_B16.json \
+  overnight_jax_validation_block_B32.json \
+  overnight_jax_validation_block_B64.json \
+  overnight_jax_validation_block_B128.json
 ```
 
 This validates the success/failure rate, replacement failures, wall time, `ncall`/`niter` growth from block overshoot, logZ accuracy on analytic targets, and `final_delta_logz` overshoot as block size increases. Larger block sizes can reduce wall time, but they may increase `ncall`/`niter` because convergence is checked between blocks.
@@ -204,7 +231,7 @@ This gives comparison against ordinary unbounded isotropic `rwalk`, unbounded li
 
 Prefer configurations with 100% success and zero replacement failures. For analytic targets, check `pull = (logz - expected_logz) / logzerr`: RMS pull around 1 is good, while large `max_abs_pull` or RMS pull greater than 2 means the configuration needs investigation. Lower wall time is only useful if logZ behavior remains sane.
 
-When comparing block sizes, inspect `seconds`, `ncall`, `niter`, `final_delta_logz`, success counts, replacement failures, RMS pull, and maximum absolute pull together. B32 was fastest in the recent validation with only mild extra `ncall`; B16 is safer if you want less convergence overshoot.
+When comparing block sizes, inspect `seconds`, `ncall`, `niter`, `final_delta_logz`, success counts, replacement failures, RMS pull, and maximum absolute pull together. B32 remains the recommended default because it is near the speed knee with only mild extra `ncall`; B16 is safer if you want less convergence overshoot, while B64/B128 should stay target-specific experimental knobs.
 
 #### Summarizing overnight validation files
 
@@ -214,7 +241,9 @@ The overnight summarizer supports multiple input files. After running the no-blo
 python benchmarks/summarize_overnight_jax_validation.py \
   overnight_jax_validation_no_block.json \
   overnight_jax_validation_block_B16.json \
-  overnight_jax_validation_block_B32.json
+  overnight_jax_validation_block_B32.json \
+  overnight_jax_validation_block_B64.json \
+  overnight_jax_validation_block_B128.json
 ```
 
 ### Expensive-likelihood validation guidance

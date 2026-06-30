@@ -59,17 +59,19 @@ python benchmarks/bench_static.py \
 
 ## Repeatable release validation
 
-Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16 and no-block/bounds comparison runs are optional diagnostics. Failures isolated to experimental live-cov/bounded/fused-bounded paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:
+Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16, B64/B128, and no-block/bounds comparison runs are optional diagnostics. Failures isolated to experimental live-cov/bounded/fused-bounded paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:
 
 1. [ ] Run `make test`.
 2. [ ] Run `make quick-validation`.
 3. [ ] For release validation, run `make overnight-b32`.
-4. [ ] Optional comparison: run `make overnight-b16` and `make overnight-comparison`.
+4. [ ] Optional comparison: run `make overnight-b16` and `make overnight-comparison`; B64/B128 sweeps are optional performance diagnostics for cheap likelihoods or external target-specific benchmarking.
 5. [ ] Run `make summarize-overnight`.
 6. [ ] Confirm B32 has 100% success, zero replacement failures, and sane analytic pulls.
 7. [ ] Confirm experimental failures do not affect the core release path.
 
 The overnight Makefile targets are opt-in local validation commands and must not be added to CI. Generated JSON outputs are local artifacts and should not be committed.
+
+The primary release gate remains B32. B64/B128 sweeps are optional performance diagnostics for cheap likelihoods or external target-specific benchmarking. They should not replace the B32 gate unless future validation shows a clear robustness and efficiency advantage.
 
 ## Documentation checks
 
