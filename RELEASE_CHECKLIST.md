@@ -83,3 +83,8 @@ python benchmarks/bench_static.py \
     --jax-block-size 32 \
     --output overnight_jax_validation_block_B32.json
   ```
+  - [ ] Confirm 50/50 success.
+  - [ ] Confirm zero replacement failures.
+  - [ ] Confirm analytic RMS pull is sane, roughly near 1.
+  - [ ] Confirm B32 remains faster than no-block isotropic.
+  - [ ] Confirm any bounded/fused bounded failures are treated as experimental-path failures and do not block the core release unless they indicate shared infrastructure breakage.
