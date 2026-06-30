@@ -833,8 +833,8 @@ def run_static_nested(
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
-    if sample not in {"prior", "rwalk", "bound"}:
-        raise ValueError("sample must be one of {'prior', 'rwalk', 'bound'}")
+    if sample not in {"prior", "rwalk"}:
+        raise ValueError("sample must be one of {'prior', 'rwalk'}")
     if kernel not in {"python", "jax"}:
         raise ValueError("kernel must be one of {'python', 'jax'}")
     if bound not in {"none", "single", "multi"}:
@@ -878,8 +878,6 @@ def run_static_nested(
             "kernel='jax', bound in {'single', 'multi'}, and "
             "rwalk_seed='bound'"
         )
-    if sample == "bound" and bound not in {"single", "multi"}:
-        raise ValueError('sample="bound" requires bound="single" or bound="multi"')
     if (
         sample == "rwalk"
         and bound in {"single", "multi"}
@@ -1547,29 +1545,7 @@ def run_static_nested(
 
             bound_failure = False
             bound_success = False
-            if sample == "bound":
-                (
-                    key,
-                    new_u,
-                    new_theta,
-                    new_logl,
-                    calls,
-                    accepted,
-                    replacement_info,
-                ) = draw_constrained_single_bound(
-                    key,
-                    loglike,
-                    prior_transform,
-                    logl_worst,
-                    current_bound,
-                    ndim,
-                    batch_size=batch_size,
-                    max_attempts=bound_max_draws or max_attempts,
-                    overlap_correction=multi_bound_overlap_correction,
-                )
-                bound_success = bool(accepted)
-                bound_failure = not accepted
-            elif sample == "prior":
+            if sample == "prior":
                 if vectorized:
                     (
                         key,

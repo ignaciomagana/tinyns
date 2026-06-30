@@ -307,8 +307,10 @@ def test_checkpoint_config_includes_bound_settings(tmp_path):
 def test_checkpoint_config_includes_multi_bound_settings(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
     make_sampler(
+        sample="rwalk",
         bound="multi",
-        sample="bound",
+        rwalk_seed="bound",
+        walks=3,
         multi_bound_max_ellipsoids=4,
         multi_bound_min_points=8,
         multi_bound_split_threshold=0.95,

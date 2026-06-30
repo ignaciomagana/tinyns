@@ -55,8 +55,8 @@ class NestedSampler:
             raise ValueError("ndim must be a positive integer")
         if nlive <= 0:
             raise ValueError("nlive must be a positive integer")
-        if sample not in {"prior", "rwalk", "bound"}:
-            raise ValueError("sample must be one of {'prior', 'rwalk', 'bound'}")
+        if sample not in {"prior", "rwalk"}:
+            raise ValueError("sample must be one of {'prior', 'rwalk'}")
         kernel = kwargs.get("kernel", "python")
         if kernel not in {"python", "jax"}:
             raise ValueError("kernel must be one of {'python', 'jax'}")
