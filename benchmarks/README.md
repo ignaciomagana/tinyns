@@ -237,24 +237,26 @@ python benchmarks/overnight_jax_validation.py \
 
 This is only a smoke recipe unless the benchmark targets include artificial likelihood cost; it is not a true expensive-likelihood benchmark by itself.
 
-### External expensive-likelihood benchmarks
+### External expensive-likelihood benchmarking
 
-Some users may want to benchmark `tinyns` on external, user-provided expensive JAX likelihoods, such as catalog or dark-siren likelihoods. Keep those benchmarks outside the core package: do not add the external likelihood package as a `tinyns` dependency, do not add domain-specific code to `tinyns`, and do not put overnight benchmark runs in CI.
+Use `benchmarks/templates/external_expensive_likelihood_template.py` as a minimal starting point for benchmarking `tinyns` on external, user-provided expensive JAX likelihoods. The template intentionally depends only on JAX and TinyNS and shows where to plug in a user likelihood and prior transform.
 
-When benchmarking the optimized path, hold the sampling problem fixed across runs:
+Do not add domain data or external scientific packages to TinyNS itself. Keep domain-specific likelihoods in user repositories or external benchmark scripts. Do not add external likelihood packages as TinyNS dependencies, do not add domain-specific code here, and do not put overnight domain benchmark runs in CI.
 
-- use a fixed random seed, or a documented fixed seed list;
+When benchmarking the optimized path, keep the sampling problem fixed across runs:
+
+- use the same likelihood, data files, masks, injections, likelihood settings, and priors;
+- use the same seed list;
 - use the same `nlive`;
 - use the same `dlogz` stopping threshold;
-- use exactly the same data files, injections, masks, and likelihood settings;
 - set the progress interval high enough that terminal output is not a material part of the timing;
-- compare wall time, scalar `ncall`, `logZ`, and replacement metadata such as replacement batches, per-replacement calls, chain usage, and success/failure counts.
+- compare evidence calibration and replacement failures before treating wall-time speedups as meaningful;
+- do not compare only scalar `ncall` for JAX batched workloads; use wall time plus replacement metadata such as replacement batches, per-replacement calls, chain usage, and success/failure counts.
 
 Starting configurations for external expensive JAX likelihoods should distinguish the recommended unbounded isotropic path from experimental candidates:
 
-- Start with the recommended unbounded cached block mode below.
-- Test live-cov, bounds, fused bounds, or bounded block mode only as experimental candidates after the primary path is calibrated.
-- Compare evidence calibration and replacement failures before treating wall-time speedups as meaningful.
+- Start with the recommended unbounded isotropic cached block path below.
+- Treat live-cov, bounds, fused bounds, or bounded block mode as experimental candidates only after the B32 baseline is calibrated.
 
 Recommended unbounded isotropic cached block baseline to validate first:
 
