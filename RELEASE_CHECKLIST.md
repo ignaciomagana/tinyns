@@ -57,6 +57,37 @@ python benchmarks/bench_static.py \
   - [ ] progress/callback example, if present
 
 
+
+## Final v0.1.0-alpha checklist
+
+Run the final alpha gate from an up-to-date `main` checkout:
+
+```bash
+git checkout main
+git pull --ff-only origin main
+ruff check .
+pytest
+make quick-validation
+make overnight-b32
+make summarize-overnight
+python benchmarks/templates/gw_like_10d_tinyns_b32_figures.py --help
+```
+
+Optional non-gate checks:
+
+```bash
+make overnight-b16
+make overnight-comparison
+# Optional extended sweep: B64/B128
+# Optional expensive 10D stress target: not a release gate
+```
+
+B32 overnight remains the release gate. B64/B128 are optional diagnostics, not defaults. The 10D GW-like stress target is opt-in and not part of release gating.
+
+## v0.1.0-alpha caveats
+
+TinyNS v0.1.0-alpha is intended as a small static nested sampler with a validated low-dimensional JAX rwalk fast path. High-dimensional, strongly curved, or multimodal targets require target-specific validation. The included 10D GW-like benchmark is a stress test for constrained-replacement mixing, not a production GW parameter-estimation pipeline.
+
 ## Repeatable release validation
 
 Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16, B64/B128, and no-block/bounds comparison runs are optional diagnostics. Failures isolated to experimental live-cov/bounded/fused-bounded paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:

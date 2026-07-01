@@ -41,6 +41,30 @@ def test_release_checklist_matches_public_surface_cleanup() -> None:
     assert "no ellipsoidal bounding" not in lowered
     assert "ellipsoidal" in lowered
     assert "experimental" in lowered
+    assert "make overnight-b32" in text
+    assert "B32 overnight remains the release gate" in text
+    assert "B64/B128 are optional diagnostics" in text
+    assert "not part of release gating" in text
+
+
+def test_changelog_alpha_release_notes_are_conservative() -> None:
+    """Lock alpha notes to the narrowed public surface and caveat language."""
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    lowered = text.lower()
+
+    assert "## v0.1.0-alpha" in text
+    assert 'sample="rwalk"' in text
+    assert 'sample="prior"' in text
+    assert "jax_block_size=32" in text
+    assert "B32 remains the default recommendation" in text
+    assert "B64/B128" in text
+    assert "optional" in lowered
+    assert "experimental" in lowered
+    assert "10D GW-like benchmark is a stress test" in text
+    assert "not a production GW parameter-estimation pipeline" in text
+    assert '`sample="bound"` public sampler paths' in text
+    assert 'sample="slice"' not in text
+    assert 'sample="rslice"' not in text
 
 
 def test_benchmark_readme_post_cleanup_validation_summary() -> None:
