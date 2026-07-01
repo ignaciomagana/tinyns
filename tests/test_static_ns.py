@@ -171,12 +171,6 @@ def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
     assert result.metadata["step_scale"] == 0.2
 
 
-
-
-
-
-
-
 def test_replacement_stats_metadata_after_normal_run() -> None:
     result = run_static_nested(
         random.PRNGKey(7),
@@ -984,8 +978,7 @@ def test_jax_block_partial_failure_after_convergence_reports_success(
     assert result.metadata["terminated_after_partial_block_failure"] is True
     assert result.metadata["partial_block_failure_offset"] == 1
     assert (
-        result.metadata["partial_block_failure_delta_logz"]
-        < result.metadata["dlogz"]
+        result.metadata["partial_block_failure_delta_logz"] < result.metadata["dlogz"]
     )
     assert result.metadata["final_delta_logz"] < result.metadata["dlogz"]
 
@@ -1018,9 +1011,124 @@ def test_jax_block_partial_failure_before_convergence_remains_failure(
     assert result.metadata["terminated_after_partial_block_failure"] is False
     assert result.metadata["partial_block_failure_offset"] == 1
     assert (
-        result.metadata["partial_block_failure_delta_logz"]
-        >= result.metadata["dlogz"]
+        result.metadata["partial_block_failure_delta_logz"] >= result.metadata["dlogz"]
     )
+    assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
+
+
+def test_jax_block_rwalk_rescue_succeeds_after_normal_failure(monkeypatch) -> None:
+    def make_kernel(*_args, **_kwargs):
+        def kernel(
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            logz_dead,
+            start_iteration,
+            nlive,
+            *_rest,
+        ):
+            block_size = 2
+            worst = int(jnp.argmin(live_logl))
+            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
+            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
+            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
+            offsets = jnp.arange(block_size)
+            iterations = start_iteration + offsets
+            logx_prev = -iterations / nlive
+            logx_new = -(iterations + 1) / nlive
+            dead_logwt = (
+                logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + live_logl[worst]
+            )
+            return (
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                dead_u,
+                dead_theta,
+                dead_logl,
+                dead_logwt,
+                jnp.full((block_size,), 2, dtype=jnp.int32),
+                jnp.zeros((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.zeros((block_size,), dtype=bool),
+                dead_u,
+                dead_theta,
+                dead_logl,
+                logz_dead,
+                -(start_iteration + block_size) / nlive,
+            )
+
+        return kernel
+
+    def rescue_draw(
+        key, _loglike, _prior_transform, logl_min, live_u, _live_logl, ndim, **_kwargs
+    ):
+        new_u = jnp.clip(live_u[0] + 0.01, 0.0, 1.0)
+        return key, new_u, new_u, jnp.asarray(logl_min + 1.0), 3, True
+
+    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", make_kernel)
+    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", rescue_draw)
+
+    result = run_static_nested(
+        random.PRNGKey(2001),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        walks=1,
+        replacement_chains=1,
+        max_attempts=2,
+        maxiter=5,
+        dlogz=10.0,
+        jax_block_size=2,
+    )
+
+    assert result.success is True
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["replacement_rescue_used"] is True
+    assert result.metadata["replacement_rescue_attempts"] == 1
+    assert result.metadata["replacement_rescue_successes"] == 1
+    assert result.metadata["replacement_rescue_failures"] == 0
+    assert result.metadata["replacement_rescue_ncall"] == 3
+    assert result.ncall == result.nlive + 5
+
+
+def test_jax_block_rwalk_rescue_fails_before_convergence(monkeypatch) -> None:
+    def rescue_draw(
+        key, _loglike, _prior_transform, logl_min, live_u, _live_logl, ndim, **_kwargs
+    ):
+        return key, live_u[0], live_u[0], jnp.asarray(logl_min), 4, False
+
+    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", rescue_draw)
+
+    result = run_static_nested(
+        random.PRNGKey(2002),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        walks=1,
+        min_accepts=3,
+        replacement_chains=1,
+        max_attempts=2,
+        maxiter=4,
+        dlogz=0.0,
+        jax_block_size=4,
+    )
+
+    assert result.success is False
+    assert "max_attempts" in result.message
+    assert result.metadata["replacement_rescue_used"] is True
+    assert result.metadata["replacement_rescue_failures"] == 1
+    assert result.metadata["replacement_rescue_attempts"] == 4
+    assert result.metadata["replacement_rescue_ncall"] == 16
     assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
 
 

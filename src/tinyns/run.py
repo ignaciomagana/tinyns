@@ -182,9 +182,8 @@ def _run_static_jax_rwalk_block(
             replacement_batches_used = (
                 replacement_ncall + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
             ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
-            replacement_chains_used = (
-                replacement_batches_used
-                * jnp.asarray(replacement_chains, dtype=jnp.int32)
+            replacement_chains_used = replacement_batches_used * jnp.asarray(
+                replacement_chains, dtype=jnp.int32
             )
         else:
             (
@@ -225,15 +224,21 @@ def _run_static_jax_rwalk_block(
             replacement_batches_used,
             replacement_chains_used,
             accepted,
+            new_u,
+            new_theta,
+            new_logl,
         )
 
     (
-        new_key,
-        new_live_u,
-        new_live_theta,
-        new_live_logl,
-        logz_dead_new,
-    ), block = lax.scan(
+        (
+            new_key,
+            new_live_u,
+            new_live_theta,
+            new_live_logl,
+            logz_dead_new,
+        ),
+        block,
+    ) = lax.scan(
         one_iteration,
         (key, live_u, live_theta, live_logl, jnp.asarray(logz_dead)),
         jnp.arange(int(block_size), dtype=jnp.int32),
@@ -248,6 +253,9 @@ def _run_static_jax_rwalk_block(
         replacement_batches_block,
         replacement_chains_used_block,
         accepted_block,
+        new_u_block,
+        new_theta_block,
+        new_logl_block,
     ) = block
     logx_final_new = -(int(start_iteration) + int(block_size)) / int(nlive)
     return (
@@ -264,6 +272,9 @@ def _run_static_jax_rwalk_block(
         replacement_batches_block,
         replacement_chains_used_block,
         accepted_block,
+        new_u_block,
+        new_theta_block,
+        new_logl_block,
         logz_dead_new,
         logx_final_new,
     )
@@ -342,9 +353,8 @@ def _make_static_jax_rwalk_block_kernel(
             replacement_batches_used = (
                 replacement_ncall + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
             ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
-            replacement_chains_used = (
-                replacement_batches_used
-                * jnp.asarray(replacement_chains, dtype=jnp.int32)
+            replacement_chains_used = replacement_batches_used * jnp.asarray(
+                replacement_chains, dtype=jnp.int32
             )
             insertion_index = (
                 jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
@@ -366,15 +376,21 @@ def _make_static_jax_rwalk_block_kernel(
                 replacement_batches_used,
                 replacement_chains_used,
                 accepted,
+                new_u,
+                new_theta,
+                new_logl,
             )
 
         (
-            new_key,
-            new_live_u,
-            new_live_theta,
-            new_live_logl,
-            logz_dead_new,
-        ), block = lax.scan(
+            (
+                new_key,
+                new_live_u,
+                new_live_theta,
+                new_live_logl,
+                logz_dead_new,
+            ),
+            block,
+        ) = lax.scan(
             one_iteration,
             (key, live_u, live_theta, live_logl, jnp.asarray(logz_dead)),
             jnp.arange(block_size, dtype=jnp.int32),
@@ -389,6 +405,9 @@ def _make_static_jax_rwalk_block_kernel(
             replacement_batches_block,
             replacement_chains_used_block,
             accepted_block,
+            new_u_block,
+            new_theta_block,
+            new_logl_block,
         ) = block
         logx_final_new = -(
             jnp.asarray(start_iteration, dtype=jnp.float32)
@@ -408,6 +427,9 @@ def _make_static_jax_rwalk_block_kernel(
             replacement_batches_block,
             replacement_chains_used_block,
             accepted_block,
+            new_u_block,
+            new_theta_block,
+            new_logl_block,
             logz_dead_new,
             logx_final_new,
         )
@@ -1065,13 +1087,17 @@ def run_static_nested(
             else (
                 "fixed-rwalk-cached"
                 if jax_block_size > 1 and replacement_chain_schedule is None
-                else "adaptive-rwalk-uncached" if jax_block_size > 1 else None
+                else "adaptive-rwalk-uncached"
+                if jax_block_size > 1
+                else None
             )
         ),
         "jax_block_impl": (
             "python-loop-fixed-bound"
             if jax_block_size > 1 and bound != "none"
-            else "lax-scan-unbounded" if jax_block_size > 1 else None
+            else "lax-scan-unbounded"
+            if jax_block_size > 1
+            else None
         ),
     }
     checkpoint_path_str = (
@@ -1179,6 +1205,13 @@ def run_static_nested(
     consecutive_bound_failures = 0
     force_bound_rebuild = False
     bound_forced_rebuilds = 0
+    replacement_rescue_attempts = 0
+    replacement_rescue_successes = 0
+    replacement_rescue_failures = 0
+    replacement_rescue_stage_counts = {str(stage): 0 for stage in range(1, 5)}
+    replacement_rescue_ncall = 0
+    replacement_rescue_max_stage = None
+    replacement_rescue_last_message = None
 
     def current_state() -> NestedRunState:
         return NestedRunState(
@@ -1223,6 +1256,9 @@ def run_static_nested(
                 live_u, ndim, rwalk_proposal, rwalk_cov_jitter
             )
             logz_dead_before_block = logz_dead
+            live_u_before_block = live_u
+            live_theta_before_block = live_theta
+            live_logl_before_block = live_logl
             block_extra = None
             if bound in {"single", "multi"}:
                 if (
@@ -1234,8 +1270,7 @@ def run_static_nested(
                     if bound == "multi":
                         current_bound = build_multi_ellipsoid_bound(
                             live_u,
-                            enlargement=multi_bound_enlargement
-                            or bound_enlargement,
+                            enlargement=multi_bound_enlargement or bound_enlargement,
                             jitter=bound_jitter,
                             max_ellipsoids=multi_bound_max_ellipsoids,
                             min_points=multi_bound_min_points,
@@ -1353,26 +1388,66 @@ def run_static_nested(
                         max_attempts=max_attempts,
                         min_accepts=min_accepts,
                     )
-                (
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    dead_u_block,
-                    dead_theta_block,
-                    dead_logl_block,
-                    dead_logwt_block,
-                    replacement_ncall_block,
-                    insertion_indices_block,
-                    replacement_batches_block,
-                    replacement_chains_used_block,
-                    accepted_block,
-                    logz_dead,
-                    logx_final,
-                ) = result
+                if len(result) == 15:
+                    (
+                        key,
+                        live_u,
+                        live_theta,
+                        live_logl,
+                        dead_u_block,
+                        dead_theta_block,
+                        dead_logl_block,
+                        dead_logwt_block,
+                        replacement_ncall_block,
+                        insertion_indices_block,
+                        replacement_batches_block,
+                        replacement_chains_used_block,
+                        accepted_block,
+                        logz_dead,
+                        logx_final,
+                    ) = result
+                    new_u_block = dead_u_block
+                    new_theta_block = dead_theta_block
+                    new_logl_block = dead_logl_block
+                else:
+                    (
+                        key,
+                        live_u,
+                        live_theta,
+                        live_logl,
+                        dead_u_block,
+                        dead_theta_block,
+                        dead_logl_block,
+                        dead_logwt_block,
+                        replacement_ncall_block,
+                        insertion_indices_block,
+                        replacement_batches_block,
+                        replacement_chains_used_block,
+                        accepted_block,
+                        new_u_block,
+                        new_theta_block,
+                        new_logl_block,
+                        logz_dead,
+                        logx_final,
+                    ) = result
             block_start = iteration
             block_accepted = [bool(x) for x in np.asarray(accepted_block)]
             failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
+            rescue_capable_block = bound == "none" and len(result) != 15
+            full_dead_u_block = dead_u_block
+            full_dead_theta_block = dead_theta_block
+            full_dead_logl_block = dead_logl_block
+            full_dead_logwt_block = dead_logwt_block
+            full_replacement_ncall_block = replacement_ncall_block
+            full_replacement_batches_block = replacement_batches_block
+            full_replacement_chains_used_block = replacement_chains_used_block
+            full_new_u_block = new_u_block if rescue_capable_block else dead_u_block
+            full_new_theta_block = (
+                new_theta_block if rescue_capable_block else dead_theta_block
+            )
+            full_new_logl_block = (
+                new_logl_block if rescue_capable_block else dead_logl_block
+            )
             if failed_offsets:
                 replacement_failures += 1
                 success = False
@@ -1437,9 +1512,7 @@ def run_static_nested(
                 bound_unit_cube_acceptance_history.extend(
                     block_bound_unit_cube_acceptance
                 )
-                bound_overlap_rejection_history.extend(
-                    block_bound_overlap_rejections
-                )
+                bound_overlap_rejection_history.extend(block_bound_overlap_rejections)
             if replacement_chain_schedule is None:
                 chain_count = str(int(replacement_chains))
                 replacement_chain_usage_counts[chain_count] = (
@@ -1469,7 +1542,194 @@ def run_static_nested(
                     message = "converged after partial block before replacement failure"
                     terminated_after_partial_block_failure = True
                     maybe_checkpoint(final=True)
-                break
+                    break
+
+                rescue_success = False
+                if (
+                    bound == "none"
+                    and replacement_chain_schedule is None
+                    and rescue_capable_block
+                    and int(max_attempts) > int(walks) * int(replacement_chains)
+                ):
+                    fail_offset = int(failed_offsets[0])
+                    rescue_live_u = live_u_before_block
+                    rescue_live_theta = live_theta_before_block
+                    rescue_live_logl = live_logl_before_block
+                    for prior_offset in range(fail_offset):
+                        prior_worst = int(jnp.argmin(rescue_live_logl))
+                        rescue_live_u = rescue_live_u.at[prior_worst].set(
+                            full_new_u_block[prior_offset]
+                        )
+                        rescue_live_theta = rescue_live_theta.at[prior_worst].set(
+                            full_new_theta_block[prior_offset]
+                        )
+                        rescue_live_logl = rescue_live_logl.at[prior_worst].set(
+                            full_new_logl_block[prior_offset]
+                        )
+                    rescue_worst = int(jnp.argmin(rescue_live_logl))
+                    rescue_logl_min = float(full_dead_logl_block[fail_offset])
+                    rescue_schedule = (
+                        (
+                            1,
+                            0.75,
+                            max(int(walks) * 2, int(walks) + 1),
+                            int(replacement_chains),
+                            int(min_accepts),
+                        ),
+                        (
+                            2,
+                            0.5,
+                            max(int(walks) * 3, int(walks) + 1),
+                            max(int(replacement_chains) * 2, int(replacement_chains)),
+                            int(min_accepts),
+                        ),
+                        (
+                            3,
+                            0.35,
+                            max(int(walks) * 4, int(walks) + 1),
+                            max(int(replacement_chains) * 2, int(replacement_chains)),
+                            max(1, int(min_accepts) // 2),
+                        ),
+                        (
+                            4,
+                            0.25,
+                            max(int(walks) * 5, int(walks) + 1),
+                            max(int(replacement_chains) * 4, int(replacement_chains)),
+                            1,
+                        ),
+                    )
+                    for (
+                        stage,
+                        scale_factor,
+                        stage_walks,
+                        stage_chains,
+                        stage_min_accepts,
+                    ) in rescue_schedule:
+                        replacement_rescue_attempts += 1
+                        replacement_rescue_stage_counts[str(stage)] += 1
+                        replacement_rescue_max_stage = int(stage)
+                        stage_max_attempts = max(
+                            int(max_attempts), int(stage_walks) * int(stage_chains)
+                        )
+                        proposal_chol_stage = _rwalk_proposal_chol(
+                            rescue_live_u, ndim, rwalk_proposal, rwalk_cov_jitter
+                        )
+                        rescue_result = draw_constrained_rwalk_jax(
+                            key,
+                            loglike,
+                            prior_transform,
+                            rescue_logl_min,
+                            rescue_live_u,
+                            rescue_live_logl,
+                            ndim,
+                            walks=int(stage_walks),
+                            step_scale=float(step_scale) * float(scale_factor),
+                            max_attempts=stage_max_attempts,
+                            min_accepts=int(stage_min_accepts),
+                            replacement_chains=int(stage_chains),
+                            proposal_chol=proposal_chol_stage,
+                        )
+                        (
+                            key,
+                            rescued_u,
+                            rescued_theta,
+                            rescued_logl,
+                            rescue_calls,
+                            rescue_accepted,
+                        ) = rescue_result
+                        rescue_calls = int(rescue_calls)
+                        replacement_rescue_ncall += rescue_calls
+                        if bool(rescue_accepted):
+                            replacement_rescue_successes += 1
+                            rescue_success = True
+                            success = True
+                            message = "converged"
+                            replacement_rescue_last_message = (
+                                f"replacement rescue stage {stage} succeeded"
+                            )
+                            fail_stop = block_start + fail_offset + 1
+                            dead_u_storage[block_start:fail_stop] = np.asarray(
+                                full_dead_u_block[: fail_offset + 1]
+                            )
+                            dead_theta_storage[block_start:fail_stop] = np.asarray(
+                                full_dead_theta_block[: fail_offset + 1]
+                            )
+                            dead_logl_storage[block_start:fail_stop] = np.asarray(
+                                full_dead_logl_block[: fail_offset + 1]
+                            )
+                            dead_logwt_storage[block_start:fail_stop] = np.asarray(
+                                full_dead_logwt_block[: fail_offset + 1]
+                            )
+                            failed_calls = int(
+                                full_replacement_ncall_block[fail_offset]
+                            )
+                            replacement_ncall.append(failed_calls + rescue_calls)
+                            replacement_batches.append(
+                                int(full_replacement_batches_block[fail_offset])
+                                + int(
+                                    math.ceil(
+                                        rescue_calls
+                                        / (int(stage_walks) * int(stage_chains))
+                                    )
+                                )
+                            )
+                            replacement_chains_used.append(
+                                int(full_replacement_chains_used_block[fail_offset])
+                                + int(stage_chains)
+                                * int(
+                                    math.ceil(
+                                        rescue_calls
+                                        / (int(stage_walks) * int(stage_chains))
+                                    )
+                                )
+                            )
+                            chain_count = str(int(stage_chains))
+                            replacement_chain_usage_counts[chain_count] = (
+                                replacement_chain_usage_counts.get(chain_count, 0)
+                                + int(
+                                    math.ceil(
+                                        rescue_calls
+                                        / (int(stage_walks) * int(stage_chains))
+                                    )
+                                )
+                            )
+                            insertion_indices.append(
+                                int(
+                                    jnp.sum(rescue_live_logl <= rescued_logl)
+                                    - (rescue_live_logl[rescue_worst] <= rescued_logl)
+                                )
+                            )
+                            logz_dead = float(
+                                jnp.logaddexp(
+                                    logz_dead, float(full_dead_logwt_block[fail_offset])
+                                )
+                            )
+                            logx_final = -fail_stop / int(nlive)
+                            rescue_live_u = rescue_live_u.at[rescue_worst].set(
+                                rescued_u
+                            )
+                            rescue_live_theta = rescue_live_theta.at[rescue_worst].set(
+                                rescued_theta
+                            )
+                            rescue_live_logl = rescue_live_logl.at[rescue_worst].set(
+                                rescued_logl
+                            )
+                            live_u, live_theta, live_logl = (
+                                rescue_live_u,
+                                rescue_live_theta,
+                                rescue_live_logl,
+                            )
+                            ncall += failed_calls + rescue_calls
+                            iteration = fail_stop
+                            break
+                    if not rescue_success:
+                        replacement_rescue_failures += 1
+                        replacement_rescue_last_message = (
+                            "replacement rescue failed after "
+                            f"{replacement_rescue_attempts} attempts; {message}"
+                        )
+                if not rescue_success:
+                    break
 
             delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
             final_delta_logz = delta_logz
@@ -1482,7 +1742,11 @@ def run_static_nested(
                 logz=logz_dead,
                 dlogz=delta_logz,
                 ncall=ncall,
-                logl_min=float(dead_logl_block[-1]),
+                logl_min=float(
+                    dead_logl_block[-1]
+                    if len(dead_logl_block)
+                    else dead_logl_storage[iteration - 1]
+                ),
                 logl_live_max=float(jnp.max(live_logl)),
                 sample=sample,
                 nlive=nlive,
@@ -2116,13 +2380,17 @@ def run_static_nested(
                 else (
                     "fixed-rwalk-cached"
                     if jax_block_size > 1 and replacement_chain_schedule is None
-                    else "adaptive-rwalk-uncached" if jax_block_size > 1 else None
+                    else "adaptive-rwalk-uncached"
+                    if jax_block_size > 1
+                    else None
                 )
             ),
             "jax_block_impl": (
                 "python-loop-fixed-bound"
                 if jax_block_size > 1 and bound != "none"
-                else "lax-scan-unbounded" if jax_block_size > 1 else None
+                else "lax-scan-unbounded"
+                if jax_block_size > 1
+                else None
             ),
             "dlogz": dlogz,
             "maxiter": maxiter,
@@ -2155,6 +2423,14 @@ def run_static_nested(
             "insertion_index_nslots": nlive,
             "insertion_index_nlive": nlive - 1,
             "replacement_failures": int(replacement_failures),
+            "replacement_rescue_used": bool(replacement_rescue_attempts > 0),
+            "replacement_rescue_attempts": int(replacement_rescue_attempts),
+            "replacement_rescue_successes": int(replacement_rescue_successes),
+            "replacement_rescue_failures": int(replacement_rescue_failures),
+            "replacement_rescue_stage_counts": dict(replacement_rescue_stage_counts),
+            "replacement_rescue_ncall": int(replacement_rescue_ncall),
+            "replacement_rescue_max_stage": replacement_rescue_max_stage,
+            "replacement_rescue_last_message": replacement_rescue_last_message,
             "terminated_after_partial_block_failure": bool(
                 terminated_after_partial_block_failure
             ),

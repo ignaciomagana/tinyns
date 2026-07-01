@@ -145,6 +145,8 @@ These results support keeping `jax_block_size=32` as the recommended fast path f
 
 These results do not promote live-cov, bounds, fused bounds, or bounded block mode. Live-cov had concerning analytic pull behavior, and fused bounded still had one eggbox replacement failure. Experimental settings still require target-specific validation.
 
+On rare constrained-replacement failures, the unbounded JAX `rwalk` block path may retry the same contour with an internal smaller-step/longer-walk rescue schedule before declaring failure. Rescue usage is recorded in result metadata. This is a robustness mechanism, not a substitute for target-specific mixing validation.
+
 #### Extended block-size smoke: B64 and B128
 
 An extended unbounded JAX rwalk block-size smoke run also tested `jax_block_size=64` and `jax_block_size=128` on the included validation targets. B16, B32, B64, and B128 all completed with 50/50 success and zero replacement failures. B64 and B128 were faster on these cheap toy targets, with B128 giving the fastest wall time, but larger block sizes increased ncall/niter overshoot. B32 remains the recommended default because it captures most of the speedup with a smaller overshoot cost.
