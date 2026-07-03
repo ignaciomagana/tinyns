@@ -100,18 +100,13 @@ def loglike(theta):
     # Curved chirp-mass / mass-ratio ridge.
     dq = q - TRUTH["q"]
     mchirp_ridge = TRUTH["mchirp"] + 9.0 * dq**2 - 1.4 * dq
-    logl_mass = -0.5 * (
-        ((mchirp - mchirp_ridge) / 0.38) ** 2 + (dq / 0.10) ** 2
-    )
+    logl_mass = -0.5 * (((mchirp - mchirp_ridge) / 0.38) ** 2 + (dq / 0.10) ** 2)
 
     # Bounded spin structure with spin-mass-ratio coupling.
-    chi_eff_ridge = TRUTH["chi_eff"] + 0.55 * dq - 0.35 * (
-        chi_p - TRUTH["chi_p"]
-    )
+    chi_eff_ridge = TRUTH["chi_eff"] + 0.55 * dq - 0.35 * (chi_p - TRUTH["chi_p"])
     chi_p_ridge = TRUTH["chi_p"] + 0.16 * dq**2 - 0.05 * dq
     logl_spin = -0.5 * (
-        ((chi_eff - chi_eff_ridge) / 0.055) ** 2
-        + ((chi_p - chi_p_ridge) / 0.060) ** 2
+        ((chi_eff - chi_eff_ridge) / 0.055) ** 2 + ((chi_p - chi_p_ridge) / 0.060) ** 2
     )
 
     # Distance/inclination amplitude degeneracy.
@@ -128,9 +123,7 @@ def loglike(theta):
 
     mirror_ra = _wrap_periodic(ra - (TRUTH["ra"] + jnp.pi), 2.0 * jnp.pi)
     mirror_dec = -TRUTH["dec"] + 0.18 * jnp.sin(2.0 * mirror_ra + 0.4)
-    mirror = -0.5 * (
-        (mirror_ra / 0.22) ** 2 + ((dec - mirror_dec) / 0.09) ** 2
-    ) - 0.45
+    mirror = -0.5 * ((mirror_ra / 0.22) ** 2 + ((dec - mirror_dec) / 0.09) ** 2) - 0.45
 
     logl_sky = jax.nn.logsumexp(jnp.array([primary, mirror]))
 
@@ -177,6 +170,8 @@ def _make_sampler(args: argparse.Namespace) -> NestedSampler:
         min_accepts=args.min_accepts,
         max_attempts=args.max_attempts,
         jax_block_size=args.jax_block_size,
+        rwalk_adaptive_step_scale=args.rwalk_adaptive_step_scale,
+        rwalk_target_accept=args.rwalk_target_accept,
     )
 
 
@@ -369,6 +364,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-accepts", type=int, default=3)
     parser.add_argument("--max-attempts", type=int, default=20000)
     parser.add_argument("--jax-block-size", type=int, default=32)
+    parser.add_argument("--rwalk-adaptive-step-scale", action="store_true")
+    parser.add_argument("--rwalk-target-accept", type=float, default=0.25)
     parser.add_argument("--output-dir", type=Path, default=Path("gw_like_10d_results"))
     parser.add_argument("--n-plot-samples", type=int, default=3000)
     parser.add_argument("--max-plot-points", type=int, default=3000)
@@ -409,6 +406,8 @@ def main(argv: list[str] | None = None) -> None:
             "min_accepts": args.min_accepts,
             "max_attempts": args.max_attempts,
             "jax_block_size": args.jax_block_size,
+            "rwalk_adaptive_step_scale": args.rwalk_adaptive_step_scale,
+            "rwalk_target_accept": args.rwalk_target_accept,
         },
         "truth": dict(TRUTH),
         "parameter_names": PARAMETER_NAMES,

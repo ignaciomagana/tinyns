@@ -241,6 +241,13 @@ The only currently recommended fast path is unbounded JAX rwalk with isotropic p
 
 Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before relying on it for scientific results.
 
+
+### Experimental adaptive rwalk step scale
+
+`rwalk_adaptive_step_scale=True` is an explicitly experimental JAX-only rwalk option that adapts the isotropic rwalk proposal scale from constrained-replacement acceptance telemetry. The default remains off, `step_scale=0.1` remains unchanged, and the recommended B32 path is still `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `step_scale=0.1`, `min_accepts=1`, `replacement_chains=1`, `replacement_chain_schedule=None`, `bound="none"`, and `jax_block_size=32`.
+
+This is intended for hard-target diagnostics where a fixed rwalk scale is a poor compromise. It is not a dynesty replacement, does not add slice/rslice or `sample="bound"`, and is not a substitute for checking insertion-rank diagnostics, replacement diagnostics, and seed/config stability on the target.
+
 ### Bounded rwalk
 
 For experimental dynesty-style bounded rwalk, use both a bound and bound seeding:

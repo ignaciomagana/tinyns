@@ -602,6 +602,8 @@ def test_recommended_rwalk_jax_isotropic_cached_block_b32_records_metadata() -> 
     assert math.isfinite(result.logz)
     assert result.ncall > 0
     assert result.metadata["niter"] > 0
+    assert result.metadata.get("rwalk_adaptive_step_scale") is False
+    assert "rwalk_adaptation_updates" not in result.metadata
 
 
 def test_nested_sampler_rwalk_jax_cached_b32_block_close_to_non_block() -> None:
@@ -1160,3 +1162,47 @@ def test_jax_bounded_block_rwalk_failure_returns_failed_result() -> None:
     assert "bounded JAX rwalk" in result.message
     assert "max_attempts=1" in result.message
     assert result.metadata["jax_block_impl"] == "python-loop-fixed-bound"
+
+
+def test_update_adaptive_step_scale_direction_and_clamps() -> None:
+    from tinyns.run import _update_adaptive_step_scale
+
+    assert _update_adaptive_step_scale(0.1, 0.05, 0.25, 0.1, 1e-4, 0.5) < 0.1
+    assert _update_adaptive_step_scale(0.1, 0.75, 0.25, 0.1, 1e-4, 0.5) > 0.1
+    assert _update_adaptive_step_scale(
+        0.1, 0.25, 0.25, 0.1, 1e-4, 0.5
+    ) == pytest.approx(0.1)
+    assert _update_adaptive_step_scale(
+        1e-4, 0.0, 1.0, 10.0, 1e-4, 0.5
+    ) == pytest.approx(1e-4)
+    assert _update_adaptive_step_scale(0.5, 1.0, 0.0, 10.0, 1e-4, 0.5) == pytest.approx(
+        0.5
+    )
+
+
+def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None:
+    from tinyns import NestedSampler
+
+    sampler = NestedSampler(
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
+        ndim=2,
+        nlive=32,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.05,
+        jax_block_size=4,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.25,
+    )
+    result = sampler.run(random.PRNGKey(314), dlogz=2.0, maxiter=120)
+
+    assert result.success is True
+    assert result.metadata["rwalk_adaptive_step_scale"] is True
+    assert result.metadata["rwalk_target_accept"] == pytest.approx(0.25)
+    assert math.isfinite(result.metadata["rwalk_effective_step_scale_final"])
+    assert math.isfinite(result.metadata["rwalk_effective_step_scale_min_seen"])
+    assert math.isfinite(result.metadata["rwalk_effective_step_scale_max_seen"])
+    assert math.isfinite(result.metadata["rwalk_effective_step_scale_mean"])
+    assert result.metadata["rwalk_adaptation_updates"] > 0

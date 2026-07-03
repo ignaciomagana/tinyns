@@ -343,6 +343,25 @@ Do not compare wall time between runs that print progress every iteration; progr
 
 The 10D GW-like template is intentionally harder than the included low-dimensional validation targets. It should be treated as a constrained-replacement mixing stress test, not as a new default configuration. It is not a production gravitational-wave parameter-estimation likelihood, and mechanically clean behavior on this target should not be presented as evidence that TinyNS is production-ready for arbitrary GW parameter estimation.
 
+
+Experimental adaptive step-scale smoke command (not a default; validate insertion ranks and replacement diagnostics before relying on it):
+
+```bash
+python benchmarks/templates/gw_like_10d_tinyns_b32_figures.py \
+  --seeds 0 \
+  --nlive 1000 \
+  --dlogz 0.5 \
+  --maxiter 20000 \
+  --walks 20 \
+  --replacement-chains 16 \
+  --step-scale 0.03 \
+  --jax-block-size 32 \
+  --rwalk-adaptive-step-scale \
+  --no-plots
+```
+
+`rwalk_adaptive_step_scale=True` is experimental and defaults off. It adapts the isotropic JAX rwalk proposal scale from replacement acceptance telemetry for hard-target diagnostics; it does not change the recommended B32 path, does not make TinyNS a dynesty replacement, and is not a substitute for checking insertion-rank diagnostics.
+
 Local runs found that weak `rwalk` settings can reach high posterior ESS and apparent convergence while still showing badly biased insertion ranks. Increasing target-specific local `rwalk` mixing fixes that insertion-rank pathology, but the stronger settings are expensive and should remain a hard-target diagnostic recipe. They are not new defaults, are not part of the release gate, and do not change the recommended fast path for the included low-dimensional validation suite:
 
 ```text
