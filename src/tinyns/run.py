@@ -184,6 +184,8 @@ def _run_static_jax_rwalk_block(
                 new_logl,
                 replacement_ncall,
                 accepted,
+                accepted_move_count,
+                total_proposal_count,
             ) = rwalk_kernel(
                 key,
                 logl_worst,
@@ -211,6 +213,8 @@ def _run_static_jax_rwalk_block(
                 replacement_batches_used,
                 replacement_chains_used,
                 _last_chain_count,
+                accepted_move_count,
+                total_proposal_count,
             ) = adaptive_rwalk_kernel(
                 key,
                 logl_worst,
@@ -239,6 +243,8 @@ def _run_static_jax_rwalk_block(
             replacement_batches_used,
             replacement_chains_used,
             accepted,
+            accepted_move_count,
+            total_proposal_count,
             new_u,
             new_theta,
             new_logl,
@@ -268,6 +274,8 @@ def _run_static_jax_rwalk_block(
         replacement_batches_block,
         replacement_chains_used_block,
         accepted_block,
+        accepted_move_count_block,
+        total_proposal_count_block,
         new_u_block,
         new_theta_block,
         new_logl_block,
@@ -287,6 +295,8 @@ def _run_static_jax_rwalk_block(
         replacement_batches_block,
         replacement_chains_used_block,
         accepted_block,
+        accepted_move_count_block,
+        total_proposal_count_block,
         new_u_block,
         new_theta_block,
         new_logl_block,
@@ -355,6 +365,8 @@ def _make_static_jax_rwalk_block_kernel(
                 new_logl,
                 replacement_ncall,
                 accepted,
+                accepted_move_count,
+                total_proposal_count,
             ) = rwalk_kernel(
                 key,
                 logl_worst,
@@ -391,6 +403,8 @@ def _make_static_jax_rwalk_block_kernel(
                 replacement_batches_used,
                 replacement_chains_used,
                 accepted,
+                accepted_move_count,
+                total_proposal_count,
                 new_u,
                 new_theta,
                 new_logl,
@@ -420,6 +434,8 @@ def _make_static_jax_rwalk_block_kernel(
             replacement_batches_block,
             replacement_chains_used_block,
             accepted_block,
+            accepted_move_count_block,
+            total_proposal_count_block,
             new_u_block,
             new_theta_block,
             new_logl_block,
@@ -442,6 +458,8 @@ def _make_static_jax_rwalk_block_kernel(
             replacement_batches_block,
             replacement_chains_used_block,
             accepted_block,
+            accepted_move_count_block,
+            total_proposal_count_block,
             new_u_block,
             new_theta_block,
             new_logl_block,
@@ -1311,6 +1329,8 @@ def run_static_nested(
             live_theta_before_block = live_theta
             live_logl_before_block = live_logl
             block_extra = None
+            accepted_move_count_block = None
+            total_proposal_count_block = None
             if bound in {"single", "multi"}:
                 if (
                     current_bound is None
@@ -1466,6 +1486,31 @@ def run_static_nested(
                     new_u_block = dead_u_block
                     new_theta_block = dead_theta_block
                     new_logl_block = dead_logl_block
+                    accepted_move_count_block = None
+                    total_proposal_count_block = None
+                elif len(result) == 20:
+                    (
+                        key,
+                        live_u,
+                        live_theta,
+                        live_logl,
+                        dead_u_block,
+                        dead_theta_block,
+                        dead_logl_block,
+                        dead_logwt_block,
+                        replacement_ncall_block,
+                        insertion_indices_block,
+                        replacement_batches_block,
+                        replacement_chains_used_block,
+                        accepted_block,
+                        accepted_move_count_block,
+                        total_proposal_count_block,
+                        new_u_block,
+                        new_theta_block,
+                        new_logl_block,
+                        logz_dead,
+                        logx_final,
+                    ) = result
                 else:
                     (
                         key,
@@ -1487,6 +1532,8 @@ def run_static_nested(
                         logz_dead,
                         logx_final,
                     ) = result
+                    accepted_move_count_block = None
+                    total_proposal_count_block = None
             block_start = iteration
             block_accepted = [bool(x) for x in np.asarray(accepted_block)]
             failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
@@ -1535,6 +1582,9 @@ def run_static_nested(
             replacement_chains_used_block = replacement_chains_used_block[
                 :block_size_now
             ]
+            if accepted_move_count_block is not None:
+                accepted_move_count_block = accepted_move_count_block[:block_size_now]
+                total_proposal_count_block = total_proposal_count_block[:block_size_now]
             dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
             dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
             dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
@@ -1570,12 +1620,16 @@ def run_static_nested(
                     block_bound_unit_cube_acceptance
                 )
                 bound_overlap_rejection_history.extend(block_bound_overlap_rejections)
-            if block_batches and sample == "rwalk" and kernel == "jax":
-                observed = float(
-                    sum(1 for ok in block_accepted[:block_size_now] if ok)
-                    / max(sum(block_batches), 1)
-                )
-                update_adaptive_scale(observed)
+            if (
+                sample == "rwalk"
+                and kernel == "jax"
+                and accepted_move_count_block is not None
+                and total_proposal_count_block is not None
+            ):
+                total_moves = int(np.sum(np.asarray(accepted_move_count_block)))
+                total_proposals = int(np.sum(np.asarray(total_proposal_count_block)))
+                if total_proposals > 0:
+                    update_adaptive_scale(total_moves / total_proposals)
             if replacement_chain_schedule is None:
                 chain_count = str(int(replacement_chains))
                 replacement_chain_usage_counts[chain_count] = (
@@ -2103,6 +2157,11 @@ def run_static_nested(
                             {
                                 "proposal_chol": proposal_chol,
                                 "jax_vectorized": jax_vectorized,
+                                **(
+                                    {"return_info": rwalk_adaptive_step_scale}
+                                    if replacement_chain_schedule is None
+                                    else {}
+                                ),
                             }
                             if kernel == "jax"
                             else {}
@@ -2169,6 +2228,14 @@ def run_static_nested(
                             replacement_chain_usage_counts.get(chain_count, 0)
                             + int(count)
                         )
+                    total_proposals = int(
+                        replacement_info.get("total_proposal_count", 0)
+                    )
+                    if total_proposals > 0:
+                        update_adaptive_scale(
+                            int(replacement_info.get("accepted_move_count", 0))
+                            / total_proposals
+                        )
                 elif draw_result is not None:
                     key, new_u, new_theta, new_logl, calls, accepted = draw_result
                     if kernel == "jax":
@@ -2187,9 +2254,8 @@ def run_static_nested(
                             replacement_chain_usage_counts.get(chain_count, 0)
                             + batches_used
                         )
-                        update_adaptive_scale(
-                            float(bool(accepted)) / max(batches_used, 1)
-                        )
+                        # Adaptive scale updates require true rwalk move-acceptance
+                        # telemetry, which legacy six-item draw results do not provide.
                     else:
                         replacement_batches.append(1)
                         replacement_chains_used.append(1)
@@ -2449,6 +2515,7 @@ def run_static_nested(
                     if adaptive_accept_history
                     else 0.0
                 ),
+                "rwalk_observed_accept_source": "move_acceptance",
             }
         )
 

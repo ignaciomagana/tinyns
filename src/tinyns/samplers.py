@@ -601,10 +601,11 @@ def _make_rwalk_jax_kernel(
         initial_ncall = jnp.asarray(0, dtype=jnp.int32)
         initial_done = jnp.asarray(False)
         initial_batch_index = jnp.asarray(0, dtype=jnp.int32)
+        initial_accepted_move_count = jnp.asarray(0, dtype=jnp.int32)
         batch_ncall = jnp.asarray(walks * replacement_chains, dtype=jnp.int32)
 
         def cond(state):
-            return (~state[2]) & (state[10] < max_batches)
+            return (~state[2]) & (state[11] < max_batches)
 
         def body(state):
             (
@@ -618,6 +619,7 @@ def _make_rwalk_jax_kernel(
                 best_u,
                 best_theta,
                 best_logl,
+                accepted_move_count,
                 batch_index,
             ) = state
 
@@ -732,6 +734,7 @@ def _make_rwalk_jax_kernel(
             out_theta = jnp.where(any_success, current_theta[selected_idx], out_theta)
             out_logl = jnp.where(any_success, current_logl[selected_idx], out_logl)
             ncall = ncall + batch_ncall
+            accepted_move_count = accepted_move_count + jnp.sum(accepted_moves)
             batch_index = batch_index + jnp.asarray(1, dtype=jnp.int32)
             return (
                 key,
@@ -744,6 +747,7 @@ def _make_rwalk_jax_kernel(
                 best_u,
                 best_theta,
                 best_logl,
+                accepted_move_count,
                 batch_index,
             )
 
@@ -758,6 +762,7 @@ def _make_rwalk_jax_kernel(
             best_u,
             best_theta,
             best_logl,
+            accepted_move_count,
             _batch_index,
         ) = lax.while_loop(
             cond,
@@ -773,13 +778,23 @@ def _make_rwalk_jax_kernel(
                 template_u,
                 template_theta,
                 initial_best_logl,
+                initial_accepted_move_count,
                 initial_batch_index,
             ),
         )
         new_u = jnp.where(done, out_u, best_u)
         new_theta = jnp.where(done, out_theta, best_theta)
         new_logl = jnp.where(done, out_logl, best_logl)
-        return key, new_u, new_theta, new_logl, ncall, accepted
+        return (
+            key,
+            new_u,
+            new_theta,
+            new_logl,
+            ncall,
+            accepted,
+            accepted_move_count,
+            ncall,
+        )
 
     return kernel
 
@@ -814,7 +829,17 @@ def _make_rwalk_jax_adaptive_kernel(
         initial_best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
 
         def cond(state):
-            _key, ncall, done, *_rest, stage_index, _batches, _chains, _last = state
+            (
+                _key,
+                ncall,
+                done,
+                *_rest,
+                stage_index,
+                _batches,
+                _chains,
+                _accepted_moves,
+                _last,
+            ) = state
             next_c = jnp.where(
                 stage_index < len(schedule), schedule_array[stage_index], schedule[-1]
             )
@@ -834,6 +859,7 @@ def _make_rwalk_jax_adaptive_kernel(
                 stage_index,
                 batches,
                 chains_used,
+                accepted_move_count,
                 _last_chain_count,
             ) = state
             chain_count = jnp.where(
@@ -947,6 +973,7 @@ def _make_rwalk_jax_adaptive_kernel(
                 stage_index + jnp.asarray(1, dtype=jnp.int32),
                 batches + jnp.asarray(1, dtype=jnp.int32),
                 chains_used + chain_count,
+                accepted_move_count + jnp.sum(accepted_moves),
                 chain_count,
             )
 
@@ -960,6 +987,7 @@ def _make_rwalk_jax_adaptive_kernel(
             template_u,
             template_theta,
             initial_best_logl,
+            jnp.asarray(0, dtype=jnp.int32),
             jnp.asarray(0, dtype=jnp.int32),
             jnp.asarray(0, dtype=jnp.int32),
             jnp.asarray(0, dtype=jnp.int32),
@@ -978,6 +1006,7 @@ def _make_rwalk_jax_adaptive_kernel(
             _stage_index,
             batches,
             chains_used,
+            accepted_move_count,
             last_chain_count,
         ) = lax.while_loop(cond, body, initial)
         new_u = jnp.where(done, out_u, best_u)
@@ -993,6 +1022,8 @@ def _make_rwalk_jax_adaptive_kernel(
             batches,
             chains_used,
             last_chain_count,
+            accepted_move_count,
+            ncall,
         )
 
     return kernel
@@ -1047,6 +1078,7 @@ def draw_constrained_rwalk_jax(
     replacement_chains: int = 1,
     proposal_chol=None,
     jax_vectorized: bool = False,
+    return_info: bool = False,
 ):
     """Draw a constrained replacement with a compiled JAX rwalk kernel."""
     if ndim <= 0:
@@ -1093,7 +1125,16 @@ def draw_constrained_rwalk_jax(
         bool(jax_vectorized),
     )
     max_batches = max_attempts // batch_ncall
-    new_key, new_u, new_theta, new_logl, ncall, accepted = kernel(
+    (
+        new_key,
+        new_u,
+        new_theta,
+        new_logl,
+        ncall,
+        accepted,
+        accepted_move_count,
+        total_proposal_count,
+    ) = kernel(
         key,
         jnp.asarray(logl_min),
         live_u,
@@ -1103,6 +1144,29 @@ def draw_constrained_rwalk_jax(
         jnp.asarray(max_batches, dtype=jnp.int32),
         proposal_chol,
     )
+    if return_info:
+        batches = int(math.ceil(int(ncall) / batch_ncall))
+        info = {
+            "replacement_batches": batches,
+            "replacement_chains_used": int(replacement_chains) * batches,
+            "replacement_chain_usage_counts": {str(int(replacement_chains)): batches},
+            "accepted_move_count": int(accepted_move_count),
+            "total_proposal_count": int(total_proposal_count),
+            "observed_rwalk_acceptance": (
+                float(accepted_move_count) / float(total_proposal_count)
+                if int(total_proposal_count) > 0
+                else 0.0
+            ),
+        }
+        return (
+            new_key,
+            new_u,
+            new_theta,
+            float(new_logl),
+            int(ncall),
+            bool(accepted),
+            info,
+        )
     return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
 
 
@@ -1176,8 +1240,17 @@ def draw_constrained_single_bound_rwalk_jax(
             replacement_chains=replacement_chains,
             proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
+            return_info=True,
         )
-        key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
+        (
+            key,
+            new_u,
+            new_theta,
+            new_logl,
+            rwalk_ncall,
+            accepted,
+            rwalk_info,
+        ) = rwalk_result
         batch_ncall = int(walks) * int(replacement_chains)
         replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
         rwalk_info = {
@@ -1186,6 +1259,7 @@ def draw_constrained_single_bound_rwalk_jax(
             "replacement_chain_usage_counts": {
                 str(int(replacement_chains)): replacement_batches
             },
+            **rwalk_info,
         }
     else:
         rwalk_result = draw_constrained_rwalk_jax_adaptive_from_seed(
@@ -1308,8 +1382,17 @@ def draw_constrained_multi_bound_rwalk_jax(
             replacement_chains=replacement_chains,
             proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
+            return_info=True,
         )
-        key, new_u, new_theta, new_logl, rwalk_ncall, accepted = rwalk_result
+        (
+            key,
+            new_u,
+            new_theta,
+            new_logl,
+            rwalk_ncall,
+            accepted,
+            rwalk_info,
+        ) = rwalk_result
         batch_ncall = int(walks) * int(replacement_chains)
         replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
         rwalk_info = {
@@ -1318,6 +1401,7 @@ def draw_constrained_multi_bound_rwalk_jax(
             "replacement_chain_usage_counts": {
                 str(int(replacement_chains)): replacement_batches
             },
+            **rwalk_info,
         }
     else:
         rwalk_result = draw_constrained_rwalk_jax_adaptive_from_seed(
@@ -1382,6 +1466,8 @@ def draw_constrained_rwalk_jax_adaptive(
         replacement_chain_schedule, walks, max_attempts
     )
     total_ncall = 0
+    accepted_move_count = 0
+    total_proposal_count = 0
     best_u = None
     best_theta = None
     best_logl = -float("inf")
@@ -1405,6 +1491,7 @@ def draw_constrained_rwalk_jax_adaptive(
             replacement_chains=int(c),
             proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
+            return_info=True,
         )
 
     c = schedule[-1]
@@ -1416,10 +1503,18 @@ def draw_constrained_rwalk_jax_adaptive(
         batch_budget = int(walks) * int(c)
         if total_ncall + batch_budget > int(max_attempts):
             break
-        key, candidate_u, candidate_theta, candidate_logl, ncall, accepted = try_batch(
-            key, c
-        )
+        (
+            key,
+            candidate_u,
+            candidate_theta,
+            candidate_logl,
+            ncall,
+            accepted,
+            batch_info,
+        ) = try_batch(key, c)
         total_ncall += int(ncall)
+        accepted_move_count += int(batch_info["accepted_move_count"])
+        total_proposal_count += int(batch_info["total_proposal_count"])
         batches += 1
         chains_used += int(c)
         usage_counts[int(c)] = usage_counts.get(int(c), 0) + 1
@@ -1434,6 +1529,13 @@ def draw_constrained_rwalk_jax_adaptive(
             "replacement_chain_usage_counts": {
                 str(k): v for k, v in usage_counts.items()
             },
+            "accepted_move_count": int(accepted_move_count),
+            "total_proposal_count": int(total_proposal_count),
+            "observed_rwalk_acceptance": (
+                float(accepted_move_count) / float(total_proposal_count)
+                if total_proposal_count > 0
+                else 0.0
+            ),
         }
         if accepted:
             return (
@@ -1453,6 +1555,13 @@ def draw_constrained_rwalk_jax_adaptive(
         "replacement_chains_used": chains_used,
         "replacement_last_chain_count": int(c),
         "replacement_chain_usage_counts": {str(k): v for k, v in usage_counts.items()},
+        "accepted_move_count": int(accepted_move_count),
+        "total_proposal_count": int(total_proposal_count),
+        "observed_rwalk_acceptance": (
+            float(accepted_move_count) / float(total_proposal_count)
+            if total_proposal_count > 0
+            else 0.0
+        ),
     }
     return key, best_u, best_theta, best_logl, total_ncall, False, info
 
