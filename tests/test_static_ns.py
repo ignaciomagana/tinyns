@@ -1180,6 +1180,88 @@ def test_update_adaptive_step_scale_direction_and_clamps() -> None:
     )
 
 
+def test_rwalk_adaptive_step_scale_uses_low_move_acceptance_to_shrink(
+    monkeypatch,
+) -> None:
+    import tinyns.run as run_mod
+    from tinyns import NestedSampler
+
+    def fake_draw(
+        key, loglike, prior_transform, logl_min, live_u, live_logl, ndim, **kwargs
+    ):
+        new_u = live_u[0]
+        new_theta = prior_transform(new_u)
+        info = {
+            "replacement_batches": 1,
+            "replacement_chains_used": 1,
+            "replacement_chain_usage_counts": {"1": 1},
+            "accepted_move_count": 1,
+            "total_proposal_count": 20,
+            "observed_rwalk_acceptance": 0.05,
+        }
+        return key, new_u, new_theta, float(loglike(new_theta)), 20, True, info
+
+    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", fake_draw)
+    sampler = NestedSampler(
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
+        ndim=2,
+        nlive=16,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.1,
+        jax_block_size=1,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.25,
+    )
+    result = sampler.run(random.PRNGKey(123), dlogz=10.0, maxiter=3)
+
+    assert result.metadata["rwalk_effective_step_scale_final"] < 0.1
+    assert result.metadata["rwalk_observed_accept_mean"] == pytest.approx(0.05)
+
+
+def test_rwalk_adaptive_step_scale_uses_high_move_acceptance_to_grow(
+    monkeypatch,
+) -> None:
+    import tinyns.run as run_mod
+    from tinyns import NestedSampler
+
+    def fake_draw(
+        key, loglike, prior_transform, logl_min, live_u, live_logl, ndim, **kwargs
+    ):
+        new_u = live_u[0]
+        new_theta = prior_transform(new_u)
+        info = {
+            "replacement_batches": 1,
+            "replacement_chains_used": 1,
+            "replacement_chain_usage_counts": {"1": 1},
+            "accepted_move_count": 15,
+            "total_proposal_count": 20,
+            "observed_rwalk_acceptance": 0.75,
+        }
+        return key, new_u, new_theta, float(loglike(new_theta)), 20, True, info
+
+    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", fake_draw)
+    sampler = NestedSampler(
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
+        ndim=2,
+        nlive=16,
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.1,
+        jax_block_size=1,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.25,
+    )
+    result = sampler.run(random.PRNGKey(124), dlogz=10.0, maxiter=3)
+
+    assert result.metadata["rwalk_effective_step_scale_final"] > 0.1
+    assert result.metadata["rwalk_observed_accept_mean"] == pytest.approx(0.75)
+
+
 def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None:
     from tinyns import NestedSampler
 
@@ -1206,3 +1288,5 @@ def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None
     assert math.isfinite(result.metadata["rwalk_effective_step_scale_max_seen"])
     assert math.isfinite(result.metadata["rwalk_effective_step_scale_mean"])
     assert result.metadata["rwalk_adaptation_updates"] > 0
+    assert math.isfinite(result.metadata["rwalk_observed_accept_mean"])
+    assert result.metadata["rwalk_observed_accept_source"] == "move_acceptance"
