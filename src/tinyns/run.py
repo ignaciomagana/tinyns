@@ -96,6 +96,21 @@ def _logzerr(logwt, logl, logz: float, nlive: int) -> float:
     return float(jnp.sqrt(jnp.maximum(information / nlive, 0.0)))
 
 
+def _update_adaptive_step_scale(
+    current_step_scale: float,
+    observed_accept: float,
+    target_accept: float,
+    rate: float,
+    min_step_scale: float,
+    max_step_scale: float,
+) -> float:
+    """Return a log-space adaptive rwalk step scale, clamped to bounds."""
+    log_scale = math.log(float(current_step_scale))
+    delta = float(rate) * float(np.clip(observed_accept - target_accept, -0.5, 0.5))
+    new_scale = math.exp(log_scale + delta)
+    return float(np.clip(new_scale, min_step_scale, max_step_scale))
+
+
 def _run_static_jax_rwalk_block(
     key,
     live_u,
@@ -852,6 +867,8 @@ def run_static_nested(
     fused_bound_rwalk: bool = False,
     jax_vectorized: bool = False,
     jax_block_size: int = 1,
+    rwalk_adaptive_step_scale: bool = False,
+    rwalk_target_accept: float = 0.25,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -929,6 +946,13 @@ def run_static_nested(
         raise ValueError("multi_bound_split_threshold must be positive")
     if multi_bound_enlargement is not None and multi_bound_enlargement <= 0.0:
         raise ValueError("multi_bound_enlargement must be positive or None")
+    if rwalk_adaptive_step_scale and not (sample == "rwalk" and kernel == "jax"):
+        raise ValueError(
+            "rwalk_adaptive_step_scale=True is supported only for "
+            "sample='rwalk', kernel='jax'"
+        )
+    if not (0.0 < float(rwalk_target_accept) < 1.0):
+        raise ValueError("rwalk_target_accept must be between 0 and 1")
     if rwalk_proposal not in {"isotropic", "live-cov"}:
         raise ValueError("rwalk_proposal must be one of {'isotropic', 'live-cov'}")
     if rwalk_cov_jitter <= 0:
@@ -1099,6 +1123,8 @@ def run_static_nested(
             if jax_block_size > 1
             else None
         ),
+        "rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale),
+        "rwalk_target_accept": float(rwalk_target_accept),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -1212,6 +1238,31 @@ def run_static_nested(
     replacement_rescue_ncall = 0
     replacement_rescue_max_stage = None
     replacement_rescue_last_message = None
+    effective_step_scale = float(step_scale)
+    adaptive_scale_history = [effective_step_scale]
+    adaptive_accept_history = []
+    adaptive_updates = 0
+    adaptive_rate = 0.05
+    adaptive_min_step_scale = 1e-4
+    adaptive_max_step_scale = 0.5
+
+    def update_adaptive_scale(observed_accept: float) -> None:
+        nonlocal effective_step_scale, adaptive_updates
+        if not rwalk_adaptive_step_scale:
+            return
+        if not math.isfinite(float(observed_accept)):
+            return
+        adaptive_accept_history.append(float(observed_accept))
+        effective_step_scale = _update_adaptive_step_scale(
+            effective_step_scale,
+            float(observed_accept),
+            float(rwalk_target_accept),
+            adaptive_rate,
+            adaptive_min_step_scale,
+            adaptive_max_step_scale,
+        )
+        adaptive_scale_history.append(effective_step_scale)
+        adaptive_updates += 1
 
     def current_state() -> NestedRunState:
         return NestedRunState(
@@ -1362,7 +1413,11 @@ def run_static_nested(
                         jnp.asarray(logz_dead),
                         jnp.asarray(iteration, dtype=jnp.int32),
                         jnp.asarray(nlive, dtype=jnp.int32),
-                        jnp.asarray(step_scale),
+                        jnp.asarray(
+                            effective_step_scale
+                            if rwalk_adaptive_step_scale
+                            else step_scale
+                        ),
                         jnp.asarray(min_accepts),
                         jnp.asarray(max_batches, dtype=jnp.int32),
                         proposal_chol,
@@ -1382,7 +1437,9 @@ def run_static_nested(
                         proposal_chol=proposal_chol,
                         block_size=block_size_now,
                         walks=walks,
-                        step_scale=step_scale,
+                        step_scale=effective_step_scale
+                        if rwalk_adaptive_step_scale
+                        else step_scale,
                         replacement_chains=replacement_chains,
                         replacement_chain_schedule=replacement_chain_schedule,
                         max_attempts=max_attempts,
@@ -1513,6 +1570,12 @@ def run_static_nested(
                     block_bound_unit_cube_acceptance
                 )
                 bound_overlap_rejection_history.extend(block_bound_overlap_rejections)
+            if block_batches and sample == "rwalk" and kernel == "jax":
+                observed = float(
+                    sum(1 for ok in block_accepted[:block_size_now] if ok)
+                    / max(sum(block_batches), 1)
+                )
+                update_adaptive_scale(observed)
             if replacement_chain_schedule is None:
                 chain_count = str(int(replacement_chains))
                 replacement_chain_usage_counts[chain_count] = (
@@ -1623,7 +1686,12 @@ def run_static_nested(
                             rescue_live_logl,
                             ndim,
                             walks=int(stage_walks),
-                            step_scale=float(step_scale) * float(scale_factor),
+                            step_scale=float(
+                                effective_step_scale
+                                if rwalk_adaptive_step_scale
+                                else step_scale
+                            )
+                            * float(scale_factor),
                             max_attempts=stage_max_attempts,
                             min_accepts=int(stage_min_accepts),
                             replacement_chains=int(stage_chains),
@@ -1721,6 +1789,7 @@ def run_static_nested(
                             )
                             ncall += failed_calls + rescue_calls
                             iteration = fail_stop
+                            update_adaptive_scale(0.0)
                             break
                     if not rescue_success:
                         replacement_rescue_failures += 1
@@ -1906,7 +1975,9 @@ def run_static_nested(
                         current_bound,
                         ndim,
                         walks=walks,
-                        step_scale=step_scale,
+                        step_scale=effective_step_scale
+                        if rwalk_adaptive_step_scale
+                        else step_scale,
                         max_attempts=max_attempts,
                         min_accepts=min_accepts,
                         replacement_chains=replacement_chains,
@@ -2023,7 +2094,9 @@ def run_static_nested(
                         seed_live_logl,
                         ndim,
                         walks=walks,
-                        step_scale=step_scale,
+                        step_scale=effective_step_scale
+                        if rwalk_adaptive_step_scale
+                        else step_scale,
                         max_attempts=max_attempts,
                         min_accepts=min_accepts,
                         **(
@@ -2113,6 +2186,9 @@ def run_static_nested(
                         replacement_chain_usage_counts[chain_count] = (
                             replacement_chain_usage_counts.get(chain_count, 0)
                             + batches_used
+                        )
+                        update_adaptive_scale(
+                            float(bool(accepted)) / max(batches_used, 1)
                         )
                     else:
                         replacement_batches.append(1)
@@ -2351,6 +2427,31 @@ def run_static_nested(
         int(bound_nellipsoid_history[-1]) if bound_nellipsoid_history else None
     )
 
+    adaptive_metadata = {"rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale)}
+    if rwalk_adaptive_step_scale:
+        adaptive_metadata.update(
+            {
+                "rwalk_target_accept": float(rwalk_target_accept),
+                "rwalk_effective_step_scale_initial": float(step_scale),
+                "rwalk_effective_step_scale_final": float(effective_step_scale),
+                "rwalk_effective_step_scale_min_seen": float(
+                    min(adaptive_scale_history)
+                ),
+                "rwalk_effective_step_scale_max_seen": float(
+                    max(adaptive_scale_history)
+                ),
+                "rwalk_effective_step_scale_mean": float(
+                    sum(adaptive_scale_history) / len(adaptive_scale_history)
+                ),
+                "rwalk_adaptation_updates": int(adaptive_updates),
+                "rwalk_observed_accept_mean": (
+                    float(sum(adaptive_accept_history) / len(adaptive_accept_history))
+                    if adaptive_accept_history
+                    else 0.0
+                ),
+            }
+        )
+
     return NestedSamplingResult(
         samples_u=samples_u,
         samples=samples,
@@ -2364,6 +2465,7 @@ def run_static_nested(
         success=success,
         message=message,
         metadata={
+            **adaptive_metadata,
             "sample": sample,
             "kernel": kernel,
             "jax_block_size": int(jax_block_size),

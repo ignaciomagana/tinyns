@@ -68,8 +68,6 @@ def test_nested_sampler_validates_configuration() -> None:
         NestedSampler(None, prior_transform, ndim=3)  # type: ignore[arg-type]
 
 
-
-
 @pytest.mark.parametrize("sample", ["slice", "rslice", "bound"])
 def test_nested_sampler_rejects_removed_samplers(sample: str) -> None:
     with pytest.raises(ValueError, match=r"sample must be one of"):
@@ -105,8 +103,6 @@ def test_nested_sampler_vectorized_rwalk_raises_on_run() -> None:
         NotImplementedError, match="vectorized rwalk is not implemented yet"
     ):
         sampler.run(key=np.array([4, 5], dtype=np.uint32), maxiter=1)
-
-
 
 
 def test_nested_sampler_run_returns_result() -> None:
@@ -163,11 +159,31 @@ def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
     assert result.metadata["min_accepts"] == 2
 
 
-
-
-
 def test_nested_sampler_rejects_invalid_min_accepts_on_run() -> None:
     sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=20, min_accepts=0)
 
     with pytest.raises(ValueError, match="min_accepts"):
         sampler.run(key=np.array([3, 4], dtype=np.uint32), maxiter=1)
+
+
+def test_rwalk_adaptive_step_scale_validates_public_args() -> None:
+    with pytest.raises(ValueError, match="rwalk_target_accept"):
+        NestedSampler(
+            loglike,
+            prior_transform,
+            ndim=2,
+            sample="rwalk",
+            kernel="jax",
+            rwalk_adaptive_step_scale=True,
+            rwalk_target_accept=1.0,
+        )
+
+    with pytest.raises(ValueError, match="rwalk_adaptive_step_scale"):
+        NestedSampler(
+            loglike,
+            prior_transform,
+            ndim=2,
+            sample="rwalk",
+            kernel="python",
+            rwalk_adaptive_step_scale=True,
+        )

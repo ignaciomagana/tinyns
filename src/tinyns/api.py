@@ -103,6 +103,15 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        if bool(kwargs.get("rwalk_adaptive_step_scale", False)) and not (
+            sample == "rwalk" and kernel == "jax"
+        ):
+            raise ValueError(
+                "rwalk_adaptive_step_scale=True is supported only for "
+                "sample='rwalk', kernel='jax'"
+            )
+        if not (0.0 < float(kwargs.get("rwalk_target_accept", 0.25)) < 1.0):
+            raise ValueError("rwalk_target_accept must be between 0 and 1")
         fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
         jax_block_size = kwargs.get("jax_block_size", 1)
         if (
@@ -209,6 +218,10 @@ class NestedSampler:
             ),
             jax_vectorized=self.kwargs.get("jax_vectorized", False),
             jax_block_size=self.kwargs.get("jax_block_size", 1),
+            rwalk_adaptive_step_scale=self.kwargs.get(
+                "rwalk_adaptive_step_scale", False
+            ),
+            rwalk_target_accept=self.kwargs.get("rwalk_target_accept", 0.25),
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
@@ -421,4 +434,8 @@ class NestedSampler:
             ),
             jax_vectorized=self.kwargs.get("jax_vectorized", False),
             jax_block_size=self.kwargs.get("jax_block_size", 1),
+            rwalk_adaptive_step_scale=self.kwargs.get(
+                "rwalk_adaptive_step_scale", False
+            ),
+            rwalk_target_accept=self.kwargs.get("rwalk_target_accept", 0.25),
         )
