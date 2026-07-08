@@ -1146,17 +1146,21 @@ def draw_constrained_rwalk_jax(
     )
     if return_info:
         batches = int(math.ceil(int(ncall) / batch_ncall))
+        observed_acceptance = (
+            float(accepted_move_count) / float(total_proposal_count)
+            if int(total_proposal_count) > 0
+            else 0.0
+        )
         info = {
             "replacement_batches": batches,
             "replacement_chains_used": int(replacement_chains) * batches,
             "replacement_chain_usage_counts": {str(int(replacement_chains)): batches},
             "accepted_move_count": int(accepted_move_count),
             "total_proposal_count": int(total_proposal_count),
-            "observed_rwalk_acceptance": (
-                float(accepted_move_count) / float(total_proposal_count)
-                if int(total_proposal_count) > 0
-                else 0.0
-            ),
+            "observed_rwalk_acceptance": observed_acceptance,
+            "accepted_rwalk_moves": int(accepted_move_count),
+            "total_rwalk_proposals": int(total_proposal_count),
+            "rwalk_acceptance": observed_acceptance,
         }
         return (
             new_key,
@@ -1221,6 +1225,12 @@ def draw_constrained_single_bound_rwalk_jax(
                 if replacement_chain_schedule is not None
                 else {str(int(replacement_chains)): 0}
             ),
+            "accepted_move_count": 0,
+            "total_proposal_count": 0,
+            "observed_rwalk_acceptance": 0.0,
+            "accepted_rwalk_moves": 0,
+            "total_rwalk_proposals": 0,
+            "rwalk_acceptance": 0.0,
         }
         return key, seed_u, seed_theta, seed_logl, int(seed_ncall), False, info
 
@@ -1363,6 +1373,12 @@ def draw_constrained_multi_bound_rwalk_jax(
                 if replacement_chain_schedule is not None
                 else {str(int(replacement_chains)): 0}
             ),
+            "accepted_move_count": 0,
+            "total_proposal_count": 0,
+            "observed_rwalk_acceptance": 0.0,
+            "accepted_rwalk_moves": 0,
+            "total_rwalk_proposals": 0,
+            "rwalk_acceptance": 0.0,
         }
         return key, seed_u, seed_theta, seed_logl, int(seed_ncall), False, info
 
@@ -1522,6 +1538,11 @@ def draw_constrained_rwalk_jax_adaptive(
             best_u = candidate_u
             best_theta = candidate_theta
             best_logl = float(candidate_logl)
+        observed_acceptance = (
+            float(accepted_move_count) / float(total_proposal_count)
+            if total_proposal_count > 0
+            else 0.0
+        )
         info = {
             "replacement_batches": batches,
             "replacement_chains_used": chains_used,
@@ -1531,11 +1552,10 @@ def draw_constrained_rwalk_jax_adaptive(
             },
             "accepted_move_count": int(accepted_move_count),
             "total_proposal_count": int(total_proposal_count),
-            "observed_rwalk_acceptance": (
-                float(accepted_move_count) / float(total_proposal_count)
-                if total_proposal_count > 0
-                else 0.0
-            ),
+            "observed_rwalk_acceptance": observed_acceptance,
+            "accepted_rwalk_moves": int(accepted_move_count),
+            "total_rwalk_proposals": int(total_proposal_count),
+            "rwalk_acceptance": observed_acceptance,
         }
         if accepted:
             return (
@@ -1550,6 +1570,11 @@ def draw_constrained_rwalk_jax_adaptive(
 
     if best_u is None:
         raise RuntimeError("adaptive replacement schedule made no attempts")
+    observed_acceptance = (
+        float(accepted_move_count) / float(total_proposal_count)
+        if total_proposal_count > 0
+        else 0.0
+    )
     info = {
         "replacement_batches": batches,
         "replacement_chains_used": chains_used,
@@ -1557,11 +1582,10 @@ def draw_constrained_rwalk_jax_adaptive(
         "replacement_chain_usage_counts": {str(k): v for k, v in usage_counts.items()},
         "accepted_move_count": int(accepted_move_count),
         "total_proposal_count": int(total_proposal_count),
-        "observed_rwalk_acceptance": (
-            float(accepted_move_count) / float(total_proposal_count)
-            if total_proposal_count > 0
-            else 0.0
-        ),
+        "observed_rwalk_acceptance": observed_acceptance,
+        "accepted_rwalk_moves": int(accepted_move_count),
+        "total_rwalk_proposals": int(total_proposal_count),
+        "rwalk_acceptance": observed_acceptance,
     }
     return key, best_u, best_theta, best_logl, total_ncall, False, info
 

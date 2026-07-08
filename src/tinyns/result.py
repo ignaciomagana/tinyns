@@ -222,9 +222,21 @@ class NestedSamplingResult:
     def information(self) -> float:
         """Return the nested-sampling information from posterior weights."""
 
+        logl = jnp.asarray(self.logl)
+        logwt = jnp.asarray(self.logwt)
+        weights = jnp.exp(logwt - self.logz)
+        if bool(jnp.any(~jnp.isfinite(weights))):
+            return math.nan
+        contributing = (weights > 0.0) & jnp.isfinite(weights) & jnp.isfinite(logl)
+        if bool(jnp.any((weights > 0.0) & ~jnp.isfinite(logl))):
+            return math.nan
+        if not bool(jnp.any(contributing)):
+            return 0.0
         information = float(
-            jnp.sum(self.weights() * (jnp.asarray(self.logl) - self.logz))
+            jnp.sum(jnp.where(contributing, weights * (logl - self.logz), 0.0))
         )
+        if not math.isfinite(information):
+            return math.nan
         if information < 0.0:
             return 0.0
         return information
@@ -286,6 +298,12 @@ class NestedSamplingResult:
         replacement_failures = metadata.get("replacement_failures")
         if replacement_failures is not None and replacement_failures > 0:
             warnings.append("replacement failures occurred")
+
+        logzerr_status = metadata.get("logzerr_status")
+        if logzerr_status is None:
+            logzerr_status = "ok" if math.isfinite(float(self.logzerr)) else "unknown"
+        if logzerr_status != "ok":
+            warnings.append(f"logzerr estimate unavailable: {logzerr_status}")
 
         replacement_chains = int(metadata.get("replacement_chains", 1) or 1)
         replacement_batch_ncall = metadata.get("replacement_batch_ncall")
@@ -358,7 +376,14 @@ class NestedSamplingResult:
             "message": self.message,
             "logz": float(self.logz),
             "logzerr": float(self.logzerr),
-            "information": self.information(),
+            "information": metadata.get("information_H", self.information()),
+            "logzerr_status": logzerr_status,
+            "information_H": metadata.get("information_H"),
+            "n_nonfinite_logl": metadata.get("n_nonfinite_logl"),
+            "n_nonfinite_logwt": metadata.get("n_nonfinite_logwt"),
+            "n_nonfinite_weights": metadata.get("n_nonfinite_weights"),
+            "n_dead_finite": metadata.get("n_dead_finite"),
+            "n_live_finite": metadata.get("n_live_finite"),
             "posterior_ess": posterior_ess,
             "max_weight_fraction": max_weight_fraction,
             "posterior_weight_entropy": posterior_weight_entropy,
@@ -397,6 +422,14 @@ class NestedSamplingResult:
             diagnostics["replacement_max_batches"] = max_replacement_batches
         if replacement_failures is not None:
             diagnostics["replacement_failures"] = replacement_failures
+        for name in (
+            "accepted_rwalk_moves",
+            "total_rwalk_proposals",
+            "rwalk_acceptance",
+            "mean_rwalk_acceptance",
+        ):
+            if name in metadata:
+                diagnostics[name] = metadata[name]
 
         return diagnostics
 

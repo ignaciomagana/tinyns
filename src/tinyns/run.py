@@ -89,11 +89,74 @@ def _transform_live_points(prior_transform, u_live, ndim: int, *, vectorized: bo
     return jnp.stack([_as_point(prior_transform(u), ndim) for u in u_live])
 
 
+def _logzerr_diagnostics(
+    logwt,
+    logl,
+    logz: float,
+    nlive: int,
+    nlive_final: int,
+) -> tuple[float, dict[str, object]]:
+    """Return ``logzerr`` and diagnostics for nonfinite inputs."""
+
+    logwt = jnp.asarray(logwt)
+    logl = jnp.asarray(logl)
+    npoints = int(logwt.size)
+    nlive_final = max(0, min(int(nlive_final), npoints))
+    ndead = npoints - nlive_final
+
+    finite_logl = jnp.isfinite(logl)
+    finite_logwt = jnp.isfinite(logwt)
+    finite_pair = finite_logl & finite_logwt
+    diagnostics: dict[str, object] = {
+        "logzerr_status": "ok",
+        "information_H": math.nan,
+        "n_nonfinite_logl": int(jnp.sum(~finite_logl)),
+        "n_nonfinite_logwt": int(jnp.sum(~finite_logwt)),
+        "n_nonfinite_weights": 0,
+        "n_dead_finite": int(jnp.sum(finite_pair[:ndead])),
+        "n_live_finite": int(jnp.sum(finite_pair[ndead:])),
+    }
+
+    if nlive <= 0:
+        diagnostics["logzerr_status"] = "invalid_nlive"
+        return math.nan, diagnostics
+    if not math.isfinite(float(logz)):
+        diagnostics["logzerr_status"] = "nonfinite_logz"
+        return math.nan, diagnostics
+
+    raw_weights = jnp.exp(logwt - logz)
+    finite_weights = jnp.isfinite(raw_weights)
+    diagnostics["n_nonfinite_weights"] = int(jnp.sum(~finite_weights))
+    if diagnostics["n_nonfinite_weights"]:
+        diagnostics["logzerr_status"] = "nonfinite_posterior_weights"
+        return math.nan, diagnostics
+
+    contributing = (raw_weights > 0.0) & finite_logl
+    if bool(jnp.any((raw_weights > 0.0) & ~finite_logl)):
+        diagnostics["logzerr_status"] = "nonfinite_weighted_logl"
+        return math.nan, diagnostics
+    if not bool(jnp.any(contributing)):
+        diagnostics["logzerr_status"] = "no_finite_weighted_samples"
+        diagnostics["information_H"] = 0.0
+        return math.nan, diagnostics
+
+    information = jnp.sum(
+        jnp.where(contributing, raw_weights * (logl - logz), 0.0)
+    )
+    information = jnp.maximum(information, 0.0)
+    diagnostics["information_H"] = float(information)
+    if not math.isfinite(float(information)):
+        diagnostics["logzerr_status"] = "nonfinite_information_H"
+        return math.nan, diagnostics
+
+    return float(jnp.sqrt(information / nlive)), diagnostics
+
+
 def _logzerr(logwt, logl, logz: float, nlive: int) -> float:
-    log_weights = jnp.asarray(logwt) - logz
-    weights = jnp.exp(log_weights)
-    information = jnp.sum(weights * (jnp.asarray(logl) - logz))
-    return float(jnp.sqrt(jnp.maximum(information / nlive, 0.0)))
+    logzerr, _diagnostics = _logzerr_diagnostics(
+        logwt, logl, logz, nlive, nlive_final=0
+    )
+    return logzerr
 
 
 def _update_adaptive_step_scale(
@@ -561,6 +624,7 @@ def _run_static_jax_bounded_rwalk_block(
     bound_seed_call_values = []
     bound_seed_batch_values = []
     rwalk_kernel_call_values = []
+    rwalk_accepted_move_values = []
     bound_draw_values = []
     bound_eval_values = []
     accepted_values = []
@@ -625,6 +689,9 @@ def _run_static_jax_bounded_rwalk_block(
         bound_seed_call_values.append(int(info.get("bound_seed_loglike_evals", 0)))
         bound_seed_batch_values.append(int(info.get("bound_seed_batches", 0)))
         rwalk_kernel_call_values.append(int(info.get("rwalk_kernel_calls", 0)))
+        rwalk_accepted_move_values.append(
+            int(info.get("accepted_rwalk_moves", info.get("accepted_move_count", 0)))
+        )
         bound_draw_values.append(int(info.get("bound_seed_draws", 0)))
         bound_eval_values.append(int(info.get("bound_seed_loglike_evals", 0)))
         bound_unit_cube_acceptance_values.append(
@@ -656,6 +723,7 @@ def _run_static_jax_bounded_rwalk_block(
         bound_seed_call_values,
         bound_seed_batch_values,
         rwalk_kernel_call_values,
+        rwalk_accepted_move_values,
         bound_draw_values,
         bound_eval_values,
         bound_unit_cube_acceptance_values,
@@ -1246,6 +1314,8 @@ def run_static_nested(
     bound_seed_call_history = []
     bound_seed_batch_history = []
     rwalk_kernel_call_history = []
+    rwalk_accepted_move_history = []
+    rwalk_proposal_history = []
     consecutive_bound_failures = 0
     force_bound_rebuild = False
     bound_forced_rebuilds = 0
@@ -1545,6 +1615,8 @@ def run_static_nested(
             full_replacement_ncall_block = replacement_ncall_block
             full_replacement_batches_block = replacement_batches_block
             full_replacement_chains_used_block = replacement_chains_used_block
+            full_accepted_move_count_block = accepted_move_count_block
+            full_total_proposal_count_block = total_proposal_count_block
             full_new_u_block = new_u_block if rescue_capable_block else dead_u_block
             full_new_theta_block = (
                 new_theta_block if rescue_capable_block else dead_theta_block
@@ -1601,11 +1673,19 @@ def run_static_nested(
             ]
             replacement_batches.extend(block_batches)
             replacement_chains_used.extend(block_chains_used)
+            if accepted_move_count_block is not None:
+                rwalk_accepted_move_history.extend(
+                    int(x) for x in np.asarray(accepted_move_count_block)
+                )
+                rwalk_proposal_history.extend(
+                    int(x) for x in np.asarray(total_proposal_count_block)
+                )
             if block_extra is not None:
                 (
                     block_bound_seed_calls,
                     block_bound_seed_batches,
                     block_rwalk_kernel_calls,
+                    block_rwalk_accepted_moves,
                     block_bound_draws,
                     block_bound_evals,
                     block_bound_unit_cube_acceptance,
@@ -1614,6 +1694,8 @@ def run_static_nested(
                 bound_seed_call_history.extend(block_bound_seed_calls)
                 bound_seed_batch_history.extend(block_bound_seed_batches)
                 rwalk_kernel_call_history.extend(block_rwalk_kernel_calls)
+                rwalk_accepted_move_history.extend(block_rwalk_accepted_moves)
+                rwalk_proposal_history.extend(block_rwalk_kernel_calls)
                 bound_draw_history.extend(block_bound_draws)
                 bound_eval_history.extend(block_bound_evals)
                 bound_unit_cube_acceptance_history.extend(
@@ -1715,6 +1797,12 @@ def run_static_nested(
                             1,
                         ),
                     )
+                    rescue_calls_total = 0
+                    rescue_batches_total = 0
+                    rescue_chains_used_total = 0
+                    rescue_accepted_moves_total = 0
+                    rescue_proposals_total = 0
+                    rescue_chain_usage_counts: dict[str, int] = {}
                     for (
                         stage,
                         scale_factor,
@@ -1750,17 +1838,70 @@ def run_static_nested(
                             min_accepts=int(stage_min_accepts),
                             replacement_chains=int(stage_chains),
                             proposal_chol=proposal_chol_stage,
+                            return_info=True,
                         )
-                        (
-                            key,
-                            rescued_u,
-                            rescued_theta,
-                            rescued_logl,
-                            rescue_calls,
-                            rescue_accepted,
-                        ) = rescue_result
+                        if len(rescue_result) == 7:
+                            (
+                                key,
+                                rescued_u,
+                                rescued_theta,
+                                rescued_logl,
+                                rescue_calls,
+                                rescue_accepted,
+                                rescue_info,
+                            ) = rescue_result
+                        else:
+                            (
+                                key,
+                                rescued_u,
+                                rescued_theta,
+                                rescued_logl,
+                                rescue_calls,
+                                rescue_accepted,
+                            ) = rescue_result
+                            rescue_info = {}
                         rescue_calls = int(rescue_calls)
                         replacement_rescue_ncall += rescue_calls
+                        rescue_calls_total += rescue_calls
+                        default_batches = int(
+                            math.ceil(
+                                rescue_calls
+                                / (int(stage_walks) * int(stage_chains))
+                            )
+                        )
+                        rescue_batches_total += int(
+                            rescue_info.get("replacement_batches", default_batches)
+                        )
+                        rescue_chains_used_total += int(
+                            rescue_info.get(
+                                "replacement_chains_used",
+                                int(stage_chains) * default_batches,
+                            )
+                        )
+                        rescue_accepted_moves_total += int(
+                            rescue_info.get(
+                                "accepted_rwalk_moves",
+                                rescue_info.get("accepted_move_count", 0),
+                            )
+                        )
+                        rescue_proposals_total += int(
+                            rescue_info.get(
+                                "total_rwalk_proposals",
+                                rescue_info.get("total_proposal_count", rescue_calls),
+                            )
+                        )
+                        stage_chain_usage = rescue_info.get(
+                            "replacement_chain_usage_counts"
+                        )
+                        if stage_chain_usage is None:
+                            stage_chain_usage = {
+                                str(int(stage_chains)): default_batches
+                            }
+                        for chain_count, count in stage_chain_usage.items():
+                            rescue_chain_usage_counts[str(chain_count)] = (
+                                rescue_chain_usage_counts.get(str(chain_count), 0)
+                                + int(count)
+                            )
                         if bool(rescue_accepted):
                             replacement_rescue_successes += 1
                             rescue_success = True
@@ -1785,36 +1926,38 @@ def run_static_nested(
                             failed_calls = int(
                                 full_replacement_ncall_block[fail_offset]
                             )
-                            replacement_ncall.append(failed_calls + rescue_calls)
+                            failed_accepted_moves = 0
+                            if full_accepted_move_count_block is not None:
+                                failed_accepted_moves = int(
+                                    full_accepted_move_count_block[fail_offset]
+                                )
+                            failed_proposals = failed_calls
+                            if full_total_proposal_count_block is not None:
+                                failed_proposals = int(
+                                    full_total_proposal_count_block[fail_offset]
+                                )
+                            rwalk_accepted_move_history.append(
+                                failed_accepted_moves + rescue_accepted_moves_total
+                            )
+                            rwalk_proposal_history.append(
+                                failed_proposals + rescue_proposals_total
+                            )
+                            replacement_ncall.append(
+                                failed_calls + rescue_calls_total
+                            )
                             replacement_batches.append(
                                 int(full_replacement_batches_block[fail_offset])
-                                + int(
-                                    math.ceil(
-                                        rescue_calls
-                                        / (int(stage_walks) * int(stage_chains))
-                                    )
-                                )
+                                + rescue_batches_total
                             )
                             replacement_chains_used.append(
                                 int(full_replacement_chains_used_block[fail_offset])
-                                + int(stage_chains)
-                                * int(
-                                    math.ceil(
-                                        rescue_calls
-                                        / (int(stage_walks) * int(stage_chains))
-                                    )
-                                )
+                                + rescue_chains_used_total
                             )
-                            chain_count = str(int(stage_chains))
-                            replacement_chain_usage_counts[chain_count] = (
-                                replacement_chain_usage_counts.get(chain_count, 0)
-                                + int(
-                                    math.ceil(
-                                        rescue_calls
-                                        / (int(stage_walks) * int(stage_chains))
-                                    )
+                            for chain_count, count in rescue_chain_usage_counts.items():
+                                replacement_chain_usage_counts[chain_count] = (
+                                    replacement_chain_usage_counts.get(chain_count, 0)
+                                    + int(count)
                                 )
-                            )
                             insertion_indices.append(
                                 int(
                                     jnp.sum(rescue_live_logl <= rescued_logl)
@@ -1841,9 +1984,19 @@ def run_static_nested(
                                 rescue_live_theta,
                                 rescue_live_logl,
                             )
-                            ncall += failed_calls + rescue_calls
+                            ncall += failed_calls + rescue_calls_total
                             iteration = fail_stop
-                            update_adaptive_scale(0.0)
+                            attempted_proposals = (
+                                failed_proposals + rescue_proposals_total
+                            )
+                            if attempted_proposals > 0:
+                                update_adaptive_scale(
+                                    (
+                                        failed_accepted_moves
+                                        + rescue_accepted_moves_total
+                                    )
+                                    / attempted_proposals
+                                )
                             break
                     if not rescue_success:
                         replacement_rescue_failures += 1
@@ -2158,7 +2311,7 @@ def run_static_nested(
                                 "proposal_chol": proposal_chol,
                                 "jax_vectorized": jax_vectorized,
                                 **(
-                                    {"return_info": rwalk_adaptive_step_scale}
+                                    {"return_info": True}
                                     if replacement_chain_schedule is None
                                     else {}
                                 ),
@@ -2229,13 +2382,21 @@ def run_static_nested(
                             + int(count)
                         )
                     total_proposals = int(
-                        replacement_info.get("total_proposal_count", 0)
+                        replacement_info.get(
+                            "total_rwalk_proposals",
+                            replacement_info.get("total_proposal_count", 0),
+                        )
+                    )
+                    accepted_moves = int(
+                        replacement_info.get(
+                            "accepted_rwalk_moves",
+                            replacement_info.get("accepted_move_count", 0),
+                        )
                     )
                     if total_proposals > 0:
-                        update_adaptive_scale(
-                            int(replacement_info.get("accepted_move_count", 0))
-                            / total_proposals
-                        )
+                        rwalk_accepted_move_history.append(accepted_moves)
+                        rwalk_proposal_history.append(total_proposals)
+                        update_adaptive_scale(accepted_moves / total_proposals)
                 elif draw_result is not None:
                     key, new_u, new_theta, new_logl, calls, accepted = draw_result
                     if kernel == "jax":
@@ -2451,11 +2612,13 @@ def run_static_nested(
         logl = live_logl
         logwt = live_logwt
 
-    logz = float(logsumexp(logwt))
-    logzerr = _logzerr(logwt, logl, logz, nlive)
     niter = int(iteration)
     nlive_final = int(live_logl.size)
     nposterior = int(logwt.size)
+    logz = float(logsumexp(logwt))
+    logzerr, logzerr_diagnostics = _logzerr_diagnostics(
+        logwt, logl, logz, nlive, nlive_final
+    )
     replacement_initial_batch_ncall = int(walks) * int(replacement_chains)
     replacement_max_batch_ncall = replacement_initial_batch_ncall
     replacement_batch_ncall = replacement_initial_batch_ncall
@@ -2477,6 +2640,13 @@ def run_static_nested(
         mean_replacement_ncall = 0.0
         max_replacement_ncall = 0
         replacement_acceptance_proxy = 0.0
+    accepted_rwalk_moves = int(sum(rwalk_accepted_move_history))
+    total_rwalk_proposals = int(sum(rwalk_proposal_history))
+    rwalk_acceptance = (
+        accepted_rwalk_moves / total_rwalk_proposals
+        if total_rwalk_proposals > 0
+        else None
+    )
     bound_log_volume = None
     if current_bound is not None:
         bound_log_volume = float(
@@ -2567,6 +2737,7 @@ def run_static_nested(
             "ndead": niter,
             "nlive_final": nlive_final,
             "nposterior": nposterior,
+            **logzerr_diagnostics,
             "final_delta_logz": float(final_delta_logz),
             "final_logx": float(logx_final),
             "final_logz_dead": float(logz_dead),
@@ -2622,6 +2793,10 @@ def run_static_nested(
             "max_replacement_chains_used": int(max(replacement_chains_used, default=0)),
             "replacement_chain_usage_counts": replacement_chain_usage_counts,
             "replacement_acceptance_proxy": replacement_acceptance_proxy,
+            "accepted_rwalk_moves": accepted_rwalk_moves,
+            "total_rwalk_proposals": total_rwalk_proposals,
+            "rwalk_acceptance": rwalk_acceptance,
+            "mean_rwalk_acceptance": rwalk_acceptance,
             "bound": bound,
             "bound_enlargement": bound_enlargement,
             "bound_update_interval": bound_update_interval,
