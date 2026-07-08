@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import jax.numpy as jnp
 import numpy as np
 from jax import random
@@ -137,6 +139,49 @@ def test_information_is_finite_and_non_negative() -> None:
     assert information >= 0.0
 
 
+def test_information_ignores_zero_weight_nonfinite_likelihood() -> None:
+    result = make_result()
+    result.logz = 0.0
+    result.logwt = jnp.array([0.0, -jnp.inf])
+    result.logl = jnp.array([0.0, -jnp.inf])
+
+    assert result.information() == 0.0
+
+
+def test_logzerr_diagnostics_explain_nonfinite_inputs() -> None:
+    from tinyns.run import _logzerr_diagnostics
+
+    logzerr, diagnostics = _logzerr_diagnostics(
+        jnp.array([0.0, -jnp.inf]),
+        jnp.array([0.0, -jnp.inf]),
+        0.0,
+        nlive=10,
+        nlive_final=1,
+    )
+
+    assert math.isfinite(logzerr)
+    assert diagnostics["logzerr_status"] == "ok"
+    assert diagnostics["n_nonfinite_logl"] == 1
+    assert diagnostics["n_nonfinite_logwt"] == 1
+    assert diagnostics["n_dead_finite"] == 1
+    assert diagnostics["n_live_finite"] == 0
+
+
+def test_logzerr_diagnostics_status_for_weighted_nonfinite_likelihood() -> None:
+    from tinyns.run import _logzerr_diagnostics
+
+    logzerr, diagnostics = _logzerr_diagnostics(
+        jnp.array([0.0]),
+        jnp.array([jnp.nan]),
+        0.0,
+        nlive=10,
+        nlive_final=0,
+    )
+
+    assert math.isnan(logzerr)
+    assert diagnostics["logzerr_status"] == "nonfinite_weighted_logl"
+
+
 def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     result = make_result()
 
@@ -155,6 +200,34 @@ def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     assert "final_logx" in diagnostics
     assert "final_logz_dead" in diagnostics
     assert "final_logl_live_max" in diagnostics
+
+
+def test_diagnostics_propagates_logzerr_status_and_finite_counts() -> None:
+    result = make_result()
+    result.logzerr = math.nan
+    result.metadata = {
+        "logzerr_status": "nonfinite_weighted_logl",
+        "information_H": math.nan,
+        "n_nonfinite_logl": 2,
+        "n_nonfinite_logwt": 1,
+        "n_nonfinite_weights": 0,
+        "n_dead_finite": 3,
+        "n_live_finite": 4,
+    }
+
+    diagnostics = result.diagnostics()
+
+    assert diagnostics["logzerr_status"] == "nonfinite_weighted_logl"
+    assert math.isnan(diagnostics["information_H"])
+    assert diagnostics["n_nonfinite_logl"] == 2
+    assert diagnostics["n_nonfinite_logwt"] == 1
+    assert diagnostics["n_nonfinite_weights"] == 0
+    assert diagnostics["n_dead_finite"] == 3
+    assert diagnostics["n_live_finite"] == 4
+    assert (
+        "logzerr estimate unavailable: nonfinite_weighted_logl"
+        in diagnostics["warnings"]
+    )
 
 
 def test_diagnostics_reports_replacement_batches_for_batched_jax_payload() -> None:

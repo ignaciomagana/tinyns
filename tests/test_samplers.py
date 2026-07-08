@@ -345,6 +345,36 @@ def test_draw_constrained_rwalk_jax_counts_walks_on_easy_target() -> None:
     assert math.isfinite(logl)
 
 
+def test_draw_constrained_rwalk_jax_can_return_move_acceptance_info() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    walks = 5
+    replacement_chains = 4
+    live_u = jnp.full((4, 2), 0.5)
+    live_logl = jnp.zeros(4)
+
+    *_, ncall, accepted, info = draw_constrained_rwalk_jax(
+        random.PRNGKey(124),
+        gaussian_loglike,
+        identity_prior_transform,
+        -math.inf,
+        live_u,
+        live_logl,
+        2,
+        walks=walks,
+        replacement_chains=replacement_chains,
+        step_scale=0.01,
+        max_attempts=100,
+        return_info=True,
+    )
+
+    assert accepted is True
+    assert ncall == walks * replacement_chains
+    assert info["total_rwalk_proposals"] == ncall
+    assert info["accepted_rwalk_moves"] <= info["total_rwalk_proposals"]
+    assert 0.0 <= info["rwalk_acceptance"] <= 1.0
+
+
 def test_draw_constrained_rwalk_jax_retries_until_chain_succeeds() -> None:
     from tinyns.samplers import draw_constrained_rwalk_jax
 

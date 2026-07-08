@@ -570,6 +570,15 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
     assert result.metadata["jax_block_cached"] is True
     assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
+    assert result.metadata["total_rwalk_proposals"] == sum(
+        result.metadata["replacement_ncall"]
+    )
+    assert (
+        0
+        <= result.metadata["accepted_rwalk_moves"]
+        <= result.metadata["total_rwalk_proposals"]
+    )
+    assert 0.0 <= result.metadata["rwalk_acceptance"] <= 1.0
 
 
 def test_recommended_rwalk_jax_isotropic_cached_block_b32_records_metadata() -> None:
@@ -738,6 +747,14 @@ def test_nested_sampler_rwalk_jax_block_adaptive_runs_and_records_usage() -> Non
     assert result.metadata["mean_replacement_chains_used"] is not None
     assert result.metadata["max_replacement_chains_used"] >= 1
     assert sum(result.metadata["replacement_chain_usage_counts"].values()) > 0
+    assert result.metadata["total_rwalk_proposals"] == sum(
+        result.metadata["replacement_ncall"]
+    )
+    assert (
+        0
+        <= result.metadata["accepted_rwalk_moves"]
+        <= result.metadata["total_rwalk_proposals"]
+    )
 
 
 def test_static_nested_multi_bound_fused_rwalk_chain_telemetry_regression() -> None:
@@ -766,6 +783,11 @@ def test_static_nested_multi_bound_fused_rwalk_chain_telemetry_regression() -> N
     assert metadata["mean_replacement_chains_used"] == pytest.approx(1.0)
     assert metadata["mean_bound_seed_calls"] == pytest.approx(128.0)
     assert metadata["mean_rwalk_kernel_calls"] == pytest.approx(5.0)
+    assert metadata["total_rwalk_proposals"] == pytest.approx(
+        metadata["mean_rwalk_kernel_calls"] * metadata["niter"]
+    )
+    assert metadata["total_rwalk_proposals"] < sum(metadata["replacement_ncall"])
+    assert 0 <= metadata["accepted_rwalk_moves"] <= metadata["total_rwalk_proposals"]
 
 
 def test_static_nested_bound_seed_kernel_jax_invalid_combinations_raise() -> None:
@@ -1065,11 +1087,44 @@ def test_jax_block_rwalk_rescue_succeeds_after_normal_failure(monkeypatch) -> No
 
         return kernel
 
+    rescue_calls = {"count": 0}
+
     def rescue_draw(
         key, _loglike, _prior_transform, logl_min, live_u, _live_logl, ndim, **_kwargs
     ):
+        rescue_calls["count"] += 1
         new_u = jnp.clip(live_u[0] + 0.01, 0.0, 1.0)
-        return key, new_u, new_u, jnp.asarray(logl_min + 1.0), 3, True
+        if rescue_calls["count"] == 1:
+            return (
+                key,
+                new_u,
+                new_u,
+                jnp.asarray(logl_min),
+                3,
+                False,
+                {
+                    "replacement_batches": 1,
+                    "replacement_chains_used": 1,
+                    "replacement_chain_usage_counts": {"1": 1},
+                    "accepted_rwalk_moves": 1,
+                    "total_rwalk_proposals": 3,
+                },
+            )
+        return (
+            key,
+            new_u,
+            new_u,
+            jnp.asarray(logl_min + 1.0),
+            5,
+            True,
+            {
+                "replacement_batches": 1,
+                "replacement_chains_used": 2,
+                "replacement_chain_usage_counts": {"2": 1},
+                "accepted_rwalk_moves": 2,
+                "total_rwalk_proposals": 5,
+            },
+        )
 
     monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", make_kernel)
     monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", rescue_draw)
@@ -1093,11 +1148,23 @@ def test_jax_block_rwalk_rescue_succeeds_after_normal_failure(monkeypatch) -> No
     assert result.success is True
     assert result.metadata["replacement_failures"] == 1
     assert result.metadata["replacement_rescue_used"] is True
-    assert result.metadata["replacement_rescue_attempts"] == 1
+    assert result.metadata["replacement_rescue_attempts"] == 2
     assert result.metadata["replacement_rescue_successes"] == 1
     assert result.metadata["replacement_rescue_failures"] == 0
-    assert result.metadata["replacement_rescue_ncall"] == 3
-    assert result.ncall == result.nlive + 5
+    assert result.metadata["replacement_rescue_ncall"] == 8
+    assert result.metadata["replacement_rescue_stage_counts"] == {
+        "1": 1,
+        "2": 1,
+        "3": 0,
+        "4": 0,
+    }
+    assert result.metadata["replacement_ncall"] == [10]
+    assert result.metadata["replacement_chain_usage_counts"]["1"] == 1
+    assert result.metadata["replacement_chain_usage_counts"]["2"] == 1
+    assert result.metadata["accepted_rwalk_moves"] == 3
+    assert result.metadata["total_rwalk_proposals"] == 10
+    assert result.metadata["rwalk_acceptance"] == pytest.approx(0.3)
+    assert result.ncall == result.nlive + 10
 
 
 def test_jax_block_rwalk_rescue_fails_before_convergence(monkeypatch) -> None:
