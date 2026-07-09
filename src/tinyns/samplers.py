@@ -16,8 +16,7 @@ from tinyns.bounds import (
     count_containing_jax_ellipsoids,
     in_unit_cube,
     sample_jax_ellipsoid_bound,
-    sample_multi_ellipsoid,
-    sample_multi_ellipsoid_corrected,
+    sample_jax_ellipsoid_bound_corrected,
     sample_single_ellipsoid,
 )
 from tinyns.math import reflect_unit_cube
@@ -125,6 +124,9 @@ def draw_constrained_single_bound(
     if getattr(bound, "ndim", ndim) != ndim:
         raise ValueError("bound dimensionality must match ndim")
 
+    is_multi = isinstance(bound, MultiEllipsoidBound)
+    jax_bound = as_jax_ellipsoid_bound(bound) if is_multi else None
+
     best_u = None
     best_theta = None
     best_logl = -math.inf
@@ -136,15 +138,17 @@ def draw_constrained_single_bound(
 
     while ncall < max_attempts:
         new_key, draw_key = random.split(new_key)
-        if isinstance(bound, MultiEllipsoidBound):
+        if is_multi:
             if overlap_correction:
-                u_batch, _idx, draws, overlap = sample_multi_ellipsoid_corrected(
-                    draw_key, bound, batch_size
+                u_batch, _idx, draws, overlap = sample_jax_ellipsoid_bound_corrected(
+                    draw_key, jax_bound, batch_size
                 )
                 bound_draws += int(draws)
                 overlap_rejections += int(overlap)
             else:
-                u_batch, _idx = sample_multi_ellipsoid(draw_key, bound, batch_size)
+                u_batch, _idx = sample_jax_ellipsoid_bound(
+                    draw_key, jax_bound, batch_size
+                )
                 bound_draws += int(batch_size)
         else:
             u_batch = sample_single_ellipsoid(draw_key, bound, batch_size)
@@ -461,7 +465,6 @@ def draw_constrained_prior(
     logl_min: float,
     ndim: int,
     *,
-    vectorized: bool = False,
     max_attempts: int = 10_000,
 ):
     """Draw a point from the prior subject to a likelihood constraint.
@@ -471,10 +474,6 @@ def draw_constrained_prior(
     attempted point satisfies the constraint, the best attempted point is
     returned with ``accepted`` set to ``False``.
     """
-    if vectorized:
-        raise NotImplementedError(
-            "draw_constrained_prior currently supports vectorized=False only"
-        )
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if max_attempts <= 0:
@@ -581,7 +580,26 @@ def _make_rwalk_jax_kernel(
     replacement_chains: int,
     jax_vectorized: bool,
 ):
-    """Return a cached compiled retrying constrained rwalk kernel."""
+    """Return a cached compiled retrying constrained rwalk kernel.
+
+    This is the single internal rwalk kernel factory. It is imported directly
+    by :mod:`tinyns.run` (for the per-iteration and block paths) and wrapped by
+    :func:`draw_constrained_rwalk_jax`. The returned jitted ``kernel`` always
+    produces an eight-element tuple, in this order:
+
+    1. ``key`` -- the advanced PRNG key.
+    2. ``new_u`` -- the accepted replacement point in unit-cube coordinates.
+    3. ``new_theta`` -- the prior-transformed replacement point.
+    4. ``new_logl`` -- the log-likelihood of ``new_theta``.
+    5. ``ncall`` -- total likelihood evaluations spent (batches x walks x
+       ``replacement_chains``).
+    6. ``accepted`` -- whether an in-constraint move was found before the batch
+       budget was exhausted.
+    7. ``accepted_move_count`` -- accepted proposals summed over all chains and
+       batches (rwalk-acceptance numerator).
+    8. ``total_proposal_count`` -- total proposals attempted; equals ``ncall``
+       and is the rwalk-acceptance denominator.
+    """
 
     @jax.jit
     def kernel(
@@ -935,36 +953,31 @@ def draw_constrained_rwalk_jax(
     return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
 
 
-def draw_constrained_single_bound_rwalk_jax(
+def _draw_constrained_bound_rwalk_jax(
     key,
     loglike,
     prior_transform,
     logl_min,
-    bound,
     ndim: int,
     *,
-    walks: int = 25,
-    step_scale: float = 0.1,
-    max_attempts: int = 10_000,
-    min_accepts: int = 1,
-    replacement_chains: int = 1,
-    replacement_chain_schedule=None,
-    bound_batch_size: int = 128,
-    bound_max_batches: int = 100,
-    jax_vectorized: bool = False,
+    seed_draw,
+    walks: int,
+    step_scale: float,
+    max_attempts: int,
+    min_accepts: int,
+    replacement_chains: int,
+    replacement_chain_schedule,
+    jax_vectorized: bool,
 ):
-    """Draw a single-bound seed and run JAX rwalk chains from that seed."""
-    seed_result = draw_constrained_single_bound_jax(
-        key,
-        loglike,
-        prior_transform,
-        logl_min,
-        bound,
-        ndim,
-        batch_size=bound_batch_size,
-        max_batches=bound_max_batches,
-        jax_vectorized=jax_vectorized,
-    )
+    """Run JAX rwalk chains from a bound-drawn seed.
+
+    Shared implementation for the single- and multi-bound rwalk wrappers. The
+    only per-variant difference is ``seed_draw``, a callable ``seed_draw(key)``
+    that returns the seven-tuple produced by the corresponding bound seed draw
+    (``key, seed_u, seed_theta, seed_logl, seed_ncall, seed_accepted,
+    seed_info``).
+    """
+    seed_result = seed_draw(key)
     (
         key,
         seed_u,
@@ -1070,6 +1083,55 @@ def draw_constrained_single_bound_rwalk_jax(
         info,
     )
 
+
+def draw_constrained_single_bound_rwalk_jax(
+    key,
+    loglike,
+    prior_transform,
+    logl_min,
+    bound,
+    ndim: int,
+    *,
+    walks: int = 25,
+    step_scale: float = 0.1,
+    max_attempts: int = 10_000,
+    min_accepts: int = 1,
+    replacement_chains: int = 1,
+    replacement_chain_schedule=None,
+    bound_batch_size: int = 128,
+    bound_max_batches: int = 100,
+    jax_vectorized: bool = False,
+):
+    """Draw a single-bound seed and run JAX rwalk chains from that seed."""
+
+    def seed_draw(seed_key):
+        return draw_constrained_single_bound_jax(
+            seed_key,
+            loglike,
+            prior_transform,
+            logl_min,
+            bound,
+            ndim,
+            batch_size=bound_batch_size,
+            max_batches=bound_max_batches,
+            jax_vectorized=jax_vectorized,
+        )
+
+    return _draw_constrained_bound_rwalk_jax(
+        key,
+        loglike,
+        prior_transform,
+        logl_min,
+        ndim,
+        seed_draw=seed_draw,
+        walks=walks,
+        step_scale=step_scale,
+        max_attempts=max_attempts,
+        min_accepts=min_accepts,
+        replacement_chains=replacement_chains,
+        replacement_chain_schedule=replacement_chain_schedule,
+        jax_vectorized=jax_vectorized,
+    )
 
 
 def draw_constrained_multi_bound_rwalk_jax(
@@ -1098,121 +1160,35 @@ def draw_constrained_multi_bound_rwalk_jax(
     with a caller-provided proposal covariance Cholesky factor.
     """
     jax_bound = as_jax_ellipsoid_bound(bound)
-    seed_result = draw_constrained_multi_bound_jax(
+
+    def seed_draw(seed_key):
+        return draw_constrained_multi_bound_jax(
+            seed_key,
+            loglike,
+            prior_transform,
+            logl_min,
+            jax_bound,
+            ndim,
+            batch_size=bound_batch_size,
+            max_batches=bound_max_batches,
+            overlap_correction=overlap_correction,
+            jax_vectorized=jax_vectorized,
+        )
+
+    return _draw_constrained_bound_rwalk_jax(
         key,
         loglike,
         prior_transform,
         logl_min,
-        jax_bound,
         ndim,
-        batch_size=bound_batch_size,
-        max_batches=bound_max_batches,
-        overlap_correction=overlap_correction,
+        seed_draw=seed_draw,
+        walks=walks,
+        step_scale=step_scale,
+        max_attempts=max_attempts,
+        min_accepts=min_accepts,
+        replacement_chains=replacement_chains,
+        replacement_chain_schedule=replacement_chain_schedule,
         jax_vectorized=jax_vectorized,
-    )
-    (
-        key,
-        seed_u,
-        seed_theta,
-        seed_logl,
-        seed_ncall,
-        seed_accepted,
-        seed_info,
-    ) = seed_result
-    if not seed_accepted:
-        info = {
-            **seed_info,
-            "rwalk_kernel_calls": 0,
-            "replacement_batches": 0,
-            "replacement_chains_used": 0,
-            "replacement_chain_usage_counts": (
-                {str(int(c)): 0 for c in replacement_chain_schedule}
-                if replacement_chain_schedule is not None
-                else {str(int(replacement_chains)): 0}
-            ),
-            "accepted_move_count": 0,
-            "total_proposal_count": 0,
-            "observed_rwalk_acceptance": 0.0,
-            "accepted_rwalk_moves": 0,
-            "total_rwalk_proposals": 0,
-            "rwalk_acceptance": 0.0,
-        }
-        return key, seed_u, seed_theta, seed_logl, int(seed_ncall), False, info
-
-    if replacement_chain_schedule is None:
-        rwalk_result = draw_constrained_rwalk_jax(
-            key,
-            loglike,
-            prior_transform,
-            logl_min,
-            jnp.asarray(seed_u).reshape((1, ndim)),
-            jnp.asarray([seed_logl]),
-            ndim,
-            walks=walks,
-            step_scale=step_scale,
-            max_attempts=max_attempts,
-            min_accepts=min_accepts,
-            replacement_chains=replacement_chains,
-            jax_vectorized=jax_vectorized,
-            return_info=True,
-        )
-        (
-            key,
-            new_u,
-            new_theta,
-            new_logl,
-            rwalk_ncall,
-            accepted,
-            rwalk_info,
-        ) = rwalk_result
-        batch_ncall = int(walks) * int(replacement_chains)
-        replacement_batches = int(math.ceil(int(rwalk_ncall) / batch_ncall))
-        rwalk_info = {
-            "replacement_batches": replacement_batches,
-            "replacement_chains_used": int(replacement_chains) * replacement_batches,
-            "replacement_chain_usage_counts": {
-                str(int(replacement_chains)): replacement_batches
-            },
-            **rwalk_info,
-        }
-    else:
-        rwalk_result = draw_constrained_rwalk_jax_adaptive_from_seed(
-            key,
-            loglike,
-            prior_transform,
-            logl_min,
-            seed_u,
-            seed_logl,
-            ndim,
-            walks=walks,
-            step_scale=step_scale,
-            max_attempts=max_attempts,
-            min_accepts=min_accepts,
-            replacement_chain_schedule=replacement_chain_schedule,
-            jax_vectorized=jax_vectorized,
-        )
-        (
-            key,
-            new_u,
-            new_theta,
-            new_logl,
-            rwalk_ncall,
-            accepted,
-            rwalk_info,
-        ) = rwalk_result
-    info = {
-        **seed_info,
-        "rwalk_kernel_calls": int(rwalk_ncall),
-        **rwalk_info,
-    }
-    return (
-        key,
-        new_u,
-        new_theta,
-        new_logl,
-        int(seed_ncall) + int(rwalk_ncall),
-        accepted,
-        info,
     )
 
 def draw_constrained_rwalk_jax_adaptive(

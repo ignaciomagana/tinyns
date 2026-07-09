@@ -151,13 +151,6 @@ def _logzerr_diagnostics(
     return float(jnp.sqrt(information / nlive)), diagnostics
 
 
-def _logzerr(logwt, logl, logz: float, nlive: int) -> float:
-    logzerr, _diagnostics = _logzerr_diagnostics(
-        logwt, logl, logz, nlive, nlive_final=0
-    )
-    return logzerr
-
-
 def _update_adaptive_step_scale(
     current_step_scale: float,
     observed_accept: float,
@@ -914,6 +907,22 @@ def run_static_nested(
     if maxiter is None:
         maxiter = 10_000 * ndim
 
+    jax_block_cached = bool(jax_block_size > 1 and bound == "none")
+    jax_block_kernel = (
+        "bounded-python-loop-fixed-bound"
+        if jax_block_size > 1 and bound != "none"
+        else "fixed-rwalk-cached"
+        if jax_block_size > 1
+        else None
+    )
+    jax_block_impl = (
+        "python-loop-fixed-bound"
+        if jax_block_size > 1 and bound != "none"
+        else "lax-scan-unbounded"
+        if jax_block_size > 1
+        else None
+    )
+
     config = {
         "ndim": int(ndim),
         "nlive": int(nlive),
@@ -951,21 +960,9 @@ def run_static_nested(
         "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
         "jax_vectorized": bool(jax_vectorized),
         "jax_block_size": int(jax_block_size),
-        "jax_block_cached": bool(jax_block_size > 1 and bound == "none"),
-        "jax_block_kernel": (
-            "bounded-python-loop-fixed-bound"
-            if jax_block_size > 1 and bound != "none"
-            else "fixed-rwalk-cached"
-            if jax_block_size > 1
-            else None
-        ),
-        "jax_block_impl": (
-            "python-loop-fixed-bound"
-            if jax_block_size > 1 and bound != "none"
-            else "lax-scan-unbounded"
-            if jax_block_size > 1
-            else None
-        ),
+        "jax_block_cached": jax_block_cached,
+        "jax_block_kernel": jax_block_kernel,
+        "jax_block_impl": jax_block_impl,
         "rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale),
         "rwalk_target_accept": float(rwalk_target_accept),
     }
@@ -1148,6 +1145,92 @@ def run_static_nested(
             save_checkpoint_npz(checkpoint_path_str, current_state(), config)
             last_checkpoint_iteration = iteration
 
+    def maybe_rebuild_bound(iter_index: int) -> None:
+        """(Re)build the active ellipsoid bound when the interval/force fires.
+
+        ``iter_index`` is the loop counter used for the periodic-rebuild modulo:
+        block mode passes ``iteration`` and per-iteration mode passes ``i`` (the
+        only behavioral difference between the two former inline copies).
+        """
+        nonlocal current_bound, bound_updates, bound_forced_rebuilds
+        nonlocal force_bound_rebuild
+        if bound not in {"single", "multi"}:
+            return
+        if not (
+            current_bound is None
+            or iter_index % bound_update_interval == 0
+            or force_bound_rebuild
+        ):
+            return
+        build_start = time.perf_counter()
+        if bound == "multi":
+            current_bound = build_multi_ellipsoid_bound(
+                live_u,
+                enlargement=multi_bound_enlargement or bound_enlargement,
+                jitter=bound_jitter,
+                max_ellipsoids=multi_bound_max_ellipsoids,
+                min_points=multi_bound_min_points,
+                split_threshold=multi_bound_split_threshold,
+            )
+        else:
+            current_bound = build_single_ellipsoid_bound(
+                live_u,
+                enlargement=bound_enlargement,
+                jitter=bound_jitter,
+            )
+        bound_build_time_history.append(time.perf_counter() - build_start)
+        bound_log_volume_history.append(
+            float(
+                current_bound.log_total_volume
+                if hasattr(current_bound, "log_total_volume")
+                else current_bound.log_volume
+            )
+        )
+        bound_nellipsoid_history.append(
+            int(len(getattr(current_bound, "ellipsoids", (current_bound,))))
+        )
+        bound_updates += 1
+        if force_bound_rebuild:
+            bound_forced_rebuilds += 1
+            force_bound_rebuild = False
+
+    def build_state(
+        *,
+        iteration: int,
+        logz: float,
+        dlogz: float,
+        ncall: int,
+        logl_min: float,
+        logl_live_max: float,
+    ) -> dict[str, object]:
+        """Assemble a run-state dict, closing over the constant config args."""
+        return _make_run_state(
+            iteration=iteration,
+            logz=logz,
+            dlogz=dlogz,
+            ncall=ncall,
+            logl_min=logl_min,
+            logl_live_max=logl_live_max,
+            sample=sample,
+            nlive=nlive,
+            ndim=ndim,
+            replacement_ncall=replacement_ncall,
+            replacement_failures=replacement_failures,
+            replacement_batches=replacement_batches,
+            replacement_chains_used=replacement_chains_used,
+            replacement_chain_usage_counts=replacement_chain_usage_counts,
+            replacement_chain_schedule=replacement_chain_schedule,
+            replacement_chains=replacement_chains,
+            kernel=kernel,
+            walks=walks,
+            bound=bound,
+            bound_draws=bound_draw_history,
+            bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
+            bound_nellipsoids=bound_nellipsoid_history,
+            rwalk_seed=rwalk_seed,
+            bound_seed_kernel=bound_seed_kernel,
+        )
+
     # A resumed run may already be terminal: converged, or checkpointed at
     # iteration >= maxiter without converging. Label it here so neither loop
     # (block mode's `while`, per-iteration's empty `range`) is entered or
@@ -1189,42 +1272,7 @@ def run_static_nested(
             accepted_move_count_block = None
             total_proposal_count_block = None
             if bound in {"single", "multi"}:
-                if (
-                    current_bound is None
-                    or iteration % bound_update_interval == 0
-                    or force_bound_rebuild
-                ):
-                    build_start = time.perf_counter()
-                    if bound == "multi":
-                        current_bound = build_multi_ellipsoid_bound(
-                            live_u,
-                            enlargement=multi_bound_enlargement or bound_enlargement,
-                            jitter=bound_jitter,
-                            max_ellipsoids=multi_bound_max_ellipsoids,
-                            min_points=multi_bound_min_points,
-                            split_threshold=multi_bound_split_threshold,
-                        )
-                    else:
-                        current_bound = build_single_ellipsoid_bound(
-                            live_u,
-                            enlargement=bound_enlargement,
-                            jitter=bound_jitter,
-                        )
-                    bound_build_time_history.append(time.perf_counter() - build_start)
-                    bound_log_volume_history.append(
-                        float(
-                            current_bound.log_total_volume
-                            if hasattr(current_bound, "log_total_volume")
-                            else current_bound.log_volume
-                        )
-                    )
-                    bound_nellipsoid_history.append(
-                        int(len(getattr(current_bound, "ellipsoids", (current_bound,))))
-                    )
-                    bound_updates += 1
-                    if force_bound_rebuild:
-                        bound_forced_rebuilds += 1
-                        force_bound_rebuild = False
+                maybe_rebuild_bound(iteration)
                 seed_limit = bound_max_draws or max_attempts
                 result = _run_static_jax_bounded_rwalk_block(
                     key,
@@ -1726,7 +1774,7 @@ def run_static_nested(
             if iteration == maxiter and delta_logz >= dlogz:
                 success = False
                 message = f"maxiter={maxiter} reached"
-            state = _make_run_state(
+            state = build_state(
                 iteration=iteration,
                 logz=logz_dead,
                 dlogz=delta_logz,
@@ -1737,24 +1785,6 @@ def run_static_nested(
                     else dead_logl_storage[iteration - 1]
                 ),
                 logl_live_max=float(jnp.max(live_logl)),
-                sample=sample,
-                nlive=nlive,
-                ndim=ndim,
-                replacement_ncall=replacement_ncall,
-                replacement_failures=replacement_failures,
-                replacement_batches=replacement_batches,
-                replacement_chains_used=replacement_chains_used,
-                replacement_chain_usage_counts=replacement_chain_usage_counts,
-                replacement_chain_schedule=replacement_chain_schedule,
-                replacement_chains=replacement_chains,
-                kernel=kernel,
-                walks=walks,
-                bound=bound,
-                bound_draws=bound_draw_history,
-                bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
-                bound_nellipsoids=bound_nellipsoid_history,
-                rwalk_seed=rwalk_seed,
-                bound_seed_kernel=bound_seed_kernel,
             )
             if callback is not None and (
                 iteration == 1 or iteration % callback_interval == 0 or final_iteration
@@ -1790,41 +1820,7 @@ def run_static_nested(
             logx_final = logx_new
 
             replacement_info = None
-            rebuild_bound = bound in {"single", "multi"} and (
-                current_bound is None
-                or i % bound_update_interval == 0
-                or force_bound_rebuild
-            )
-            if rebuild_bound:
-                build_start = time.perf_counter()
-                if bound == "multi":
-                    current_bound = build_multi_ellipsoid_bound(
-                        live_u,
-                        enlargement=multi_bound_enlargement or bound_enlargement,
-                        jitter=bound_jitter,
-                        max_ellipsoids=multi_bound_max_ellipsoids,
-                        min_points=multi_bound_min_points,
-                        split_threshold=multi_bound_split_threshold,
-                    )
-                else:
-                    current_bound = build_single_ellipsoid_bound(
-                        live_u, enlargement=bound_enlargement, jitter=bound_jitter
-                    )
-                bound_build_time_history.append(time.perf_counter() - build_start)
-                bound_log_volume_history.append(
-                    float(
-                        current_bound.log_total_volume
-                        if hasattr(current_bound, "log_total_volume")
-                        else current_bound.log_volume
-                    )
-                )
-                bound_nellipsoid_history.append(
-                    int(len(getattr(current_bound, "ellipsoids", (current_bound,))))
-                )
-                bound_updates += 1
-                if force_bound_rebuild:
-                    bound_forced_rebuilds += 1
-                    force_bound_rebuild = False
+            maybe_rebuild_bound(i)
 
             bound_failure = False
             bound_success = False
@@ -1860,7 +1856,6 @@ def run_static_nested(
                         prior_transform,
                         logl_worst,
                         ndim,
-                        vectorized=False,
                         max_attempts=max_attempts,
                     )
             elif sample == "rwalk":
@@ -2193,34 +2188,15 @@ def run_static_nested(
                 message = (
                     f"max_attempts={max_attempts} hit during constrained prior draw"
                 )
-                logz_remain = logx_new + float(jnp.max(live_logl))
-                delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+                delta_logz = _remaining_delta_logz(logz_dead, logx_new, live_logl)
                 final_delta_logz = delta_logz
-                state = _make_run_state(
+                state = build_state(
                     iteration=i + 1,
                     logz=logz_dead,
                     dlogz=delta_logz,
                     ncall=ncall,
                     logl_min=logl_worst,
                     logl_live_max=float(jnp.max(live_logl)),
-                    sample=sample,
-                    nlive=nlive,
-                    ndim=ndim,
-                    replacement_ncall=replacement_ncall,
-                    replacement_failures=replacement_failures,
-                    replacement_batches=replacement_batches,
-                    replacement_chains_used=replacement_chains_used,
-                    replacement_chain_usage_counts=replacement_chain_usage_counts,
-                    replacement_chain_schedule=replacement_chain_schedule,
-                    replacement_chains=replacement_chains,
-                    kernel=kernel,
-                    walks=walks,
-                    bound=bound,
-                    bound_draws=bound_draw_history,
-                    bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
-                    bound_nellipsoids=bound_nellipsoid_history,
-                    rwalk_seed=rwalk_seed,
-                    bound_seed_kernel=bound_seed_kernel,
                 )
                 if callback is not None and (
                     i + 1 == 1 or (i + 1) % callback_interval == 0
@@ -2244,38 +2220,19 @@ def run_static_nested(
             live_logl = live_logl.at[worst].set(new_logl)
             maybe_checkpoint()
 
-            logz_remain = logx_new + float(jnp.max(live_logl))
-            delta_logz = float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
+            delta_logz = _remaining_delta_logz(logz_dead, logx_new, live_logl)
             final_delta_logz = delta_logz
             final_iteration = delta_logz < dlogz or i + 1 == maxiter
             if i + 1 == maxiter and delta_logz >= dlogz:
                 success = False
                 message = f"maxiter={maxiter} reached"
-            state = _make_run_state(
+            state = build_state(
                 iteration=i + 1,
                 logz=logz_dead,
                 dlogz=delta_logz,
                 ncall=ncall,
                 logl_min=logl_worst,
                 logl_live_max=float(jnp.max(live_logl)),
-                sample=sample,
-                nlive=nlive,
-                ndim=ndim,
-                replacement_ncall=replacement_ncall,
-                replacement_failures=replacement_failures,
-                replacement_batches=replacement_batches,
-                replacement_chains_used=replacement_chains_used,
-                replacement_chain_usage_counts=replacement_chain_usage_counts,
-                replacement_chain_schedule=replacement_chain_schedule,
-                replacement_chains=replacement_chains,
-                kernel=kernel,
-                walks=walks,
-                bound=bound,
-                bound_draws=bound_draw_history,
-                bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
-                bound_nellipsoids=bound_nellipsoid_history,
-                rwalk_seed=rwalk_seed,
-                bound_seed_kernel=bound_seed_kernel,
             )
             if callback is not None and (
                 i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
@@ -2408,21 +2365,9 @@ def run_static_nested(
             "jax_block_size": int(jax_block_size),
             "jax_block_mode": bool(jax_block_size > 1),
             "jax_block_bound_fixed": bool(jax_block_size > 1 and bound != "none"),
-            "jax_block_cached": bool(jax_block_size > 1 and bound == "none"),
-            "jax_block_kernel": (
-                "bounded-python-loop-fixed-bound"
-                if jax_block_size > 1 and bound != "none"
-                else "fixed-rwalk-cached"
-                if jax_block_size > 1
-                else None
-            ),
-            "jax_block_impl": (
-                "python-loop-fixed-bound"
-                if jax_block_size > 1 and bound != "none"
-                else "lax-scan-unbounded"
-                if jax_block_size > 1
-                else None
-            ),
+            "jax_block_cached": jax_block_cached,
+            "jax_block_kernel": jax_block_kernel,
+            "jax_block_impl": jax_block_impl,
             "dlogz": dlogz,
             "maxiter": maxiter,
             "niter": niter,
