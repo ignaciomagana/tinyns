@@ -31,18 +31,19 @@ def test_public_exports() -> None:
 
 
 def test_nested_sampler_stores_configuration() -> None:
-    sampler = NestedSampler(
-        loglike,
-        prior_transform,
-        ndim=3,
-        nlive=500,
-        vectorized=True,
-        sample="rwalk",
-        max_attempts=123,
-        walks=12,
-        step_scale=0.2,
-        bootstrap=10,
-    )
+    with pytest.warns(UserWarning, match="bootstrap"):
+        sampler = NestedSampler(
+            loglike,
+            prior_transform,
+            ndim=3,
+            nlive=500,
+            vectorized=True,
+            sample="rwalk",
+            max_attempts=123,
+            walks=12,
+            step_scale=0.2,
+            bootstrap=10,
+        )
 
     assert sampler.loglike is loglike
     assert sampler.prior_transform is prior_transform
@@ -51,7 +52,33 @@ def test_nested_sampler_stores_configuration() -> None:
     assert sampler.vectorized is True
     assert sampler.sample == "rwalk"
     assert sampler.max_attempts == 123
+    # Unknown kwargs still stored for dynesty drop-in compatibility.
     assert sampler.kwargs == {"walks": 12, "step_scale": 0.2, "bootstrap": 10}
+
+
+def test_nested_sampler_no_warning_for_known_kwargs(recwarn) -> None:
+    sampler = NestedSampler(
+        loglike,
+        prior_transform,
+        ndim=2,
+        nlive=100,
+        sample="rwalk",
+        kernel="jax",
+        walks=10,
+        step_scale=0.1,
+        min_accepts=1,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.3,
+    )
+
+    unknown = [
+        w
+        for w in recwarn.list
+        if issubclass(w.category, UserWarning)
+        and "unknown keyword" in str(w.message)
+    ]
+    assert unknown == []
+    assert sampler.kwargs["walks"] == 10
 
 
 def test_nested_sampler_validates_configuration() -> None:

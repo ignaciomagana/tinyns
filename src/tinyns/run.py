@@ -1327,6 +1327,12 @@ def run_static_nested(
     replacement_rescue_max_stage = None
     replacement_rescue_last_message = None
     effective_step_scale = float(step_scale)
+    if initial_state is not None:
+        restored_step_scale = getattr(initial_state, "effective_step_scale", None)
+        if restored_step_scale is not None and math.isfinite(
+            float(restored_step_scale)
+        ):
+            effective_step_scale = float(restored_step_scale)
     adaptive_scale_history = [effective_step_scale]
     adaptive_accept_history = []
     adaptive_updates = 0
@@ -1372,15 +1378,42 @@ def run_static_nested(
             success=success,
             message=message,
             stopped_by_callback=stopped_by_callback,
+            effective_step_scale=effective_step_scale,
         )
 
+    last_checkpoint_iteration = initial_iteration
+
     def maybe_checkpoint(*, final: bool = False) -> None:
+        nonlocal last_checkpoint_iteration
         if checkpoint_path_str is None:
             return
-        if final or iteration == 1 or iteration % checkpoint_interval == 0:
+        if final or (iteration - last_checkpoint_iteration) >= checkpoint_interval:
             save_checkpoint_npz(checkpoint_path_str, current_state(), config)
+            last_checkpoint_iteration = iteration
 
-    if jax_block_size > 1:
+    # A resumed run may already be terminal: converged, or checkpointed at
+    # iteration >= maxiter without converging. Label it here so neither loop
+    # (block mode's `while`, per-iteration's empty `range`) is entered or
+    # skipped with the stale neutral `success=True, message="converged"`
+    # initial values.
+    resumed_terminal = False
+    if iteration > 0:
+        delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+        final_delta_logz = delta_logz
+        if delta_logz < dlogz:
+            success = True
+            message = "converged"
+            maybe_checkpoint(final=True)
+            resumed_terminal = True
+        elif iteration >= maxiter:
+            success = False
+            message = f"maxiter={maxiter} reached"
+            maybe_checkpoint(final=True)
+            resumed_terminal = True
+
+    if resumed_terminal:
+        pass
+    elif jax_block_size > 1:
         while iteration < maxiter:
             if iteration > 0:
                 delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
@@ -1638,6 +1671,12 @@ def run_static_nested(
                 partial_block_failure_offset = int(failed_offsets[0])
                 partial_block_failure_message = message
                 block_size_now = failed_offsets[0]
+                failed_calls = int(
+                    np.asarray(full_replacement_ncall_block)[
+                        partial_block_failure_offset
+                    ]
+                )
+                ncall += failed_calls
             block_stop = iteration + block_size_now
             if failed_offsets:
                 logz_dead = float(logz_dead_before_block)
@@ -1923,9 +1962,6 @@ def run_static_nested(
                             dead_logwt_storage[block_start:fail_stop] = np.asarray(
                                 full_dead_logwt_block[: fail_offset + 1]
                             )
-                            failed_calls = int(
-                                full_replacement_ncall_block[fail_offset]
-                            )
                             failed_accepted_moves = 0
                             if full_accepted_move_count_block is not None:
                                 failed_accepted_moves = int(
@@ -1984,7 +2020,6 @@ def run_static_nested(
                                 rescue_live_theta,
                                 rescue_live_logl,
                             )
-                            ncall += failed_calls + rescue_calls_total
                             iteration = fail_stop
                             attempted_proposals = (
                                 failed_proposals + rescue_proposals_total
@@ -1998,6 +2033,7 @@ def run_static_nested(
                                     / attempted_proposals
                                 )
                             break
+                    ncall += rescue_calls_total
                     if not rescue_success:
                         replacement_rescue_failures += 1
                         replacement_rescue_last_message = (
@@ -2588,12 +2624,6 @@ def run_static_nested(
             if final_iteration:
                 maybe_checkpoint(final=True)
                 break
-        else:
-            success = False
-            message = f"maxiter={maxiter} reached"
-            logx_final = -maxiter / nlive
-            iteration = maxiter
-            maybe_checkpoint(final=True)
 
     live_logwt = logx_final - math.log(nlive) + live_logl
 

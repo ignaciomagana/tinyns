@@ -55,6 +55,7 @@ class NestedRunState:
     success: bool
     message: str
     stopped_by_callback: bool = False
+    effective_step_scale: float | None = None
 
 
 def _npz_scalar(value):
@@ -100,6 +101,11 @@ def save_checkpoint_npz(path, state: NestedRunState, config: dict) -> None:
             success=np.asarray(bool(state.success)),
             message=np.asarray(str(state.message)),
             stopped_by_callback=np.asarray(bool(state.stopped_by_callback)),
+            effective_step_scale=np.asarray(
+                float(state.effective_step_scale)
+                if state.effective_step_scale is not None
+                else float("nan")
+            ),
             config_json=np.asarray(json.dumps(config, sort_keys=True)),
         )
     os.replace(tmp_path, path)
@@ -121,6 +127,11 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
                 f"{format_version!r}; expected {_CHECKPOINT_NPZ_FORMAT_VERSION!r}"
             )
         config = json.loads(str(_npz_scalar(data["config_json"])))
+        effective_step_scale = None
+        if "effective_step_scale" in data.files:
+            raw_step_scale = float(_npz_scalar(data["effective_step_scale"]))
+            if np.isfinite(raw_step_scale):
+                effective_step_scale = raw_step_scale
         dead_u = [jnp.asarray(point) for point in np.asarray(data["dead_u"])]
         dead_theta = [jnp.asarray(point) for point in np.asarray(data["dead_theta"])]
         state = NestedRunState(
@@ -142,5 +153,6 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
             success=bool(_npz_scalar(data["success"])),
             message=str(_npz_scalar(data["message"])),
             stopped_by_callback=bool(_npz_scalar(data["stopped_by_callback"])),
+            effective_step_scale=effective_step_scale,
         )
         return state, config
