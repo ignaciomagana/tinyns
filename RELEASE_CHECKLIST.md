@@ -90,7 +90,7 @@ TinyNS v0.1.0-alpha is intended as a small static nested sampler with a validate
 
 ## Repeatable release validation
 
-Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16, B64/B128, and no-block/bounds comparison runs are optional diagnostics. Failures isolated to experimental live-cov/bounded/fused-bounded paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:
+Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16, B64/B128, and no-block/bounds comparison runs are optional diagnostics. Failures isolated to experimental bounded/fused-bounded paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:
 
 1. [ ] Run `make test`.
 2. [ ] Run `make quick-validation`.
