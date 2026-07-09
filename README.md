@@ -116,11 +116,10 @@ benchmark targets; it should still be revalidated for new target geometries.
 | Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` | Best validated path on included benchmarks |
 | Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
 | Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
-| Experimental | `rwalk_proposal="live-cov"` | Not promoted due to concerning validation pulls |
 | Experimental | bounds / fused bounds / bounded block | Useful research direction; not production-ready |
 | Experimental | adaptive replacement-chain schedules | Useful tuning knob; not the main recommended path |
 
-Removed: slice/random-slice samplers were removed to keep TinyNS small. Use dynesty for slice-based external comparisons.
+Removed: slice/random-slice samplers were removed to keep TinyNS small (use dynesty for slice-based external comparisons). `rwalk_proposal="live-cov"` (with `rwalk_cov_jitter`) has also been removed.
 
 ### Recommended fast JAX rwalk path
 
@@ -261,7 +260,7 @@ sampler = NestedSampler(
     kernel="jax",
     bound="multi",
     rwalk_seed="bound",
-    rwalk_proposal="live-cov",
+    rwalk_proposal="isotropic",
     walks=5,
     replacement_chains=16,
 )
@@ -288,7 +287,7 @@ NestedSampler(
     kernel="jax",
     bound="multi",
     rwalk_seed="bound",
-    rwalk_proposal="live-cov",
+    rwalk_proposal="isotropic",
     walks=5,
     replacement_chains=16,
 )
@@ -310,7 +309,7 @@ The recommended fast path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="is
 - `banana2d`
 - `eggbox2d`
 
-The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Bounds and `rwalk_proposal="live-cov"` are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
+The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Bounds are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
 
 ### `min_accepts`
 
