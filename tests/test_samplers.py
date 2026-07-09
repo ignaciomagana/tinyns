@@ -62,8 +62,8 @@ def test_draw_constrained_prior_returns_best_after_impossible_threshold() -> Non
     assert ncall == max_attempts
 
 
-def test_draw_constrained_prior_rejects_vectorized_mode() -> None:
-    with pytest.raises(NotImplementedError, match="vectorized=False only"):
+def test_draw_constrained_prior_rejects_vectorized_kwarg() -> None:
+    with pytest.raises(TypeError):
         draw_constrained_prior(
             random.PRNGKey(0),
             gaussian_loglike,

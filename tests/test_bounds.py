@@ -16,14 +16,11 @@ from tinyns.bounds import (
     build_single_ellipsoid_bound,
     contains_jax_ellipsoid_bound,
     contains_single_ellipsoid,
-    count_containing_ellipsoids,
     count_containing_jax_ellipsoids,
     in_unit_cube,
     jax_bound_volume_probs,
-    jax_in_unit_cube,
     sample_jax_ellipsoid_bound,
     sample_jax_ellipsoid_bound_corrected,
-    sample_multi_ellipsoid,
     sample_single_ellipsoid,
     unit_ball_log_volume,
 )
@@ -108,7 +105,8 @@ def test_multi_ellipsoid_bound_handles_nearly_rank_deficient_clusters() -> None:
     )
 
     assert 1 <= len(bound.ellipsoids) <= 4
-    assert bool(jnp.all(count_containing_ellipsoids(bound, live_u) > 0))
+    counts = count_containing_jax_ellipsoids(as_jax_ellipsoid_bound(bound), live_u)
+    assert bool(jnp.all(counts > 0))
     assert math.isfinite(bound.log_total_volume)
 
 
@@ -223,16 +221,16 @@ def test_unit_ball_log_volume_is_finite_for_common_dimensions() -> None:
 
 def test_multi_ellipsoid_bound_geometry_smoke() -> None:
     live_u = _clustered_live_points()
-    from tinyns.bounds import contains_multi_ellipsoid
 
     bound = build_multi_ellipsoid_bound(
         live_u, max_ellipsoids=4, min_points=8, split_threshold=0.99
     )
-    samples, indices = sample_multi_ellipsoid(random.PRNGKey(12), bound, 13)
-    counts = count_containing_ellipsoids(bound, live_u)
+    jax_bound = as_jax_ellipsoid_bound(bound)
+    samples, indices = sample_jax_ellipsoid_bound(random.PRNGKey(12), jax_bound, 13)
+    counts = count_containing_jax_ellipsoids(jax_bound, live_u)
 
     assert 1 <= len(bound.ellipsoids) <= 4
-    assert bool(jnp.all(contains_multi_ellipsoid(bound, live_u)))
+    assert bool(jnp.all(contains_jax_ellipsoid_bound(jax_bound, live_u)))
     assert samples.shape == (13, 2)
     assert indices.shape == (13,)
     assert bool(jnp.all(counts > 0))
@@ -311,9 +309,13 @@ def test_count_containing_jax_ellipsoids_agrees_with_multi_bound() -> None:
     )
     bound = as_jax_ellipsoid_bound(multi, max_ellipsoids=6)
 
+    expected = sum(
+        contains_single_ellipsoid(ellipsoid, live_u).astype(int)
+        for ellipsoid in multi.ellipsoids
+    )
     assert jnp.array_equal(
         count_containing_jax_ellipsoids(bound, live_u),
-        count_containing_ellipsoids(multi, live_u),
+        expected,
     )
 
 
@@ -460,13 +462,7 @@ def test_sample_jax_ellipsoid_bound_corrected_invalid_multiplier_raises() -> Non
         )
 
 
-def test_jax_in_unit_cube_matches_existing_helper() -> None:
-    u = jnp.array([[0.2, 0.3], [1.2, 0.3]])
-
-    assert jnp.array_equal(jax_in_unit_cube(u), in_unit_cube(u))
-
-
-def test_existing_python_sampling_outputs_are_unchanged() -> None:
+def test_ellipsoid_sampling_outputs_lie_inside_bounds() -> None:
     single = build_single_ellipsoid_bound(_live_points(32, 3))
     multi = build_multi_ellipsoid_bound(
         _clustered_live_points(),
@@ -474,12 +470,15 @@ def test_existing_python_sampling_outputs_are_unchanged() -> None:
         min_points=8,
         split_threshold=0.99,
     )
+    jax_multi = as_jax_ellipsoid_bound(multi)
 
     single_samples = sample_single_ellipsoid(random.PRNGKey(30), single, 5)
-    multi_samples, multi_indices = sample_multi_ellipsoid(random.PRNGKey(31), multi, 5)
+    multi_samples, multi_indices = sample_jax_ellipsoid_bound(
+        random.PRNGKey(31), jax_multi, 5
+    )
 
     assert single_samples.shape == (5, 3)
     assert multi_samples.shape == (5, 2)
     assert multi_indices.shape == (5,)
     assert bool(jnp.all(contains_single_ellipsoid(single, single_samples)))
-    assert bool(jnp.all(count_containing_ellipsoids(multi, multi_samples) > 0))
+    assert bool(jnp.all(count_containing_jax_ellipsoids(jax_multi, multi_samples) > 0))
