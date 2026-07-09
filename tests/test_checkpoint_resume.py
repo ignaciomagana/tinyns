@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import tinyns.run as run_mod
 from tinyns import NestedSampler
 from tinyns.run import run_static_nested
 from tinyns.state import load_checkpoint_npz
@@ -358,3 +359,222 @@ def test_checkpoint_config_validates_bound_rebuild_policy(tmp_path):
             bound_rebuild_on_failure=True,
             bound_failure_rebuild_threshold=1,
         ).resume(path, maxiter=2)
+
+
+def _rewrite_checkpoint_array(path, name, value):
+    with np.load(path) as data:
+        arrays = {n: data[n] for n in data.files}
+    arrays[name] = np.asarray(value)
+    with open(path, "wb") as file:
+        np.savez_compressed(file, **arrays)
+
+
+def test_block_mode_writes_intermediate_checkpoints(tmp_path, monkeypatch):
+    saves = []
+    original_save = run_mod.save_checkpoint_npz
+
+    def recording_save(path, state, config):
+        saves.append((int(state.iteration), bool(state.success)))
+        return original_save(path, state, config)
+
+    monkeypatch.setattr(run_mod, "save_checkpoint_npz", recording_save)
+
+    path = tmp_path / "block.checkpoint.npz"
+    # Block advances iteration by 8; with interval 10 the new cadence saves at
+    # 16, 32, 48, ... The old `iteration % interval == 0` cadence would not save
+    # until iteration 40 (block 32 / interval 100 example: not until 800).
+    result = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.1,
+        jax_block_size=8,
+    ).run(21, maxiter=400, dlogz=0.1, checkpoint_path=path, checkpoint_interval=10)
+
+    final_iteration = result.metadata["final_iteration"]
+    assert final_iteration > 16
+    nonfinal_iterations = {it for (it, _s) in saves if it < final_iteration}
+    assert nonfinal_iterations, "expected intermediate block-mode checkpoints"
+    assert 16 in nonfinal_iterations
+    assert all(it % 8 == 0 for it in nonfinal_iterations)
+    assert result.success is True
+
+
+def test_resume_of_converged_run_reports_success_python(tmp_path):
+    path = tmp_path / "converged_python.checkpoint.npz"
+    sampler = make_sampler(sample="rwalk", kernel="python", walks=5)
+
+    first = sampler.run(30, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
+    assert first.success is True
+    assert "converged" in first.message
+
+    resumed = sampler.resume(path, dlogz=0.5)
+
+    assert resumed.success is True
+    assert "converged" in resumed.message
+    assert resumed.metadata["resumed_from_checkpoint"] is True
+
+
+def test_resume_of_converged_run_reports_success_block(tmp_path):
+    path = tmp_path / "converged_block.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk", kernel="jax", walks=5, step_scale=0.1, jax_block_size=8
+    )
+
+    first = sampler.run(31, dlogz=0.5, checkpoint_path=path, checkpoint_interval=8)
+    assert first.success is True
+    assert "converged" in first.message
+
+    resumed = sampler.resume(path, dlogz=0.5)
+
+    assert resumed.success is True
+    assert "converged" in resumed.message
+    assert resumed.metadata["resumed_from_checkpoint"] is True
+
+
+def test_adaptive_step_scale_restored_on_resume(tmp_path):
+    path = tmp_path / "adaptive.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.1,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.5,
+    )
+
+    first = sampler.run(40, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
+    assert first.success is True
+
+    state, _ = load_checkpoint_npz(path)
+    assert state.effective_step_scale is not None
+    # Force a distinctive effective scale, clearly different from base step_scale.
+    _rewrite_checkpoint_array(path, "effective_step_scale", 0.037)
+
+    resumed = sampler.resume(path, dlogz=0.5)
+
+    assert resumed.success is True
+    # Already converged on resume, so no further adaptation runs: the reported
+    # final effective scale is the restored checkpoint value, not base 0.1.
+    assert resumed.metadata["rwalk_effective_step_scale_final"] == pytest.approx(0.037)
+    assert resumed.metadata["rwalk_effective_step_scale_initial"] == pytest.approx(0.1)
+
+
+def test_resume_without_effective_step_scale_field_falls_back(tmp_path):
+    path = tmp_path / "adaptive_full.checkpoint.npz"
+    stripped = tmp_path / "adaptive_stripped.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=5,
+        step_scale=0.1,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.5,
+    )
+
+    sampler.run(41, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
+
+    with np.load(path) as data:
+        values = {
+            name: data[name]
+            for name in data.files
+            if name != "effective_step_scale"
+        }
+    np.savez(stripped, **values)
+
+    state, _ = load_checkpoint_npz(stripped)
+    assert state.effective_step_scale is None
+
+    resumed = sampler.resume(stripped, dlogz=0.5)
+
+    assert resumed.success is True
+    # Missing field falls back to the base step_scale.
+    assert resumed.metadata["rwalk_effective_step_scale_final"] == pytest.approx(0.1)
+
+
+def test_resume_rejects_rwalk_adaptive_step_scale_mismatch(tmp_path):
+    path = tmp_path / "adaptive_config.checkpoint.npz"
+    make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=3,
+        rwalk_adaptive_step_scale=True,
+    ).run(42, maxiter=2, dlogz=0.0, checkpoint_path=path)
+
+    with pytest.raises(ValueError, match="rwalk_adaptive_step_scale"):
+        make_sampler(sample="rwalk", kernel="jax", walks=3).resume(path, maxiter=3)
+
+
+def test_resume_rejects_rwalk_target_accept_mismatch(tmp_path):
+    path = tmp_path / "target_accept_config.checkpoint.npz"
+    make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=3,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.5,
+    ).run(43, maxiter=2, dlogz=0.0, checkpoint_path=path)
+
+    with pytest.raises(ValueError, match="rwalk_target_accept"):
+        make_sampler(
+            sample="rwalk",
+            kernel="jax",
+            walks=3,
+            rwalk_adaptive_step_scale=True,
+            rwalk_target_accept=0.3,
+        ).resume(path, maxiter=3)
+
+
+def test_resume_at_maxiter_without_convergence_reports_maxiter_python(
+    tmp_path, monkeypatch
+):
+    captured = []
+    original_save = run_mod.save_checkpoint_npz
+
+    def recording_save(path, state, config):
+        captured.append(state)
+        return original_save(path, state, config)
+
+    monkeypatch.setattr(run_mod, "save_checkpoint_npz", recording_save)
+
+    path = tmp_path / "midrun.checkpoint.npz"
+    make_sampler().run(
+        50, maxiter=6, dlogz=0.0, checkpoint_path=path, checkpoint_interval=1
+    )
+
+    # A mid-run snapshot: iteration 3, far from converged, carrying the neutral
+    # in-progress labels (success=True, message="converged").
+    state = next(s for s in captured if s.iteration == 3)
+    assert state.success is True
+
+    result = run_static_nested(
+        state.key,
+        loglike,
+        prior_transform,
+        ndim=2,
+        nlive=20,
+        dlogz=0.1,
+        maxiter=3,
+        initial_state=state,
+    )
+
+    assert result.success is False
+    assert "maxiter" in result.message
+    assert "converged" not in result.message
+
+
+def test_resume_at_maxiter_without_convergence_reports_maxiter_block(tmp_path):
+    path = tmp_path / "maxiter_block.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk", kernel="jax", walks=5, step_scale=0.1, jax_block_size=4
+    )
+
+    first = sampler.run(51, maxiter=4, dlogz=0.0, checkpoint_path=path)
+    assert first.success is False
+    assert "maxiter" in first.message
+
+    resumed = sampler.resume(path, maxiter=4, dlogz=0.1)
+
+    assert resumed.success is False
+    assert "maxiter" in resumed.message
+    assert "converged" not in resumed.message

@@ -1164,7 +1164,11 @@ def test_jax_block_rwalk_rescue_succeeds_after_normal_failure(monkeypatch) -> No
     assert result.metadata["accepted_rwalk_moves"] == 3
     assert result.metadata["total_rwalk_proposals"] == 10
     assert result.metadata["rwalk_acceptance"] == pytest.approx(0.3)
-    assert result.ncall == result.nlive + 10
+    # ncall accounts for both the failed offset's calls (2) and the full rescue
+    # ladder's calls (stage 1: 3 + stage 2: 5 = 8): nlive + 2 + 8 == nlive + 10.
+    failed_offset_calls = 2
+    rescue_calls_total = 3 + 5
+    assert result.ncall == result.nlive + failed_offset_calls + rescue_calls_total
 
 
 def test_jax_block_rwalk_rescue_fails_before_convergence(monkeypatch) -> None:
@@ -1199,6 +1203,101 @@ def test_jax_block_rwalk_rescue_fails_before_convergence(monkeypatch) -> None:
     assert result.metadata["replacement_rescue_attempts"] == 4
     assert result.metadata["replacement_rescue_ncall"] == 16
     assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
+
+
+def _partial_failure_block_kernel_20tuple(
+    *, accepted_prefix: int, replacement_ncall
+):
+    replacement_ncall = tuple(int(x) for x in replacement_ncall)
+    block_size = len(replacement_ncall)
+
+    def make_kernel(*_args, **_kwargs):
+        def kernel(
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            logz_dead,
+            start_iteration,
+            nlive,
+            *_rest,
+        ):
+            worst = int(jnp.argmin(live_logl))
+            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
+            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
+            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
+            offsets = jnp.arange(block_size)
+            iterations = start_iteration + offsets
+            logx_prev = -iterations / nlive
+            logx_new = -(iterations + 1) / nlive
+            dead_logwt = (
+                logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + live_logl[worst]
+            )
+            ncall_block = jnp.asarray(replacement_ncall, dtype=jnp.int32)
+            accepted = offsets < accepted_prefix
+            return (
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                dead_u,
+                dead_theta,
+                dead_logl,
+                dead_logwt,
+                ncall_block,
+                jnp.zeros((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                accepted,
+                jnp.ones((block_size,), dtype=jnp.int32),
+                ncall_block,
+                dead_u,
+                dead_theta,
+                dead_logl,
+                logz_dead,
+                -(start_iteration + block_size) / nlive,
+            )
+
+        return kernel
+
+    return make_kernel
+
+
+def test_jax_block_ncall_counts_failed_offset_when_rescue_skipped(monkeypatch) -> None:
+    # Prefix offsets 0, 1 succeed (3 + 3 calls); offset 2 fails (9 calls).
+    monkeypatch.setattr(
+        run_mod,
+        "_make_static_jax_rwalk_block_kernel",
+        _partial_failure_block_kernel_20tuple(
+            accepted_prefix=2, replacement_ncall=(3, 3, 9, 3)
+        ),
+    )
+
+    result = run_static_nested(
+        random.PRNGKey(4242),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        walks=1,
+        replacement_chains=1,
+        # max_attempts == walks * replacement_chains disables the rescue ladder.
+        max_attempts=1,
+        maxiter=8,
+        dlogz=0.0,
+        jax_block_size=4,
+    )
+
+    assert result.success is False
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["partial_block_failure_offset"] == 2
+    assert result.metadata["replacement_rescue_used"] is False
+    # nlive initial evals + successful prefix (3 + 3) + failed offset (9).
+    successful_prefix_calls = 3 + 3
+    failed_offset_calls = 9
+    assert result.ncall == result.nlive + successful_prefix_calls + failed_offset_calls
 
 
 def test_jax_bounded_block_rwalk_failure_returns_failed_result() -> None:
