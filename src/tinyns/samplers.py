@@ -592,7 +592,6 @@ def _make_rwalk_jax_kernel(
         step_scale,
         min_accepts,
         max_batches,
-        proposal_chol,
     ):
         nlive = live_u.shape[0]
         template_u = live_u[0]
@@ -654,7 +653,7 @@ def _make_rwalk_jax_kernel(
                 ) = carry
                 key, proposal_key = random.split(key)
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
-                step = step_scale * (z @ proposal_chol.T)
+                step = step_scale * z
                 u_prop = reflect_unit_cube(current_u + step)
                 if jax_vectorized:
                     theta_prop = prior_transform(u_prop)
@@ -799,236 +798,6 @@ def _make_rwalk_jax_kernel(
     return kernel
 
 
-@lru_cache(maxsize=32)
-def _make_rwalk_jax_adaptive_kernel(
-    loglike,
-    prior_transform,
-    ndim: int,
-    walks: int,
-    replacement_chain_schedule: tuple[int, ...],
-):
-    """Return a cached compiled adaptive constrained rwalk kernel."""
-    schedule = tuple(int(c) for c in replacement_chain_schedule)
-    max_chains = max(schedule)
-    schedule_array = jnp.asarray(schedule, dtype=jnp.int32)
-
-    @jax.jit
-    def kernel(
-        key,
-        logl_min,
-        live_u,
-        live_logl,
-        step_scale,
-        min_accepts,
-        max_attempts,
-        proposal_chol,
-    ):
-        nlive = live_u.shape[0]
-        template_u = live_u[0]
-        template_theta = jnp.asarray(prior_transform(template_u))
-        initial_best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
-
-        def cond(state):
-            (
-                _key,
-                ncall,
-                done,
-                *_rest,
-                stage_index,
-                _batches,
-                _chains,
-                _accepted_moves,
-                _last,
-            ) = state
-            next_c = jnp.where(
-                stage_index < len(schedule), schedule_array[stage_index], schedule[-1]
-            )
-            return (~done) & (ncall + next_c * int(walks) <= max_attempts)
-
-        def body(state):
-            (
-                key,
-                ncall,
-                _done,
-                out_u,
-                out_theta,
-                out_logl,
-                best_u,
-                best_theta,
-                best_logl,
-                stage_index,
-                batches,
-                chains_used,
-                accepted_move_count,
-                _last_chain_count,
-            ) = state
-            chain_count = jnp.where(
-                stage_index < len(schedule), schedule_array[stage_index], schedule[-1]
-            )
-            active = jnp.arange(max_chains, dtype=jnp.int32) < chain_count
-            key, seed_key = random.split(key)
-            seed_idx = random.randint(
-                seed_key, shape=(max_chains,), minval=0, maxval=nlive
-            )
-            current_u = live_u[seed_idx]
-            current_theta = jax.vmap(prior_transform)(current_u)
-            current_logl = live_logl[seed_idx]
-            attempt_best_u = current_u
-            attempt_best_theta = current_theta
-            attempt_best_logl = jnp.full((max_chains,), -jnp.inf, live_logl.dtype)
-            accepted_moves = jnp.zeros((max_chains,), dtype=jnp.int32)
-
-            def one_step(carry, _):
-                (
-                    key,
-                    current_u,
-                    current_theta,
-                    current_logl,
-                    attempt_best_u,
-                    attempt_best_theta,
-                    attempt_best_logl,
-                    accepted_moves,
-                ) = carry
-                key, proposal_key = random.split(key)
-                z = random.normal(proposal_key, shape=(max_chains, ndim))
-                u_prop = reflect_unit_cube(
-                    current_u + step_scale * (z @ proposal_chol.T)
-                )
-                theta_prop = jax.vmap(prior_transform)(u_prop)
-                logl_prop = jax.vmap(loglike)(theta_prop)
-                is_best = active & (logl_prop > attempt_best_logl)
-                attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
-                attempt_best_theta = jnp.where(
-                    is_best[:, None], theta_prop, attempt_best_theta
-                )
-                attempt_best_logl = jnp.where(is_best, logl_prop, attempt_best_logl)
-                accept = active & (logl_prop >= logl_min)
-                current_u = jnp.where(accept[:, None], u_prop, current_u)
-                current_theta = jnp.where(accept[:, None], theta_prop, current_theta)
-                current_logl = jnp.where(accept, logl_prop, current_logl)
-                accepted_moves = accepted_moves + accept.astype(jnp.int32)
-                return (
-                    key,
-                    current_u,
-                    current_theta,
-                    current_logl,
-                    attempt_best_u,
-                    attempt_best_theta,
-                    attempt_best_logl,
-                    accepted_moves,
-                ), None
-
-            (
-                key,
-                current_u,
-                current_theta,
-                current_logl,
-                attempt_best_u,
-                attempt_best_theta,
-                attempt_best_logl,
-                accepted_moves,
-            ), _ = lax.scan(
-                one_step,
-                (
-                    key,
-                    current_u,
-                    current_theta,
-                    current_logl,
-                    attempt_best_u,
-                    attempt_best_theta,
-                    attempt_best_logl,
-                    accepted_moves,
-                ),
-                xs=None,
-                length=walks,
-            )
-            batch_best_idx = jnp.argmax(attempt_best_logl)
-            batch_best_logl = attempt_best_logl[batch_best_idx]
-            is_global_best = batch_best_logl > best_logl
-            best_u = jnp.where(is_global_best, attempt_best_u[batch_best_idx], best_u)
-            best_theta = jnp.where(
-                is_global_best, attempt_best_theta[batch_best_idx], best_theta
-            )
-            best_logl = jnp.where(is_global_best, batch_best_logl, best_logl)
-            success_mask = active & (accepted_moves >= min_accepts)
-            any_success = jnp.any(success_mask)
-            key, select_key = random.split(key)
-            selection_scores = jnp.where(
-                success_mask, random.uniform(select_key, (max_chains,)), -1.0
-            )
-            selected_idx = jnp.argmax(selection_scores)
-            out_u = jnp.where(any_success, current_u[selected_idx], out_u)
-            out_theta = jnp.where(any_success, current_theta[selected_idx], out_theta)
-            out_logl = jnp.where(any_success, current_logl[selected_idx], out_logl)
-            return (
-                key,
-                ncall + chain_count * int(walks),
-                any_success,
-                out_u,
-                out_theta,
-                out_logl,
-                best_u,
-                best_theta,
-                best_logl,
-                stage_index + jnp.asarray(1, dtype=jnp.int32),
-                batches + jnp.asarray(1, dtype=jnp.int32),
-                chains_used + chain_count,
-                accepted_move_count + jnp.sum(accepted_moves),
-                chain_count,
-            )
-
-        initial = (
-            key,
-            jnp.asarray(0, dtype=jnp.int32),
-            jnp.asarray(False),
-            template_u,
-            template_theta,
-            initial_best_logl,
-            template_u,
-            template_theta,
-            initial_best_logl,
-            jnp.asarray(0, dtype=jnp.int32),
-            jnp.asarray(0, dtype=jnp.int32),
-            jnp.asarray(0, dtype=jnp.int32),
-            jnp.asarray(0, dtype=jnp.int32),
-            jnp.asarray(schedule[0], dtype=jnp.int32),
-        )
-        (
-            key,
-            ncall,
-            done,
-            out_u,
-            out_theta,
-            out_logl,
-            best_u,
-            best_theta,
-            best_logl,
-            _stage_index,
-            batches,
-            chains_used,
-            accepted_move_count,
-            last_chain_count,
-        ) = lax.while_loop(cond, body, initial)
-        new_u = jnp.where(done, out_u, best_u)
-        new_theta = jnp.where(done, out_theta, best_theta)
-        new_logl = jnp.where(done, out_logl, best_logl)
-        return (
-            key,
-            new_u,
-            new_theta,
-            new_logl,
-            ncall,
-            done,
-            batches,
-            chains_used,
-            last_chain_count,
-            accepted_move_count,
-            ncall,
-        )
-
-    return kernel
-
-
 def _validate_replacement_chain_schedule(
     replacement_chain_schedule, walks: int, max_attempts: int
 ) -> tuple[int, ...]:
@@ -1076,7 +845,6 @@ def draw_constrained_rwalk_jax(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chains: int = 1,
-    proposal_chol=None,
     jax_vectorized: bool = False,
     return_info: bool = False,
 ):
@@ -1109,12 +877,6 @@ def draw_constrained_rwalk_jax(
         raise ValueError("live_u must contain at least one live point")
     if live_logl.shape != (nlive,):
         raise ValueError(f"live_logl must have shape ({nlive},)")
-    if proposal_chol is None:
-        proposal_chol = jnp.eye(ndim, dtype=live_u.dtype)
-    else:
-        proposal_chol = jnp.asarray(proposal_chol, dtype=live_u.dtype)
-        if proposal_chol.shape != (ndim, ndim):
-            raise ValueError(f"proposal_chol must have shape ({ndim}, {ndim})")
 
     kernel = _make_rwalk_jax_kernel(
         loglike,
@@ -1142,7 +904,6 @@ def draw_constrained_rwalk_jax(
         jnp.asarray(step_scale),
         jnp.asarray(min_accepts),
         jnp.asarray(max_batches, dtype=jnp.int32),
-        proposal_chol,
     )
     if return_info:
         batches = int(math.ceil(int(ncall) / batch_ncall))
@@ -1190,7 +951,6 @@ def draw_constrained_single_bound_rwalk_jax(
     replacement_chain_schedule=None,
     bound_batch_size: int = 128,
     bound_max_batches: int = 100,
-    proposal_chol=None,
     jax_vectorized: bool = False,
 ):
     """Draw a single-bound seed and run JAX rwalk chains from that seed."""
@@ -1248,7 +1008,6 @@ def draw_constrained_single_bound_rwalk_jax(
             max_attempts=max_attempts,
             min_accepts=min_accepts,
             replacement_chains=replacement_chains,
-            proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
             return_info=True,
         )
@@ -1285,7 +1044,6 @@ def draw_constrained_single_bound_rwalk_jax(
             max_attempts=max_attempts,
             min_accepts=min_accepts,
             replacement_chain_schedule=replacement_chain_schedule,
-            proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
         )
         (
@@ -1331,7 +1089,6 @@ def draw_constrained_multi_bound_rwalk_jax(
     bound_batch_size: int = 128,
     bound_max_batches: int = 100,
     overlap_correction: bool = True,
-    proposal_chol=None,
     jax_vectorized: bool = False,
 ):
     """Draw a multi-bound seed and run JAX rwalk chains from that seed.
@@ -1396,7 +1153,6 @@ def draw_constrained_multi_bound_rwalk_jax(
             max_attempts=max_attempts,
             min_accepts=min_accepts,
             replacement_chains=replacement_chains,
-            proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
             return_info=True,
         )
@@ -1433,7 +1189,6 @@ def draw_constrained_multi_bound_rwalk_jax(
             max_attempts=max_attempts,
             min_accepts=min_accepts,
             replacement_chain_schedule=replacement_chain_schedule,
-            proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
         )
         (
@@ -1474,7 +1229,6 @@ def draw_constrained_rwalk_jax_adaptive(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chain_schedule=(1, 4, 16, 64),
-    proposal_chol=None,
     jax_vectorized: bool = False,
 ):
     """Draw a constrained JAX rwalk replacement with adaptive batch retries."""
@@ -1505,7 +1259,6 @@ def draw_constrained_rwalk_jax_adaptive(
             max_attempts=int(walks) * int(c),
             min_accepts=min_accepts,
             replacement_chains=int(c),
-            proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
             return_info=True,
         )
@@ -1605,7 +1358,6 @@ def draw_constrained_rwalk_jax_adaptive_from_seed(
     max_attempts: int = 10_000,
     min_accepts: int = 1,
     replacement_chain_schedule=(1, 4, 16, 64),
-    proposal_chol=None,
     jax_vectorized: bool = False,
 ):
     """Run adaptive JAX rwalk replacement batches from one fixed seed."""
@@ -1627,7 +1379,6 @@ def draw_constrained_rwalk_jax_adaptive_from_seed(
         max_attempts=max_attempts,
         min_accepts=min_accepts,
         replacement_chain_schedule=replacement_chain_schedule,
-        proposal_chol=proposal_chol,
         jax_vectorized=jax_vectorized,
     )
 

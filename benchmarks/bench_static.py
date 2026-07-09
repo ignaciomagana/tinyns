@@ -152,7 +152,6 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "replacement_chains": args.replacement_chains,
         "replacement_chain_schedule": args.replacement_chain_schedule,
         "rwalk_proposal": args.rwalk_proposal,
-        "rwalk_cov_jitter": args.rwalk_cov_jitter,
         "bound": args.bound,
         "bound_enlargement": args.bound_enlargement,
         "bound_update_interval": args.bound_update_interval,
@@ -367,9 +366,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-accepts", type=int, default=1)
     parser.add_argument("--replacement-chains", type=int, default=1)
     parser.add_argument(
-        "--rwalk-proposal", choices=["isotropic", "live-cov"], default="isotropic"
+        "--rwalk-proposal", choices=["isotropic"], default="isotropic"
     )
-    parser.add_argument("--rwalk-cov-jitter", type=float, default=1e-6)
     parser.add_argument("--bound", choices=["none", "single", "multi"], default="none")
     parser.add_argument("--bound-enlargement", type=float, default=1.25)
     parser.add_argument("--bound-update-interval", type=int, default=1)

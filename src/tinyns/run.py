@@ -22,7 +22,6 @@ from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
     _evaluate_jax_batch,
-    _make_rwalk_jax_adaptive_kernel,
     _make_rwalk_jax_kernel,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
@@ -174,200 +173,6 @@ def _update_adaptive_step_scale(
     return float(np.clip(new_scale, min_step_scale, max_step_scale))
 
 
-def _run_static_jax_rwalk_block(
-    key,
-    live_u,
-    live_theta,
-    live_logl,
-    logz_dead,
-    start_iteration,
-    nlive,
-    loglike,
-    prior_transform,
-    ndim,
-    *,
-    proposal_chol,
-    block_size,
-    walks,
-    step_scale,
-    replacement_chains,
-    replacement_chain_schedule=None,
-    max_attempts,
-    min_accepts,
-):
-    """Run an experimental fixed-size block of unbounded JAX rwalk iterations.
-
-    Convergence is intentionally checked only between blocks by the Python
-    driver, so an experimental block-mode run may overshoot ``dlogz`` by up to
-    ``block_size - 1`` nested iterations.
-    """
-
-    if replacement_chain_schedule is None:
-        batch_ncall = int(walks) * int(replacement_chains)
-        max_batches = int(max_attempts) // batch_ncall
-        rwalk_kernel = _make_rwalk_jax_kernel(
-            loglike,
-            prior_transform,
-            int(ndim),
-            int(walks),
-            int(replacement_chains),
-            False,
-        )
-        adaptive_rwalk_kernel = None
-    else:
-        replacement_chain_schedule = tuple(int(c) for c in replacement_chain_schedule)
-        rwalk_kernel = None
-        adaptive_rwalk_kernel = _make_rwalk_jax_adaptive_kernel(
-            loglike,
-            prior_transform,
-            int(ndim),
-            int(walks),
-            replacement_chain_schedule,
-        )
-    proposal_chol = jnp.asarray(proposal_chol, dtype=jnp.asarray(live_u).dtype)
-
-    def one_iteration(carry, offset):
-        key, live_u, live_theta, live_logl, logz_dead = carry
-        worst = jnp.argmin(live_logl)
-        dead_u = live_u[worst]
-        dead_theta = live_theta[worst]
-        logl_worst = live_logl[worst]
-        iteration = jnp.asarray(start_iteration, dtype=jnp.int32) + offset
-        logx_prev = -iteration / nlive
-        logx_new = -(iteration + 1) / nlive
-        logwidth = logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev))
-        logwt = logwidth + logl_worst
-        logz_dead = jnp.logaddexp(logz_dead, logwt)
-
-        if adaptive_rwalk_kernel is None:
-            (
-                key,
-                new_u,
-                new_theta,
-                new_logl,
-                replacement_ncall,
-                accepted,
-                accepted_move_count,
-                total_proposal_count,
-            ) = rwalk_kernel(
-                key,
-                logl_worst,
-                live_u,
-                live_logl,
-                jnp.asarray(step_scale),
-                jnp.asarray(min_accepts),
-                jnp.asarray(max_batches, dtype=jnp.int32),
-                proposal_chol,
-            )
-            replacement_batches_used = (
-                replacement_ncall + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
-            ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
-            replacement_chains_used = replacement_batches_used * jnp.asarray(
-                replacement_chains, dtype=jnp.int32
-            )
-        else:
-            (
-                key,
-                new_u,
-                new_theta,
-                new_logl,
-                replacement_ncall,
-                accepted,
-                replacement_batches_used,
-                replacement_chains_used,
-                _last_chain_count,
-                accepted_move_count,
-                total_proposal_count,
-            ) = adaptive_rwalk_kernel(
-                key,
-                logl_worst,
-                live_u,
-                live_logl,
-                jnp.asarray(step_scale),
-                jnp.asarray(min_accepts),
-                jnp.asarray(max_attempts, dtype=jnp.int32),
-                proposal_chol,
-            )
-        insertion_index = (
-            jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
-        ).astype(jnp.int32)
-        live_u = jnp.where(accepted, live_u.at[worst].set(new_u), live_u)
-        live_theta = jnp.where(
-            accepted, live_theta.at[worst].set(new_theta), live_theta
-        )
-        live_logl = jnp.where(accepted, live_logl.at[worst].set(new_logl), live_logl)
-        return (key, live_u, live_theta, live_logl, logz_dead), (
-            dead_u,
-            dead_theta,
-            logl_worst,
-            logwt,
-            replacement_ncall,
-            insertion_index,
-            replacement_batches_used,
-            replacement_chains_used,
-            accepted,
-            accepted_move_count,
-            total_proposal_count,
-            new_u,
-            new_theta,
-            new_logl,
-        )
-
-    (
-        (
-            new_key,
-            new_live_u,
-            new_live_theta,
-            new_live_logl,
-            logz_dead_new,
-        ),
-        block,
-    ) = lax.scan(
-        one_iteration,
-        (key, live_u, live_theta, live_logl, jnp.asarray(logz_dead)),
-        jnp.arange(int(block_size), dtype=jnp.int32),
-    )
-    (
-        dead_u_block,
-        dead_theta_block,
-        dead_logl_block,
-        dead_logwt_block,
-        replacement_ncall_block,
-        insertion_indices_block,
-        replacement_batches_block,
-        replacement_chains_used_block,
-        accepted_block,
-        accepted_move_count_block,
-        total_proposal_count_block,
-        new_u_block,
-        new_theta_block,
-        new_logl_block,
-    ) = block
-    logx_final_new = -(int(start_iteration) + int(block_size)) / int(nlive)
-    return (
-        new_key,
-        new_live_u,
-        new_live_theta,
-        new_live_logl,
-        dead_u_block,
-        dead_theta_block,
-        dead_logl_block,
-        dead_logwt_block,
-        replacement_ncall_block,
-        insertion_indices_block,
-        replacement_batches_block,
-        replacement_chains_used_block,
-        accepted_block,
-        accepted_move_count_block,
-        total_proposal_count_block,
-        new_u_block,
-        new_theta_block,
-        new_logl_block,
-        logz_dead_new,
-        logx_final_new,
-    )
-
-
 @functools.cache
 def _make_static_jax_rwalk_block_kernel(
     loglike,
@@ -404,10 +209,7 @@ def _make_static_jax_rwalk_block_kernel(
         step_scale,
         min_accepts,
         max_batches,
-        proposal_chol,
     ):
-        proposal_chol = jnp.asarray(proposal_chol, dtype=jnp.asarray(live_u).dtype)
-
         def one_iteration(carry, offset):
             key, live_u, live_theta, live_logl, logz_dead = carry
             worst = jnp.argmin(live_logl)
@@ -438,7 +240,6 @@ def _make_static_jax_rwalk_block_kernel(
                 jnp.asarray(step_scale),
                 jnp.asarray(min_accepts),
                 jnp.asarray(max_batches, dtype=jnp.int32),
-                proposal_chol,
             )
             replacement_batches_used = (
                 replacement_ncall + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
@@ -533,45 +334,6 @@ def _make_static_jax_rwalk_block_kernel(
     return jax.jit(block_kernel)
 
 
-def _rwalk_proposal_chol(
-    live_u, ndim: int, rwalk_proposal: str, rwalk_cov_jitter: float
-):
-    """Return the JAX rwalk proposal factor for the current live set."""
-
-    live_u_arr = jnp.asarray(live_u)
-    dtype = live_u_arr.dtype
-
-    if rwalk_proposal != "live-cov":
-        return jnp.eye(ndim, dtype=dtype)
-
-    live_np = np.asarray(live_u_arr, dtype=float)
-    if live_np.ndim != 2 or live_np.shape[1] != ndim:
-        raise ValueError(f"live_u must have shape (nlive, {ndim})")
-
-    centered = live_np - np.mean(live_np, axis=0)
-    denom = max(live_np.shape[0] - 1, 1)
-    cov = (centered.T @ centered) / denom
-    cov = 0.5 * (cov + cov.T)
-
-    # The live-cov factor is a tiny ndim x ndim proposal preconditioner
-    # computed outside the jitted replacement kernel. Using NumPy avoids
-    # GPU/cuSolver Cholesky fragility on small or nearly singular covariance
-    # matrices.
-    eye = np.eye(ndim, dtype=cov.dtype)
-    base_jitter = float(rwalk_cov_jitter)
-    for scale in (1.0, 10.0, 100.0, 1000.0, 1.0e4, 1.0e5):
-        try:
-            chol = np.linalg.cholesky(cov + base_jitter * scale * eye)
-            return jnp.asarray(chol, dtype=dtype)
-        except np.linalg.LinAlgError:
-            continue
-
-    evals, evecs = np.linalg.eigh(cov)
-    evals = np.maximum(evals, base_jitter)
-    factor = evecs @ np.diag(np.sqrt(evals))
-    return jnp.asarray(factor, dtype=dtype)
-
-
 def _run_static_jax_bounded_rwalk_block(
     key,
     live_u,
@@ -596,7 +358,6 @@ def _run_static_jax_bounded_rwalk_block(
     bound_batch_size,
     bound_max_batches,
     overlap_correction,
-    proposal_chol=None,
     jax_vectorized: bool = False,
 ):
     """Run an experimental bounded rwalk block with one fixed JAX bound.
@@ -658,7 +419,6 @@ def _run_static_jax_bounded_rwalk_block(
             replacement_chain_schedule=replacement_chain_schedule,
             bound_batch_size=bound_batch_size,
             bound_max_batches=bound_max_batches,
-            proposal_chol=proposal_chol,
             jax_vectorized=jax_vectorized,
             **(
                 {"overlap_correction": overlap_correction}
@@ -933,7 +693,6 @@ def run_static_nested(
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
     rwalk_proposal: str = "isotropic",
-    rwalk_cov_jitter: float = 1e-6,
     bound: str = "none",
     bound_enlargement: float = 1.25,
     bound_update_interval: int = 1,
@@ -1039,14 +798,10 @@ def run_static_nested(
         )
     if not (0.0 < float(rwalk_target_accept) < 1.0):
         raise ValueError("rwalk_target_accept must be between 0 and 1")
-    if rwalk_proposal not in {"isotropic", "live-cov"}:
-        raise ValueError("rwalk_proposal must be one of {'isotropic', 'live-cov'}")
-    if rwalk_cov_jitter <= 0:
-        raise ValueError("rwalk_cov_jitter must be positive")
-    if rwalk_proposal == "live-cov" and not (sample == "rwalk" and kernel == "jax"):
-        raise NotImplementedError(
-            'rwalk_proposal="live-cov" is currently supported only with '
-            'sample="rwalk", kernel="jax"'
+    if rwalk_proposal != "isotropic":
+        raise ValueError(
+            "rwalk_proposal='live-cov' has been removed; only "
+            "rwalk_proposal='isotropic' is supported"
         )
     if kernel == "jax" and sample not in {"rwalk"}:
         raise NotImplementedError(
@@ -1125,6 +880,12 @@ def run_static_nested(
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        if jax_block_size > 1:
+            raise ValueError(
+                "replacement_chain_schedule is not supported with "
+                "jax_block_size > 1; use jax_block_size=1 for adaptive "
+                "replacement-chain schedules"
+            )
         try:
             replacement_chain_schedule = tuple(replacement_chain_schedule)
         except TypeError as exc:
@@ -1144,10 +905,14 @@ def run_static_nested(
             raise ValueError(
                 "max_attempts must be at least max(replacement_chain_schedule) * walks"
             )
+    if maxiter is not None and (
+        not isinstance(maxiter, int)
+        or isinstance(maxiter, bool)
+        or maxiter < 1
+    ):
+        raise ValueError("maxiter must be a positive integer")
     if maxiter is None:
         maxiter = 10_000 * ndim
-    if maxiter < 0:
-        raise ValueError("maxiter must be non-negative")
 
     config = {
         "ndim": int(ndim),
@@ -1186,21 +951,13 @@ def run_static_nested(
         "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
         "jax_vectorized": bool(jax_vectorized),
         "jax_block_size": int(jax_block_size),
-        "jax_block_cached": bool(
-            jax_block_size > 1
-            and bound == "none"
-            and replacement_chain_schedule is None
-        ),
+        "jax_block_cached": bool(jax_block_size > 1 and bound == "none"),
         "jax_block_kernel": (
             "bounded-python-loop-fixed-bound"
             if jax_block_size > 1 and bound != "none"
-            else (
-                "fixed-rwalk-cached"
-                if jax_block_size > 1 and replacement_chain_schedule is None
-                else "adaptive-rwalk-uncached"
-                if jax_block_size > 1
-                else None
-            )
+            else "fixed-rwalk-cached"
+            if jax_block_size > 1
+            else None
         ),
         "jax_block_impl": (
             "python-loop-fixed-bound"
@@ -1424,9 +1181,6 @@ def run_static_nested(
                     maybe_checkpoint(final=True)
                     break
             block_size_now = min(int(jax_block_size), maxiter - iteration)
-            proposal_chol = _rwalk_proposal_chol(
-                live_u, ndim, rwalk_proposal, rwalk_cov_jitter
-            )
             logz_dead_before_block = logz_dead
             live_u_before_block = live_u
             live_theta_before_block = live_theta
@@ -1495,7 +1249,6 @@ def run_static_nested(
                     bound_batch_size=batch_size,
                     bound_max_batches=int(math.ceil(seed_limit / batch_size)),
                     overlap_correction=multi_bound_overlap_correction,
-                    proposal_chol=proposal_chol,
                     jax_vectorized=jax_vectorized,
                 )
                 (
@@ -1517,130 +1270,58 @@ def run_static_nested(
                     *block_extra,
                 ) = result
             else:
-                if replacement_chain_schedule is None:
-                    batch_ncall = int(walks) * int(replacement_chains)
-                    max_batches = int(max_attempts) // batch_ncall
-                    block_kernel = _make_static_jax_rwalk_block_kernel(
-                        loglike,
-                        prior_transform,
-                        int(ndim),
-                        int(walks),
-                        int(replacement_chains),
-                        int(block_size_now),
-                    )
-                    result = block_kernel(
-                        key,
-                        live_u,
-                        live_theta,
-                        live_logl,
-                        jnp.asarray(logz_dead),
-                        jnp.asarray(iteration, dtype=jnp.int32),
-                        jnp.asarray(nlive, dtype=jnp.int32),
-                        jnp.asarray(
-                            effective_step_scale
-                            if rwalk_adaptive_step_scale
-                            else step_scale
-                        ),
-                        jnp.asarray(min_accepts),
-                        jnp.asarray(max_batches, dtype=jnp.int32),
-                        proposal_chol,
-                    )
-                else:
-                    result = _run_static_jax_rwalk_block(
-                        key,
-                        live_u,
-                        live_theta,
-                        live_logl,
-                        logz_dead,
-                        iteration,
-                        nlive,
-                        loglike,
-                        prior_transform,
-                        ndim,
-                        proposal_chol=proposal_chol,
-                        block_size=block_size_now,
-                        walks=walks,
-                        step_scale=effective_step_scale
+                batch_ncall = int(walks) * int(replacement_chains)
+                max_batches = int(max_attempts) // batch_ncall
+                block_kernel = _make_static_jax_rwalk_block_kernel(
+                    loglike,
+                    prior_transform,
+                    int(ndim),
+                    int(walks),
+                    int(replacement_chains),
+                    int(block_size_now),
+                )
+                result = block_kernel(
+                    key,
+                    live_u,
+                    live_theta,
+                    live_logl,
+                    jnp.asarray(logz_dead),
+                    jnp.asarray(iteration, dtype=jnp.int32),
+                    jnp.asarray(nlive, dtype=jnp.int32),
+                    jnp.asarray(
+                        effective_step_scale
                         if rwalk_adaptive_step_scale
-                        else step_scale,
-                        replacement_chains=replacement_chains,
-                        replacement_chain_schedule=replacement_chain_schedule,
-                        max_attempts=max_attempts,
-                        min_accepts=min_accepts,
-                    )
-                if len(result) == 15:
-                    (
-                        key,
-                        live_u,
-                        live_theta,
-                        live_logl,
-                        dead_u_block,
-                        dead_theta_block,
-                        dead_logl_block,
-                        dead_logwt_block,
-                        replacement_ncall_block,
-                        insertion_indices_block,
-                        replacement_batches_block,
-                        replacement_chains_used_block,
-                        accepted_block,
-                        logz_dead,
-                        logx_final,
-                    ) = result
-                    new_u_block = dead_u_block
-                    new_theta_block = dead_theta_block
-                    new_logl_block = dead_logl_block
-                    accepted_move_count_block = None
-                    total_proposal_count_block = None
-                elif len(result) == 20:
-                    (
-                        key,
-                        live_u,
-                        live_theta,
-                        live_logl,
-                        dead_u_block,
-                        dead_theta_block,
-                        dead_logl_block,
-                        dead_logwt_block,
-                        replacement_ncall_block,
-                        insertion_indices_block,
-                        replacement_batches_block,
-                        replacement_chains_used_block,
-                        accepted_block,
-                        accepted_move_count_block,
-                        total_proposal_count_block,
-                        new_u_block,
-                        new_theta_block,
-                        new_logl_block,
-                        logz_dead,
-                        logx_final,
-                    ) = result
-                else:
-                    (
-                        key,
-                        live_u,
-                        live_theta,
-                        live_logl,
-                        dead_u_block,
-                        dead_theta_block,
-                        dead_logl_block,
-                        dead_logwt_block,
-                        replacement_ncall_block,
-                        insertion_indices_block,
-                        replacement_batches_block,
-                        replacement_chains_used_block,
-                        accepted_block,
-                        new_u_block,
-                        new_theta_block,
-                        new_logl_block,
-                        logz_dead,
-                        logx_final,
-                    ) = result
-                    accepted_move_count_block = None
-                    total_proposal_count_block = None
+                        else step_scale
+                    ),
+                    jnp.asarray(min_accepts),
+                    jnp.asarray(max_batches, dtype=jnp.int32),
+                )
+                (
+                    key,
+                    live_u,
+                    live_theta,
+                    live_logl,
+                    dead_u_block,
+                    dead_theta_block,
+                    dead_logl_block,
+                    dead_logwt_block,
+                    replacement_ncall_block,
+                    insertion_indices_block,
+                    replacement_batches_block,
+                    replacement_chains_used_block,
+                    accepted_block,
+                    accepted_move_count_block,
+                    total_proposal_count_block,
+                    new_u_block,
+                    new_theta_block,
+                    new_logl_block,
+                    logz_dead,
+                    logx_final,
+                ) = result
             block_start = iteration
             block_accepted = [bool(x) for x in np.asarray(accepted_block)]
             failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
-            rescue_capable_block = bound == "none" and len(result) != 15
+            rescue_capable_block = bound == "none"
             full_dead_u_block = dead_u_block
             full_dead_theta_block = dead_theta_block
             full_dead_logl_block = dead_logl_block
@@ -1855,9 +1536,6 @@ def run_static_nested(
                         stage_max_attempts = max(
                             int(max_attempts), int(stage_walks) * int(stage_chains)
                         )
-                        proposal_chol_stage = _rwalk_proposal_chol(
-                            rescue_live_u, ndim, rwalk_proposal, rwalk_cov_jitter
-                        )
                         rescue_result = draw_constrained_rwalk_jax(
                             key,
                             loglike,
@@ -1876,7 +1554,6 @@ def run_static_nested(
                             max_attempts=stage_max_attempts,
                             min_accepts=int(stage_min_accepts),
                             replacement_chains=int(stage_chains),
-                            proposal_chol=proposal_chol_stage,
                             return_info=True,
                         )
                         if len(rescue_result) == 7:
@@ -2196,11 +1873,6 @@ def run_static_nested(
                         else draw_constrained_rwalk
                     )
                 )
-                proposal_chol = None
-                if kernel == "jax":
-                    proposal_chol = _rwalk_proposal_chol(
-                        live_u, ndim, rwalk_proposal, rwalk_cov_jitter
-                    )
                 seed_live_u = live_u
                 seed_live_logl = live_logl
                 if fused_bound_rwalk:
@@ -2227,7 +1899,6 @@ def run_static_nested(
                         replacement_chain_schedule=replacement_chain_schedule,
                         bound_batch_size=batch_size,
                         bound_max_batches=int(math.ceil(seed_limit / batch_size)),
-                        proposal_chol=proposal_chol,
                         jax_vectorized=jax_vectorized,
                         **(
                             {"overlap_correction": multi_bound_overlap_correction}
@@ -2344,7 +2015,6 @@ def run_static_nested(
                         min_accepts=min_accepts,
                         **(
                             {
-                                "proposal_chol": proposal_chol,
                                 "jax_vectorized": jax_vectorized,
                                 **(
                                     {"return_info": True}
@@ -2738,21 +2408,13 @@ def run_static_nested(
             "jax_block_size": int(jax_block_size),
             "jax_block_mode": bool(jax_block_size > 1),
             "jax_block_bound_fixed": bool(jax_block_size > 1 and bound != "none"),
-            "jax_block_cached": bool(
-                jax_block_size > 1
-                and bound == "none"
-                and replacement_chain_schedule is None
-            ),
+            "jax_block_cached": bool(jax_block_size > 1 and bound == "none"),
             "jax_block_kernel": (
                 "bounded-python-loop-fixed-bound"
                 if jax_block_size > 1 and bound != "none"
-                else (
-                    "fixed-rwalk-cached"
-                    if jax_block_size > 1 and replacement_chain_schedule is None
-                    else "adaptive-rwalk-uncached"
-                    if jax_block_size > 1
-                    else None
-                )
+                else "fixed-rwalk-cached"
+                if jax_block_size > 1
+                else None
             ),
             "jax_block_impl": (
                 "python-loop-fixed-bound"
@@ -2776,7 +2438,6 @@ def run_static_nested(
             "step_scale": step_scale,
             "min_accepts": min_accepts,
             "rwalk_proposal": rwalk_proposal,
-            "rwalk_cov_jitter": rwalk_cov_jitter,
             "replacement_chains": replacement_chains,
             "replacement_chain_schedule": (
                 None
