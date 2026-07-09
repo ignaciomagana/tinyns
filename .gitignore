@@ -222,3 +222,6 @@ quick_validation.json
 overnight_jax_validation_*.json
 overnight_after_*.json
 benchmarks/results/*.json
+
+# TinyNS checkpoint files
+*.checkpoint.npz

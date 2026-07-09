@@ -287,7 +287,7 @@ When benchmarking the optimized path, keep the sampling problem fixed across run
 Starting configurations for external expensive JAX likelihoods should distinguish the recommended unbounded isotropic path from experimental candidates:
 
 - Start with the recommended unbounded isotropic cached block path below.
-- Treat live-cov, bounds, fused bounds, or bounded block mode as experimental candidates only after the B32 baseline is calibrated.
+- Treat bounds, fused bounds, or bounded block mode as experimental candidates only after the B32 baseline is calibrated. (`rwalk_proposal="live-cov"` has been removed; the bench scripts only accept `--rwalk-proposal isotropic`.)
 
 Recommended unbounded isotropic cached block baseline to validate first:
 
@@ -300,16 +300,6 @@ Recommended unbounded isotropic cached block baseline to validate first:
 --jax-block-size 32
 ```
 
-Experimental 10D live-cov candidate for separate validation:
-
-```bash
---sample rwalk \
---kernel jax \
---walks 5 \
---replacement-chains 16 \
---rwalk-proposal live-cov
-```
-
 Experimental bounded 10D candidate for separate validation:
 
 ```bash
@@ -317,7 +307,7 @@ Experimental bounded 10D candidate for separate validation:
 --kernel jax \
 --bound multi \
 --rwalk-seed bound \
---rwalk-proposal live-cov \
+--rwalk-proposal isotropic \
 --walks 5 \
 --replacement-chains 16 \
 --bound-update-interval 25
@@ -330,7 +320,7 @@ Experimental bounded/fused candidate for separate validation (do not treat this 
 --kernel jax \
 --bound multi \
 --rwalk-seed bound \
---rwalk-proposal live-cov \
+--rwalk-proposal isotropic \
 --fused-bound-rwalk \
 --jax-block-size 10
 ```
