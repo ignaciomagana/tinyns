@@ -750,8 +750,14 @@ def _make_rwalk_jax_kernel(
             out_u = jnp.where(any_success, current_u[selected_idx], out_u)
             out_theta = jnp.where(any_success, current_theta[selected_idx], out_theta)
             out_logl = jnp.where(any_success, current_logl[selected_idx], out_logl)
-            ncall = ncall + batch_ncall
-            accepted_move_count = accepted_move_count + jnp.sum(accepted_moves)
+            # dtype-pinned accumulation: under JAX_ENABLE_X64 the bare
+            # jnp.sum promotes to int64 while the while_loop carry was
+            # initialized int32, which aborts the kernel with a carry-type
+            # mismatch (state[10] int32 vs int64).
+            ncall = ncall + jnp.asarray(batch_ncall, dtype=ncall.dtype)
+            accepted_move_count = accepted_move_count + jnp.sum(
+                accepted_moves, dtype=accepted_move_count.dtype
+            )
             batch_index = batch_index + jnp.asarray(1, dtype=jnp.int32)
             return (
                 key,
