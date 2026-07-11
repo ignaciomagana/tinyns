@@ -30,7 +30,6 @@ _KNOWN_KWARGS = frozenset(
         "batch_size",
         "min_accepts",
         "rwalk_proposal",
-        "rwalk_cov_jitter",
         "bound_enlargement",
         "bound_update_interval",
         "bound_jitter",
@@ -142,6 +141,11 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
+        if kwargs.get("rwalk_proposal", "isotropic") != "isotropic":
+            raise ValueError(
+                "rwalk_proposal='live-cov' has been removed; only "
+                "rwalk_proposal='isotropic' is supported"
+            )
         if bool(kwargs.get("rwalk_adaptive_step_scale", False)) and not (
             sample == "rwalk" and kernel == "jax"
         ):
@@ -176,6 +180,12 @@ class NestedSampler:
                     "block mode with bound in {'single', 'multi'}, "
                     "rwalk_seed='bound', bound_seed_kernel='jax', and "
                     "fused_bound_rwalk=True"
+                )
+            if replacement_chain_schedule is not None:
+                raise ValueError(
+                    "replacement_chain_schedule is not supported with "
+                    "jax_block_size > 1; use jax_block_size=1 for adaptive "
+                    "replacement-chain schedules"
                 )
         if fused_bound_rwalk and not (
             sample == "rwalk"
@@ -236,7 +246,6 @@ class NestedSampler:
             replacement_chains=self.kwargs.get("replacement_chains", 1),
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
             rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
-            rwalk_cov_jitter=self.kwargs.get("rwalk_cov_jitter", 1e-6),
             bound=self.kwargs.get("bound", "none"),
             bound_enlargement=self.kwargs.get("bound_enlargement", 1.25),
             bound_update_interval=self.kwargs.get("bound_update_interval", 1),
@@ -284,7 +293,6 @@ class NestedSampler:
             "min_accepts": int(self.kwargs.get("min_accepts", 1)),
             "replacement_chains": int(self.kwargs.get("replacement_chains", 1)),
             "rwalk_proposal": str(self.kwargs.get("rwalk_proposal", "isotropic")),
-            "rwalk_cov_jitter": float(self.kwargs.get("rwalk_cov_jitter", 1e-6)),
             "replacement_chain_schedule": (
                 None
                 if self.kwargs.get("replacement_chain_schedule") is None
@@ -353,7 +361,6 @@ class NestedSampler:
             "min_accepts",
             "replacement_chains",
             "rwalk_proposal",
-            "rwalk_cov_jitter",
             "replacement_chain_schedule",
             "bound",
             "bound_enlargement",
@@ -381,7 +388,6 @@ class NestedSampler:
                 "min_accepts": 1,
                 "replacement_chains": 1,
                 "rwalk_proposal": "isotropic",
-                "rwalk_cov_jitter": 1e-6,
                 "bound": "none",
                 "bound_enlargement": 1.25,
                 "bound_update_interval": 1,
@@ -462,7 +468,6 @@ class NestedSampler:
             replacement_chains=self.kwargs.get("replacement_chains", 1),
             replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
             rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
-            rwalk_cov_jitter=self.kwargs.get("rwalk_cov_jitter", 1e-6),
             bound=self.kwargs.get("bound", "none"),
             bound_enlargement=self.kwargs.get("bound_enlargement", 1.25),
             bound_update_interval=self.kwargs.get("bound_update_interval", 1),

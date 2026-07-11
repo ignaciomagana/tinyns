@@ -62,8 +62,8 @@ def test_draw_constrained_prior_returns_best_after_impossible_threshold() -> Non
     assert ncall == max_attempts
 
 
-def test_draw_constrained_prior_rejects_vectorized_mode() -> None:
-    with pytest.raises(NotImplementedError, match="vectorized=False only"):
+def test_draw_constrained_prior_rejects_vectorized_kwarg() -> None:
+    with pytest.raises(TypeError):
         draw_constrained_prior(
             random.PRNGKey(0),
             gaussian_loglike,
@@ -583,30 +583,6 @@ def test_draw_constrained_rwalk_jax_adaptive_exhausts_schedule_budget() -> None:
     assert not accepted
     assert ncall == 10
     assert info["replacement_chains_used"] == 5
-
-
-def test_draw_constrained_rwalk_jax_accepts_proposal_chol() -> None:
-    from tinyns.samplers import draw_constrained_rwalk_jax
-
-    proposal_chol = jnp.asarray([[0.1, 0.0], [0.05, 0.2]])
-    _, _, _, logl, ncall, accepted = draw_constrained_rwalk_jax(
-        random.PRNGKey(44),
-        gaussian_loglike,
-        identity_prior_transform,
-        -math.inf,
-        jnp.full((8, 2), 0.5),
-        jnp.zeros(8),
-        2,
-        walks=5,
-        replacement_chains=4,
-        step_scale=0.01,
-        max_attempts=100,
-        proposal_chol=proposal_chol,
-    )
-
-    assert accepted is True
-    assert ncall == 20
-    assert math.isfinite(logl)
 
 
 def test_draw_constrained_single_bound_returns_finite_point() -> None:

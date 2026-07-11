@@ -102,10 +102,6 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
     configs = [
         Config("unbounded_isotropic_rwalk", {**common, "bound": "none"}),
         Config(
-            "unbounded_live_cov_rwalk",
-            {**common, "bound": "none", "rwalk_proposal": "live-cov"},
-        ),
-        Config(
             "adaptive_rwalk",
             {
                 **common,

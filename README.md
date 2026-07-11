@@ -63,6 +63,13 @@ print(result.summary())
 | `result.to_numpy()` | Plain dictionary with array fields converted to NumPy arrays. |
 | `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
 
+`NestedSampler` accepts many optional keyword arguments (`sample`, `kernel`,
+`bound`, `walks`, `rwalk_proposal`, and others documented below). An unknown
+keyword argument is not an error: it is still stored, preserving dynesty
+drop-in compatibility, but `NestedSampler` emits a `UserWarning` naming the
+unrecognized keyword(s) so typos or unsupported options are not silently
+ignored.
+
 ## Saving and loading results
 
 Final results can be saved without extra dependencies using NumPy `.npz`:
@@ -116,11 +123,10 @@ benchmark targets; it should still be revalidated for new target geometries.
 | Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` | Best validated path on included benchmarks |
 | Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
 | Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
-| Experimental | `rwalk_proposal="live-cov"` | Not promoted due to concerning validation pulls |
 | Experimental | bounds / fused bounds / bounded block | Useful research direction; not production-ready |
 | Experimental | adaptive replacement-chain schedules | Useful tuning knob; not the main recommended path |
 
-Removed: slice/random-slice samplers were removed to keep TinyNS small. Use dynesty for slice-based external comparisons.
+Removed: slice/random-slice samplers were removed to keep TinyNS small (use dynesty for slice-based external comparisons). `rwalk_proposal="live-cov"` (with `rwalk_cov_jitter`) has also been removed.
 
 ### Recommended fast JAX rwalk path
 
@@ -216,6 +222,13 @@ sampler = NestedSampler(
 
 Use this when replacement difficulty varies across the nested-sampling run. The sampler returns as soon as any stage succeeds and randomly selects among successful chains in that stage. This avoids always paying for large batches.
 
+`replacement_chain_schedule` requires `jax_block_size=1` (the default). It is
+rejected with a clear error when combined with `jax_block_size > 1`: the
+cached block kernel does not implement schedule-aware early return, so it
+cannot benefit from a schedule and would otherwise silently overstate the
+savings. Use the host-level per-iteration path (`jax_block_size=1`) for
+adaptive replacement-chain schedules.
+
 > Warning: Adaptive schedules do not replace validation. Check evidence calibration and insertion-rank diagnostics on representative targets.
 
 For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python"` with `sample="rwalk"`.
@@ -237,7 +250,7 @@ Vectorized `rwalk` replacement sampling is not implemented yet.
 
 `tinyns` supports `bound="none"` by default. Bounds are experimental modifiers for rwalk, not a separate public sampler mode. Use `sample="rwalk"` with `bound="single"` or `bound="multi"` and `rwalk_seed="bound"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
 
-The only currently recommended fast path is unbounded JAX rwalk with isotropic proposals and cached block mode. Live-cov proposals and bounded/fused-bounded paths remain experimental and require target-specific validation.
+The only currently recommended fast path is unbounded JAX rwalk with isotropic proposals and cached block mode. Bounded/fused-bounded paths remain experimental and require target-specific validation. (`rwalk_proposal="live-cov"` has been removed; see the "Removed" line above.)
 
 Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before relying on it for scientific results.
 
@@ -261,7 +274,7 @@ sampler = NestedSampler(
     kernel="jax",
     bound="multi",
     rwalk_seed="bound",
-    rwalk_proposal="live-cov",
+    rwalk_proposal="isotropic",
     walks=5,
     replacement_chains=16,
 )
@@ -288,7 +301,7 @@ NestedSampler(
     kernel="jax",
     bound="multi",
     rwalk_seed="bound",
-    rwalk_proposal="live-cov",
+    rwalk_proposal="isotropic",
     walks=5,
     replacement_chains=16,
 )
@@ -310,7 +323,7 @@ The recommended fast path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="is
 - `banana2d`
 - `eggbox2d`
 
-The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Bounds and `rwalk_proposal="live-cov"` are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
+The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Bounds are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
 
 ### `min_accepts`
 
@@ -390,6 +403,12 @@ posterior weights.
 
 ## Checkpoint and resume
 
+`run(...)` and `resume(...)` both accept `maxiter`, the maximum number of
+nested-sampling replacement iterations. It defaults to `10_000 * ndim` and, if
+given explicitly, must be a positive integer (`maxiter >= 1`). A run still
+stops early once `dlogz` is satisfied (or a callback returns `False`)
+regardless of `maxiter`.
+
 Long static nested-sampling runs can save active checkpoints:
 
 ```python
@@ -399,6 +418,14 @@ result = sampler.run(
     checkpoint_interval=100,
 )
 ```
+
+Checkpoints are written every `checkpoint_interval` nested-sampling
+iterations, counting elapsed iterations since the last checkpoint (or since
+the run/resume start) rather than an iteration-modulo check. This applies in
+both per-iteration mode and block mode (`jax_block_size > 1`): a run with, for
+example, `jax_block_size=32` and the default `checkpoint_interval=100` still
+checkpoints roughly every 100 iterations rather than only after the first
+block boundary that happens to land on a multiple of 100.
 
 A checkpoint stores the active live points, accumulated dead points, PRNG key,
 iteration counters, and sampler metadata. It does not serialize user functions.

@@ -342,23 +342,12 @@ def sample_jax_ellipsoid_bound_corrected(
     return samples, indices, draws, overlap_rejections
 
 
-def jax_in_unit_cube(u: ArrayLike) -> jnp.ndarray:
-    """JAX-native unit-cube membership helper for one point or a batch."""
-
-    return in_unit_cube(u)
-
-
 def sample_single_ellipsoid(key, bound: SingleEllipsoidBound, n: int):
     """Draw ``n`` samples uniformly from the raw ellipsoid."""
 
     if n < 0:
         raise ValueError("n must be non-negative")
-    key_dir, key_r = random.split(key)
-    z = random.normal(key_dir, shape=(n, bound.ndim))
-    norm = jnp.linalg.norm(z, axis=-1, keepdims=True)
-    direction = z / jnp.maximum(norm, jnp.finfo(z.dtype).tiny)
-    radius = random.uniform(key_r, shape=(n, 1)) ** (1.0 / bound.ndim)
-    x = radius * direction
+    x = _sample_unit_ball(key, n, bound.ndim)
     return bound.center + x @ bound.chol.T
 
 
@@ -478,97 +467,6 @@ def build_multi_ellipsoid_bound(
         log_volumes=log_volumes,
         log_total_volume=log_total_volume,
         ndim=int(ndim),
-    )
-
-
-def contains_multi_ellipsoid(bound: MultiEllipsoidBound, u: ArrayLike) -> jnp.ndarray:
-    """Return whether points lie inside at least one ellipsoid in ``bound``."""
-
-    return count_containing_ellipsoids(bound, u) > 0
-
-
-def count_containing_ellipsoids(
-    bound: MultiEllipsoidBound, u: ArrayLike
-) -> jnp.ndarray:
-    """Count how many ellipsoids contain each point."""
-
-    u = jnp.asarray(u, dtype=float)
-    if u.shape[-1:] != (bound.ndim,):
-        raise ValueError("u must have shape (ndim,) or (..., ndim)")
-    counts = jnp.zeros(u.shape[:-1], dtype=int)
-    for ellipsoid in bound.ellipsoids:
-        counts = counts + contains_single_ellipsoid(ellipsoid, u).astype(int)
-    return counts
-
-
-def sample_multi_ellipsoid(key, bound: MultiEllipsoidBound, n: int):
-    """Draw raw samples from volume-weighted ellipsoids and return indices."""
-
-    if n < 0:
-        raise ValueError("n must be non-negative")
-    if not bound.ellipsoids:
-        raise ValueError("bound must contain at least one ellipsoid")
-    key_idx, *sample_keys = random.split(key, len(bound.ellipsoids) + 1)
-    probs = jnp.exp(bound.log_volumes - bound.log_total_volume)
-    indices = random.choice(key_idx, len(bound.ellipsoids), shape=(n,), p=probs)
-    per_ellipsoid = [
-        sample_single_ellipsoid(sample_key, ellipsoid, n)
-        for sample_key, ellipsoid in zip(sample_keys, bound.ellipsoids, strict=True)
-    ]
-    stacked = jnp.stack(per_ellipsoid, axis=0)
-    return stacked[indices, jnp.arange(n)], indices
-
-
-def sample_multi_ellipsoid_corrected(
-    key,
-    bound: MultiEllipsoidBound,
-    n: int,
-    *,
-    max_draws_multiplier: int = 10,
-):
-    """Draw approximately uniform samples from an overlapping ellipsoid union."""
-
-    if n < 0:
-        raise ValueError("n must be non-negative")
-    if max_draws_multiplier <= 0:
-        raise ValueError("max_draws_multiplier must be positive")
-    if n == 0:
-        return jnp.empty((0, bound.ndim)), jnp.empty((0,), dtype=int), 0, 0
-    budget = max(n, int(n) * int(max_draws_multiplier))
-    accepted_samples = []
-    accepted_indices = []
-    draws = 0
-    overlap_rejections = 0
-    new_key = key
-    while len(accepted_samples) < n and draws < budget:
-        batch = min(n, budget - draws)
-        new_key, draw_key, accept_key = random.split(new_key, 3)
-        candidates, indices = sample_multi_ellipsoid(draw_key, bound, batch)
-        counts = count_containing_ellipsoids(bound, candidates)
-        accept_prob = 1.0 / jnp.maximum(counts, 1)
-        accepted = random.uniform(accept_key, shape=(batch,)) < accept_prob
-        draws += int(batch)
-        overlap_rejections += int(jnp.sum(~accepted))
-        for candidate, index, is_accepted in zip(
-            candidates, indices, accepted, strict=True
-        ):
-            if bool(is_accepted):
-                accepted_samples.append(candidate)
-                accepted_indices.append(index)
-                if len(accepted_samples) == n:
-                    break
-    if not accepted_samples:
-        return (
-            jnp.empty((0, bound.ndim)),
-            jnp.empty((0,), dtype=int),
-            draws,
-            overlap_rejections,
-        )
-    return (
-        jnp.stack(accepted_samples),
-        jnp.asarray(accepted_indices, dtype=int),
-        draws,
-        overlap_rejections,
     )
 
 
