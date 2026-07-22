@@ -1060,6 +1060,11 @@ def run_static_nested(
         None if checkpoint_path is None else os.fspath(checkpoint_path)
     )
     resumed_from_checkpoint = initial_state is not None
+    restored_telemetry = (
+        dict(getattr(initial_state, "telemetry", {}) or {})
+        if initial_state is not None
+        else {}
+    )
 
     if initial_state is None:
         key = random.PRNGKey(int(key)) if isinstance(key, int) else key
@@ -1112,9 +1117,20 @@ def run_static_nested(
         replacement_ncall = list(initial_state.replacement_ncall)
         insertion_indices = list(initial_state.insertion_indices)
         replacement_failures = int(initial_state.replacement_failures)
-        replacement_batches = []
-        replacement_chains_used = []
-        replacement_chain_usage_counts = {}
+        replacement_batches = [
+            int(value)
+            for value in restored_telemetry.get("replacement_batches", [])
+        ]
+        replacement_chains_used = [
+            int(value)
+            for value in restored_telemetry.get("replacement_chains_used", [])
+        ]
+        replacement_chain_usage_counts = {
+            str(chain_count): int(count)
+            for chain_count, count in restored_telemetry.get(
+                "replacement_chain_usage_counts", {}
+            ).items()
+        }
         success = True
         message = "converged"
         stopped_by_callback = False
@@ -1147,29 +1163,91 @@ def run_static_nested(
     partial_block_failure_message = None
     progress_printer = _ProgressPrinter() if progress else None
     current_bound = None
-    bound_updates = 0
-    bound_draw_history = []
-    bound_eval_history = []
-    bound_unit_cube_acceptance_history = []
-    bound_build_time_history = []
-    bound_log_volume_history = []
-    bound_nellipsoid_history = []
-    bound_overlap_rejection_history = []
-    bound_seed_call_history = []
-    bound_seed_batch_history = []
-    rwalk_kernel_call_history = []
-    rwalk_accepted_move_history = []
-    rwalk_proposal_history = []
-    consecutive_bound_failures = 0
-    force_bound_rebuild = False
-    bound_forced_rebuilds = 0
-    replacement_rescue_attempts = 0
-    replacement_rescue_successes = 0
-    replacement_rescue_failures = 0
+    bound_updates = int(restored_telemetry.get("bound_updates", 0))
+    bound_draw_history = [
+        int(value) for value in restored_telemetry.get("bound_draw_history", [])
+    ]
+    bound_eval_history = [
+        int(value) for value in restored_telemetry.get("bound_eval_history", [])
+    ]
+    bound_unit_cube_acceptance_history = [
+        float(value)
+        for value in restored_telemetry.get(
+            "bound_unit_cube_acceptance_history", []
+        )
+    ]
+    bound_build_time_history = [
+        float(value)
+        for value in restored_telemetry.get("bound_build_time_history", [])
+    ]
+    bound_log_volume_history = [
+        float(value)
+        for value in restored_telemetry.get("bound_log_volume_history", [])
+    ]
+    bound_nellipsoid_history = [
+        int(value)
+        for value in restored_telemetry.get("bound_nellipsoid_history", [])
+    ]
+    bound_overlap_rejection_history = [
+        int(value)
+        for value in restored_telemetry.get("bound_overlap_rejection_history", [])
+    ]
+    bound_seed_call_history = [
+        int(value)
+        for value in restored_telemetry.get("bound_seed_call_history", [])
+    ]
+    bound_seed_batch_history = [
+        int(value)
+        for value in restored_telemetry.get("bound_seed_batch_history", [])
+    ]
+    rwalk_kernel_call_history = [
+        int(value)
+        for value in restored_telemetry.get("rwalk_kernel_call_history", [])
+    ]
+    rwalk_accepted_move_history = [
+        int(value)
+        for value in restored_telemetry.get("rwalk_accepted_move_history", [])
+    ]
+    rwalk_proposal_history = [
+        int(value)
+        for value in restored_telemetry.get("rwalk_proposal_history", [])
+    ]
+    consecutive_bound_failures = int(
+        restored_telemetry.get("consecutive_bound_failures", 0)
+    )
+    force_bound_rebuild = bool(restored_telemetry.get("force_bound_rebuild", False))
+    bound_forced_rebuilds = int(
+        restored_telemetry.get("bound_forced_rebuilds", 0)
+    )
+    replacement_rescue_attempts = int(
+        restored_telemetry.get("replacement_rescue_attempts", 0)
+    )
+    replacement_rescue_successes = int(
+        restored_telemetry.get("replacement_rescue_successes", 0)
+    )
+    replacement_rescue_failures = int(
+        restored_telemetry.get("replacement_rescue_failures", 0)
+    )
     replacement_rescue_stage_counts = {str(stage): 0 for stage in range(1, 5)}
-    replacement_rescue_ncall = 0
-    replacement_rescue_max_stage = None
-    replacement_rescue_last_message = None
+    replacement_rescue_stage_counts.update(
+        {
+            str(stage): int(count)
+            for stage, count in restored_telemetry.get(
+                "replacement_rescue_stage_counts", {}
+            ).items()
+        }
+    )
+    replacement_rescue_ncall = int(
+        restored_telemetry.get("replacement_rescue_ncall", 0)
+    )
+    replacement_rescue_max_stage = restored_telemetry.get(
+        "replacement_rescue_max_stage"
+    )
+    if replacement_rescue_max_stage is not None:
+        replacement_rescue_max_stage = int(replacement_rescue_max_stage)
+    replacement_rescue_last_message = restored_telemetry.get(
+        "replacement_rescue_last_message"
+    )
     effective_step_scale = float(step_scale)
     if initial_state is not None:
         restored_step_scale = getattr(initial_state, "effective_step_scale", None)
@@ -1177,9 +1255,17 @@ def run_static_nested(
             float(restored_step_scale)
         ):
             effective_step_scale = float(restored_step_scale)
-    adaptive_scale_history = [effective_step_scale]
-    adaptive_accept_history = []
-    adaptive_updates = 0
+    adaptive_scale_history = [
+        float(value)
+        for value in restored_telemetry.get("adaptive_scale_history", [])
+    ]
+    if not adaptive_scale_history or adaptive_scale_history[-1] != effective_step_scale:
+        adaptive_scale_history.append(effective_step_scale)
+    adaptive_accept_history = [
+        float(value)
+        for value in restored_telemetry.get("adaptive_accept_history", [])
+    ]
+    adaptive_updates = int(restored_telemetry.get("adaptive_updates", 0))
     adaptive_rate = 0.05
     adaptive_min_step_scale = 1e-4
     adaptive_max_step_scale = 0.5
@@ -1223,6 +1309,47 @@ def run_static_nested(
             message=message,
             stopped_by_callback=stopped_by_callback,
             effective_step_scale=effective_step_scale,
+            telemetry={
+                "replacement_batches": list(replacement_batches),
+                "replacement_chains_used": list(replacement_chains_used),
+                "replacement_chain_usage_counts": dict(
+                    replacement_chain_usage_counts
+                ),
+                "bound_updates": int(bound_updates),
+                "bound_draw_history": list(bound_draw_history),
+                "bound_eval_history": list(bound_eval_history),
+                "bound_unit_cube_acceptance_history": list(
+                    bound_unit_cube_acceptance_history
+                ),
+                "bound_build_time_history": list(bound_build_time_history),
+                "bound_log_volume_history": list(bound_log_volume_history),
+                "bound_nellipsoid_history": list(bound_nellipsoid_history),
+                "bound_overlap_rejection_history": list(
+                    bound_overlap_rejection_history
+                ),
+                "bound_seed_call_history": list(bound_seed_call_history),
+                "bound_seed_batch_history": list(bound_seed_batch_history),
+                "rwalk_kernel_call_history": list(rwalk_kernel_call_history),
+                "rwalk_accepted_move_history": list(
+                    rwalk_accepted_move_history
+                ),
+                "rwalk_proposal_history": list(rwalk_proposal_history),
+                "consecutive_bound_failures": int(consecutive_bound_failures),
+                "force_bound_rebuild": bool(force_bound_rebuild),
+                "bound_forced_rebuilds": int(bound_forced_rebuilds),
+                "replacement_rescue_attempts": int(replacement_rescue_attempts),
+                "replacement_rescue_successes": int(replacement_rescue_successes),
+                "replacement_rescue_failures": int(replacement_rescue_failures),
+                "replacement_rescue_stage_counts": dict(
+                    replacement_rescue_stage_counts
+                ),
+                "replacement_rescue_ncall": int(replacement_rescue_ncall),
+                "replacement_rescue_max_stage": replacement_rescue_max_stage,
+                "replacement_rescue_last_message": replacement_rescue_last_message,
+                "adaptive_scale_history": list(adaptive_scale_history),
+                "adaptive_accept_history": list(adaptive_accept_history),
+                "adaptive_updates": int(adaptive_updates),
+            },
         )
 
     last_checkpoint_iteration = initial_iteration
