@@ -345,6 +345,77 @@ def test_draw_constrained_rwalk_jax_counts_walks_on_easy_target() -> None:
     assert math.isfinite(logl)
 
 
+def test_draw_constrained_rwalk_jax_keeps_vectorized_prior_calls_batched() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    def prior_batch(u):
+        if u.ndim != 2:
+            raise ValueError("batch-only prior received a non-batch input")
+        return 2.0 * u - 1.0
+
+    def loglike_batch(theta):
+        if theta.ndim != 2:
+            raise ValueError("batch-only likelihood received a non-batch input")
+        return -jnp.sum(theta**2, axis=1)
+
+    live_u = jnp.asarray(((0.2, 0.3), (0.4, 0.7), (0.8, 0.6), (0.5, 0.5)))
+    live_logl = loglike_batch(prior_batch(live_u))
+    _, new_u, new_theta, new_logl, ncall, accepted = (
+        draw_constrained_rwalk_jax(
+            random.PRNGKey(125),
+            loglike_batch,
+            prior_batch,
+            -math.inf,
+            live_u,
+            live_logl,
+            2,
+            walks=2,
+            replacement_chains=2,
+            max_attempts=8,
+            jax_vectorized=True,
+        )
+    )
+
+    assert accepted is True
+    assert ncall == 4
+    assert new_u.shape == (2,)
+    assert new_theta.shape == (2,)
+    assert jnp.isfinite(new_logl)
+
+
+def test_draw_constrained_rwalk_jax_normalizes_scalar_one_dimensional_prior() -> None:
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    def scalar_prior(u):
+        return 2.0 * u[0] - 1.0
+
+    def vector_loglike(theta):
+        return -(theta[0] ** 2)
+
+    live_u = jnp.asarray(((0.2,), (0.4,), (0.6,), (0.8,)))
+    live_logl = -(2.0 * live_u[:, 0] - 1.0) ** 2
+    _, new_u, new_theta, new_logl, ncall, accepted = (
+        draw_constrained_rwalk_jax(
+            random.PRNGKey(126),
+            vector_loglike,
+            scalar_prior,
+            -math.inf,
+            live_u,
+            live_logl,
+            1,
+            walks=2,
+            replacement_chains=2,
+            max_attempts=8,
+        )
+    )
+
+    assert accepted is True
+    assert ncall == 4
+    assert new_u.shape == (1,)
+    assert new_theta.shape == (1,)
+    assert jnp.isfinite(new_logl)
+
+
 def test_draw_constrained_rwalk_jax_can_return_move_acceptance_info() -> None:
     from tinyns.samplers import draw_constrained_rwalk_jax
 
