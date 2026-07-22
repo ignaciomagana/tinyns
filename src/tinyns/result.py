@@ -96,6 +96,81 @@ def _npz_scalar(value):
     raise ValueError("expected scalar value in result .npz file")
 
 
+@dataclass(frozen=True)
+class LogZBootstrap:
+    """Simulated-weights (jittered) log-evidence realizations.
+
+    Produced by :meth:`NestedSamplingResult.logz_bootstrap`. ``logzerr`` is the
+    sample standard deviation of the log-evidence realizations and is the honest
+    single-run evidence uncertainty; the percentiles capture the (typically
+    left-skewed) shape that a single Gaussian ``sqrt(H/nlive)`` cannot.
+    """
+
+    logz_mean: float
+    logzerr: float
+    logz_median: float
+    logz_p16: float
+    logz_p84: float
+    n_realizations: int
+    samples: np.ndarray
+
+
+def _np_logsumexp(values, axis):
+    """Return a stable ``log(sum(exp(values)))`` reduction over ``axis``."""
+
+    values = np.asarray(values, dtype=float)
+    vmax = np.max(values, axis=axis, keepdims=True)
+    safe = np.where(np.isfinite(vmax), vmax, 0.0)
+    total = np.sum(np.exp(values - safe), axis=axis, keepdims=True)
+    with np.errstate(divide="ignore"):
+        out = safe + np.log(total)
+    out = np.where(total > 0.0, out, -np.inf)
+    return np.squeeze(out, axis=axis)
+
+
+def _simulate_logz_realizations(dead_logl, live_logl, nlive, log_shrinkage):
+    """Recompute log-evidence for jittered prior-volume shrinkage sequences.
+
+    Reproduces the sampler's own evidence convention (a left-Riemann dead-point
+    width ``X_i - X_{i+1}`` plus an equal ``X_final / nlive`` share for each
+    surviving live point), but with the deterministic ``log X_i = -i / nlive``
+    schedule replaced by the per-realization ``log_shrinkage`` random walk.
+
+    Parameters
+    ----------
+    dead_logl:
+        Dead-point log-likelihoods in removal order, shape ``(ndead,)``.
+    live_logl:
+        Final live-point log-likelihoods, shape ``(nlive_final,)``.
+    nlive:
+        Constant live-point count used during sampling.
+    log_shrinkage:
+        Per-step ``log t_i`` values, shape ``(n_realizations, ndead)``. Each
+        ``t_i`` is a prior-volume shrinkage factor.
+    """
+
+    dead_logl = np.asarray(dead_logl, dtype=float)
+    live_logl = np.asarray(live_logl, dtype=float)
+    log_shrinkage = np.asarray(log_shrinkage, dtype=float)
+    n_realizations = log_shrinkage.shape[0]
+
+    zeros = np.zeros((n_realizations, 1))
+    log_x = np.concatenate([zeros, np.cumsum(log_shrinkage, axis=1)], axis=1)
+    # Dead-point widths: log(exp(log_x[i]) - exp(log_x[i + 1])) with log_x[i]
+    # strictly greater than log_x[i + 1] because every shrinkage is < 1.
+    upper = log_x[:, :-1]
+    lower = log_x[:, 1:]
+    with np.errstate(divide="ignore"):
+        log_width = upper + np.log1p(-np.exp(lower - upper))
+    dead_logwt = log_width + dead_logl[None, :]
+
+    log_x_final = log_x[:, -1:]
+    live_logwt = log_x_final - math.log(nlive) + live_logl[None, :]
+
+    all_logwt = np.concatenate([dead_logwt, live_logwt], axis=1)
+    return _np_logsumexp(all_logwt, axis=1)
+
+
 @dataclass
 class NestedSamplingResult:
     """Container for completed nested-sampling outputs."""
@@ -240,6 +315,72 @@ class NestedSamplingResult:
         if information < 0.0:
             return 0.0
         return information
+
+    def logz_bootstrap(
+        self, n_realizations: int = 256, seed: int = 0
+    ) -> LogZBootstrap:
+        """Return simulated-weights (jittered) log-evidence realizations.
+
+        The analytic ``logzerr = sqrt(H / nlive)`` is a Gaussian approximation
+        of the prior-volume path uncertainty. This estimator instead draws the
+        per-step shrinkage ``t_i`` directly from its ``Beta(nlive, 1)`` law
+        (``log t_i = log(U_i) / nlive`` with ``U_i`` uniform), rebuilds the
+        weights over the stored dead-point likelihood sequence, and recomputes
+        ``logz`` for ``n_realizations`` independent volume paths. It is pure
+        post-processing -- no resampling of the likelihood is performed.
+
+        The returned ``logzerr`` (the realization standard deviation) captures
+        the skewed path uncertainty that ``sqrt(H / nlive)`` structurally
+        cannot. It does not capture sampling bias (e.g. under-decorrelated
+        walks), so it is a lower bound on the true single-run uncertainty; a
+        biased ``insertion_rank`` distribution can still inflate seed-to-seed
+        scatter beyond this estimate.
+
+        The final live points reuse the sampler's equal ``X_final / nlive``
+        split with the jittered ``X_final``; their volume subdivision is not
+        additionally jittered, so results are least conservative when the final
+        live set carries a large posterior weight fraction.
+        """
+
+        if int(n_realizations) < 1:
+            raise ValueError("n_realizations must be at least 1")
+        nlive = int(self.nlive)
+        if nlive <= 0:
+            raise ValueError("nlive must be a positive integer")
+
+        logl = np.asarray(self.logl, dtype=float)
+        npoints = int(logl.size)
+        nlive_final = self._valid_nlive_final()
+        metadata = {} if self.metadata is None else self.metadata
+        ndead = metadata.get("ndead")
+        if not isinstance(ndead, numbers.Integral) or isinstance(ndead, bool):
+            ndead = npoints - (nlive_final or 0)
+        ndead = int(max(0, min(int(ndead), npoints)))
+
+        dead_logl = logl[:ndead]
+        live_logl = logl[ndead:]
+
+        rng = np.random.default_rng(seed)
+        uniforms = rng.random((int(n_realizations), ndead))
+        with np.errstate(divide="ignore"):
+            log_shrinkage = np.log(uniforms) / nlive
+        samples = _simulate_logz_realizations(
+            dead_logl, live_logl, nlive, log_shrinkage
+        )
+
+        finite = samples[np.isfinite(samples)]
+        if finite.size == 0:
+            nan = math.nan
+            return LogZBootstrap(nan, nan, nan, nan, nan, int(n_realizations), samples)
+        return LogZBootstrap(
+            logz_mean=float(np.mean(finite)),
+            logzerr=float(np.std(finite, ddof=1)) if finite.size > 1 else 0.0,
+            logz_median=float(np.median(finite)),
+            logz_p16=float(np.percentile(finite, 16.0)),
+            logz_p84=float(np.percentile(finite, 84.0)),
+            n_realizations=int(n_realizations),
+            samples=samples,
+        )
 
     def diagnostics(self) -> dict[str, object]:
         """Return lightweight run diagnostics as a plain dictionary."""

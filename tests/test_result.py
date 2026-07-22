@@ -148,6 +148,73 @@ def test_information_ignores_zero_weight_nonfinite_likelihood() -> None:
     assert result.information() == 0.0
 
 
+def _small_gaussian_run():
+    from tinyns.run import run_static_nested
+
+    def loglike(theta):
+        return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
+
+    return run_static_nested(
+        random.PRNGKey(0),
+        loglike,
+        lambda u: 4.0 * u - 2.0,
+        ndim=2,
+        nlive=50,
+        dlogz=0.3,
+        maxiter=200000,
+        sample="prior",
+    )
+
+
+def test_logz_bootstrap_reconstruction_matches_sampler() -> None:
+    from tinyns.result import _simulate_logz_realizations
+
+    result = _small_gaussian_run()
+    ndead = int(result.metadata["ndead"])
+    logl = np.asarray(result.logl, dtype=float)
+    nlive = int(result.nlive)
+
+    # Feeding the deterministic shrinkage log t_i = -1 / nlive must reproduce
+    # the sampler's own logz, confirming the weight convention matches.
+    log_shrinkage = np.full((1, ndead), -1.0 / nlive)
+    reconstructed = _simulate_logz_realizations(
+        logl[:ndead], logl[ndead:], nlive, log_shrinkage
+    )[0]
+
+    assert abs(float(reconstructed) - float(result.logz)) < 1e-5
+
+
+def test_logz_bootstrap_is_deterministic_and_sane() -> None:
+    result = _small_gaussian_run()
+
+    first = result.logz_bootstrap(n_realizations=512, seed=0)
+    repeat = result.logz_bootstrap(n_realizations=512, seed=0)
+    other = result.logz_bootstrap(n_realizations=512, seed=1)
+
+    assert first.n_realizations == 512
+    assert first.samples.shape == (512,)
+    assert np.array_equal(first.samples, repeat.samples)
+    assert not np.array_equal(first.samples, other.samples)
+
+    assert math.isfinite(first.logzerr) and first.logzerr > 0.0
+    assert first.logz_p16 <= first.logz_median <= first.logz_p84
+    # Mean realization sits near the reported logz.
+    assert abs(first.logz_mean - float(result.logz)) < 5.0 * first.logzerr
+    # Volume-path uncertainty is the same order as the analytic sqrt(H/nlive).
+    analytic = math.sqrt(max(result.information(), 0.0) / result.nlive)
+    assert 0.25 * analytic < first.logzerr < 4.0 * analytic
+
+
+def test_logz_bootstrap_input_validation() -> None:
+    result = make_result()
+    with np.testing.assert_raises(ValueError):
+        result.logz_bootstrap(n_realizations=0)
+
+    result.nlive = 0
+    with np.testing.assert_raises(ValueError):
+        result.logz_bootstrap(n_realizations=8)
+
+
 def test_logzerr_diagnostics_explain_nonfinite_inputs() -> None:
     from tinyns.run import _logzerr_diagnostics
 

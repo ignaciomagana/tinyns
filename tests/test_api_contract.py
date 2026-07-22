@@ -23,11 +23,13 @@ def test_public_exports() -> None:
     assert tinyns.__all__ == [
         "NestedSampler",
         "NestedSamplingResult",
+        "LogZBootstrap",
         "run_static_nested",
     ]
     assert tinyns.NestedSampler is NestedSampler
     assert tinyns.NestedSamplingResult is NestedSamplingResult
     assert tinyns.run_static_nested is run_static_nested
+    assert tinyns.LogZBootstrap is tinyns.result.LogZBootstrap
 
 
 def test_nested_sampler_stores_configuration() -> None:
