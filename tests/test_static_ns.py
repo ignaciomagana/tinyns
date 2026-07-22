@@ -1201,6 +1201,150 @@ def _partial_failure_block_kernel_20tuple(
     return make_kernel
 
 
+def test_jax_block_stops_scanning_after_first_failed_replacement(monkeypatch) -> None:
+    def make_rwalk_kernel(*_args, **_kwargs):
+        def kernel(
+            key,
+            logl_min,
+            live_u,
+            _live_logl,
+            _step_scale,
+            _min_accepts,
+            _max_batches,
+        ):
+            accepted = key == 0
+            new_u = jnp.full(
+                live_u.shape[1:], (key + 3).astype(live_u.dtype) / 10
+            )
+            return (
+                key + 1,
+                new_u,
+                new_u,
+                logl_min + 1,
+                jnp.asarray(1, dtype=jnp.int32),
+                accepted,
+                accepted.astype(jnp.int32),
+                jnp.asarray(1, dtype=jnp.int32),
+            )
+
+        return kernel
+
+    monkeypatch.setattr(run_mod, "_make_rwalk_jax_kernel", make_rwalk_kernel)
+    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+    kernel = run_mod._make_static_jax_rwalk_block_kernel(
+        lambda theta: theta[0],
+        lambda u: u,
+        2,
+        1,
+        1,
+        4,
+    )
+    result = kernel(
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(((0.1, 0.1), (0.2, 0.2))),
+        jnp.asarray(((0.1, 0.1), (0.2, 0.2))),
+        jnp.asarray((0.0, 1.0)),
+        jnp.asarray(-jnp.inf),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(2, dtype=jnp.int32),
+        jnp.asarray(0.1),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+
+    assert int(result[0]) == 2
+    assert jnp.asarray(result[12]).tolist() == [True, False, False, False]
+    assert jnp.asarray(result[8]).tolist() == [1, 1, 0, 0]
+    assert jnp.asarray(result[14]).tolist() == [1, 1, 0, 0]
+    assert jnp.allclose(
+        jnp.sort(jnp.asarray(result[1]), axis=0),
+        jnp.asarray(((0.2, 0.2), (0.3, 0.3))),
+    )
+
+
+def test_jax_block_partial_failure_restores_successful_live_prefix(
+    monkeypatch,
+) -> None:
+    def make_kernel(*_args, **_kwargs):
+        def kernel(
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            logz_dead,
+            start_iteration,
+            nlive,
+            *_rest,
+        ):
+            block_size = 4
+            worst = int(jnp.argmin(live_logl))
+            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
+            dead_theta = jnp.repeat(
+                live_theta[worst][None, :], block_size, axis=0
+            )
+            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
+            offsets = jnp.arange(block_size)
+            iterations = start_iteration + offsets
+            logx_prev = -iterations / nlive
+            logx_new = -(iterations + 1) / nlive
+            dead_logwt = (
+                logx_prev
+                + jnp.log1p(-jnp.exp(logx_new - logx_prev))
+                + dead_logl
+            )
+            new_u = jnp.asarray(
+                ((0.25, 0.25), (0.99, 0.99), (0.99, 0.99), (0.99, 0.99))
+            )
+            new_logl = jnp.asarray((1.0, 2.0, 3.0, 4.0))
+            corrupted_live = jnp.full_like(live_u, 0.99)
+            return (
+                key,
+                corrupted_live,
+                jnp.full_like(live_theta, 0.99),
+                jnp.full_like(live_logl, 99.0),
+                dead_u,
+                dead_theta,
+                dead_logl,
+                dead_logwt,
+                jnp.asarray((1, 2, 7, 11), dtype=jnp.int32),
+                jnp.zeros((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.asarray((True, False, False, False)),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                jnp.asarray((1, 2, 7, 11), dtype=jnp.int32),
+                new_u,
+                new_u,
+                new_logl,
+                logz_dead,
+                -(start_iteration + block_size) / nlive,
+            )
+
+        return kernel
+
+    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", make_kernel)
+    result = run_static_nested(
+        random.PRNGKey(4241),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        maxiter=4,
+        dlogz=10.0,
+        jax_block_size=4,
+    )
+
+    final_live_u = jnp.asarray(result.samples_u[-result.nlive :])
+    final_live_logl = jnp.asarray(result.logl[-result.nlive :])
+    assert jnp.any(jnp.all(jnp.isclose(final_live_u, 0.25), axis=1))
+    assert not jnp.any(jnp.all(jnp.isclose(final_live_u, 0.99), axis=1))
+    assert 1.0 in final_live_logl
+    assert 99.0 not in final_live_logl
+    assert result.ncall == result.nlive + 1 + 2
+
+
 def test_jax_block_ncall_counts_failed_offset_when_rescue_skipped(monkeypatch) -> None:
     # Prefix offsets 0, 1 succeed (3 + 3 calls); offset 2 fails (9 calls).
     monkeypatch.setattr(

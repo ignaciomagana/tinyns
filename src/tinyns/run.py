@@ -204,67 +204,118 @@ def _make_static_jax_rwalk_block_kernel(
         max_batches,
     ):
         def one_iteration(carry, offset):
-            key, live_u, live_theta, live_logl, logz_dead = carry
-            worst = jnp.argmin(live_logl)
-            dead_u = live_u[worst]
-            dead_theta = live_theta[worst]
-            logl_worst = live_logl[worst]
-            iteration = jnp.asarray(start_iteration, dtype=jnp.int32) + offset
-            logx_prev = -iteration / nlive
-            logx_new = -(iteration + 1) / nlive
-            logwidth = logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev))
-            logwt = logwidth + logl_worst
-            logz_dead = jnp.logaddexp(logz_dead, logwt)
+            key, live_u, live_theta, live_logl, logz_dead, active = carry
 
-            (
-                key,
-                new_u,
-                new_theta,
-                new_logl,
-                replacement_ncall,
-                accepted,
-                accepted_move_count,
-                total_proposal_count,
-            ) = rwalk_kernel(
-                key,
-                logl_worst,
-                live_u,
-                live_logl,
-                jnp.asarray(step_scale),
-                jnp.asarray(min_accepts),
-                jnp.asarray(max_batches, dtype=jnp.int32),
-            )
-            replacement_batches_used = (
-                replacement_ncall + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
-            ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
-            replacement_chains_used = replacement_batches_used * jnp.asarray(
-                replacement_chains, dtype=jnp.int32
-            )
-            insertion_index = (
-                jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
-            ).astype(jnp.int32)
-            live_u = jnp.where(accepted, live_u.at[worst].set(new_u), live_u)
-            live_theta = jnp.where(
-                accepted, live_theta.at[worst].set(new_theta), live_theta
-            )
-            live_logl = jnp.where(
-                accepted, live_logl.at[worst].set(new_logl), live_logl
-            )
-            return (key, live_u, live_theta, live_logl, logz_dead), (
-                dead_u,
-                dead_theta,
-                logl_worst,
-                logwt,
-                replacement_ncall,
-                insertion_index,
-                replacement_batches_used,
-                replacement_chains_used,
-                accepted,
-                accepted_move_count,
-                total_proposal_count,
-                new_u,
-                new_theta,
-                new_logl,
+            def run_iteration(state):
+                key, live_u, live_theta, live_logl, logz_dead = state
+                worst = jnp.argmin(live_logl)
+                dead_u = live_u[worst]
+                dead_theta = live_theta[worst]
+                logl_worst = live_logl[worst]
+                iteration = jnp.asarray(start_iteration, dtype=jnp.int32) + offset
+                logx_prev = -iteration / nlive
+                logx_new = -(iteration + 1) / nlive
+                logwidth = logx_prev + jnp.log1p(
+                    -jnp.exp(logx_new - logx_prev)
+                )
+                logwt = logwidth + logl_worst
+                logz_dead = jnp.logaddexp(logz_dead, logwt)
+
+                (
+                    key,
+                    new_u,
+                    new_theta,
+                    new_logl,
+                    replacement_ncall,
+                    accepted,
+                    accepted_move_count,
+                    total_proposal_count,
+                ) = rwalk_kernel(
+                    key,
+                    logl_worst,
+                    live_u,
+                    live_logl,
+                    jnp.asarray(step_scale),
+                    jnp.asarray(min_accepts),
+                    jnp.asarray(max_batches, dtype=jnp.int32),
+                )
+                replacement_batches_used = (
+                    replacement_ncall
+                    + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
+                ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
+                replacement_chains_used = replacement_batches_used * jnp.asarray(
+                    replacement_chains, dtype=jnp.int32
+                )
+                insertion_index = (
+                    jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
+                ).astype(jnp.int32)
+                live_u = jnp.where(accepted, live_u.at[worst].set(new_u), live_u)
+                live_theta = jnp.where(
+                    accepted, live_theta.at[worst].set(new_theta), live_theta
+                )
+                live_logl = jnp.where(
+                    accepted, live_logl.at[worst].set(new_logl), live_logl
+                )
+                return (
+                    key,
+                    live_u,
+                    live_theta,
+                    live_logl,
+                    logz_dead,
+                    accepted,
+                ), (
+                    dead_u,
+                    dead_theta,
+                    logl_worst,
+                    logwt,
+                    replacement_ncall,
+                    insertion_index,
+                    replacement_batches_used,
+                    replacement_chains_used,
+                    accepted,
+                    accepted_move_count,
+                    total_proposal_count,
+                    new_u,
+                    new_theta,
+                    new_logl,
+                )
+
+            def skip_iteration(state):
+                key, live_u, live_theta, live_logl, logz_dead = state
+                worst = jnp.argmin(live_logl)
+                dead_u = live_u[worst]
+                dead_theta = live_theta[worst]
+                logl_worst = live_logl[worst]
+                zero = jnp.asarray(0, dtype=jnp.int32)
+                return (
+                    key,
+                    live_u,
+                    live_theta,
+                    live_logl,
+                    logz_dead,
+                    jnp.asarray(False),
+                ), (
+                    dead_u,
+                    dead_theta,
+                    logl_worst,
+                    jnp.asarray(-jnp.inf, dtype=live_logl.dtype),
+                    zero,
+                    zero,
+                    zero,
+                    zero,
+                    jnp.asarray(False),
+                    zero,
+                    zero,
+                    dead_u,
+                    dead_theta,
+                    logl_worst,
+                )
+
+            return lax.cond(
+                active,
+                run_iteration,
+                skip_iteration,
+                (key, live_u, live_theta, live_logl, logz_dead),
             )
 
         (
@@ -274,11 +325,19 @@ def _make_static_jax_rwalk_block_kernel(
                 new_live_theta,
                 new_live_logl,
                 logz_dead_new,
+                _,
             ),
             block,
         ) = lax.scan(
             one_iteration,
-            (key, live_u, live_theta, live_logl, jnp.asarray(logz_dead)),
+            (
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                jnp.asarray(logz_dead),
+                jnp.asarray(True),
+            ),
             jnp.arange(block_size, dtype=jnp.int32),
         )
         (
@@ -1406,6 +1465,21 @@ def run_static_nested(
                     ]
                 )
                 ncall += failed_calls
+                if rescue_capable_block:
+                    live_u = live_u_before_block
+                    live_theta = live_theta_before_block
+                    live_logl = live_logl_before_block
+                    for prior_offset in range(block_size_now):
+                        prior_worst = int(jnp.argmin(live_logl))
+                        live_u = live_u.at[prior_worst].set(
+                            full_new_u_block[prior_offset]
+                        )
+                        live_theta = live_theta.at[prior_worst].set(
+                            full_new_theta_block[prior_offset]
+                        )
+                        live_logl = live_logl.at[prior_worst].set(
+                            full_new_logl_block[prior_offset]
+                        )
             block_stop = iteration + block_size_now
             if failed_offsets:
                 logz_dead = float(logz_dead_before_block)
@@ -1519,20 +1593,9 @@ def run_static_nested(
                     and int(max_attempts) > int(walks) * int(replacement_chains)
                 ):
                     fail_offset = int(failed_offsets[0])
-                    rescue_live_u = live_u_before_block
-                    rescue_live_theta = live_theta_before_block
-                    rescue_live_logl = live_logl_before_block
-                    for prior_offset in range(fail_offset):
-                        prior_worst = int(jnp.argmin(rescue_live_logl))
-                        rescue_live_u = rescue_live_u.at[prior_worst].set(
-                            full_new_u_block[prior_offset]
-                        )
-                        rescue_live_theta = rescue_live_theta.at[prior_worst].set(
-                            full_new_theta_block[prior_offset]
-                        )
-                        rescue_live_logl = rescue_live_logl.at[prior_worst].set(
-                            full_new_logl_block[prior_offset]
-                        )
+                    rescue_live_u = live_u
+                    rescue_live_theta = live_theta
+                    rescue_live_logl = live_logl
                     rescue_worst = int(jnp.argmin(rescue_live_logl))
                     rescue_logl_min = float(full_dead_logl_block[fail_offset])
                     rescue_schedule = (
