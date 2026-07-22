@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax.numpy as jnp
@@ -56,6 +56,7 @@ class NestedRunState:
     message: str
     stopped_by_callback: bool = False
     effective_step_scale: float | None = None
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 def _npz_scalar(value):
@@ -106,6 +107,7 @@ def save_checkpoint_npz(path, state: NestedRunState, config: dict) -> None:
                 if state.effective_step_scale is not None
                 else float("nan")
             ),
+            telemetry_json=np.asarray(json.dumps(state.telemetry, sort_keys=True)),
             config_json=np.asarray(json.dumps(config, sort_keys=True)),
         )
     os.replace(tmp_path, path)
@@ -132,6 +134,9 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
             raw_step_scale = float(_npz_scalar(data["effective_step_scale"]))
             if np.isfinite(raw_step_scale):
                 effective_step_scale = raw_step_scale
+        telemetry = {}
+        if "telemetry_json" in data.files:
+            telemetry = json.loads(str(_npz_scalar(data["telemetry_json"])))
         dead_u = [jnp.asarray(point) for point in np.asarray(data["dead_u"])]
         dead_theta = [jnp.asarray(point) for point in np.asarray(data["dead_theta"])]
         state = NestedRunState(
@@ -154,5 +159,6 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
             message=str(_npz_scalar(data["message"])),
             stopped_by_callback=bool(_npz_scalar(data["stopped_by_callback"])),
             effective_step_scale=effective_step_scale,
+            telemetry=telemetry,
         )
         return state, config

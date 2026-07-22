@@ -146,6 +146,122 @@ def test_resume_matches_uninterrupted_run(tmp_path):
     assert resumed.logz == full.logz
 
 
+def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
+    path = tmp_path / "rwalk_telemetry.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=2,
+        replacement_chains=2,
+        max_attempts=16,
+        rwalk_adaptive_step_scale=True,
+        rwalk_target_accept=0.4,
+    )
+
+    full = sampler.run(100, maxiter=8, dlogz=0.0)
+    sampler.run(
+        100,
+        maxiter=4,
+        dlogz=0.0,
+        checkpoint_path=path,
+        checkpoint_interval=1,
+    )
+    state, _ = load_checkpoint_npz(path)
+    resumed = sampler.resume(path, maxiter=8, dlogz=0.0)
+
+    assert len(state.telemetry["replacement_batches"]) == 4
+    assert len(state.telemetry["rwalk_proposal_history"]) == 4
+    assert resumed.ncall == full.ncall
+    assert resumed.metadata["replacement_ncall"] == full.metadata[
+        "replacement_ncall"
+    ]
+    assert resumed.metadata["replacement_chain_usage_counts"] == full.metadata[
+        "replacement_chain_usage_counts"
+    ]
+    for key in (
+        "mean_replacement_batches",
+        "max_replacement_batches",
+        "mean_replacement_chains_used",
+        "max_replacement_chains_used",
+        "accepted_rwalk_moves",
+        "total_rwalk_proposals",
+        "rwalk_adaptation_updates",
+    ):
+        assert resumed.metadata[key] == full.metadata[key]
+    for key in (
+        "rwalk_acceptance",
+        "rwalk_effective_step_scale_min_seen",
+        "rwalk_effective_step_scale_max_seen",
+        "rwalk_effective_step_scale_mean",
+        "rwalk_observed_accept_mean",
+    ):
+        assert resumed.metadata[key] == pytest.approx(full.metadata[key])
+
+
+def test_resume_preserves_cumulative_bound_telemetry(tmp_path):
+    path = tmp_path / "bound_telemetry.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=1,
+        bound="single",
+        rwalk_seed="bound",
+        bound_seed_kernel="jax",
+        batch_size=8,
+        bound_max_draws=8,
+        max_attempts=8,
+    )
+
+    full = sampler.run(101, maxiter=4, dlogz=0.0)
+    sampler.run(
+        101,
+        maxiter=2,
+        dlogz=0.0,
+        checkpoint_path=path,
+        checkpoint_interval=1,
+    )
+    resumed = sampler.resume(path, maxiter=4, dlogz=0.0)
+
+    for key in (
+        "bound_updates",
+        "bound_build_count",
+        "max_bound_draws",
+        "max_bound_seed_calls",
+        "max_bound_seed_batches",
+    ):
+        assert resumed.metadata[key] == full.metadata[key]
+    for key in (
+        "mean_bound_draws",
+        "mean_bound_loglike_evals",
+        "mean_bound_unit_cube_acceptance",
+        "mean_bound_seed_calls",
+        "mean_bound_seed_batches",
+        "mean_rwalk_kernel_calls",
+        "bound_log_volume_mean",
+        "bound_nellipsoids_mean",
+    ):
+        assert resumed.metadata[key] == pytest.approx(full.metadata[key])
+
+
+def test_resume_without_telemetry_payload_uses_empty_history_defaults(tmp_path):
+    path = tmp_path / "telemetry_full.checkpoint.npz"
+    stripped = tmp_path / "telemetry_stripped.checkpoint.npz"
+    make_sampler().run(102, maxiter=2, dlogz=0.0, checkpoint_path=path)
+
+    with np.load(path) as data:
+        values = {
+            name: data[name] for name in data.files if name != "telemetry_json"
+        }
+    np.savez(stripped, **values)
+
+    state, _ = load_checkpoint_npz(stripped)
+    result = make_sampler().resume(stripped, maxiter=3, dlogz=0.0)
+
+    assert state.telemetry == {}
+    assert result.metadata["resumed_from_checkpoint"] is True
+    assert math.isfinite(result.logz)
+
+
 def test_checkpoint_with_min_accepts_two_resumes_with_matching_config(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
     sampler = make_sampler(sample="rwalk", walks=3, min_accepts=2)
