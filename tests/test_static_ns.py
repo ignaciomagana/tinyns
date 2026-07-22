@@ -1020,6 +1020,35 @@ def test_jax_block_rwalk_supports_unhashable_callable_instances() -> None:
     assert jnp.isfinite(result.logz)
 
 
+def test_static_jax_block_kernel_cache_is_bounded() -> None:
+    def prior_transform(u):
+        return u
+
+    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+    run_mod._make_rwalk_jax_kernel.cache_clear()
+    try:
+        for offset in range(40):
+            def loglike(theta, offset=offset):
+                return -jnp.sum(theta**2) + offset
+
+            run_mod._make_static_jax_rwalk_block_kernel(
+                loglike,
+                prior_transform,
+                2,
+                1,
+                1,
+                2,
+            )
+
+        cache_info = run_mod._make_static_jax_rwalk_block_kernel.cache_info()
+        assert cache_info.maxsize == 32
+        assert cache_info.currsize == 32
+        assert cache_info.misses == 40
+    finally:
+        run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+        run_mod._make_rwalk_jax_kernel.cache_clear()
+
+
 def test_jax_block_partial_failure_after_convergence_reports_success(
     monkeypatch,
 ) -> None:

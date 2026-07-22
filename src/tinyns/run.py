@@ -168,7 +168,7 @@ def _update_adaptive_step_scale(
     return float(np.clip(new_scale, min_step_scale, max_step_scale))
 
 
-@functools.cache
+@functools.lru_cache(maxsize=32)
 def _make_static_jax_rwalk_block_kernel_cached(
     loglike,
     prior_transform,
