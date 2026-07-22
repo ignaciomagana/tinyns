@@ -2428,9 +2428,12 @@ def run_static_nested(
                 maybe_checkpoint(final=True)
                 break
 
-            other_live_logl = jnp.delete(live_logl, worst)
+            # Insertion rank == number of surviving live points at or below the
+            # replacement. Count the full live array (still holding the worst
+            # point here) and drop the worst, matching the cached block path and
+            # avoiding a per-iteration O(nlive log nlive) sort.
             insertion_index = int(
-                jnp.searchsorted(jnp.sort(other_live_logl), new_logl, side="right")
+                jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
             )
             insertion_indices.append(insertion_index)
 
