@@ -221,6 +221,62 @@ def test_insertion_indices_metadata_after_normal_run() -> None:
     assert bool(jnp.all(insertion_indices <= metadata["insertion_index_nlive"]))
 
 
+def test_static_insertion_ranks_match_bruteforce_reference(monkeypatch) -> None:
+    """Non-block insertion ranks equal the count of surviving live points at or
+    below each replacement.
+
+    Guards the sort-free rank computation in the Python-loop path: a controlled
+    initial live set and scripted replacements produce a known, varied rank
+    sequence that is checked against an independent brute-force count.
+    """
+    initial_live_logl = jnp.asarray(
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], dtype=float
+    )
+    nlive = int(initial_live_logl.size)
+
+    monkeypatch.setattr(
+        run_mod,
+        "_evaluate_live_points",
+        lambda *_args, **_kwargs: initial_live_logl,
+    )
+
+    # Each scripted likelihood is strictly above the worst it replaces (so the
+    # draw is accepted) and chosen to land at a varied insertion rank.
+    scripted_new_logl = [0.5, 6.5, 1.5, 4.5, 100.0, 3.5]
+    calls = {"i": 0}
+
+    def fake_draw(key, loglike, prior_transform, logl_min, ndim, **_kwargs):
+        new_logl = scripted_new_logl[calls["i"]]
+        calls["i"] += 1
+        new_u = jnp.full((ndim,), 0.5)
+        return key, new_u, new_u, jnp.asarray(new_logl, dtype=float), 1, True
+
+    monkeypatch.setattr(run_mod, "draw_constrained_prior", fake_draw)
+
+    result = run_static_nested(
+        random.PRNGKey(0),
+        lambda theta: 0.0,
+        lambda u: u,
+        ndim=1,
+        nlive=nlive,
+        sample="prior",
+        maxiter=len(scripted_new_logl),
+    )
+
+    got = [int(x) for x in result.metadata["insertion_indices"]]
+
+    live = [float(x) for x in initial_live_logl]
+    expected = []
+    for new_logl in scripted_new_logl[: len(got)]:
+        worst = min(range(len(live)), key=lambda j: live[j])
+        others = live[:worst] + live[worst + 1 :]
+        expected.append(sum(1 for value in others if value <= new_logl))
+        live[worst] = new_logl
+
+    assert len(got) >= 4  # exercise the varied, non-zero middle ranks
+    assert got == expected
+
+
 def test_failure_to_replace_increments_replacement_failures() -> None:
     result = run_static_nested(
         random.PRNGKey(8),
