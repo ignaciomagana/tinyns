@@ -986,6 +986,40 @@ def test_jax_block_rwalk_failure_propagates_replacement_failure() -> None:
     assert "max_attempts=1" in result.message
 
 
+def test_jax_block_rwalk_supports_unhashable_callable_instances() -> None:
+    class UnhashablePrior:
+        __hash__ = None
+
+        def __call__(self, u):
+            return 2.0 * u - 1.0
+
+    class UnhashableLogLike:
+        __hash__ = None
+
+        def __call__(self, theta):
+            return -jnp.sum(theta**2)
+
+    result = run_static_nested(
+        random.PRNGKey(12341),
+        UnhashableLogLike(),
+        UnhashablePrior(),
+        2,
+        12,
+        sample="rwalk",
+        kernel="jax",
+        walks=1,
+        max_attempts=4,
+        maxiter=2,
+        dlogz=10.0,
+        jax_block_size=2,
+    )
+
+    assert result.success is True
+    assert result.metadata["niter"] == 2
+    assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
+    assert jnp.isfinite(result.logz)
+
+
 def test_jax_block_partial_failure_after_convergence_reports_success(
     monkeypatch,
 ) -> None:

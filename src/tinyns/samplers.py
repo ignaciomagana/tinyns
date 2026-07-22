@@ -23,6 +23,35 @@ from tinyns.math import reflect_unit_cube
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
+class _IdentityCacheKey:
+    """Hash an otherwise unhashable object by identity for internal caches."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, _IdentityCacheKey) and self.value is other.value
+        )
+
+
+def _cacheable_callable(value):
+    try:
+        hash(value)
+    except TypeError:
+        return _IdentityCacheKey(value)
+    return value
+
+
+def _unwrap_cacheable_callable(value):
+    return value.value if isinstance(value, _IdentityCacheKey) else value
+
+
 def _validate_theta_shape(theta, ndim: int):
     theta = jnp.asarray(theta)
     if ndim == 1 and theta.shape == ():
@@ -600,7 +629,7 @@ def draw_constrained_prior_vectorized(
 
 
 @lru_cache(maxsize=32)
-def _make_rwalk_jax_kernel(
+def _make_rwalk_jax_kernel_cached(
     loglike,
     prior_transform,
     ndim: int,
@@ -628,6 +657,9 @@ def _make_rwalk_jax_kernel(
     8. ``total_proposal_count`` -- total proposals attempted; equals ``ncall``
        and is the rwalk-acceptance denominator.
     """
+
+    loglike = _unwrap_cacheable_callable(loglike)
+    prior_transform = _unwrap_cacheable_callable(prior_transform)
 
     @jax.jit
     def kernel(
@@ -855,6 +887,29 @@ def _make_rwalk_jax_kernel(
         )
 
     return kernel
+
+
+def _make_rwalk_jax_kernel(
+    loglike,
+    prior_transform,
+    ndim: int,
+    walks: int,
+    replacement_chains: int,
+    jax_vectorized: bool,
+):
+    """Return a cached rwalk kernel for hashable or unhashable callables."""
+    return _make_rwalk_jax_kernel_cached(
+        _cacheable_callable(loglike),
+        _cacheable_callable(prior_transform),
+        ndim,
+        walks,
+        replacement_chains,
+        jax_vectorized,
+    )
+
+
+_make_rwalk_jax_kernel.cache_clear = _make_rwalk_jax_kernel_cached.cache_clear
+_make_rwalk_jax_kernel.cache_info = _make_rwalk_jax_kernel_cached.cache_info
 
 
 def _validate_replacement_chain_schedule(

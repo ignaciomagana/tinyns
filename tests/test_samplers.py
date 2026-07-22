@@ -416,6 +416,54 @@ def test_draw_constrained_rwalk_jax_normalizes_scalar_one_dimensional_prior() ->
     assert jnp.isfinite(new_logl)
 
 
+def test_draw_constrained_rwalk_jax_caches_unhashable_callable_instances() -> None:
+    from tinyns.samplers import (
+        _make_rwalk_jax_kernel,
+        draw_constrained_rwalk_jax,
+    )
+
+    class UnhashablePrior:
+        __hash__ = None
+
+        def __call__(self, u):
+            return 2.0 * u - 1.0
+
+    class UnhashableLogLike:
+        __hash__ = None
+
+        def __call__(self, theta):
+            return -jnp.sum(theta**2)
+
+    prior = UnhashablePrior()
+    loglike = UnhashableLogLike()
+    _make_rwalk_jax_kernel.cache_clear()
+    first_kernel = _make_rwalk_jax_kernel(loglike, prior, 2, 2, 1, False)
+    second_kernel = _make_rwalk_jax_kernel(loglike, prior, 2, 2, 1, False)
+
+    assert first_kernel is second_kernel
+    live_u = jnp.asarray(((0.2, 0.3), (0.4, 0.7), (0.8, 0.6), (0.5, 0.5)))
+    live_logl = jax.vmap(lambda u: loglike(prior(u)))(live_u)
+    _, new_u, new_theta, new_logl, ncall, accepted = (
+        draw_constrained_rwalk_jax(
+            random.PRNGKey(127),
+            loglike,
+            prior,
+            -math.inf,
+            live_u,
+            live_logl,
+            2,
+            walks=2,
+            max_attempts=4,
+        )
+    )
+
+    assert accepted is True
+    assert ncall == 2
+    assert new_u.shape == (2,)
+    assert new_theta.shape == (2,)
+    assert jnp.isfinite(new_logl)
+
+
 def test_draw_constrained_rwalk_jax_can_return_move_acceptance_info() -> None:
     from tinyns.samplers import draw_constrained_rwalk_jax
 

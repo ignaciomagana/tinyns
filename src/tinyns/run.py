@@ -21,8 +21,10 @@ from tinyns.bounds import (
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
+    _cacheable_callable,
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel,
+    _unwrap_cacheable_callable,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
     draw_constrained_prior,
@@ -167,7 +169,7 @@ def _update_adaptive_step_scale(
 
 
 @functools.cache
-def _make_static_jax_rwalk_block_kernel(
+def _make_static_jax_rwalk_block_kernel_cached(
     loglike,
     prior_transform,
     ndim: int,
@@ -177,6 +179,8 @@ def _make_static_jax_rwalk_block_kernel(
 ):
     """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel."""
 
+    loglike = _unwrap_cacheable_callable(loglike)
+    prior_transform = _unwrap_cacheable_callable(prior_transform)
     ndim = int(ndim)
     walks = int(walks)
     replacement_chains = int(replacement_chains)
@@ -384,6 +388,33 @@ def _make_static_jax_rwalk_block_kernel(
         )
 
     return jax.jit(block_kernel)
+
+
+def _make_static_jax_rwalk_block_kernel(
+    loglike,
+    prior_transform,
+    ndim: int,
+    walks: int,
+    replacement_chains: int,
+    block_size: int,
+):
+    """Return a cached block kernel for hashable or unhashable callables."""
+    return _make_static_jax_rwalk_block_kernel_cached(
+        _cacheable_callable(loglike),
+        _cacheable_callable(prior_transform),
+        ndim,
+        walks,
+        replacement_chains,
+        block_size,
+    )
+
+
+_make_static_jax_rwalk_block_kernel.cache_clear = (
+    _make_static_jax_rwalk_block_kernel_cached.cache_clear
+)
+_make_static_jax_rwalk_block_kernel.cache_info = (
+    _make_static_jax_rwalk_block_kernel_cached.cache_info
+)
 
 
 def _run_static_jax_bounded_rwalk_block(
