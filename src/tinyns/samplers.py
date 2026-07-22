@@ -32,6 +32,36 @@ def _validate_theta_shape(theta, ndim: int):
     return theta
 
 
+def _evaluate_jax_prior_batch(
+    prior_transform,
+    u_batch,
+    ndim: int,
+    *,
+    jax_vectorized: bool,
+):
+    """Evaluate a JAX prior transform and normalize its batch shape."""
+    u_batch = jnp.asarray(u_batch)
+    if u_batch.ndim != 2 or u_batch.shape[1] != ndim:
+        raise ValueError(f"u_batch must have shape (batch, {ndim})")
+    batch_size = int(u_batch.shape[0])
+
+    if jax_vectorized:
+        theta_batch = jnp.asarray(prior_transform(u_batch))
+        if theta_batch.shape != (batch_size, ndim):
+            raise ValueError(
+                "jax_vectorized prior_transform must return shape "
+                f"({batch_size}, {ndim}); got {theta_batch.shape}"
+            )
+        return theta_batch
+
+    theta_batch = jnp.asarray(jax.vmap(prior_transform)(u_batch))
+    if ndim == 1 and theta_batch.shape == (batch_size,):
+        theta_batch = theta_batch.reshape((batch_size, 1))
+    if theta_batch.shape != (batch_size, ndim):
+        raise ValueError(f"prior_transform must return shape ({ndim},)")
+    return theta_batch
+
+
 def _evaluate_jax_batch(
     loglike,
     prior_transform,
@@ -45,14 +75,14 @@ def _evaluate_jax_batch(
     if u_batch.ndim != 2 or u_batch.shape[1] != ndim:
         raise ValueError(f"u_batch must have shape (batch, {ndim})")
     batch_size = int(u_batch.shape[0])
+    theta_batch = _evaluate_jax_prior_batch(
+        prior_transform,
+        u_batch,
+        ndim,
+        jax_vectorized=jax_vectorized,
+    )
 
     if jax_vectorized:
-        theta_batch = jnp.asarray(prior_transform(u_batch))
-        if theta_batch.shape != (batch_size, ndim):
-            raise ValueError(
-                "jax_vectorized prior_transform must return shape "
-                f"({batch_size}, {ndim}); got {theta_batch.shape}"
-            )
         logl_batch = jnp.asarray(loglike(theta_batch))
         if logl_batch.shape != (batch_size,):
             raise ValueError(
@@ -61,13 +91,11 @@ def _evaluate_jax_batch(
             )
         return theta_batch, logl_batch
 
-    theta_batch = jnp.asarray(jax.vmap(prior_transform)(u_batch))
-    if theta_batch.shape != (batch_size, ndim):
-        raise ValueError(f"prior_transform must return shape ({ndim},)")
     logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
     if logl_batch.shape != (batch_size,):
         raise ValueError("loglike must return a scalar")
     return theta_batch, logl_batch
+
 
 def _validate_min_accepts(min_accepts: int) -> None:
     if (
@@ -613,7 +641,12 @@ def _make_rwalk_jax_kernel(
     ):
         nlive = live_u.shape[0]
         template_u = live_u[0]
-        template_theta = jnp.asarray(prior_transform(template_u))
+        template_theta = _evaluate_jax_prior_batch(
+            prior_transform,
+            template_u[None, :],
+            ndim,
+            jax_vectorized=jax_vectorized,
+        )[0]
         initial_best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
         initial_ncall = jnp.asarray(0, dtype=jnp.int32)
         initial_done = jnp.asarray(False)
@@ -645,10 +678,11 @@ def _make_rwalk_jax_kernel(
                 seed_key, shape=(replacement_chains,), minval=0, maxval=nlive
             )
             current_u = live_u[seed_idx]
-            current_theta = (
-                prior_transform(current_u)
-                if jax_vectorized
-                else jax.vmap(prior_transform)(current_u)
+            current_theta = _evaluate_jax_prior_batch(
+                prior_transform,
+                current_u,
+                ndim,
+                jax_vectorized=jax_vectorized,
             )
             current_logl = live_logl[seed_idx]
             attempt_best_u = current_u
@@ -673,12 +707,13 @@ def _make_rwalk_jax_kernel(
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
                 step = step_scale * z
                 u_prop = reflect_unit_cube(current_u + step)
-                if jax_vectorized:
-                    theta_prop = prior_transform(u_prop)
-                    logl_prop = loglike(theta_prop)
-                else:
-                    theta_prop = jax.vmap(prior_transform)(u_prop)
-                    logl_prop = jax.vmap(loglike)(theta_prop)
+                theta_prop, logl_prop = _evaluate_jax_batch(
+                    loglike,
+                    prior_transform,
+                    u_prop,
+                    ndim,
+                    jax_vectorized=jax_vectorized,
+                )
 
                 is_best = logl_prop > attempt_best_logl
                 attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
