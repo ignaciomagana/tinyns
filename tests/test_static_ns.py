@@ -790,6 +790,91 @@ def test_static_nested_bound_seed_kernel_jax_invalid_combinations_raise() -> Non
         )
 
 
+def test_failed_bound_seed_calls_are_counted_when_rwalk_fallback_succeeds(
+    monkeypatch,
+) -> None:
+    def failed_seed(
+        key,
+        _loglike,
+        _prior_transform,
+        logl_min,
+        _bound,
+        ndim,
+        **_kwargs,
+    ):
+        seed_u = jnp.full((ndim,), 0.5)
+        return (
+            key,
+            seed_u,
+            seed_u,
+            logl_min - 1.0,
+            7,
+            False,
+            {
+                "bound_draws": 9,
+                "bound_loglike_evals": 7,
+                "bound_unit_cube_acceptance": 7 / 9,
+                "bound_overlap_rejections": 0,
+            },
+        )
+
+    def successful_fallback(
+        key,
+        _loglike,
+        _prior_transform,
+        logl_min,
+        _live_u,
+        _live_logl,
+        ndim,
+        **_kwargs,
+    ):
+        new_u = jnp.full((ndim,), 0.75)
+        return (
+            key,
+            new_u,
+            new_u,
+            logl_min + 1.0,
+            3,
+            True,
+            {
+                "replacement_batches": 1,
+                "replacement_chains_used": 1,
+                "replacement_chain_usage_counts": {"1": 1},
+                "accepted_rwalk_moves": 2,
+                "total_rwalk_proposals": 3,
+            },
+        )
+
+    monkeypatch.setattr(run_mod, "draw_constrained_single_bound", failed_seed)
+    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", successful_fallback)
+    result = run_static_nested(
+        random.PRNGKey(2103),
+        lambda theta: -jnp.sum(theta**2),
+        lambda u: u,
+        ndim=2,
+        nlive=8,
+        sample="rwalk",
+        kernel="jax",
+        bound="single",
+        rwalk_seed="bound",
+        rwalk_seed_fallback=True,
+        bound_max_draws=7,
+        walks=3,
+        max_attempts=3,
+        maxiter=1,
+        dlogz=10.0,
+    )
+
+    assert result.success is True
+    assert result.ncall == result.nlive + 7 + 3
+    assert result.metadata["replacement_ncall"] == [10]
+    assert result.metadata["mean_bound_seed_calls"] == pytest.approx(7.0)
+    assert result.metadata["mean_rwalk_kernel_calls"] == pytest.approx(3.0)
+    assert result.metadata["mean_bound_loglike_evals"] == pytest.approx(7.0)
+    assert result.metadata["accepted_rwalk_moves"] == 2
+    assert result.metadata["total_rwalk_proposals"] == 3
+
+
 def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
     result = run_static_nested(
         random.PRNGKey(107),

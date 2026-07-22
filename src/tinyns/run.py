@@ -2042,8 +2042,6 @@ def run_static_nested(
                         bound_seed_batch_history.append(
                             int(seed_info.get("bound_seed_batches", 0))
                         )
-                    elif not seed_accepted:
-                        seed_calls = 0
                 else:
                     seed_calls = 0
                     seed_accepted = True
