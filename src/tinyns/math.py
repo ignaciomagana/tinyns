@@ -30,6 +30,10 @@ def logsumexp(values: ArrayLike) -> float:
     array = jnp.asarray(values, dtype=float)
     if array.size == 0:
         return float("-inf")
+    if bool(jnp.any(jnp.isnan(array))):
+        return float("nan")
+    if bool(jnp.any(jnp.isposinf(array))):
+        return float("inf")
 
     maximum = jnp.max(array)
     if bool(jnp.isneginf(maximum)):
@@ -50,10 +54,27 @@ def logdiffexp(a: float, b: float):
 
 
 def normalize_log_weights(logw: ArrayLike):
-    """Return log weights normalized to sum to one in probability space."""
+    """Return log weights normalized to sum to one in probability space.
+
+    Empty, NaN, and all-negative-infinity inputs have no defined probability
+    distribution and raise ValueError. If one or more entries are positive
+    infinity, probability is shared uniformly among those entries.
+    """
 
     logw = jnp.asarray(logw, dtype=float)
+    if logw.size == 0:
+        raise ValueError("log weights must not be empty")
+    if bool(jnp.any(jnp.isnan(logw))):
+        raise ValueError("log weights must not contain NaN")
+
+    positive_infinity = jnp.isposinf(logw)
+    if bool(jnp.any(positive_infinity)):
+        count = jnp.sum(positive_infinity, dtype=logw.dtype)
+        return jnp.where(positive_infinity, -jnp.log(count), -jnp.inf)
+
     maximum = jnp.max(logw)
+    if bool(jnp.isneginf(maximum)):
+        raise ValueError("log weights must contain at least one finite value")
     return logw - (maximum + jnp.log(jnp.sum(jnp.exp(logw - maximum))))
 
 
