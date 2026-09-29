@@ -331,6 +331,7 @@ class NestedSampler:
             "jax_block_size": int(self.kwargs.get("jax_block_size", 1)),
             "rwalk_adaptive_step_scale": bool(
                 self.kwargs.get("rwalk_adaptive_step_scale", False)
+                or self.kwargs.get("rwalk_proposal") == "live-cov"
             ),
             "rwalk_target_accept": float(
                 self.kwargs.get("rwalk_target_accept", 0.25)

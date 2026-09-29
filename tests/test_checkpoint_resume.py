@@ -694,3 +694,24 @@ def test_resume_at_maxiter_without_convergence_reports_maxiter_block(tmp_path):
     assert resumed.success is False
     assert "maxiter" in resumed.message
     assert "converged" not in resumed.message
+
+
+def test_live_cov_resume_continues_with_adapted_scale(tmp_path):
+    path = tmp_path / "live_cov.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=8,
+        step_scale=0.1,
+        rwalk_proposal="live-cov",
+        jax_block_size=4,
+    )
+    partial = sampler.run(43, maxiter=40, dlogz=0.5, checkpoint_path=path)
+    state, _ = load_checkpoint_npz(path)
+    assert state.effective_step_scale is not None
+    assert state.effective_step_scale != pytest.approx(0.1)
+
+    resumed = sampler.resume(path, dlogz=0.5)
+    assert resumed.success is True
+    assert len(resumed.logl) > len(partial.logl)
+    assert resumed.metadata["rwalk_proposal"] == "live-cov"

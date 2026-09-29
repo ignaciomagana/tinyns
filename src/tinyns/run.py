@@ -1065,6 +1065,7 @@ def run_static_nested(
         "step_scale": float(step_scale),
         "min_accepts": int(min_accepts),
         "replacement_chains": int(replacement_chains),
+        "rwalk_proposal": str(rwalk_proposal),
         "replacement_chain_schedule": (
             None
             if replacement_chain_schedule is None
