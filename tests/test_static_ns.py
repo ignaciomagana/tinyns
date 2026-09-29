@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax import random
 
@@ -763,10 +764,10 @@ def test_schedule_with_block_size_gt_one_raises() -> None:
         )
 
 
-def test_live_cov_proposal_rejected() -> None:
+def test_unknown_rwalk_proposal_rejected() -> None:
     from tinyns import NestedSampler
 
-    with pytest.raises(ValueError, match="live-cov"):
+    with pytest.raises(ValueError, match="rwalk_proposal"):
         NestedSampler(
             _jax_loglike,
             _jax_prior_transform,
@@ -774,20 +775,72 @@ def test_live_cov_proposal_rejected() -> None:
             nlive=20,
             sample="rwalk",
             kernel="jax",
-            rwalk_proposal="live-cov",
+            rwalk_proposal="ellipsoid",
         )
 
-    with pytest.raises(ValueError, match="live-cov"):
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"kernel": "python"},
+        {"bound": "single", "rwalk_seed": "bound"},
+        {"replacement_chain_schedule": (1, 2)},
+    ],
+)
+def test_live_cov_proposal_requires_unbounded_jax_rwalk(extra) -> None:
+    kwargs = {"sample": "rwalk", "kernel": "jax", "rwalk_proposal": "live-cov"}
+    kwargs.update(extra)
+    with pytest.raises(NotImplementedError, match="live-cov"):
         run_static_nested(
-            random.PRNGKey(15),
-            _jax_loglike,
-            _jax_prior_transform,
-            2,
-            20,
-            sample="rwalk",
-            kernel="jax",
-            rwalk_proposal="live-cov",
+            random.PRNGKey(15), _jax_loglike, _jax_prior_transform, 2, 20, **kwargs
         )
+
+
+def test_live_cov_cholesky_handles_degenerate_live_set() -> None:
+    from tinyns.samplers import live_cov_cholesky
+
+    live_u = jnp.tile(jnp.asarray([[0.3, 0.7, 0.5]]), (8, 1))
+    chol = live_cov_cholesky(live_u)
+    assert chol.shape == (3, 3)
+    assert bool(jnp.all(jnp.isfinite(chol)))
+
+    rng = np.random.default_rng(0)
+    points = rng.uniform(size=(400, 2))
+    chol = live_cov_cholesky(jnp.asarray(points))
+    np.testing.assert_allclose(chol @ chol.T, np.cov(points.T), rtol=1e-6)
+
+
+@pytest.mark.parametrize("jax_block_size", [1, 8])
+def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(jax_block_size) -> None:
+    """A narrow, strongly correlated 2D Gaussian under a wide box prior."""
+    width = 20.0
+    cov = np.array([[1.0, 0.95 * 0.05], [0.95 * 0.05, 0.05**2]])
+    prec = jnp.asarray(np.linalg.inv(cov))
+    norm = -0.5 * (2 * math.log(2 * math.pi) + math.log(np.linalg.det(cov)))
+
+    def loglike(theta):
+        return norm - 0.5 * theta @ prec @ theta
+
+    def prior_transform(u):
+        return -0.5 * width + width * u
+
+    result = run_static_nested(
+        random.PRNGKey(3),
+        loglike,
+        prior_transform,
+        2,
+        200,
+        sample="rwalk",
+        kernel="jax",
+        rwalk_proposal="live-cov",
+        walks=25,
+        jax_block_size=jax_block_size,
+    )
+    assert result.success
+    assert abs(result.logz - (-2 * math.log(width))) < 5 * result.logzerr
+    metadata = result.metadata
+    assert metadata["rwalk_adaptive_step_scale"] is True
+    assert 0.1 < metadata["rwalk_acceptance"] < 0.5
 
 
 def test_static_nested_multi_bound_fused_rwalk_chain_telemetry_regression() -> None:

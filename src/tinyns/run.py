@@ -76,6 +76,30 @@ def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
     return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
 
 
+def _evaluate_live_points_jax(loglike, prior_transform, live_u, ndim, *, chunk_size):
+    """Evaluate the initial live set in one compiled pass.
+
+    Points go through ``lax.map`` ``chunk_size`` at a time (vmapped within a
+    chunk), so device memory is bounded by the same batch the rwalk kernel uses.
+    """
+    nlive = int(live_u.shape[0])
+    chunk_size = max(1, min(int(chunk_size), nlive))
+    nchunks = -(-nlive // chunk_size)
+    pad = nchunks * chunk_size - nlive
+    padded = jnp.concatenate(
+        [live_u, jnp.broadcast_to(live_u[:1], (pad, ndim))], axis=0
+    ).reshape((nchunks, chunk_size, ndim))
+
+    def evaluate_chunk(u_chunk):
+        return _evaluate_jax_batch(
+            loglike, prior_transform, u_chunk, ndim, jax_vectorized=False
+        )
+
+    theta, logl = jax.jit(lambda u: lax.map(evaluate_chunk, u))(padded)
+    theta = theta.reshape((nchunks * chunk_size,) + theta.shape[2:])[:nlive]
+    return theta, logl.reshape((-1,))[:nlive]
+
+
 def _remaining_delta_logz(logz_dead, logx_final, live_logl):
     """Return the live-evidence remainder in log-evidence units."""
 
@@ -888,6 +912,10 @@ def run_static_nested(
         raise ValueError("rwalk_target_accept must be between 0 and 1")
     if rwalk_proposal not in RWALK_PROPOSALS:
         raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
+    if rwalk_proposal == "live-cov":
+        # live-cov steps are a dimensionless multiple of the live covariance;
+        # the multiple is always adapted to the target acceptance.
+        rwalk_adaptive_step_scale = True
     if rwalk_proposal == "live-cov" and not (
         sample == "rwalk"
         and kernel == "jax"
@@ -1089,6 +1117,14 @@ def run_static_nested(
                 live_u,
                 ndim,
                 jax_vectorized=True,
+            )
+        elif kernel == "jax":
+            live_theta, live_logl = _evaluate_live_points_jax(
+                loglike,
+                prior_transform,
+                live_u,
+                ndim,
+                chunk_size=replacement_chains,
             )
         else:
             live_theta = _transform_live_points(
