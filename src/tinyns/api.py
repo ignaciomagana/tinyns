@@ -7,6 +7,7 @@ from typing import Any
 
 from tinyns.result import NestedSamplingResult
 from tinyns.run import run_static_nested
+from tinyns.samplers import RWALK_PROPOSALS
 from tinyns.state import load_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -141,11 +142,8 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
-        if kwargs.get("rwalk_proposal", "isotropic") != "isotropic":
-            raise ValueError(
-                "rwalk_proposal='live-cov' has been removed; only "
-                "rwalk_proposal='isotropic' is supported"
-            )
+        if kwargs.get("rwalk_proposal", "isotropic") not in RWALK_PROPOSALS:
+            raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
         if bool(kwargs.get("rwalk_adaptive_step_scale", False)) and not (
             sample == "rwalk" and kernel == "jax"
         ):

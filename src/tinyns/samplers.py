@@ -628,6 +628,27 @@ def draw_constrained_prior_vectorized(
     return new_key, best_u, best_theta, best_logl, ncall, False
 
 
+RWALK_PROPOSALS = ("isotropic", "live-cov")
+
+
+def live_cov_cholesky(live_u):
+    """Return the Cholesky factor of the live-point covariance (unit cube).
+
+    A small relative jitter keeps near-degenerate live sets factorable; if the
+    factorization still fails, the per-axis standard deviations are used.
+    """
+    live_u = jnp.asarray(live_u)
+    nlive, ndim = live_u.shape
+    centered = live_u - jnp.mean(live_u, axis=0)
+    cov = centered.T @ centered / max(nlive - 1, 1)
+    mean_var = jnp.maximum(jnp.trace(cov) / ndim, jnp.finfo(cov.dtype).tiny)
+    jitter = 10.0 * jnp.finfo(cov.dtype).eps * mean_var
+    cov = cov + jitter * jnp.eye(ndim, dtype=cov.dtype)
+    chol = jnp.linalg.cholesky(cov)
+    fallback = jnp.diag(jnp.sqrt(jnp.diag(cov)))
+    return jnp.where(jnp.all(jnp.isfinite(chol)), chol, fallback)
+
+
 @lru_cache(maxsize=32)
 def _make_rwalk_jax_kernel_cached(
     loglike,
@@ -636,6 +657,7 @@ def _make_rwalk_jax_kernel_cached(
     walks: int,
     replacement_chains: int,
     jax_vectorized: bool,
+    proposal: str = "isotropic",
 ):
     """Return a cached compiled retrying constrained rwalk kernel.
 
@@ -656,8 +678,19 @@ def _make_rwalk_jax_kernel_cached(
        batches (rwalk-acceptance numerator).
     8. ``total_proposal_count`` -- total proposals attempted; equals ``ncall``
        and is the rwalk-acceptance denominator.
+
+    ``proposal="isotropic"`` steps by ``step_scale * N(0, I)`` in the unit cube
+    and reflects at the cube faces. ``proposal="live-cov"`` steps by
+    ``step_scale * L N(0, I)`` with ``L`` the Cholesky factor of the live-point
+    covariance, so the step follows the contracting, correlated live set; moves
+    that leave the cube are rejected (reflection is not symmetric for
+    correlated steps). Its chains start from live points strictly above
+    ``logl_min`` whenever any exist.
     """
 
+    if proposal not in RWALK_PROPOSALS:
+        raise ValueError(f"proposal must be one of {RWALK_PROPOSALS}")
+    live_cov = proposal == "live-cov"
     loglike = _unwrap_cacheable_callable(loglike)
     prior_transform = _unwrap_cacheable_callable(prior_transform)
 
@@ -672,6 +705,13 @@ def _make_rwalk_jax_kernel_cached(
         max_batches,
     ):
         nlive = live_u.shape[0]
+        chol = live_cov_cholesky(live_u) if live_cov else None
+        if live_cov:
+            # Never restart a chain from the point being replaced when others exist.
+            above = live_logl > logl_min
+            seed_logits = jnp.where(
+                jnp.any(above), jnp.where(above, 0.0, -jnp.inf), 0.0
+            )
         template_u = live_u[0]
         template_theta = _evaluate_jax_prior_batch(
             prior_transform,
@@ -706,9 +746,14 @@ def _make_rwalk_jax_kernel_cached(
             ) = state
 
             key, seed_key = random.split(key)
-            seed_idx = random.randint(
-                seed_key, shape=(replacement_chains,), minval=0, maxval=nlive
-            )
+            if live_cov:
+                seed_idx = random.categorical(
+                    seed_key, seed_logits, shape=(replacement_chains,)
+                )
+            else:
+                seed_idx = random.randint(
+                    seed_key, shape=(replacement_chains,), minval=0, maxval=nlive
+                )
             current_u = live_u[seed_idx]
             current_theta = _evaluate_jax_prior_batch(
                 prior_transform,
@@ -737,8 +782,12 @@ def _make_rwalk_jax_kernel_cached(
                 ) = carry
                 key, proposal_key = random.split(key)
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
-                step = step_scale * z
-                u_prop = reflect_unit_cube(current_u + step)
+                if live_cov:
+                    u_raw = current_u + step_scale * (z @ chol.T)
+                    in_cube = jnp.all((u_raw >= 0.0) & (u_raw <= 1.0), axis=1)
+                    u_prop = jnp.clip(u_raw, 0.0, 1.0)
+                else:
+                    u_prop = reflect_unit_cube(current_u + step_scale * z)
                 theta_prop, logl_prop = _evaluate_jax_batch(
                     loglike,
                     prior_transform,
@@ -746,6 +795,8 @@ def _make_rwalk_jax_kernel_cached(
                     ndim,
                     jax_vectorized=jax_vectorized,
                 )
+                if live_cov:
+                    logl_prop = jnp.where(in_cube, logl_prop, -jnp.inf)
 
                 is_best = logl_prop > attempt_best_logl
                 attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
@@ -896,6 +947,7 @@ def _make_rwalk_jax_kernel(
     walks: int,
     replacement_chains: int,
     jax_vectorized: bool,
+    proposal: str = "isotropic",
 ):
     """Return a cached rwalk kernel for hashable or unhashable callables."""
     return _make_rwalk_jax_kernel_cached(
@@ -905,6 +957,7 @@ def _make_rwalk_jax_kernel(
         walks,
         replacement_chains,
         jax_vectorized,
+        proposal,
     )
 
 
@@ -961,6 +1014,7 @@ def draw_constrained_rwalk_jax(
     replacement_chains: int = 1,
     jax_vectorized: bool = False,
     return_info: bool = False,
+    proposal: str = "isotropic",
 ):
     """Draw a constrained replacement with a compiled JAX rwalk kernel."""
     if ndim <= 0:
@@ -999,6 +1053,7 @@ def draw_constrained_rwalk_jax(
         int(walks),
         int(replacement_chains),
         bool(jax_vectorized),
+        str(proposal),
     )
     max_batches = max_attempts // batch_ncall
     (

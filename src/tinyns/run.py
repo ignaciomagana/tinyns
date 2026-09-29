@@ -21,6 +21,7 @@ from tinyns.bounds import (
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
+    RWALK_PROPOSALS,
     _cacheable_callable,
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel,
@@ -176,6 +177,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
     walks: int,
     replacement_chains: int,
     block_size: int,
+    proposal: str = "isotropic",
 ):
     """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel."""
 
@@ -193,6 +195,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
         walks,
         replacement_chains,
         False,
+        proposal,
     )
 
     def block_kernel(
@@ -397,6 +400,7 @@ def _make_static_jax_rwalk_block_kernel(
     walks: int,
     replacement_chains: int,
     block_size: int,
+    proposal: str = "isotropic",
 ):
     """Return a cached block kernel for hashable or unhashable callables."""
     return _make_static_jax_rwalk_block_kernel_cached(
@@ -406,6 +410,7 @@ def _make_static_jax_rwalk_block_kernel(
         walks,
         replacement_chains,
         block_size,
+        proposal,
     )
 
 
@@ -881,10 +886,17 @@ def run_static_nested(
         )
     if not (0.0 < float(rwalk_target_accept) < 1.0):
         raise ValueError("rwalk_target_accept must be between 0 and 1")
-    if rwalk_proposal != "isotropic":
-        raise ValueError(
-            "rwalk_proposal='live-cov' has been removed; only "
-            "rwalk_proposal='isotropic' is supported"
+    if rwalk_proposal not in RWALK_PROPOSALS:
+        raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
+    if rwalk_proposal == "live-cov" and not (
+        sample == "rwalk"
+        and kernel == "jax"
+        and bound == "none"
+        and replacement_chain_schedule is None
+    ):
+        raise NotImplementedError(
+            "rwalk_proposal='live-cov' is supported only for sample='rwalk', "
+            "kernel='jax', bound='none' and a fixed replacement_chains"
         )
     if kernel == "jax" and sample not in {"rwalk"}:
         raise NotImplementedError(
@@ -1266,9 +1278,16 @@ def run_static_nested(
         for value in restored_telemetry.get("adaptive_accept_history", [])
     ]
     adaptive_updates = int(restored_telemetry.get("adaptive_updates", 0))
-    adaptive_rate = 0.05
-    adaptive_min_step_scale = 1e-4
-    adaptive_max_step_scale = 0.5
+    if rwalk_proposal == "live-cov":
+        # The live-cov step already follows the contracting live set, so the
+        # scale is a dimensionless O(1) factor that the update can chase fast.
+        adaptive_rate = 0.5
+        adaptive_min_step_scale = 1e-3
+        adaptive_max_step_scale = 10.0
+    else:
+        adaptive_rate = 0.05
+        adaptive_min_step_scale = 1e-4
+        adaptive_max_step_scale = 0.5
 
     def update_adaptive_scale(observed_accept: float) -> None:
         nonlocal effective_step_scale, adaptive_updates
@@ -1544,6 +1563,7 @@ def run_static_nested(
                     int(walks),
                     int(replacement_chains),
                     int(block_size_now),
+                    rwalk_proposal,
                 )
                 result = block_kernel(
                     key,
@@ -1824,6 +1844,7 @@ def run_static_nested(
                             min_accepts=int(stage_min_accepts),
                             replacement_chains=int(stage_chains),
                             return_info=True,
+                            proposal=rwalk_proposal,
                         )
                         if len(rescue_result) == 7:
                             (
@@ -2231,7 +2252,7 @@ def run_static_nested(
                             {
                                 "jax_vectorized": jax_vectorized,
                                 **(
-                                    {"return_info": True}
+                                    {"return_info": True, "proposal": rwalk_proposal}
                                     if replacement_chain_schedule is None
                                     else {}
                                 ),
