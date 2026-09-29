@@ -795,9 +795,10 @@ def _make_rwalk_jax_kernel_cached(
                     ndim,
                     jax_vectorized=jax_vectorized,
                 )
-                if live_cov:
-                    logl_prop = jnp.where(in_cube, logl_prop, -jnp.inf)
 
+                if live_cov:
+                    # Out-of-cube moves never count as the fallback best point.
+                    logl_prop = jnp.where(in_cube, logl_prop, -jnp.inf)
                 is_best = logl_prop > attempt_best_logl
                 attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
                 attempt_best_theta = jnp.where(
@@ -806,6 +807,9 @@ def _make_rwalk_jax_kernel_cached(
                 attempt_best_logl = jnp.where(is_best, logl_prop, attempt_best_logl)
 
                 accept = logl_prop >= logl_min
+                if live_cov:
+                    # Out-of-cube moves are rejected even when logl_min is -inf.
+                    accept = accept & in_cube
                 current_u = jnp.where(accept[:, None], u_prop, current_u)
                 current_theta = jnp.where(accept[:, None], theta_prop, current_theta)
                 current_logl = jnp.where(accept, logl_prop, current_logl)
