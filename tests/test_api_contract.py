@@ -263,7 +263,7 @@ def test_run_static_nested_defaults_match_nested_sampler() -> None:
     np.testing.assert_allclose(direct.logl, via_sampler.logl)
 
 
-@pytest.mark.parametrize("ndim, walks", [(1, 25), (4, 25), (5, 30), (10, 60)])
+@pytest.mark.parametrize("ndim, walks", [(1, 12), (2, 25), (4, 25), (5, 30), (10, 60)])
 def test_default_walks_is_max_25_or_six_ndim(ndim: int, walks: int) -> None:
     sampler = NestedSampler(_jax_gaussian_loglike, _jax_box_prior, ndim=ndim)
 

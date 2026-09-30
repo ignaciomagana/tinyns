@@ -113,8 +113,9 @@ class NestedSampler:
         Additional sampler options, with the defaults of
         :func:`~tinyns.run_static_nested`. By default ``sample="rwalk"`` runs
         the fast path: ``kernel="jax"``, ``rwalk_proposal="live-cov"``,
-        ``jax_block_size=32``, ``walks=max(25, 6 * ndim)`` and an initial
-        ``step_scale=0.5`` that is adapted toward ``rwalk_target_accept``.
+        ``jax_block_size=32``, ``walks=max(25, 6 * ndim)`` (12 for ``ndim=1``)
+        and an initial ``step_scale=0.5`` that is adapted toward
+        ``rwalk_target_accept``.
         Where live-cov is unsupported (``kernel="python"``, a bound, or a
         ``replacement_chain_schedule``) the defaults fall back to
         ``rwalk_proposal="isotropic"``, ``step_scale=0.1`` and

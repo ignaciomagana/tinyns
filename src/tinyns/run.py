@@ -52,9 +52,9 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     proposal defaults to ``"live-cov"`` and ``jax_block_size`` to 32 (1 with
     ``jax_vectorized``); elsewhere they fall back to ``"isotropic"`` and 1. An
     explicit ``"live-cov"`` is not overridden, so an unsupported combination
-    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` and the initial
-    ``step_scale`` to 0.5 for live-cov, 0.1 for isotropic. Explicit values
-    pass through unchanged.
+    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for
+    ``ndim=1``) and the initial ``step_scale`` to 0.5 for live-cov, 0.1 for
+    isotropic. Explicit values pass through unchanged.
     """
 
     kernel = options["kernel"]
@@ -74,7 +74,9 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
         step_scale = 0.5 if proposal == "live-cov" else 0.1
     walks = options["walks"]
     if walks is None:
-        walks = max(25, 6 * int(ndim))
+        # 1-D needs far fewer walks for unbiased logZ (validated to 10);
+        # from 2-D on, max(25, 6 * ndim) (see CHANGELOG, v0.2.0 / v0.2.1).
+        walks = 12 if int(ndim) == 1 else max(25, 6 * int(ndim))
     jax_block_size = options["jax_block_size"]
     if jax_block_size is None:
         jax_block_size = 32 if fast_path and not options["jax_vectorized"] else 1
