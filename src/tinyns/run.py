@@ -23,8 +23,11 @@ from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
     RWALK_PROPOSALS,
     _cacheable_callable,
+    _callable_leaves,
+    _combine_callable,
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel,
+    _partition_callable,
     _unwrap_cacheable_callable,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
@@ -119,11 +122,16 @@ def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
     return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
 
 
-def _evaluate_live_points_jax(loglike, prior_transform, live_u, ndim, *, chunk_size):
+def _evaluate_live_points_jax(
+    loglike, prior_transform, live_u, ndim, *, chunk_size, callable_leaves=None
+):
     """Evaluate the initial live set in one compiled pass.
 
     Points go through ``lax.map`` ``chunk_size`` at a time (vmapped within a
     chunk), so device memory is bounded by the same batch the rwalk kernel uses.
+    Array leaves of pytree callables are jit arguments, not constants;
+    ``callable_leaves`` (default: taken from the callables) lets the caller pass
+    leaves it has already placed on the device.
     """
     nlive = int(live_u.shape[0])
     chunk_size = max(1, min(int(chunk_size), nlive))
@@ -133,12 +141,32 @@ def _evaluate_live_points_jax(loglike, prior_transform, live_u, ndim, *, chunk_s
         [live_u, jnp.broadcast_to(live_u[:1], (pad, ndim))], axis=0
     ).reshape((nchunks, chunk_size, ndim))
 
-    def evaluate_chunk(u_chunk):
-        return _evaluate_jax_batch(
-            loglike, prior_transform, u_chunk, ndim, jax_vectorized=False
+    loglike_dynamic, loglike_static = _partition_callable(loglike)
+    prior_dynamic, prior_static = _partition_callable(prior_transform)
+    if callable_leaves is None:
+        callable_leaves = loglike_dynamic + prior_dynamic
+    nloglike_leaves = len(loglike_dynamic)
+
+    def evaluate(u, *leaves):
+        loglike_fn = (
+            _combine_callable(leaves[:nloglike_leaves], loglike_static)
+            if loglike_dynamic
+            else loglike
+        )
+        prior_fn = (
+            _combine_callable(leaves[nloglike_leaves:], prior_static)
+            if prior_dynamic
+            else prior_transform
         )
 
-    theta, logl = jax.jit(lambda u: lax.map(evaluate_chunk, u))(padded)
+        def evaluate_chunk(u_chunk):
+            return _evaluate_jax_batch(
+                loglike_fn, prior_fn, u_chunk, ndim, jax_vectorized=False
+            )
+
+        return lax.map(evaluate_chunk, u)
+
+    theta, logl = jax.jit(evaluate)(padded, *callable_leaves)
     theta = theta.reshape((nchunks * chunk_size,) + theta.shape[2:])[:nlive]
     return theta, logl.reshape((-1,))[:nlive]
 
@@ -246,7 +274,13 @@ def _make_static_jax_rwalk_block_kernel_cached(
     block_size: int,
     proposal: str = "isotropic",
 ):
-    """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel."""
+    """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel.
+
+    The returned ``block_kernel`` takes the array leaves of pytree callables
+    (``*_callable_leaves(loglike, prior_transform)``) as trailing arguments and
+    threads them to the rwalk kernel, so they are jit arguments rather than
+    compiled-in constants. Plain callables take no trailing arguments.
+    """
 
     loglike = _unwrap_cacheable_callable(loglike)
     prior_transform = _unwrap_cacheable_callable(prior_transform)
@@ -276,6 +310,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
         step_scale,
         min_accepts,
         max_batches,
+        *callable_leaves,
     ):
         def one_iteration(carry, offset):
             key, live_u, live_theta, live_logl, logz_dead, active = carry
@@ -312,6 +347,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     jnp.asarray(step_scale),
                     jnp.asarray(min_accepts),
                     jnp.asarray(max_batches, dtype=jnp.int32),
+                    *callable_leaves,
                 )
                 replacement_batches_used = (
                     replacement_ncall
@@ -1172,6 +1208,15 @@ def run_static_nested(
         else {}
     )
 
+    # Array leaves of pytree callables, placed on the device once per run and
+    # passed to the compiled fast-path kernels as arguments (empty for plain
+    # functions and closures).
+    callable_leaves = (
+        tuple(jnp.asarray(leaf) for leaf in _callable_leaves(loglike, prior_transform))
+        if kernel == "jax"
+        else ()
+    )
+
     if initial_state is None:
         key = random.PRNGKey(int(key)) if isinstance(key, int) else key
         key, init_key = random.split(key)
@@ -1191,6 +1236,7 @@ def run_static_nested(
                 live_u,
                 ndim,
                 chunk_size=replacement_chains,
+                callable_leaves=callable_leaves,
             )
         else:
             live_theta = _transform_live_points(
@@ -1682,6 +1728,7 @@ def run_static_nested(
                     ),
                     jnp.asarray(min_accepts),
                     jnp.asarray(max_batches, dtype=jnp.int32),
+                    *callable_leaves,
                 )
                 (
                     key,

@@ -7,6 +7,7 @@ from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax, random
 
 from tinyns.bounds import (
@@ -50,6 +51,58 @@ def _cacheable_callable(value):
 
 def _unwrap_cacheable_callable(value):
     return value.value if isinstance(value, _IdentityCacheKey) else value
+
+
+def _is_dynamic_leaf(leaf) -> bool:
+    return isinstance(leaf, (jax.Array, np.ndarray))
+
+
+def _partition_callable(fn):
+    """Split a pytree callable into ``(dynamic, static)`` (eqx.partition-style).
+
+    ``dynamic`` is the tuple of array leaves (``jax.Array`` / ``np.ndarray``) of
+    ``jax.tree_util.tree_flatten(fn)``; ``static`` holds the treedef and every
+    other leaf. The compiled fast-path kernels take ``dynamic`` as explicit jit
+    arguments and rebuild ``fn`` inside the trace with
+    :func:`_combine_callable`, so large data are not embedded as constants.
+
+    A plain function or closure flattens to ``[fn]``: ``dynamic`` is empty and
+    :func:`_combine_callable` returns ``fn`` itself (closure semantics).
+
+    Only the fast-path jit boundaries use this split: the unbounded rwalk
+    kernel (:func:`_make_rwalk_jax_kernel_cached`, hence
+    :func:`draw_constrained_rwalk_jax`), the block kernel and the initial
+    live-point pass in :mod:`tinyns.run`. The bounded and fused-bounded
+    kernels, the ``replacement_chain_schedule`` adaptive kernels, the python
+    kernel and prior sampling keep closure semantics: pytree callables work
+    there, but their arrays are embedded in the compiled programs as constants.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(fn)
+    mask = tuple(_is_dynamic_leaf(leaf) for leaf in leaves)
+    dynamic = tuple(leaf for leaf in leaves if _is_dynamic_leaf(leaf))
+    static_leaves = tuple(None if _is_dynamic_leaf(leaf) else leaf for leaf in leaves)
+    return dynamic, (treedef, mask, static_leaves)
+
+
+def _combine_callable(dynamic, static):
+    """Rebuild the callable split by :func:`_partition_callable`."""
+    treedef, mask, static_leaves = static
+    dynamic = tuple(dynamic)
+    if len(dynamic) != sum(mask):
+        raise ValueError(
+            f"expected {sum(mask)} dynamic callable leaves, got {len(dynamic)}"
+        )
+    it = iter(dynamic)
+    leaves = [
+        next(it) if is_dyn else leaf
+        for leaf, is_dyn in zip(static_leaves, mask, strict=True)
+    ]
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+def _callable_leaves(loglike, prior_transform):
+    """Return the dynamic leaves of ``loglike`` then ``prior_transform``."""
+    return _partition_callable(loglike)[0] + _partition_callable(prior_transform)[0]
 
 
 def _validate_theta_shape(theta, ndim: int):
@@ -686,13 +739,28 @@ def _make_rwalk_jax_kernel_cached(
     that leave the cube are rejected (reflection is not symmetric for
     correlated steps). Its chains start from live points strictly above
     ``logl_min`` whenever any exist.
+
+    ``loglike`` and ``prior_transform`` may be JAX pytrees (for example
+    ``jax.tree_util.Partial(fn, data)``). Their array leaves are then trailing
+    arguments of ``kernel``: call it as ``kernel(key, ..., max_batches,
+    *_callable_leaves(loglike, prior_transform))`` and the callables are rebuilt
+    inside the trace, so the arrays are jit arguments rather than baked-in
+    constants. Called without them, ``kernel`` closes over the callables
+    (closure semantics). Plain functions and closures have no array leaves,
+    take no trailing arguments and are traced exactly as before.
     """
 
     if proposal not in RWALK_PROPOSALS:
         raise ValueError(f"proposal must be one of {RWALK_PROPOSALS}")
     live_cov = proposal == "live-cov"
-    loglike = _unwrap_cacheable_callable(loglike)
-    prior_transform = _unwrap_cacheable_callable(prior_transform)
+    loglike_closure = _unwrap_cacheable_callable(loglike)
+    prior_closure = _unwrap_cacheable_callable(prior_transform)
+    loglike_dynamic, loglike_static = _partition_callable(loglike_closure)
+    prior_dynamic, prior_static = _partition_callable(prior_closure)
+    nloglike_leaves = len(loglike_dynamic)
+    nprior_leaves = len(prior_dynamic)
+    # Only the static halves are kept; the array leaves arrive as arguments.
+    del loglike_dynamic, prior_dynamic
 
     @jax.jit
     def kernel(
@@ -703,7 +771,26 @@ def _make_rwalk_jax_kernel_cached(
         step_scale,
         min_accepts,
         max_batches,
+        *callable_leaves,
     ):
+        # No trailing leaves: closure semantics (the arrays become constants).
+        if callable_leaves and len(callable_leaves) != (
+            nloglike_leaves + nprior_leaves
+        ):
+            raise ValueError(
+                f"kernel expects {nloglike_leaves + nprior_leaves} callable "
+                f"array leaves, got {len(callable_leaves)}"
+            )
+        loglike = (
+            _combine_callable(callable_leaves[:nloglike_leaves], loglike_static)
+            if callable_leaves and nloglike_leaves
+            else loglike_closure
+        )
+        prior_transform = (
+            _combine_callable(callable_leaves[nloglike_leaves:], prior_static)
+            if callable_leaves and nprior_leaves
+            else prior_closure
+        )
         nlive = live_u.shape[0]
         chol = live_cov_cholesky(live_u) if live_cov else None
         if live_cov:
@@ -1020,7 +1107,13 @@ def draw_constrained_rwalk_jax(
     return_info: bool = False,
     proposal: str = "isotropic",
 ):
-    """Draw a constrained replacement with a compiled JAX rwalk kernel."""
+    """Draw a constrained replacement with a compiled JAX rwalk kernel.
+
+    Array leaves of pytree ``loglike`` / ``prior_transform`` callables (see
+    :func:`_partition_callable`) are passed to the compiled kernel as arguments.
+    ``np.ndarray`` leaves are copied to the device on every call; use
+    ``jax.Array`` leaves to avoid that.
+    """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if walks <= 0:
@@ -1077,6 +1170,7 @@ def draw_constrained_rwalk_jax(
         jnp.asarray(step_scale),
         jnp.asarray(min_accepts),
         jnp.asarray(max_batches, dtype=jnp.int32),
+        *_callable_leaves(loglike, prior_transform),
     )
     if return_info:
         batches = int(math.ceil(int(ncall) / batch_ncall))

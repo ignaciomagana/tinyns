@@ -90,9 +90,13 @@ class NestedSampler:
     ----------
     loglike:
         Callable accepting a point in parameter space and returning its log
-        likelihood.
+        likelihood. It may be a JAX pytree callable such as
+        ``jax.tree_util.Partial(loglike_fn, data)``: on the fast path its array
+        leaves are passed to the compiled kernels as arguments rather than
+        embedded as constants, which helps when ``data`` is large.
     prior_transform:
-        Callable mapping a unit-cube point to parameter space.
+        Callable mapping a unit-cube point to parameter space. May be a pytree
+        callable, like ``loglike``.
     ndim:
         Number of model dimensions. Must be positive.
     nlive:
