@@ -361,3 +361,27 @@ def test_run_static_nested_explicit_live_cov_python_kernel_raises() -> None:
             rwalk_proposal="live-cov",
             maxiter=1,
         )
+
+
+def test_max_attempts_none_resolves_from_walks() -> None:
+    import jax.numpy as jnp
+    from jax import random
+
+    from tinyns import NestedSampler, run_static_nested
+
+    def loglike(theta):
+        return -0.5 * jnp.sum(((theta - 0.5) / 0.1) ** 2)
+
+    def prior_transform(u):
+        return u
+
+    sampler = NestedSampler(
+        loglike, prior_transform, 3, nlive=20, max_attempts=None, walks=4000,
+        replacement_chains=4,
+    )
+    assert sampler.max_attempts == 16_000
+    result = run_static_nested(
+        random.PRNGKey(0), loglike, prior_transform, 2, 20, max_attempts=None,
+        maxiter=10,
+    )
+    assert len(result.logl) >= 10

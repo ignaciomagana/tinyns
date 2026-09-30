@@ -107,7 +107,8 @@ class NestedSampler:
     sample:
         Sampling strategy: ``"rwalk"`` (default) or ``"prior"``.
     max_attempts:
-        Cap on rejection attempts per constrained prior draw.
+        Cap on likelihood calls per constrained replacement draw. ``None``
+        resolves to ``max(10_000, walks * replacement_chains)``.
     **kwargs:
         Additional sampler options, with the defaults of
         :func:`~tinyns.run_static_nested`. By default ``sample="rwalk"`` runs
@@ -132,7 +133,7 @@ class NestedSampler:
         *,
         vectorized: bool = False,
         sample: str = "rwalk",
-        max_attempts: int = 10_000,
+        max_attempts: int | None = 10_000,
         **kwargs: Any,
     ):
         if ndim <= 0:
@@ -170,6 +171,10 @@ class NestedSampler:
         self.vectorized = vectorized
         self.sample = sample
         self.kernel = kernel
+        if max_attempts is None:
+            max_attempts = max(
+                10_000, int(options["walks"]) * int(options["replacement_chains"])
+            )
         self.max_attempts = max_attempts
 
         replacement_chains = options["replacement_chains"]

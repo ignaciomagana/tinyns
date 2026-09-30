@@ -872,7 +872,7 @@ def run_static_nested(
     sample: str = "rwalk",
     kernel: str | None = None,
     vectorized: bool = False,
-    max_attempts: int = 10_000,
+    max_attempts: int | None = 10_000,
     progress: bool = False,
     progress_interval: int = 100,
     callback=None,
@@ -1036,6 +1036,8 @@ def run_static_nested(
             "vectorized rwalk is not implemented yet; use vectorized=False "
             'with sample="rwalk"'
         )
+    if max_attempts is None:
+        max_attempts = max(10_000, int(walks) * int(replacement_chains))
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
     if progress_interval <= 0:
