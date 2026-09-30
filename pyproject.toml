@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tinyns"
-version = "0.2.0"
+version = "0.2.1"
 description = "A tiny dynesty-style nested sampler for JAX likelihoods."
 keywords = ["nested-sampling", "jax", "bayesian-inference", "monte-carlo"]
 classifiers = [

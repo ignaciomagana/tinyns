@@ -125,7 +125,7 @@ target geometries.
 
 | Tier | Options | Status |
 | --- | --- | --- |
-| Recommended fast path (default) | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`, `walks=max(25, 6 * ndim)`, `replacement_chains=1`, `jax_block_size=32` | Likelihood calls per iteration stay at `walks` on correlated Gaussians, d = 2..18 |
+| Recommended fast path (default) | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`, `walks=max(25, 6 * ndim)` (12 in 1-D), `replacement_chains=1`, `jax_block_size=32` | Likelihood calls per iteration stay at `walks` on correlated Gaussians, d = 2..18 |
 | Isotropic block path | `rwalk_proposal="isotropic"`, `walks=5`, `jax_block_size=32` | Validated on the included 2D benchmark targets; cost per iteration grows geometrically at d >= 4 |
 | Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
 | Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
@@ -146,7 +146,7 @@ result = sampler.run(key, dlogz=0.1)
 ```
 
 This is `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`,
-`walks=max(25, 6 * ndim)`, `step_scale=0.5`, `replacement_chains=1` and
+`walks=max(25, 6 * ndim)` (12 in 1-D), `step_scale=0.5`, `replacement_chains=1` and
 `jax_block_size=32`. Each live-cov step is `step_scale * L @ z`, where `L` is
 the Cholesky factor of the live-point covariance in the unit cube and `z` is a
 standard normal vector. Moves that leave the unit cube are rejected. The step
@@ -160,7 +160,9 @@ live-cov keeps the likelihood calls per iteration flat at `walks`. Unbiased
 evidence needs `walks` of about 5-6 x `ndim`: `walks=25` biased logZ high by
 +0.5 nats at 13D and +1.4 nats at 18D, while `walks >= 5 * ndim` was within
 about 0.2 nats, with seed scatter matching the reported `logzerr`. Hence the
-default `walks=max(25, 6 * ndim)`.
+default `walks=max(25, 6 * ndim)`. In 1-D, 10 walks were already unbiased
+(20 seeds, bias 0.2 x `logzerr`), so 1-D defaults to 12; from 2-D on, 15 walks
+still biased logZ on Gaussian and banana targets.
 
 Live-cov is supported only for unbounded JAX rwalk with a fixed
 `replacement_chains`. If you choose `kernel="python"`, a bound, or a
@@ -172,17 +174,25 @@ Passing `rwalk_proposal="live-cov"` explicitly in those combinations raises
 With `kernel="jax"`, the initial live points are evaluated in one compiled
 pass.
 
-If your likelihood carries large arrays, pass it as a pytree callable, for
-example `jax.tree_util.Partial(loglike_fn, data)` with `loglike_fn(data, theta)`,
-so the data are passed to the compiled kernels as arguments instead of being
-embedded as constants (faster compiles, less memory). The same holds for
-`prior_transform`, and for equinox-style modules or registered dataclasses with
-`__call__`: their `jax.Array` / `np.ndarray` leaves become kernel arguments, and
-everything else stays static. Use `jax.Array` leaves so the data move to the
-device once. A plain function or closure has no array leaves and behaves
-exactly as before. This applies to the fast path (unbounded JAX rwalk, block
-and per-iteration modes, and the rescue ladder); the bounded, fused-bounded and
-`replacement_chain_schedule` kernels still close over the callables.
+Large arrays used by `loglike` or `prior_transform` are passed to the compiled
+kernels as arguments instead of being embedded as constants (faster compiles,
+less memory). A closure gets this automatically: tinyns traces it once, and
+every captured array with at least 4096 elements, `jax.Array` or `np.ndarray`
+and including operands of a nested `jax.jit` call, becomes a kernel argument,
+while smaller constants stay embedded, so a hoisted closure compiles the same
+program as the equivalent pytree callable. If tracing the closure fails, it
+keeps closure semantics. Arrays captured inside the body of
+an inner `jax.jit` function (rather than passed to it) stay embedded.
+
+A pytree callable is the explicit form, for example
+`jax.tree_util.Partial(loglike_fn, data)` with `loglike_fn(data, theta)`, or an
+equinox-style module or registered dataclass with `__call__`: its `jax.Array` /
+`np.ndarray` leaves become kernel arguments and everything else stays static.
+Use `jax.Array` leaves so the data move to the device once. Both forms apply to
+the fast path (unbounded JAX rwalk, block and per-iteration modes, the rescue
+ladder and the initial live-point pass, without `jax_vectorized`); the bounded,
+fused-bounded and `replacement_chain_schedule` kernels still close over the
+callables.
 
 `jax_block_size > 1` batches several nested-sampling replacement iterations
 into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,
@@ -270,7 +280,7 @@ For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python
 
 For local constrained samplers, step-count parameters are decorrelation lengths:
 
-- `walks`: number of random-walk proposals per replacement attempt for `rwalk` (default `max(25, 6 * ndim)`)
+- `walks`: number of random-walk proposals per replacement attempt for `rwalk` (default `max(25, 6 * ndim)`, 12 in 1-D)
 - `min_accepts`: minimum number of accepted constrained rwalk moves required for the replacement to be considered valid
 
 The sampler does not return merely after the first accepted local move; it runs the requested local update length.

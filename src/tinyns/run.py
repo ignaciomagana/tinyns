@@ -24,10 +24,9 @@ from tinyns.samplers import (
     RWALK_PROPOSALS,
     _cacheable_callable,
     _callable_leaves,
-    _combine_callable,
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel,
-    _partition_callable,
+    _split_callables,
     _unwrap_cacheable_callable,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
@@ -52,9 +51,9 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     proposal defaults to ``"live-cov"`` and ``jax_block_size`` to 32 (1 with
     ``jax_vectorized``); elsewhere they fall back to ``"isotropic"`` and 1. An
     explicit ``"live-cov"`` is not overridden, so an unsupported combination
-    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` and the initial
-    ``step_scale`` to 0.5 for live-cov, 0.1 for isotropic. Explicit values
-    pass through unchanged.
+    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for
+    ``ndim=1``) and the initial ``step_scale`` to 0.5 for live-cov, 0.1 for
+    isotropic. Explicit values pass through unchanged.
     """
 
     kernel = options["kernel"]
@@ -74,7 +73,9 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
         step_scale = 0.5 if proposal == "live-cov" else 0.1
     walks = options["walks"]
     if walks is None:
-        walks = max(25, 6 * int(ndim))
+        # 1-D needs far fewer walks for unbiased logZ (validated to 10);
+        # from 2-D on, max(25, 6 * ndim) (see CHANGELOG, v0.2.0 / v0.2.1).
+        walks = 12 if int(ndim) == 1 else max(25, 6 * int(ndim))
     jax_block_size = options["jax_block_size"]
     if jax_block_size is None:
         jax_block_size = 32 if fast_path and not options["jax_vectorized"] else 1
@@ -129,9 +130,9 @@ def _evaluate_live_points_jax(
 
     Points go through ``lax.map`` ``chunk_size`` at a time (vmapped within a
     chunk), so device memory is bounded by the same batch the rwalk kernel uses.
-    Array leaves of pytree callables are jit arguments, not constants;
-    ``callable_leaves`` (default: taken from the callables) lets the caller pass
-    leaves it has already placed on the device.
+    Array leaves of pytree callables and large closure constants are jit
+    arguments, not constants; ``callable_leaves`` (default: taken from the
+    callables) lets the caller pass leaves it has already placed on the device.
     """
     nlive = int(live_u.shape[0])
     chunk_size = max(1, min(int(chunk_size), nlive))
@@ -141,23 +142,16 @@ def _evaluate_live_points_jax(
         [live_u, jnp.broadcast_to(live_u[:1], (pad, ndim))], axis=0
     ).reshape((nchunks, chunk_size, ndim))
 
-    loglike_dynamic, loglike_static = _partition_callable(loglike)
-    prior_dynamic, prior_static = _partition_callable(prior_transform)
+    (loglike_dynamic, loglike_rebuild), (prior_dynamic, prior_rebuild) = (
+        _split_callables(loglike, prior_transform, ndim)
+    )
     if callable_leaves is None:
-        callable_leaves = loglike_dynamic + prior_dynamic
+        callable_leaves = tuple(loglike_dynamic) + tuple(prior_dynamic)
     nloglike_leaves = len(loglike_dynamic)
 
     def evaluate(u, *leaves):
-        loglike_fn = (
-            _combine_callable(leaves[:nloglike_leaves], loglike_static)
-            if loglike_dynamic
-            else loglike
-        )
-        prior_fn = (
-            _combine_callable(leaves[nloglike_leaves:], prior_static)
-            if prior_dynamic
-            else prior_transform
-        )
+        loglike_fn = loglike_rebuild(leaves[:nloglike_leaves])
+        prior_fn = prior_rebuild(leaves[nloglike_leaves:])
 
         def evaluate_chunk(u_chunk):
             return _evaluate_jax_batch(
@@ -277,9 +271,11 @@ def _make_static_jax_rwalk_block_kernel_cached(
     """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel.
 
     The returned ``block_kernel`` takes the array leaves of pytree callables
-    (``*_callable_leaves(loglike, prior_transform)``) as trailing arguments and
-    threads them to the rwalk kernel, so they are jit arguments rather than
-    compiled-in constants. Plain callables take no trailing arguments.
+    and the large constants of closures
+    (``*_callable_leaves(loglike, prior_transform, ndim)``) as trailing
+    arguments and threads them to the rwalk kernel, so they are jit arguments
+    rather than compiled-in constants. Callables with neither take no trailing
+    arguments.
     """
 
     loglike = _unwrap_cacheable_callable(loglike)
@@ -1210,11 +1206,14 @@ def run_static_nested(
         else {}
     )
 
-    # Array leaves of pytree callables, placed on the device once per run and
-    # passed to the compiled fast-path kernels as arguments (empty for plain
-    # functions and closures).
+    # Array leaves of pytree callables and large closure constants, placed on
+    # the device once per run and passed to the compiled fast-path kernels as
+    # arguments (empty for callables with neither).
     callable_leaves = (
-        tuple(jnp.asarray(leaf) for leaf in _callable_leaves(loglike, prior_transform))
+        tuple(
+            jnp.asarray(leaf)
+            for leaf in _callable_leaves(loglike, prior_transform, ndim)
+        )
         if kernel == "jax"
         else ()
     )
