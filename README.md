@@ -172,6 +172,18 @@ Passing `rwalk_proposal="live-cov"` explicitly in those combinations raises
 With `kernel="jax"`, the initial live points are evaluated in one compiled
 pass.
 
+If your likelihood carries large arrays, pass it as a pytree callable, for
+example `jax.tree_util.Partial(loglike_fn, data)` with `loglike_fn(data, theta)`,
+so the data are passed to the compiled kernels as arguments instead of being
+embedded as constants (faster compiles, less memory). The same holds for
+`prior_transform`, and for equinox-style modules or registered dataclasses with
+`__call__`: their `jax.Array` / `np.ndarray` leaves become kernel arguments, and
+everything else stays static. Use `jax.Array` leaves so the data move to the
+device once. A plain function or closure has no array leaves and behaves
+exactly as before. This applies to the fast path (unbounded JAX rwalk, block
+and per-iteration modes, and the rescue ladder); the bounded, fused-bounded and
+`replacement_chain_schedule` kernels still close over the callables.
+
 `jax_block_size > 1` batches several nested-sampling replacement iterations
 into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,
 which usually gives a large speedup for cheap or moderately expensive JAX
