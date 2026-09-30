@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 (unreleased)
 
 - Added `rwalk_proposal="live-cov"`: each rwalk step is `step_scale * L @ z`, with `L` the Cholesky factor of the live-point covariance in the unit cube. Moves that leave the cube are rejected rather than reflected, and the step scale always adapts toward `rwalk_target_accept`. It is supported for unbounded `sample="rwalk"`, `kernel="jax"` with a fixed `replacement_chains`; other combinations raise `NotImplementedError`.
 - **Changed defaults**: `NestedSampler(loglike, prior_transform, ndim).run(key)` and `run_static_nested` now run the fast path: `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`, `jax_block_size=32`, `walks=max(25, 6 * ndim)` and an initial `step_scale=0.5`. The old defaults were `sample="prior"`, `kernel="python"`, `rwalk_proposal="isotropic"`, `jax_block_size=1`, `walks=25` and `step_scale=0.1`; pass them explicitly to keep the old behavior. The default `kernel="jax"` needs JAX-traceable `loglike` and `prior_transform`.
