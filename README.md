@@ -51,6 +51,11 @@ result = sampler.run(key, dlogz=0.1)
 print(result.summary())
 ```
 
+The defaults run the recommended fast path (JAX `rwalk` with live-cov
+proposals and cached blocks of 32 iterations; see below), so `loglike` and
+`prior_transform` must be JAX-traceable. For plain Python or NumPy functions,
+pass `kernel="python"`.
+
 ## Minimal API
 
 | API | Purpose |
@@ -115,41 +120,57 @@ partial `NestedSamplingResult`.
 
 TinyNS is intentionally organized around one recommended fast path, with
 reference baselines and experimental research knobs separated from that primary
-route. The currently recommended fast path was validated on the included
-benchmark targets; it should still be revalidated for new target geometries.
+route. The fast path is the default. It should still be revalidated for new
+target geometries.
 
 | Tier | Options | Status |
 | --- | --- | --- |
-| Recommended fast path | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32` | Best validated path on included benchmarks |
+| Recommended fast path (default) | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`, `walks=max(25, 6 * ndim)`, `replacement_chains=1`, `jax_block_size=32` | Likelihood calls per iteration stay at `walks` on correlated Gaussians, d = 2..18 |
+| Isotropic block path | `rwalk_proposal="isotropic"`, `walks=5`, `jax_block_size=32` | Validated on the included 2D benchmark targets; cost per iteration grows geometrically at d >= 4 |
 | Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
 | Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
 | Experimental | bounds / fused bounds / bounded block | Useful research direction; not production-ready |
 | Experimental | adaptive replacement-chain schedules | Useful tuning knob; not the main recommended path |
 
-Removed: slice/random-slice samplers were removed to keep TinyNS small (use dynesty for slice-based external comparisons). `rwalk_proposal="live-cov"` (with `rwalk_cov_jitter`) has also been removed.
+Removed: slice/random-slice samplers were removed to keep TinyNS small (use dynesty for slice-based external comparisons). An earlier live-cov proposal that reflected moves at the unit-cube faces, and its `rwalk_cov_jitter` option, were also removed; the current `rwalk_proposal="live-cov"` rejects such moves instead.
 
 ### Recommended fast JAX rwalk path
 
-For unbounded JAX rwalk on the included validation targets, the recommended
-fast path is the cached block kernel with isotropic proposals:
+The defaults are the fast path:
 
 ```python
 from tinyns import NestedSampler
 
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-    kernel="jax",
-    walks=5,
-    replacement_chains=1,
-    rwalk_proposal="isotropic",
-    jax_block_size=32,
-)
-
+sampler = NestedSampler(loglike, prior_transform, ndim)
 result = sampler.run(key, dlogz=0.1)
 ```
+
+This is `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`,
+`walks=max(25, 6 * ndim)`, `step_scale=0.5`, `replacement_chains=1` and
+`jax_block_size=32`. Each live-cov step is `step_scale * L @ z`, where `L` is
+the Cholesky factor of the live-point covariance in the unit cube and `z` is a
+standard normal vector. Moves that leave the unit cube are rejected. The step
+follows the contracting, correlated live set, and `step_scale` is only the
+initial value: live-cov always adapts it toward `rwalk_target_accept` (0.25).
+
+The old default, a fixed isotropic unit-cube step (`step_scale=0.1`), does not
+follow the contracting live set: its acceptance collapsed, and the cost per
+iteration grew geometrically at d >= 4. On anisotropic correlated Gaussians, d = 2..18,
+live-cov keeps the likelihood calls per iteration flat at `walks`. Unbiased
+evidence needs `walks` of about 5-6 x `ndim`: `walks=25` biased logZ high by
++0.5 nats at 13D and +1.4 nats at 18D, while `walks >= 5 * ndim` was within
+about 0.2 nats, with seed scatter matching the reported `logzerr`. Hence the
+default `walks=max(25, 6 * ndim)`.
+
+Live-cov is supported only for unbounded JAX rwalk with a fixed
+`replacement_chains`. If you choose `kernel="python"`, a bound, or a
+`replacement_chain_schedule` and leave `rwalk_proposal` unset, the proposal
+falls back to `"isotropic"` with `step_scale=0.1` and `jax_block_size=1`.
+Passing `rwalk_proposal="live-cov"` explicitly in those combinations raises
+`NotImplementedError`. `sample="prior"` defaults to `kernel="python"`.
+
+With `kernel="jax"`, the initial live points are evaluated in one compiled
+pass.
 
 `jax_block_size > 1` batches several nested-sampling replacement iterations
 into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,
@@ -159,12 +180,12 @@ likelihood cost dominates dispatch overhead. Convergence is checked between
 blocks, not after every individual nested iteration, so a run may overshoot the
 requested `dlogz` threshold by up to roughly `jax_block_size - 1` iterations.
 
-Use `jax_block_size=32` for the fastest validated unbounded JAX rwalk path. Use
-`jax_block_size=16` if you want a more conservative block size with slightly
-less convergence overshoot. Leave `jax_block_size=1` for the most conservative
-behavior, which disables block mode. This recommendation is based on current
-validation on the included benchmark targets; it is not a proof for all
-likelihoods.
+`jax_block_size=32` (the default for unbounded JAX rwalk) is the fastest
+validated block size. Use `jax_block_size=16` if you want a more conservative
+block size with slightly less convergence overshoot. Use `jax_block_size=1` for
+the most conservative behavior, which disables block mode. This recommendation
+is based on current validation on the included benchmark targets; it is not a
+proof for all likelihoods.
 
 
 ### Bound update interval
@@ -222,8 +243,8 @@ sampler = NestedSampler(
 
 Use this when replacement difficulty varies across the nested-sampling run. The sampler returns as soon as any stage succeeds and randomly selects among successful chains in that stage. This avoids always paying for large batches.
 
-`replacement_chain_schedule` requires `jax_block_size=1` (the default). It is
-rejected with a clear error when combined with `jax_block_size > 1`: the
+`replacement_chain_schedule` requires `jax_block_size=1` (the default when a
+schedule is given). It is rejected with a clear error when combined with `jax_block_size > 1`: the
 cached block kernel does not implement schedule-aware early return, so it
 cannot benefit from a schedule and would otherwise silently overstate the
 savings. Use the host-level per-iteration path (`jax_block_size=1`) for
@@ -237,27 +258,28 @@ For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python
 
 For local constrained samplers, step-count parameters are decorrelation lengths:
 
-- `walks`: number of reflected random-walk proposals per replacement attempt for `rwalk`
+- `walks`: number of random-walk proposals per replacement attempt for `rwalk` (default `max(25, 6 * ndim)`)
 - `min_accepts`: minimum number of accepted constrained rwalk moves required for the replacement to be considered valid
 
 The sampler does not return merely after the first accepted local move; it runs the requested local update length.
 
 `sample="prior"` supports vectorized replacement proposals with
 `vectorized=True`; the full nested-sampling loop remains a small Python loop.
-Vectorized `rwalk` replacement sampling is not implemented yet.
+Vectorized `rwalk` replacement sampling is not implemented yet, so
+`vectorized=True` needs an explicit `sample="prior"`.
 
 ### Bounding
 
 `tinyns` supports `bound="none"` by default. Bounds are experimental modifiers for rwalk, not a separate public sampler mode. Use `sample="rwalk"` with `bound="single"` or `bound="multi"` and `rwalk_seed="bound"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
 
-The only currently recommended fast path is unbounded JAX rwalk with isotropic proposals and cached block mode. Bounded/fused-bounded paths remain experimental and require target-specific validation. (`rwalk_proposal="live-cov"` has been removed; see the "Removed" line above.)
+The only currently recommended fast path is unbounded JAX rwalk with live-cov proposals and cached block mode. Bounded rwalk uses isotropic proposals. Bounded/fused-bounded paths remain experimental and require target-specific validation.
 
 Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before relying on it for scientific results.
 
 
 ### Experimental adaptive rwalk step scale
 
-`rwalk_adaptive_step_scale=True` is an explicitly experimental JAX-only rwalk option that adapts the isotropic rwalk proposal scale from constrained-replacement acceptance telemetry. The default remains off, `step_scale=0.1` remains unchanged, and the recommended B32 path is still `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `step_scale=0.1`, `min_accepts=1`, `replacement_chains=1`, `replacement_chain_schedule=None`, `bound="none"`, and `jax_block_size=32`.
+Live-cov always adapts its step scale. For isotropic proposals, `rwalk_adaptive_step_scale=True` is an explicitly experimental JAX-only rwalk option that adapts the isotropic proposal scale from constrained-replacement acceptance telemetry. It defaults to off, with a fixed `step_scale=0.1`.
 
 This is intended for hard-target diagnostics where a fixed rwalk scale is a poor compromise. It is not a dynesty replacement, does not add slice/rslice or `sample="bound"`, and is not a substitute for checking insertion-rank diagnostics, replacement diagnostics, and seed/config stability on the target.
 
@@ -315,7 +337,7 @@ This mode is experimental and is not the recommended fast path. Check evidence c
 
 ## Current validation status
 
-The recommended fast path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32`) has been checked with repeated-seed validation on the included benchmark targets:
+The live-cov default was checked on anisotropic correlated Gaussians, d = 2..18 (see the fast-path section above). The isotropic block path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32`) has been checked with repeated-seed validation on the included benchmark targets:
 
 - `gaussian2d`
 - `correlated_gaussian2d`
@@ -355,6 +377,13 @@ programming language.
 
 - Static nested sampling only.
 - No dynamic nested sampling.
+- The default `kernel="jax"` needs JAX-traceable `loglike` and
+  `prior_transform`; use `kernel="python"` otherwise.
+- Live-cov proposals need unbounded JAX rwalk with a fixed
+  `replacement_chains`; bounds, `kernel="python"` and replacement-chain
+  schedules use isotropic proposals.
+- Unbiased evidence needs `walks` of about 5-6 x `ndim`, so likelihood calls
+  per iteration grow linearly with dimension.
 - Multiellipsoid bounding is experimental.
 - No full vectorized `rwalk` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
@@ -367,13 +396,13 @@ programming language.
 
 ### Primary
 
-- `examples/gaussian_2d_rwalk_jax_block.py`: recommended validated fast path using JAX `rwalk`, isotropic proposals, one replacement chain, and cached block mode with `jax_block_size=32`.
+- `examples/gaussian_2d_rwalk_jax_block.py`: recommended fast path with the defaults (JAX `rwalk`, live-cov proposals, cached block mode with `jax_block_size=32`).
 
 ### Reference
 
-- `examples/gaussian_2d.py`: 2D Gaussian with prior rejection.
-- `examples/gaussian_2d_rwalk.py`: reflected Python random-walk constrained sampling.
-- `examples/gaussian_2d_rwalk_jax.py`: simple JAX-native random-walk replacement path without the full cached block configuration.
+- `examples/gaussian_2d.py`: 2D Gaussian with the default sampler.
+- `examples/gaussian_2d_rwalk.py`: reflected isotropic Python random-walk constrained sampling.
+- `examples/gaussian_2d_rwalk_jax.py`: JAX-native random-walk replacement without block mode (`jax_block_size=1`).
 
 ### Utility
 
@@ -435,7 +464,12 @@ To resume, reconstruct the same sampler and call:
 result = sampler.resume("run.checkpoint.npz")
 ```
 
-The sampler configuration must match the checkpoint. Checkpoints are distinct
+The sampler configuration must match the checkpoint. Checkpoints record the
+resolved `walks`, `step_scale`, `rwalk_proposal` and `jax_block_size`, so a
+sampler built with the same (or default) arguments resumes it. A checkpoint
+written by an earlier version with default arguments records the old defaults
+(`sample="prior"`, `kernel="python"`, `rwalk_proposal="isotropic"`, ...);
+pass those values explicitly to resume it. Checkpoints are distinct
 from final result files saved with `result.save_npz(...)`. Checkpoints use NumPy
 `.npz` files to avoid extra dependencies. Checkpoint/resume is intended for
 static nested sampling; dynamic nested sampling is not implemented yet.

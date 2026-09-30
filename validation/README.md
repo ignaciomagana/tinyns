@@ -72,7 +72,7 @@ not a formal statistical test.
 
 Repeated-seed validation currently separates the recommended path from baselines and reference-only samplers:
 
-- `sample="rwalk", kernel="jax"`: recommended fast path for JAX-native likelihoods when used with isotropic proposals, `walks=5`, `replacement_chains=1`, and cached block mode validated on included benchmark targets
+- `sample="rwalk", kernel="jax"`: JAX rwalk; this harness runs it with isotropic proposals and `jax_block_size=1` (the sampler default is live-cov with `jax_block_size=32`)
 - `sample="rwalk", kernel="python"`: simple CPU/Python correctness/debug baseline
 - `sample="prior"`: conceptual brute-force constrained-prior baseline
 

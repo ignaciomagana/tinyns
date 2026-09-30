@@ -36,6 +36,7 @@ def main():
         prior_transform,
         ndim=NDIM,
         sample="rwalk",
+        kernel="python",
         walks=25,
         step_scale=0.1,
         nlive=200,

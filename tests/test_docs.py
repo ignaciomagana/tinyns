@@ -28,9 +28,10 @@ def test_readme_support_tiers_keep_key_paths() -> None:
     assert removed_steps not in text
 
     assert "experimental" in lowered
-    # live-cov is now documented only as a removed option, not a live tier.
-    removed_pos = lowered.index("removed:")
-    assert "live-cov" in lowered[removed_pos:]
+    # live-cov is the documented default; only the old reflected variant is removed.
+    assert 'rwalk_proposal="live-cov"' in text
+    assert "walks=max(25, 6 * ndim)" in text
+    assert "has also been removed" not in lowered
     assert 'rwalk_proposal="isotropic"' in text
     assert 'bound="multi"' in text
 
