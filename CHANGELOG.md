@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.0 (unreleased)
+
+- Added `rwalk_proposal="live-cov"`: each rwalk step is `step_scale * L @ z`, with `L` the Cholesky factor of the live-point covariance in the unit cube. Moves that leave the cube are rejected rather than reflected, and the step scale always adapts toward `rwalk_target_accept`. It is supported for unbounded `sample="rwalk"`, `kernel="jax"` with a fixed `replacement_chains`; other combinations raise `NotImplementedError`.
+- **Changed defaults**: `NestedSampler(loglike, prior_transform, ndim).run(key)` and `run_static_nested` now run the fast path: `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`, `jax_block_size=32`, `walks=max(25, 6 * ndim)` and an initial `step_scale=0.5`. The old defaults were `sample="prior"`, `kernel="python"`, `rwalk_proposal="isotropic"`, `jax_block_size=1`, `walks=25` and `step_scale=0.1`; pass them explicitly to keep the old behavior. The default `kernel="jax"` needs JAX-traceable `loglike` and `prior_transform`.
+- Where live-cov is unsupported (`kernel="python"`, a bound, or a `replacement_chain_schedule`), an unset `rwalk_proposal` falls back to `"isotropic"` with `step_scale=0.1` and `jax_block_size=1`, and `sample="prior"` defaults to `kernel="python"`. An explicit `rwalk_proposal="live-cov"` in those combinations still raises.
+- Why: the fixed isotropic unit-cube step (`step_scale=0.1`) did not follow the contracting live set, so acceptance collapsed and the cost per iteration grew geometrically at d >= 4. On anisotropic correlated Gaussians, d = 2..18, live-cov keeps the likelihood calls per iteration flat at `walks`. Unbiased evidence needs `walks` of about 5-6 x `ndim`: `walks=25` biased logZ high by +0.5 nats at 13D and +1.4 nats at 18D, while `walks >= 5 * ndim` was within about 0.2 nats, with seed scatter matching the reported `logzerr`.
+- With `kernel="jax"`, the initial live points are now evaluated in one compiled pass.
+- `loglike` and `prior_transform` may be JAX pytree callables (`jax.tree_util.Partial(loglike_fn, data)`, an equinox-style Module, a registered dataclass with `__call__`). On the fast path (unbounded JAX rwalk: block kernel, per-iteration kernel, rescue draws and the initial live-point pass) their array leaves are passed to the compiled kernels as jit arguments instead of being embedded as constants. On a GW likelihood with 2.5M-row selection arrays (H100) this cut compile time from 76 s to 15 s and peak host RSS from 10.7 GB to 2.8 GB. Detection is automatic; plain functions and closures give bit-identical results to before. Bounded, fused-bounded and `replacement_chain_schedule` kernels keep closure semantics.
+- Checkpoints record the resolved `walks`, `step_scale`, `rwalk_proposal` and `jax_block_size`, so a resume with default arguments matches a fresh run with default arguments. Checkpoints without `rwalk_proposal` are read as `"isotropic"` (no format-version bump).
+- The benchmark and validation harnesses (`bench_static.py`, `overnight_jax_validation.py`, `validation/run_validation.py`) pin `rwalk_proposal="isotropic"` and `jax_block_size=1` unless a block size is requested, so their configurations are unchanged.
+
 ## v0.1.0-alpha
 
 - Narrowed TinyNS public sampler surface to `sample="rwalk"` and `sample="prior"`.

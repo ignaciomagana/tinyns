@@ -30,6 +30,7 @@ def main() -> None:
         ndim=2,
         nlive=40,
         sample="rwalk",
+        kernel="python",
         walks=5,
         step_scale=0.2,
     )

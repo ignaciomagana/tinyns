@@ -154,6 +154,8 @@ def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
         walks=2,
         replacement_chains=2,
         max_attempts=16,
+        rwalk_proposal="isotropic",
+        jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.4,
     )
@@ -285,6 +287,7 @@ def test_resume_rejects_checkpoint_after_replacement_failure(tmp_path):
         prior_transform,
         ndim=1,
         nlive=1,
+        sample="prior",
         max_attempts=1,
     )
     result = failed_sampler.run(0, maxiter=10, dlogz=0.0, checkpoint_path=path)
@@ -555,6 +558,8 @@ def test_adaptive_step_scale_restored_on_resume(tmp_path):
         kernel="jax",
         walks=5,
         step_scale=0.1,
+        rwalk_proposal="isotropic",
+        jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.5,
     )
@@ -584,6 +589,8 @@ def test_resume_without_effective_step_scale_field_falls_back(tmp_path):
         kernel="jax",
         walks=5,
         step_scale=0.1,
+        rwalk_proposal="isotropic",
+        jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.5,
     )
@@ -614,11 +621,14 @@ def test_resume_rejects_rwalk_adaptive_step_scale_mismatch(tmp_path):
         sample="rwalk",
         kernel="jax",
         walks=3,
+        rwalk_proposal="isotropic",
         rwalk_adaptive_step_scale=True,
     ).run(42, maxiter=2, dlogz=0.0, checkpoint_path=path)
 
     with pytest.raises(ValueError, match="rwalk_adaptive_step_scale"):
-        make_sampler(sample="rwalk", kernel="jax", walks=3).resume(path, maxiter=3)
+        make_sampler(
+            sample="rwalk", kernel="jax", walks=3, rwalk_proposal="isotropic"
+        ).resume(path, maxiter=3)
 
 
 def test_resume_rejects_rwalk_target_accept_mismatch(tmp_path):
@@ -694,3 +704,72 @@ def test_resume_at_maxiter_without_convergence_reports_maxiter_block(tmp_path):
     assert resumed.success is False
     assert "maxiter" in resumed.message
     assert "converged" not in resumed.message
+
+
+def test_live_cov_resume_continues_with_adapted_scale(tmp_path):
+    path = tmp_path / "live_cov.checkpoint.npz"
+    sampler = make_sampler(
+        sample="rwalk",
+        kernel="jax",
+        walks=8,
+        step_scale=0.1,
+        rwalk_proposal="live-cov",
+        jax_block_size=4,
+    )
+    partial = sampler.run(43, maxiter=40, dlogz=0.5, checkpoint_path=path)
+    state, _ = load_checkpoint_npz(path)
+    assert state.effective_step_scale is not None
+    assert state.effective_step_scale != pytest.approx(0.1)
+
+    resumed = sampler.resume(path, dlogz=0.5)
+    assert resumed.success is True
+    assert len(resumed.logl) > len(partial.logl)
+    assert resumed.metadata["rwalk_proposal"] == "live-cov"
+
+
+def test_default_kwargs_checkpoint_round_trip(tmp_path):
+    path = tmp_path / "defaults.checkpoint.npz"
+
+    def default_sampler():
+        return NestedSampler(loglike, prior_transform, ndim=2, nlive=30)
+
+    full = default_sampler().run(44, maxiter=128, dlogz=0.0)
+    default_sampler().run(
+        44, maxiter=64, dlogz=0.0, checkpoint_path=path, checkpoint_interval=32
+    )
+    _, config = load_checkpoint_npz(path)
+
+    # The resolved defaults are recorded, not the None placeholders.
+    assert config["sample"] == "rwalk"
+    assert config["kernel"] == "jax"
+    assert config["rwalk_proposal"] == "live-cov"
+    assert config["walks"] == 25
+    assert config["step_scale"] == 0.5
+    assert config["jax_block_size"] == 32
+    assert config["rwalk_adaptive_step_scale"] is True
+
+    resumed = default_sampler().resume(path, maxiter=128, dlogz=0.0)
+
+    np.testing.assert_allclose(resumed.samples_u, full.samples_u)
+    np.testing.assert_allclose(resumed.logl, full.logl)
+    assert resumed.ncall == full.ncall
+    assert resumed.logz == pytest.approx(full.logz)
+
+
+def test_old_checkpoint_without_rwalk_proposal_is_isotropic(tmp_path):
+    path = tmp_path / "old_isotropic.checkpoint.npz"
+    old_kwargs = dict(
+        sample="rwalk", kernel="jax", walks=5, step_scale=0.1, jax_block_size=1
+    )
+    make_sampler(rwalk_proposal="isotropic", **old_kwargs).run(
+        45, maxiter=2, dlogz=0.0, checkpoint_path=path
+    )
+    _rewrite_checkpoint_config(path, lambda config: config.pop("rwalk_proposal"))
+
+    # A checkpoint without the key predates live-cov, so it was isotropic.
+    with pytest.raises(ValueError, match="rwalk_proposal"):
+        make_sampler(rwalk_proposal="live-cov", **old_kwargs).resume(path, maxiter=4)
+    result = make_sampler(rwalk_proposal="isotropic", **old_kwargs).resume(
+        path, maxiter=4
+    )
+    assert result.metadata["rwalk_proposal"] == "isotropic"

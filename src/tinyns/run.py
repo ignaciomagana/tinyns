@@ -21,9 +21,13 @@ from tinyns.bounds import (
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
+    RWALK_PROPOSALS,
     _cacheable_callable,
+    _callable_leaves,
+    _combine_callable,
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel,
+    _partition_callable,
     _unwrap_cacheable_callable,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
@@ -38,6 +42,49 @@ from tinyns.samplers import (
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
+
+
+def _resolve_defaults(ndim: int, sample: str, options) -> dict:
+    """Resolve the ``None`` (fast-path) defaults of the rwalk options.
+
+    ``kernel`` defaults to ``"jax"`` for ``sample="rwalk"``. Where live-cov is
+    supported (unbounded JAX rwalk with a fixed ``replacement_chains``) the
+    proposal defaults to ``"live-cov"`` and ``jax_block_size`` to 32 (1 with
+    ``jax_vectorized``); elsewhere they fall back to ``"isotropic"`` and 1. An
+    explicit ``"live-cov"`` is not overridden, so an unsupported combination
+    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` and the initial
+    ``step_scale`` to 0.5 for live-cov, 0.1 for isotropic. Explicit values
+    pass through unchanged.
+    """
+
+    kernel = options["kernel"]
+    if kernel is None:
+        kernel = "jax" if sample == "rwalk" else "python"
+    fast_path = (
+        sample == "rwalk"
+        and kernel == "jax"
+        and options["bound"] == "none"
+        and options["replacement_chain_schedule"] is None
+    )
+    proposal = options["rwalk_proposal"]
+    if proposal is None:
+        proposal = "live-cov" if fast_path else "isotropic"
+    step_scale = options["step_scale"]
+    if step_scale is None:
+        step_scale = 0.5 if proposal == "live-cov" else 0.1
+    walks = options["walks"]
+    if walks is None:
+        walks = max(25, 6 * int(ndim))
+    jax_block_size = options["jax_block_size"]
+    if jax_block_size is None:
+        jax_block_size = 32 if fast_path and not options["jax_vectorized"] else 1
+    return {
+        "kernel": kernel,
+        "walks": walks,
+        "step_scale": step_scale,
+        "rwalk_proposal": proposal,
+        "jax_block_size": jax_block_size,
+    }
 
 
 def _as_points(array, ndim: int):
@@ -73,6 +120,55 @@ def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
             )
         return logl
     return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
+
+
+def _evaluate_live_points_jax(
+    loglike, prior_transform, live_u, ndim, *, chunk_size, callable_leaves=None
+):
+    """Evaluate the initial live set in one compiled pass.
+
+    Points go through ``lax.map`` ``chunk_size`` at a time (vmapped within a
+    chunk), so device memory is bounded by the same batch the rwalk kernel uses.
+    Array leaves of pytree callables are jit arguments, not constants;
+    ``callable_leaves`` (default: taken from the callables) lets the caller pass
+    leaves it has already placed on the device.
+    """
+    nlive = int(live_u.shape[0])
+    chunk_size = max(1, min(int(chunk_size), nlive))
+    nchunks = -(-nlive // chunk_size)
+    pad = nchunks * chunk_size - nlive
+    padded = jnp.concatenate(
+        [live_u, jnp.broadcast_to(live_u[:1], (pad, ndim))], axis=0
+    ).reshape((nchunks, chunk_size, ndim))
+
+    loglike_dynamic, loglike_static = _partition_callable(loglike)
+    prior_dynamic, prior_static = _partition_callable(prior_transform)
+    if callable_leaves is None:
+        callable_leaves = loglike_dynamic + prior_dynamic
+    nloglike_leaves = len(loglike_dynamic)
+
+    def evaluate(u, *leaves):
+        loglike_fn = (
+            _combine_callable(leaves[:nloglike_leaves], loglike_static)
+            if loglike_dynamic
+            else loglike
+        )
+        prior_fn = (
+            _combine_callable(leaves[nloglike_leaves:], prior_static)
+            if prior_dynamic
+            else prior_transform
+        )
+
+        def evaluate_chunk(u_chunk):
+            return _evaluate_jax_batch(
+                loglike_fn, prior_fn, u_chunk, ndim, jax_vectorized=False
+            )
+
+        return lax.map(evaluate_chunk, u)
+
+    theta, logl = jax.jit(evaluate)(padded, *callable_leaves)
+    theta = theta.reshape((nchunks * chunk_size,) + theta.shape[2:])[:nlive]
+    return theta, logl.reshape((-1,))[:nlive]
 
 
 def _remaining_delta_logz(logz_dead, logx_final, live_logl):
@@ -176,8 +272,15 @@ def _make_static_jax_rwalk_block_kernel_cached(
     walks: int,
     replacement_chains: int,
     block_size: int,
+    proposal: str = "isotropic",
 ):
-    """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel."""
+    """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel.
+
+    The returned ``block_kernel`` takes the array leaves of pytree callables
+    (``*_callable_leaves(loglike, prior_transform)``) as trailing arguments and
+    threads them to the rwalk kernel, so they are jit arguments rather than
+    compiled-in constants. Plain callables take no trailing arguments.
+    """
 
     loglike = _unwrap_cacheable_callable(loglike)
     prior_transform = _unwrap_cacheable_callable(prior_transform)
@@ -193,6 +296,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
         walks,
         replacement_chains,
         False,
+        proposal,
     )
 
     def block_kernel(
@@ -206,6 +310,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
         step_scale,
         min_accepts,
         max_batches,
+        *callable_leaves,
     ):
         def one_iteration(carry, offset):
             key, live_u, live_theta, live_logl, logz_dead, active = carry
@@ -242,6 +347,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     jnp.asarray(step_scale),
                     jnp.asarray(min_accepts),
                     jnp.asarray(max_batches, dtype=jnp.int32),
+                    *callable_leaves,
                 )
                 replacement_batches_used = (
                     replacement_ncall
@@ -397,6 +503,7 @@ def _make_static_jax_rwalk_block_kernel(
     walks: int,
     replacement_chains: int,
     block_size: int,
+    proposal: str = "isotropic",
 ):
     """Return a cached block kernel for hashable or unhashable callables."""
     return _make_static_jax_rwalk_block_kernel_cached(
@@ -406,6 +513,7 @@ def _make_static_jax_rwalk_block_kernel(
         walks,
         replacement_chains,
         block_size,
+        proposal,
     )
 
 
@@ -761,21 +869,21 @@ def run_static_nested(
     *,
     dlogz: float = 0.1,
     maxiter: int | None = None,
-    sample: str = "prior",
-    kernel: str = "python",
+    sample: str = "rwalk",
+    kernel: str | None = None,
     vectorized: bool = False,
-    max_attempts: int = 10_000,
+    max_attempts: int | None = 10_000,
     progress: bool = False,
     progress_interval: int = 100,
     callback=None,
     callback_interval: int = 100,
     batch_size: int = 128,
-    walks: int = 25,
-    step_scale: float = 0.1,
+    walks: int | None = None,
+    step_scale: float | None = None,
     min_accepts: int = 1,
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
-    rwalk_proposal: str = "isotropic",
+    rwalk_proposal: str | None = None,
     bound: str = "none",
     bound_enlargement: float = 1.25,
     bound_update_interval: int = 1,
@@ -794,7 +902,7 @@ def run_static_nested(
     allow_unused_bound: bool = False,
     fused_bound_rwalk: bool = False,
     jax_vectorized: bool = False,
-    jax_block_size: int = 1,
+    jax_block_size: int | None = None,
     rwalk_adaptive_step_scale: bool = False,
     rwalk_target_accept: float = 0.25,
     initial_state: NestedRunState | None = None,
@@ -803,12 +911,34 @@ def run_static_nested(
 ):
     """Run a simple static nested-sampling loop.
 
-    The replacement ``sample`` strategy may be ``"prior"`` or ``"rwalk"``.
+    The replacement ``sample`` strategy may be ``"rwalk"`` (default) or
+    ``"prior"``. ``None`` options (``kernel``, ``walks``, ``step_scale``,
+    ``rwalk_proposal``, ``jax_block_size``) resolve to the fast path where it
+    is supported; see :func:`_resolve_defaults`.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
+    resolved = _resolve_defaults(
+        ndim,
+        sample,
+        {
+            "kernel": kernel,
+            "bound": bound,
+            "replacement_chain_schedule": replacement_chain_schedule,
+            "jax_vectorized": jax_vectorized,
+            "walks": walks,
+            "step_scale": step_scale,
+            "rwalk_proposal": rwalk_proposal,
+            "jax_block_size": jax_block_size,
+        },
+    )
+    kernel = resolved["kernel"]
+    walks = resolved["walks"]
+    step_scale = resolved["step_scale"]
+    rwalk_proposal = resolved["rwalk_proposal"]
+    jax_block_size = resolved["jax_block_size"]
     if sample not in {"prior", "rwalk"}:
         raise ValueError("sample must be one of {'prior', 'rwalk'}")
     if kernel not in {"python", "jax"}:
@@ -881,10 +1011,21 @@ def run_static_nested(
         )
     if not (0.0 < float(rwalk_target_accept) < 1.0):
         raise ValueError("rwalk_target_accept must be between 0 and 1")
-    if rwalk_proposal != "isotropic":
-        raise ValueError(
-            "rwalk_proposal='live-cov' has been removed; only "
-            "rwalk_proposal='isotropic' is supported"
+    if rwalk_proposal not in RWALK_PROPOSALS:
+        raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
+    if rwalk_proposal == "live-cov":
+        # live-cov steps are a dimensionless multiple of the live covariance;
+        # the multiple is always adapted to the target acceptance.
+        rwalk_adaptive_step_scale = True
+    if rwalk_proposal == "live-cov" and not (
+        sample == "rwalk"
+        and kernel == "jax"
+        and bound == "none"
+        and replacement_chain_schedule is None
+    ):
+        raise NotImplementedError(
+            "rwalk_proposal='live-cov' is supported only for sample='rwalk', "
+            "kernel='jax', bound='none' and a fixed replacement_chains"
         )
     if kernel == "jax" and sample not in {"rwalk"}:
         raise NotImplementedError(
@@ -895,6 +1036,8 @@ def run_static_nested(
             "vectorized rwalk is not implemented yet; use vectorized=False "
             'with sample="rwalk"'
         )
+    if max_attempts is None:
+        max_attempts = max(10_000, int(walks) * int(replacement_chains))
     if max_attempts <= 0:
         raise ValueError("max_attempts must be a positive integer")
     if progress_interval <= 0:
@@ -1025,6 +1168,7 @@ def run_static_nested(
         "step_scale": float(step_scale),
         "min_accepts": int(min_accepts),
         "replacement_chains": int(replacement_chains),
+        "rwalk_proposal": str(rwalk_proposal),
         "replacement_chain_schedule": (
             None
             if replacement_chain_schedule is None
@@ -1066,6 +1210,15 @@ def run_static_nested(
         else {}
     )
 
+    # Array leaves of pytree callables, placed on the device once per run and
+    # passed to the compiled fast-path kernels as arguments (empty for plain
+    # functions and closures).
+    callable_leaves = (
+        tuple(jnp.asarray(leaf) for leaf in _callable_leaves(loglike, prior_transform))
+        if kernel == "jax"
+        else ()
+    )
+
     if initial_state is None:
         key = random.PRNGKey(int(key)) if isinstance(key, int) else key
         key, init_key = random.split(key)
@@ -1077,6 +1230,15 @@ def run_static_nested(
                 live_u,
                 ndim,
                 jax_vectorized=True,
+            )
+        elif kernel == "jax":
+            live_theta, live_logl = _evaluate_live_points_jax(
+                loglike,
+                prior_transform,
+                live_u,
+                ndim,
+                chunk_size=replacement_chains,
+                callable_leaves=callable_leaves,
             )
         else:
             live_theta = _transform_live_points(
@@ -1266,9 +1428,16 @@ def run_static_nested(
         for value in restored_telemetry.get("adaptive_accept_history", [])
     ]
     adaptive_updates = int(restored_telemetry.get("adaptive_updates", 0))
-    adaptive_rate = 0.05
-    adaptive_min_step_scale = 1e-4
-    adaptive_max_step_scale = 0.5
+    if rwalk_proposal == "live-cov":
+        # The live-cov step already follows the contracting live set, so the
+        # scale is a dimensionless O(1) factor that the update can chase fast.
+        adaptive_rate = 0.5
+        adaptive_min_step_scale = 1e-3
+        adaptive_max_step_scale = 10.0
+    else:
+        adaptive_rate = 0.05
+        adaptive_min_step_scale = 1e-4
+        adaptive_max_step_scale = 0.5
 
     def update_adaptive_scale(observed_accept: float) -> None:
         nonlocal effective_step_scale, adaptive_updates
@@ -1544,6 +1713,7 @@ def run_static_nested(
                     int(walks),
                     int(replacement_chains),
                     int(block_size_now),
+                    rwalk_proposal,
                 )
                 result = block_kernel(
                     key,
@@ -1560,6 +1730,7 @@ def run_static_nested(
                     ),
                     jnp.asarray(min_accepts),
                     jnp.asarray(max_batches, dtype=jnp.int32),
+                    *callable_leaves,
                 )
                 (
                     key,
@@ -1824,6 +1995,7 @@ def run_static_nested(
                             min_accepts=int(stage_min_accepts),
                             replacement_chains=int(stage_chains),
                             return_info=True,
+                            proposal=rwalk_proposal,
                         )
                         if len(rescue_result) == 7:
                             (
@@ -2231,7 +2403,7 @@ def run_static_nested(
                             {
                                 "jax_vectorized": jax_vectorized,
                                 **(
-                                    {"return_info": True}
+                                    {"return_info": True, "proposal": rwalk_proposal}
                                     if replacement_chain_schedule is None
                                     else {}
                                 ),

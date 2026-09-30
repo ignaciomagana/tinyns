@@ -32,6 +32,7 @@ def main():
         sample="rwalk",
         kernel="jax",
         walks=25,
+        jax_block_size=1,
     )
     result = sampler.run(jax.random.PRNGKey(0), dlogz=0.5)
 

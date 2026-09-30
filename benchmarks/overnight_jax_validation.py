@@ -98,6 +98,8 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
         "min_accepts": args.min_accepts,
         "replacement_chains": args.replacement_chains,
         "bound_update_interval": args.bound_update_interval,
+        "rwalk_proposal": "isotropic",
+        "jax_block_size": 1,
     }
     configs = [
         Config("unbounded_isotropic_rwalk", {**common, "bound": "none"}),

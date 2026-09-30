@@ -2,50 +2,85 @@
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from typing import Any
 
 from tinyns.result import NestedSamplingResult
-from tinyns.run import run_static_nested
+from tinyns.run import _resolve_defaults, run_static_nested
+from tinyns.samplers import RWALK_PROPOSALS
 from tinyns.state import load_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
-# Every keyword argument consumed from ``**kwargs`` anywhere in this module.
-# Unknown keys are still stored (dynesty drop-in compatibility) but trigger a
-# warning so typos and unsupported options are not silently ignored.
-_KNOWN_KWARGS = frozenset(
-    {
-        "kernel",
-        "bound",
-        "rwalk_seed",
-        "bound_seed_kernel",
-        "replacement_chains",
-        "replacement_chain_schedule",
-        "rwalk_adaptive_step_scale",
-        "rwalk_target_accept",
-        "fused_bound_rwalk",
-        "jax_block_size",
-        "walks",
-        "step_scale",
-        "batch_size",
-        "min_accepts",
-        "rwalk_proposal",
-        "bound_enlargement",
-        "bound_update_interval",
-        "bound_jitter",
-        "bound_max_draws",
-        "multi_bound_max_ellipsoids",
-        "multi_bound_min_points",
-        "multi_bound_split_threshold",
-        "multi_bound_enlargement",
-        "multi_bound_overlap_correction",
-        "rwalk_seed_fallback",
-        "allow_unused_bound",
-        "bound_rebuild_on_failure",
-        "bound_failure_rebuild_threshold",
-        "jax_vectorized",
-    }
+# Sampler options forwarded from ``**kwargs`` to :func:`run_static_nested`, with
+# their defaults taken from its signature so the two entry points cannot drift.
+# ``None`` defaults (``kernel``, ``walks``, ``step_scale``, ``rwalk_proposal``,
+# ``jax_block_size``) are resolved per sampler by ``_resolve_defaults``. Unknown
+# keys are still stored (dynesty drop-in compatibility) but trigger a warning so
+# typos and unsupported options are not silently ignored.
+_OPTION_NAMES = (
+    "kernel",
+    "walks",
+    "step_scale",
+    "batch_size",
+    "min_accepts",
+    "replacement_chains",
+    "replacement_chain_schedule",
+    "rwalk_proposal",
+    "bound",
+    "bound_enlargement",
+    "bound_update_interval",
+    "bound_jitter",
+    "bound_max_draws",
+    "multi_bound_max_ellipsoids",
+    "multi_bound_min_points",
+    "multi_bound_split_threshold",
+    "multi_bound_enlargement",
+    "multi_bound_overlap_correction",
+    "rwalk_seed",
+    "rwalk_seed_fallback",
+    "bound_seed_kernel",
+    "allow_unused_bound",
+    "fused_bound_rwalk",
+    "bound_rebuild_on_failure",
+    "bound_failure_rebuild_threshold",
+    "jax_vectorized",
+    "jax_block_size",
+    "rwalk_adaptive_step_scale",
+    "rwalk_target_accept",
 )
+_RUN_PARAMETERS = inspect.signature(run_static_nested).parameters
+_OPTION_DEFAULTS = {name: _RUN_PARAMETERS[name].default for name in _OPTION_NAMES}
+_KNOWN_KWARGS = frozenset(_OPTION_NAMES)
+
+# Values assumed for keys missing from checkpoints written by older versions.
+# These are the historical defaults and must not follow later default changes.
+_OLD_CHECKPOINT_DEFAULTS = {
+    "min_accepts": 1,
+    "replacement_chains": 1,
+    "rwalk_proposal": "isotropic",
+    "bound": "none",
+    "bound_enlargement": 1.25,
+    "bound_update_interval": 1,
+    "bound_jitter": 1e-6,
+    "bound_max_draws": None,
+    "multi_bound_max_ellipsoids": 32,
+    "multi_bound_min_points": None,
+    "multi_bound_split_threshold": 0.9,
+    "multi_bound_enlargement": None,
+    "multi_bound_overlap_correction": True,
+    "rwalk_seed": "live",
+    "rwalk_seed_fallback": True,
+    "bound_seed_kernel": "python",
+    "allow_unused_bound": False,
+    "fused_bound_rwalk": False,
+    "bound_rebuild_on_failure": False,
+    "bound_failure_rebuild_threshold": 1,
+    "jax_vectorized": False,
+    "jax_block_size": 1,
+    "rwalk_adaptive_step_scale": False,
+    "rwalk_target_accept": 0.25,
+}
 
 
 class NestedSampler:
@@ -55,23 +90,35 @@ class NestedSampler:
     ----------
     loglike:
         Callable accepting a point in parameter space and returning its log
-        likelihood.
+        likelihood. It may be a JAX pytree callable such as
+        ``jax.tree_util.Partial(loglike_fn, data)``: on the fast path its array
+        leaves are passed to the compiled kernels as arguments rather than
+        embedded as constants, which helps when ``data`` is large.
     prior_transform:
-        Callable mapping a unit-cube point to parameter space.
+        Callable mapping a unit-cube point to parameter space. May be a pytree
+        callable, like ``loglike``.
     ndim:
         Number of model dimensions. Must be positive.
     nlive:
         Number of live points to use. Must be positive.
     vectorized:
-        Whether ``loglike`` and ``prior_transform`` accept batches of points.
+        Whether ``loglike`` and ``prior_transform`` accept batches of points
+        (``sample="prior"`` only).
     sample:
-        Sampling strategy. ``"prior"`` and ``"rwalk"`` are currently supported.
+        Sampling strategy: ``"rwalk"`` (default) or ``"prior"``.
     max_attempts:
-        Cap on rejection attempts per constrained prior draw.
+        Cap on likelihood calls per constrained replacement draw. ``None``
+        resolves to ``max(10_000, walks * replacement_chains)``.
     **kwargs:
-        Additional sampler options. ``walks``, ``step_scale``, and
-        ``min_accepts`` are used by ``sample="rwalk"``. ``kernel`` may be
-        ``"python"`` (default) or experimental ``"jax"`` for ``sample="rwalk"``.
+        Additional sampler options, with the defaults of
+        :func:`~tinyns.run_static_nested`. By default ``sample="rwalk"`` runs
+        the fast path: ``kernel="jax"``, ``rwalk_proposal="live-cov"``,
+        ``jax_block_size=32``, ``walks=max(25, 6 * ndim)`` and an initial
+        ``step_scale=0.5`` that is adapted toward ``rwalk_target_accept``.
+        Where live-cov is unsupported (``kernel="python"``, a bound, or a
+        ``replacement_chain_schedule``) the defaults fall back to
+        ``rwalk_proposal="isotropic"``, ``step_scale=0.1`` and
+        ``jax_block_size=1``. ``sample="prior"`` defaults to ``kernel="python"``.
         ``jax_vectorized=True`` declares that JAX replacement kernels should call
         ``prior_transform`` and ``loglike`` on explicit batches instead of using
         ``jax.vmap`` around scalar callables.
@@ -85,8 +132,8 @@ class NestedSampler:
         nlive: int = 500,
         *,
         vectorized: bool = False,
-        sample: str = "prior",
-        max_attempts: int = 10_000,
+        sample: str = "rwalk",
+        max_attempts: int | None = 10_000,
         **kwargs: Any,
     ):
         if ndim <= 0:
@@ -95,16 +142,21 @@ class NestedSampler:
             raise ValueError("nlive must be a positive integer")
         if sample not in {"prior", "rwalk"}:
             raise ValueError("sample must be one of {'prior', 'rwalk'}")
-        kernel = kwargs.get("kernel", "python")
+        options = {
+            **_OPTION_DEFAULTS,
+            **{name: value for name, value in kwargs.items() if name in _KNOWN_KWARGS},
+        }
+        options.update(_resolve_defaults(ndim, sample, options))
+        kernel = options["kernel"]
         if kernel not in {"python", "jax"}:
             raise ValueError("kernel must be one of {'python', 'jax'}")
-        bound = kwargs.get("bound", "none")
+        bound = options["bound"]
         if bound not in {"none", "single", "multi"}:
             raise ValueError("bound must be one of {'none', 'single', 'multi'}")
-        rwalk_seed = kwargs.get("rwalk_seed", "live")
+        rwalk_seed = options["rwalk_seed"]
         if rwalk_seed not in {"live", "bound"}:
             raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
-        bound_seed_kernel = kwargs.get("bound_seed_kernel", "python")
+        bound_seed_kernel = options["bound_seed_kernel"]
         if bound_seed_kernel not in {"python", "jax"}:
             raise ValueError("bound_seed_kernel must be one of {'python', 'jax'}")
         if not callable(loglike):
@@ -119,9 +171,13 @@ class NestedSampler:
         self.vectorized = vectorized
         self.sample = sample
         self.kernel = kernel
+        if max_attempts is None:
+            max_attempts = max(
+                10_000, int(options["walks"]) * int(options["replacement_chains"])
+            )
         self.max_attempts = max_attempts
 
-        replacement_chains = kwargs.get("replacement_chains", 1)
+        replacement_chains = options["replacement_chains"]
         if (
             not isinstance(replacement_chains, int)
             or isinstance(replacement_chains, bool)
@@ -133,7 +189,7 @@ class NestedSampler:
                 "replacement_chains is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
-        replacement_chain_schedule = kwargs.get("replacement_chain_schedule")
+        replacement_chain_schedule = options["replacement_chain_schedule"]
         if replacement_chain_schedule is not None and not (
             sample == "rwalk" and kernel == "jax"
         ):
@@ -141,22 +197,30 @@ class NestedSampler:
                 "replacement_chain_schedule is currently supported only for "
                 "sample='rwalk', kernel='jax'"
             )
-        if kwargs.get("rwalk_proposal", "isotropic") != "isotropic":
-            raise ValueError(
-                "rwalk_proposal='live-cov' has been removed; only "
-                "rwalk_proposal='isotropic' is supported"
+        rwalk_proposal = options["rwalk_proposal"]
+        if rwalk_proposal not in RWALK_PROPOSALS:
+            raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
+        if rwalk_proposal == "live-cov" and not (
+            sample == "rwalk"
+            and kernel == "jax"
+            and bound == "none"
+            and replacement_chain_schedule is None
+        ):
+            raise NotImplementedError(
+                "rwalk_proposal='live-cov' is supported only for sample='rwalk', "
+                "kernel='jax', bound='none' and a fixed replacement_chains"
             )
-        if bool(kwargs.get("rwalk_adaptive_step_scale", False)) and not (
+        if bool(options["rwalk_adaptive_step_scale"]) and not (
             sample == "rwalk" and kernel == "jax"
         ):
             raise ValueError(
                 "rwalk_adaptive_step_scale=True is supported only for "
                 "sample='rwalk', kernel='jax'"
             )
-        if not (0.0 < float(kwargs.get("rwalk_target_accept", 0.25)) < 1.0):
+        if not (0.0 < float(options["rwalk_target_accept"]) < 1.0):
             raise ValueError("rwalk_target_accept must be between 0 and 1")
-        fused_bound_rwalk = bool(kwargs.get("fused_bound_rwalk", False))
-        jax_block_size = kwargs.get("jax_block_size", 1)
+        fused_bound_rwalk = bool(options["fused_bound_rwalk"])
+        jax_block_size = options["jax_block_size"]
         if (
             not isinstance(jax_block_size, int)
             or isinstance(jax_block_size, bool)
@@ -205,6 +269,8 @@ class NestedSampler:
                 stacklevel=2,
             )
         self.kwargs = dict(kwargs)
+        # Resolved options, forwarded to run_static_nested and checkpointed.
+        self._options = options
 
     def run(
         self,
@@ -230,7 +296,6 @@ class NestedSampler:
             dlogz=dlogz,
             maxiter=maxiter,
             sample=self.sample,
-            kernel=self.kernel,
             vectorized=self.vectorized,
             max_attempts=self.max_attempts,
             progress=progress,
@@ -239,47 +304,12 @@ class NestedSampler:
             callback_interval=callback_interval,
             checkpoint_path=checkpoint_path,
             checkpoint_interval=checkpoint_interval,
-            walks=self.kwargs.get("walks", 25),
-            step_scale=self.kwargs.get("step_scale", 0.1),
-            batch_size=self.kwargs.get("batch_size", 128),
-            min_accepts=self.kwargs.get("min_accepts", 1),
-            replacement_chains=self.kwargs.get("replacement_chains", 1),
-            replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
-            rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
-            bound=self.kwargs.get("bound", "none"),
-            bound_enlargement=self.kwargs.get("bound_enlargement", 1.25),
-            bound_update_interval=self.kwargs.get("bound_update_interval", 1),
-            bound_jitter=self.kwargs.get("bound_jitter", 1e-6),
-            bound_max_draws=self.kwargs.get("bound_max_draws"),
-            multi_bound_max_ellipsoids=self.kwargs.get(
-                "multi_bound_max_ellipsoids", 32
-            ),
-            multi_bound_min_points=self.kwargs.get("multi_bound_min_points"),
-            multi_bound_split_threshold=self.kwargs.get(
-                "multi_bound_split_threshold", 0.9
-            ),
-            multi_bound_enlargement=self.kwargs.get("multi_bound_enlargement"),
-            multi_bound_overlap_correction=self.kwargs.get(
-                "multi_bound_overlap_correction", True
-            ),
-            rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
-            rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
-            bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
-            allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
-            fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
-            bound_rebuild_on_failure=self.kwargs.get("bound_rebuild_on_failure", False),
-            bound_failure_rebuild_threshold=self.kwargs.get(
-                "bound_failure_rebuild_threshold", 1
-            ),
-            jax_vectorized=self.kwargs.get("jax_vectorized", False),
-            jax_block_size=self.kwargs.get("jax_block_size", 1),
-            rwalk_adaptive_step_scale=self.kwargs.get(
-                "rwalk_adaptive_step_scale", False
-            ),
-            rwalk_target_accept=self.kwargs.get("rwalk_target_accept", 0.25),
+            **self._options,
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
+        options = self._options
+        schedule = options["replacement_chain_schedule"]
         return {
             "ndim": int(self.ndim),
             "nlive": int(self.nlive),
@@ -287,56 +317,48 @@ class NestedSampler:
             "kernel": str(self.kernel),
             "vectorized": bool(self.vectorized),
             "max_attempts": int(self.max_attempts),
-            "batch_size": int(self.kwargs.get("batch_size", 128)),
-            "walks": int(self.kwargs.get("walks", 25)),
-            "step_scale": float(self.kwargs.get("step_scale", 0.1)),
-            "min_accepts": int(self.kwargs.get("min_accepts", 1)),
-            "replacement_chains": int(self.kwargs.get("replacement_chains", 1)),
-            "rwalk_proposal": str(self.kwargs.get("rwalk_proposal", "isotropic")),
-            "replacement_chain_schedule": (
-                None
-                if self.kwargs.get("replacement_chain_schedule") is None
-                else list(self.kwargs.get("replacement_chain_schedule"))
-            ),
-            "bound": str(self.kwargs.get("bound", "none")),
-            "bound_enlargement": float(self.kwargs.get("bound_enlargement", 1.25)),
-            "bound_update_interval": int(self.kwargs.get("bound_update_interval", 1)),
-            "bound_jitter": float(self.kwargs.get("bound_jitter", 1e-6)),
-            "bound_max_draws": self.kwargs.get("bound_max_draws"),
-            "multi_bound_max_ellipsoids": int(
-                self.kwargs.get("multi_bound_max_ellipsoids", 32)
-            ),
-            "multi_bound_min_points": self.kwargs.get("multi_bound_min_points"),
+            "batch_size": int(options["batch_size"]),
+            "walks": int(options["walks"]),
+            "step_scale": float(options["step_scale"]),
+            "min_accepts": int(options["min_accepts"]),
+            "replacement_chains": int(options["replacement_chains"]),
+            "rwalk_proposal": str(options["rwalk_proposal"]),
+            "replacement_chain_schedule": None if schedule is None else list(schedule),
+            "bound": str(options["bound"]),
+            "bound_enlargement": float(options["bound_enlargement"]),
+            "bound_update_interval": int(options["bound_update_interval"]),
+            "bound_jitter": float(options["bound_jitter"]),
+            "bound_max_draws": options["bound_max_draws"],
+            "multi_bound_max_ellipsoids": int(options["multi_bound_max_ellipsoids"]),
+            "multi_bound_min_points": options["multi_bound_min_points"],
             "multi_bound_split_threshold": float(
-                self.kwargs.get("multi_bound_split_threshold", 0.9)
+                options["multi_bound_split_threshold"]
             ),
-            "multi_bound_enlargement": self.kwargs.get("multi_bound_enlargement"),
+            "multi_bound_enlargement": options["multi_bound_enlargement"],
             "multi_bound_overlap_correction": bool(
-                self.kwargs.get("multi_bound_overlap_correction", True)
+                options["multi_bound_overlap_correction"]
             ),
-            "rwalk_seed": str(self.kwargs.get("rwalk_seed", "live")),
-            "rwalk_seed_fallback": bool(self.kwargs.get("rwalk_seed_fallback", True)),
+            "rwalk_seed": str(options["rwalk_seed"]),
+            "rwalk_seed_fallback": bool(options["rwalk_seed_fallback"]),
             "bound_seed_kernel": (
                 "jax"
-                if self.kwargs.get("fused_bound_rwalk", False)
-                else str(self.kwargs.get("bound_seed_kernel", "python"))
+                if options["fused_bound_rwalk"]
+                else str(options["bound_seed_kernel"])
             ),
-            "allow_unused_bound": bool(self.kwargs.get("allow_unused_bound", False)),
-            "fused_bound_rwalk": bool(self.kwargs.get("fused_bound_rwalk", False)),
-            "bound_rebuild_on_failure": bool(
-                self.kwargs.get("bound_rebuild_on_failure", False)
-            ),
+            "allow_unused_bound": bool(options["allow_unused_bound"]),
+            "fused_bound_rwalk": bool(options["fused_bound_rwalk"]),
+            "bound_rebuild_on_failure": bool(options["bound_rebuild_on_failure"]),
             "bound_failure_rebuild_threshold": int(
-                self.kwargs.get("bound_failure_rebuild_threshold", 1)
+                options["bound_failure_rebuild_threshold"]
             ),
-            "jax_vectorized": bool(self.kwargs.get("jax_vectorized", False)),
-            "jax_block_size": int(self.kwargs.get("jax_block_size", 1)),
+            "jax_vectorized": bool(options["jax_vectorized"]),
+            "jax_block_size": int(options["jax_block_size"]),
+            # live-cov always adapts its step scale (see run_static_nested).
             "rwalk_adaptive_step_scale": bool(
-                self.kwargs.get("rwalk_adaptive_step_scale", False)
+                options["rwalk_adaptive_step_scale"]
+                or options["rwalk_proposal"] == "live-cov"
             ),
-            "rwalk_target_accept": float(
-                self.kwargs.get("rwalk_target_accept", 0.25)
-            ),
+            "rwalk_target_accept": float(options["rwalk_target_accept"]),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
@@ -347,74 +369,14 @@ class NestedSampler:
             raise ValueError(
                 f"checkpoint kernel={checkpoint_config.get('kernel')!r} is invalid"
             )
-        for name in ("ndim", "nlive", "sample", "kernel", "vectorized"):
-            if checkpoint_config.get(name) != current[name]:
-                raise ValueError(
-                    f"checkpoint {name}={checkpoint_config.get(name)!r} is not "
-                    f"compatible with sampler {name}={current[name]!r}"
-                )
-        for name in (
-            "max_attempts",
-            "batch_size",
-            "walks",
-            "step_scale",
-            "min_accepts",
-            "replacement_chains",
-            "rwalk_proposal",
-            "replacement_chain_schedule",
-            "bound",
-            "bound_enlargement",
-            "bound_update_interval",
-            "bound_jitter",
-            "bound_max_draws",
-            "multi_bound_max_ellipsoids",
-            "multi_bound_min_points",
-            "multi_bound_split_threshold",
-            "multi_bound_enlargement",
-            "multi_bound_overlap_correction",
-            "rwalk_seed",
-            "rwalk_seed_fallback",
-            "bound_seed_kernel",
-            "allow_unused_bound",
-            "fused_bound_rwalk",
-            "bound_rebuild_on_failure",
-            "bound_failure_rebuild_threshold",
-            "jax_vectorized",
-            "jax_block_size",
-            "rwalk_adaptive_step_scale",
-            "rwalk_target_accept",
-        ):
-            default_values = {
-                "min_accepts": 1,
-                "replacement_chains": 1,
-                "rwalk_proposal": "isotropic",
-                "bound": "none",
-                "bound_enlargement": 1.25,
-                "bound_update_interval": 1,
-                "bound_jitter": 1e-6,
-                "bound_max_draws": None,
-                "multi_bound_max_ellipsoids": 32,
-                "multi_bound_min_points": None,
-                "multi_bound_split_threshold": 0.9,
-                "multi_bound_enlargement": None,
-                "multi_bound_overlap_correction": True,
-                "rwalk_seed": "live",
-                "rwalk_seed_fallback": True,
-                "bound_seed_kernel": "python",
-                "allow_unused_bound": False,
-                "fused_bound_rwalk": False,
-                "bound_rebuild_on_failure": False,
-                "bound_failure_rebuild_threshold": 1,
-                "jax_vectorized": False,
-                "jax_block_size": 1,
-                "rwalk_adaptive_step_scale": False,
-                "rwalk_target_accept": 0.25,
-            }
-            checkpoint_value = checkpoint_config.get(name, default_values.get(name))
-            if checkpoint_value != current[name]:
+        for name, current_value in current.items():
+            checkpoint_value = checkpoint_config.get(
+                name, _OLD_CHECKPOINT_DEFAULTS.get(name)
+            )
+            if checkpoint_value != current_value:
                 raise ValueError(
                     f"checkpoint {name}={checkpoint_value!r} is not "
-                    f"compatible with sampler {name}={current[name]!r}"
+                    f"compatible with sampler {name}={current_value!r}"
                 )
 
     def resume(
@@ -451,7 +413,6 @@ class NestedSampler:
             dlogz=dlogz,
             maxiter=maxiter,
             sample=self.sample,
-            kernel=self.kernel,
             vectorized=self.vectorized,
             max_attempts=self.max_attempts,
             progress=progress,
@@ -461,42 +422,5 @@ class NestedSampler:
             checkpoint_path=output_path,
             checkpoint_interval=checkpoint_interval,
             initial_state=state,
-            walks=self.kwargs.get("walks", 25),
-            step_scale=self.kwargs.get("step_scale", 0.1),
-            batch_size=self.kwargs.get("batch_size", 128),
-            min_accepts=self.kwargs.get("min_accepts", 1),
-            replacement_chains=self.kwargs.get("replacement_chains", 1),
-            replacement_chain_schedule=self.kwargs.get("replacement_chain_schedule"),
-            rwalk_proposal=self.kwargs.get("rwalk_proposal", "isotropic"),
-            bound=self.kwargs.get("bound", "none"),
-            bound_enlargement=self.kwargs.get("bound_enlargement", 1.25),
-            bound_update_interval=self.kwargs.get("bound_update_interval", 1),
-            bound_jitter=self.kwargs.get("bound_jitter", 1e-6),
-            bound_max_draws=self.kwargs.get("bound_max_draws"),
-            multi_bound_max_ellipsoids=self.kwargs.get(
-                "multi_bound_max_ellipsoids", 32
-            ),
-            multi_bound_min_points=self.kwargs.get("multi_bound_min_points"),
-            multi_bound_split_threshold=self.kwargs.get(
-                "multi_bound_split_threshold", 0.9
-            ),
-            multi_bound_enlargement=self.kwargs.get("multi_bound_enlargement"),
-            multi_bound_overlap_correction=self.kwargs.get(
-                "multi_bound_overlap_correction", True
-            ),
-            rwalk_seed=self.kwargs.get("rwalk_seed", "live"),
-            rwalk_seed_fallback=self.kwargs.get("rwalk_seed_fallback", True),
-            bound_seed_kernel=self.kwargs.get("bound_seed_kernel", "python"),
-            allow_unused_bound=self.kwargs.get("allow_unused_bound", False),
-            fused_bound_rwalk=self.kwargs.get("fused_bound_rwalk", False),
-            bound_rebuild_on_failure=self.kwargs.get("bound_rebuild_on_failure", False),
-            bound_failure_rebuild_threshold=self.kwargs.get(
-                "bound_failure_rebuild_threshold", 1
-            ),
-            jax_vectorized=self.kwargs.get("jax_vectorized", False),
-            jax_block_size=self.kwargs.get("jax_block_size", 1),
-            rwalk_adaptive_step_scale=self.kwargs.get(
-                "rwalk_adaptive_step_scale", False
-            ),
-            rwalk_target_accept=self.kwargs.get("rwalk_target_accept", 0.25),
+            **self._options,
         )

@@ -99,6 +99,9 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
         "min_accepts": args.min_accepts,
         "kernel": args.kernel,
         "replacement_chains": args.replacement_chains,
+        # Pin the isotropic per-iteration path this harness was calibrated on.
+        "rwalk_proposal": "isotropic",
+        "jax_block_size": 1,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks

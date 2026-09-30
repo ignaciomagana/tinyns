@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax import random
 
@@ -39,6 +40,7 @@ def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None
         prior_transform,
         ndim=1,
         nlive=100,
+        sample="prior",
         dlogz=0.05,
         maxiter=2_000,
     )
@@ -54,6 +56,7 @@ def test_result_shapes_finite_logz_and_equal_resampling() -> None:
         lambda u: 2.0 * u - 1.0,
         ndim=3,
         nlive=40,
+        sample="prior",
         dlogz=0.1,
         maxiter=500,
     )
@@ -73,6 +76,7 @@ def test_static_nested_result_counts_match_metadata() -> None:
         lambda u: u,
         ndim=2,
         nlive=12,
+        sample="prior",
         dlogz=0.0,
         maxiter=5,
     )
@@ -102,6 +106,7 @@ def test_failure_to_replace_returns_result_with_live_contribution() -> None:
         lambda u: u,
         ndim=1,
         nlive=3,
+        sample="prior",
         dlogz=0.0,
         maxiter=10,
         max_attempts=1,
@@ -122,6 +127,7 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
         lambda u: u[0],
         ndim=1,
         nlive=5,
+        sample="prior",
         maxiter=2,
     )
 
@@ -147,6 +153,7 @@ def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
         prior_transform,
         ndim=1,
         nlive=40,
+        kernel="python",
         dlogz=0.1,
         maxiter=300,
         sample="rwalk",
@@ -167,6 +174,7 @@ def test_replacement_stats_metadata_after_normal_run() -> None:
         lambda u: u,
         ndim=2,
         nlive=10,
+        sample="prior",
         dlogz=0.1,
         maxiter=20,
     )
@@ -206,6 +214,7 @@ def test_insertion_indices_metadata_after_normal_run() -> None:
         lambda u: u,
         ndim=2,
         nlive=10,
+        sample="prior",
         dlogz=0.1,
         maxiter=20,
     )
@@ -284,6 +293,7 @@ def test_failure_to_replace_increments_replacement_failures() -> None:
         lambda u: u,
         ndim=1,
         nlive=3,
+        sample="prior",
         dlogz=0.0,
         maxiter=10,
         max_attempts=1,
@@ -301,6 +311,7 @@ def test_vectorized_prior_constant_likelihood_returns_finite_logz() -> None:
         lambda u_batch: u_batch,
         ndim=2,
         nlive=20,
+        sample="prior",
         dlogz=0.1,
         maxiter=50,
         vectorized=True,
@@ -323,6 +334,7 @@ def test_vectorized_prior_1d_gaussian_returns_finite_logz() -> None:
         lambda u_batch: 20.0 * u_batch - 10.0,
         ndim=1,
         nlive=30,
+        sample="prior",
         dlogz=0.2,
         maxiter=100,
         vectorized=True,
@@ -341,6 +353,7 @@ def test_vectorized_loglike_correct_initial_shape_passes() -> None:
         lambda u_batch: u_batch,
         ndim=2,
         nlive=7,
+        sample="prior",
         maxiter=2,
         vectorized=True,
     )
@@ -357,6 +370,7 @@ def test_vectorized_loglike_scalar_initial_shape_raises() -> None:
             lambda u_batch: u_batch,
             ndim=2,
             nlive=7,
+            sample="prior",
             maxiter=1,
             vectorized=True,
         )
@@ -370,6 +384,7 @@ def test_vectorized_loglike_wrong_initial_shape_raises() -> None:
             lambda u_batch: u_batch,
             ndim=2,
             nlive=7,
+            sample="prior",
             maxiter=1,
             vectorized=True,
         )
@@ -542,6 +557,8 @@ def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
         kernel="jax",
         walks=5,
         step_scale=0.05,
+        rwalk_proposal="isotropic",
+        jax_block_size=1,
     )
     result = sampler.run(random.PRNGKey(0), dlogz=10.0)
 
@@ -562,13 +579,16 @@ def test_nested_sampler_rwalk_jax_block_size_one_matches_existing_path() -> None
         step_scale=0.05,
         maxiter=5,
         max_attempts=60,
+        rwalk_proposal="isotropic",
     )
+    # jax_block_size=1 was the default before the fast path; pass it explicitly.
     existing = run_static_nested(
         random.PRNGKey(10),
         _jax_loglike,
         _jax_prior_transform,
         2,
         15,
+        jax_block_size=1,
         **base_kwargs,
     )
     block_one = run_static_nested(
@@ -763,10 +783,10 @@ def test_schedule_with_block_size_gt_one_raises() -> None:
         )
 
 
-def test_live_cov_proposal_rejected() -> None:
+def test_unknown_rwalk_proposal_rejected() -> None:
     from tinyns import NestedSampler
 
-    with pytest.raises(ValueError, match="live-cov"):
+    with pytest.raises(ValueError, match="rwalk_proposal"):
         NestedSampler(
             _jax_loglike,
             _jax_prior_transform,
@@ -774,20 +794,72 @@ def test_live_cov_proposal_rejected() -> None:
             nlive=20,
             sample="rwalk",
             kernel="jax",
-            rwalk_proposal="live-cov",
+            rwalk_proposal="ellipsoid",
         )
 
-    with pytest.raises(ValueError, match="live-cov"):
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"kernel": "python"},
+        {"bound": "single", "rwalk_seed": "bound"},
+        {"replacement_chain_schedule": (1, 2)},
+    ],
+)
+def test_live_cov_proposal_requires_unbounded_jax_rwalk(extra) -> None:
+    kwargs = {"sample": "rwalk", "kernel": "jax", "rwalk_proposal": "live-cov"}
+    kwargs.update(extra)
+    with pytest.raises(NotImplementedError, match="live-cov"):
         run_static_nested(
-            random.PRNGKey(15),
-            _jax_loglike,
-            _jax_prior_transform,
-            2,
-            20,
-            sample="rwalk",
-            kernel="jax",
-            rwalk_proposal="live-cov",
+            random.PRNGKey(15), _jax_loglike, _jax_prior_transform, 2, 20, **kwargs
         )
+
+
+def test_live_cov_cholesky_handles_degenerate_live_set() -> None:
+    from tinyns.samplers import live_cov_cholesky
+
+    live_u = jnp.tile(jnp.asarray([[0.3, 0.7, 0.5]]), (8, 1))
+    chol = live_cov_cholesky(live_u)
+    assert chol.shape == (3, 3)
+    assert bool(jnp.all(jnp.isfinite(chol)))
+
+    rng = np.random.default_rng(0)
+    points = rng.uniform(size=(400, 2))
+    chol = live_cov_cholesky(jnp.asarray(points))
+    np.testing.assert_allclose(chol @ chol.T, np.cov(points.T), rtol=1e-6)
+
+
+@pytest.mark.parametrize("jax_block_size", [1, 8])
+def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(jax_block_size) -> None:
+    """A narrow, strongly correlated 2D Gaussian under a wide box prior."""
+    width = 20.0
+    cov = np.array([[1.0, 0.95 * 0.05], [0.95 * 0.05, 0.05**2]])
+    prec = jnp.asarray(np.linalg.inv(cov))
+    norm = -0.5 * (2 * math.log(2 * math.pi) + math.log(np.linalg.det(cov)))
+
+    def loglike(theta):
+        return norm - 0.5 * theta @ prec @ theta
+
+    def prior_transform(u):
+        return -0.5 * width + width * u
+
+    result = run_static_nested(
+        random.PRNGKey(3),
+        loglike,
+        prior_transform,
+        2,
+        200,
+        sample="rwalk",
+        kernel="jax",
+        rwalk_proposal="live-cov",
+        walks=25,
+        jax_block_size=jax_block_size,
+    )
+    assert result.success
+    assert abs(result.logz - (-2 * math.log(width))) < 5 * result.logzerr
+    metadata = result.metadata
+    assert metadata["rwalk_adaptive_step_scale"] is True
+    assert 0.1 < metadata["rwalk_acceptance"] < 0.5
 
 
 def test_static_nested_multi_bound_fused_rwalk_chain_telemetry_regression() -> None:
@@ -969,6 +1041,7 @@ def test_static_nested_invalid_multi_bound_options_raise() -> None:
             lambda u: u,
             ndim=2,
             nlive=10,
+            sample="prior",
             bound="multi",
             multi_bound_max_ellipsoids=0,
         )
@@ -1663,6 +1736,7 @@ def test_rwalk_adaptive_step_scale_uses_low_move_acceptance_to_shrink(
         kernel="jax",
         walks=5,
         step_scale=0.1,
+        rwalk_proposal="isotropic",
         jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.25,
@@ -1704,6 +1778,7 @@ def test_rwalk_adaptive_step_scale_uses_high_move_acceptance_to_grow(
         kernel="jax",
         walks=5,
         step_scale=0.1,
+        rwalk_proposal="isotropic",
         jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.25,
@@ -1726,6 +1801,7 @@ def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None
         kernel="jax",
         walks=5,
         step_scale=0.05,
+        rwalk_proposal="isotropic",
         jax_block_size=4,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.25,
