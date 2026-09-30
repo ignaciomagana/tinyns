@@ -152,6 +152,7 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "replacement_chains": args.replacement_chains,
         "replacement_chain_schedule": args.replacement_chain_schedule,
         "rwalk_proposal": args.rwalk_proposal,
+        "jax_block_size": 1,
         "bound": args.bound,
         "bound_enlargement": args.bound_enlargement,
         "bound_update_interval": args.bound_update_interval,

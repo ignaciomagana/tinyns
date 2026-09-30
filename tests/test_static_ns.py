@@ -40,6 +40,7 @@ def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None
         prior_transform,
         ndim=1,
         nlive=100,
+        sample="prior",
         dlogz=0.05,
         maxiter=2_000,
     )
@@ -55,6 +56,7 @@ def test_result_shapes_finite_logz_and_equal_resampling() -> None:
         lambda u: 2.0 * u - 1.0,
         ndim=3,
         nlive=40,
+        sample="prior",
         dlogz=0.1,
         maxiter=500,
     )
@@ -74,6 +76,7 @@ def test_static_nested_result_counts_match_metadata() -> None:
         lambda u: u,
         ndim=2,
         nlive=12,
+        sample="prior",
         dlogz=0.0,
         maxiter=5,
     )
@@ -103,6 +106,7 @@ def test_failure_to_replace_returns_result_with_live_contribution() -> None:
         lambda u: u,
         ndim=1,
         nlive=3,
+        sample="prior",
         dlogz=0.0,
         maxiter=10,
         max_attempts=1,
@@ -123,6 +127,7 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
         lambda u: u[0],
         ndim=1,
         nlive=5,
+        sample="prior",
         maxiter=2,
     )
 
@@ -148,6 +153,7 @@ def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
         prior_transform,
         ndim=1,
         nlive=40,
+        kernel="python",
         dlogz=0.1,
         maxiter=300,
         sample="rwalk",
@@ -168,6 +174,7 @@ def test_replacement_stats_metadata_after_normal_run() -> None:
         lambda u: u,
         ndim=2,
         nlive=10,
+        sample="prior",
         dlogz=0.1,
         maxiter=20,
     )
@@ -207,6 +214,7 @@ def test_insertion_indices_metadata_after_normal_run() -> None:
         lambda u: u,
         ndim=2,
         nlive=10,
+        sample="prior",
         dlogz=0.1,
         maxiter=20,
     )
@@ -285,6 +293,7 @@ def test_failure_to_replace_increments_replacement_failures() -> None:
         lambda u: u,
         ndim=1,
         nlive=3,
+        sample="prior",
         dlogz=0.0,
         maxiter=10,
         max_attempts=1,
@@ -302,6 +311,7 @@ def test_vectorized_prior_constant_likelihood_returns_finite_logz() -> None:
         lambda u_batch: u_batch,
         ndim=2,
         nlive=20,
+        sample="prior",
         dlogz=0.1,
         maxiter=50,
         vectorized=True,
@@ -324,6 +334,7 @@ def test_vectorized_prior_1d_gaussian_returns_finite_logz() -> None:
         lambda u_batch: 20.0 * u_batch - 10.0,
         ndim=1,
         nlive=30,
+        sample="prior",
         dlogz=0.2,
         maxiter=100,
         vectorized=True,
@@ -342,6 +353,7 @@ def test_vectorized_loglike_correct_initial_shape_passes() -> None:
         lambda u_batch: u_batch,
         ndim=2,
         nlive=7,
+        sample="prior",
         maxiter=2,
         vectorized=True,
     )
@@ -358,6 +370,7 @@ def test_vectorized_loglike_scalar_initial_shape_raises() -> None:
             lambda u_batch: u_batch,
             ndim=2,
             nlive=7,
+            sample="prior",
             maxiter=1,
             vectorized=True,
         )
@@ -371,6 +384,7 @@ def test_vectorized_loglike_wrong_initial_shape_raises() -> None:
             lambda u_batch: u_batch,
             ndim=2,
             nlive=7,
+            sample="prior",
             maxiter=1,
             vectorized=True,
         )
@@ -543,6 +557,8 @@ def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
         kernel="jax",
         walks=5,
         step_scale=0.05,
+        rwalk_proposal="isotropic",
+        jax_block_size=1,
     )
     result = sampler.run(random.PRNGKey(0), dlogz=10.0)
 
@@ -563,13 +579,16 @@ def test_nested_sampler_rwalk_jax_block_size_one_matches_existing_path() -> None
         step_scale=0.05,
         maxiter=5,
         max_attempts=60,
+        rwalk_proposal="isotropic",
     )
+    # jax_block_size=1 was the default before the fast path; pass it explicitly.
     existing = run_static_nested(
         random.PRNGKey(10),
         _jax_loglike,
         _jax_prior_transform,
         2,
         15,
+        jax_block_size=1,
         **base_kwargs,
     )
     block_one = run_static_nested(
@@ -1022,6 +1041,7 @@ def test_static_nested_invalid_multi_bound_options_raise() -> None:
             lambda u: u,
             ndim=2,
             nlive=10,
+            sample="prior",
             bound="multi",
             multi_bound_max_ellipsoids=0,
         )
@@ -1716,6 +1736,7 @@ def test_rwalk_adaptive_step_scale_uses_low_move_acceptance_to_shrink(
         kernel="jax",
         walks=5,
         step_scale=0.1,
+        rwalk_proposal="isotropic",
         jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.25,
@@ -1757,6 +1778,7 @@ def test_rwalk_adaptive_step_scale_uses_high_move_acceptance_to_grow(
         kernel="jax",
         walks=5,
         step_scale=0.1,
+        rwalk_proposal="isotropic",
         jax_block_size=1,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.25,
@@ -1779,6 +1801,7 @@ def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None
         kernel="jax",
         walks=5,
         step_scale=0.05,
+        rwalk_proposal="isotropic",
         jax_block_size=4,
         rwalk_adaptive_step_scale=True,
         rwalk_target_accept=0.25,

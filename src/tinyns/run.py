@@ -41,6 +41,49 @@ from tinyns.state import NestedRunState, save_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 
+def _resolve_defaults(ndim: int, sample: str, options) -> dict:
+    """Resolve the ``None`` (fast-path) defaults of the rwalk options.
+
+    ``kernel`` defaults to ``"jax"`` for ``sample="rwalk"``. Where live-cov is
+    supported (unbounded JAX rwalk with a fixed ``replacement_chains``) the
+    proposal defaults to ``"live-cov"`` and ``jax_block_size`` to 32 (1 with
+    ``jax_vectorized``); elsewhere they fall back to ``"isotropic"`` and 1. An
+    explicit ``"live-cov"`` is not overridden, so an unsupported combination
+    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` and the initial
+    ``step_scale`` to 0.5 for live-cov, 0.1 for isotropic. Explicit values
+    pass through unchanged.
+    """
+
+    kernel = options["kernel"]
+    if kernel is None:
+        kernel = "jax" if sample == "rwalk" else "python"
+    fast_path = (
+        sample == "rwalk"
+        and kernel == "jax"
+        and options["bound"] == "none"
+        and options["replacement_chain_schedule"] is None
+    )
+    proposal = options["rwalk_proposal"]
+    if proposal is None:
+        proposal = "live-cov" if fast_path else "isotropic"
+    step_scale = options["step_scale"]
+    if step_scale is None:
+        step_scale = 0.5 if proposal == "live-cov" else 0.1
+    walks = options["walks"]
+    if walks is None:
+        walks = max(25, 6 * int(ndim))
+    jax_block_size = options["jax_block_size"]
+    if jax_block_size is None:
+        jax_block_size = 32 if fast_path and not options["jax_vectorized"] else 1
+    return {
+        "kernel": kernel,
+        "walks": walks,
+        "step_scale": step_scale,
+        "rwalk_proposal": proposal,
+        "jax_block_size": jax_block_size,
+    }
+
+
 def _as_points(array, ndim: int):
     """Return an array with trailing dimension ``ndim`` for sample points."""
 
@@ -790,8 +833,8 @@ def run_static_nested(
     *,
     dlogz: float = 0.1,
     maxiter: int | None = None,
-    sample: str = "prior",
-    kernel: str = "python",
+    sample: str = "rwalk",
+    kernel: str | None = None,
     vectorized: bool = False,
     max_attempts: int = 10_000,
     progress: bool = False,
@@ -799,12 +842,12 @@ def run_static_nested(
     callback=None,
     callback_interval: int = 100,
     batch_size: int = 128,
-    walks: int = 25,
-    step_scale: float = 0.1,
+    walks: int | None = None,
+    step_scale: float | None = None,
     min_accepts: int = 1,
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
-    rwalk_proposal: str = "isotropic",
+    rwalk_proposal: str | None = None,
     bound: str = "none",
     bound_enlargement: float = 1.25,
     bound_update_interval: int = 1,
@@ -823,7 +866,7 @@ def run_static_nested(
     allow_unused_bound: bool = False,
     fused_bound_rwalk: bool = False,
     jax_vectorized: bool = False,
-    jax_block_size: int = 1,
+    jax_block_size: int | None = None,
     rwalk_adaptive_step_scale: bool = False,
     rwalk_target_accept: float = 0.25,
     initial_state: NestedRunState | None = None,
@@ -832,12 +875,34 @@ def run_static_nested(
 ):
     """Run a simple static nested-sampling loop.
 
-    The replacement ``sample`` strategy may be ``"prior"`` or ``"rwalk"``.
+    The replacement ``sample`` strategy may be ``"rwalk"`` (default) or
+    ``"prior"``. ``None`` options (``kernel``, ``walks``, ``step_scale``,
+    ``rwalk_proposal``, ``jax_block_size``) resolve to the fast path where it
+    is supported; see :func:`_resolve_defaults`.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
+    resolved = _resolve_defaults(
+        ndim,
+        sample,
+        {
+            "kernel": kernel,
+            "bound": bound,
+            "replacement_chain_schedule": replacement_chain_schedule,
+            "jax_vectorized": jax_vectorized,
+            "walks": walks,
+            "step_scale": step_scale,
+            "rwalk_proposal": rwalk_proposal,
+            "jax_block_size": jax_block_size,
+        },
+    )
+    kernel = resolved["kernel"]
+    walks = resolved["walks"]
+    step_scale = resolved["step_scale"]
+    rwalk_proposal = resolved["rwalk_proposal"]
+    jax_block_size = resolved["jax_block_size"]
     if sample not in {"prior", "rwalk"}:
         raise ValueError("sample must be one of {'prior', 'rwalk'}")
     if kernel not in {"python", "jax"}:

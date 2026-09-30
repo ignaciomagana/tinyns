@@ -135,7 +135,7 @@ def test_nested_sampler_vectorized_rwalk_raises_on_run() -> None:
 
 
 def test_nested_sampler_run_returns_result() -> None:
-    sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=20)
+    sampler = NestedSampler(loglike, prior_transform, ndim=3, nlive=20, sample="prior")
 
     result = sampler.run(
         key=np.array([0, 0], dtype=np.uint32),
@@ -169,6 +169,7 @@ def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
         ndim=1,
         nlive=40,
         sample="rwalk",
+        kernel="python",
         walks=5,
         step_scale=0.2,
         min_accepts=2,
@@ -215,4 +216,148 @@ def test_rwalk_adaptive_step_scale_validates_public_args() -> None:
             sample="rwalk",
             kernel="python",
             rwalk_adaptive_step_scale=True,
+        )
+
+
+def _jax_gaussian_loglike(theta):
+    return -0.5 * jnp.sum(theta**2)
+
+
+def _jax_box_prior(unit):
+    return 10.0 * unit - 5.0
+
+
+def _run_metadata(result) -> dict:
+    keys = ("sample", "kernel", "rwalk_proposal", "walks", "step_scale")
+    return {key: result.metadata[key] for key in keys}
+
+
+def test_default_sampler_runs_live_cov_fast_path() -> None:
+    sampler = NestedSampler(_jax_gaussian_loglike, _jax_box_prior, ndim=2, nlive=40)
+    result = sampler.run(np.array([0, 7], dtype=np.uint32), maxiter=64)
+
+    assert sampler.sample == "rwalk"
+    assert sampler.kernel == "jax"
+    assert _run_metadata(result) == {
+        "sample": "rwalk",
+        "kernel": "jax",
+        "rwalk_proposal": "live-cov",
+        "walks": 25,
+        "step_scale": 0.5,
+    }
+    assert result.metadata["jax_block_size"] == 32
+    assert result.metadata["rwalk_adaptive_step_scale"] is True
+    assert math.isfinite(result.logz)
+
+
+def test_run_static_nested_defaults_match_nested_sampler() -> None:
+    key = np.array([0, 8], dtype=np.uint32)
+    direct = run_static_nested(
+        key, _jax_gaussian_loglike, _jax_box_prior, ndim=2, nlive=30, maxiter=32
+    )
+    facade = NestedSampler(_jax_gaussian_loglike, _jax_box_prior, ndim=2, nlive=30)
+    via_sampler = facade.run(key, maxiter=32)
+
+    assert _run_metadata(direct) == _run_metadata(via_sampler)
+    assert direct.metadata["jax_block_size"] == 32
+    np.testing.assert_allclose(direct.logl, via_sampler.logl)
+
+
+@pytest.mark.parametrize("ndim, walks", [(1, 25), (4, 25), (5, 30), (10, 60)])
+def test_default_walks_is_max_25_or_six_ndim(ndim: int, walks: int) -> None:
+    sampler = NestedSampler(_jax_gaussian_loglike, _jax_box_prior, ndim=ndim)
+
+    assert sampler._checkpoint_config()["walks"] == walks
+
+
+def test_default_walks_reaches_run_metadata() -> None:
+    result = run_static_nested(
+        np.array([0, 9], dtype=np.uint32),
+        _jax_gaussian_loglike,
+        _jax_box_prior,
+        ndim=5,
+        nlive=20,
+        maxiter=2,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["walks"] == 30
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"kernel": "python"},
+        {"bound": "single", "rwalk_seed": "bound"},
+        {"replacement_chain_schedule": (1, 2)},
+    ],
+)
+def test_default_proposal_falls_back_to_isotropic(extra) -> None:
+    sampler = NestedSampler(
+        _jax_gaussian_loglike, _jax_box_prior, ndim=2, nlive=20, walks=5, **extra
+    )
+    config = sampler._checkpoint_config()
+    assert config["rwalk_proposal"] == "isotropic"
+    assert config["step_scale"] == 0.1
+    assert config["jax_block_size"] == 1
+    assert config["rwalk_adaptive_step_scale"] is False
+
+    result = sampler.run(np.array([1, 9], dtype=np.uint32), maxiter=3, dlogz=0.0)
+    assert result.metadata["rwalk_proposal"] == "isotropic"
+    assert result.metadata["step_scale"] == 0.1
+
+
+def test_run_static_nested_python_kernel_falls_back_to_isotropic() -> None:
+    result = run_static_nested(
+        np.array([2, 9], dtype=np.uint32),
+        loglike,
+        prior_transform,
+        ndim=2,
+        nlive=10,
+        kernel="python",
+        walks=3,
+        maxiter=3,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["rwalk_proposal"] == "isotropic"
+    assert result.metadata["jax_block_size"] == 1
+
+
+def test_prior_sampler_defaults_to_python_kernel() -> None:
+    sampler = NestedSampler(loglike, prior_transform, ndim=2, sample="prior")
+
+    assert sampler.kernel == "python"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"kernel": "python"},
+        {"bound": "single", "rwalk_seed": "bound"},
+        {"replacement_chain_schedule": (1, 2)},
+    ],
+)
+def test_explicit_live_cov_in_unsupported_combination_raises(extra) -> None:
+    with pytest.raises(NotImplementedError, match="live-cov"):
+        NestedSampler(
+            loglike,
+            prior_transform,
+            ndim=2,
+            rwalk_proposal="live-cov",
+            **extra,
+        )
+
+
+def test_run_static_nested_explicit_live_cov_python_kernel_raises() -> None:
+    with pytest.raises(NotImplementedError, match="live-cov"):
+        run_static_nested(
+            np.array([3, 9], dtype=np.uint32),
+            loglike,
+            prior_transform,
+            ndim=2,
+            nlive=10,
+            kernel="python",
+            rwalk_proposal="live-cov",
+            maxiter=1,
         )
