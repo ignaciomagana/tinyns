@@ -826,7 +826,9 @@ def test_live_cov_cholesky_handles_degenerate_live_set() -> None:
     rng = np.random.default_rng(0)
     points = rng.uniform(size=(400, 2))
     chol = live_cov_cholesky(jnp.asarray(points))
-    np.testing.assert_allclose(chol @ chol.T, np.cov(points.T), rtol=1e-6)
+    # float32 (CI default) tolerance: the helper adds a ~1e-6 relative diagonal
+    # jitter, and the off-diagonal covariance of uniform points is near zero.
+    np.testing.assert_allclose(chol @ chol.T, np.cov(points.T), rtol=1e-4, atol=1e-6)
 
 
 @pytest.mark.parametrize("jax_block_size", [1, 8])
