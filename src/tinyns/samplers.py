@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from functools import lru_cache
 
@@ -22,6 +23,24 @@ from tinyns.bounds import (
 )
 from tinyns.math import reflect_unit_cube
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
+
+try:  # jaxpr evaluation moved between JAX versions; hoisting is optional.
+    from jax.extend.core import eval_jaxpr as _eval_jaxpr
+except ImportError:
+    try:
+        from jax.core import eval_jaxpr as _eval_jaxpr
+    except ImportError:
+        _eval_jaxpr = None
+try:
+    from jax.core import Tracer as _Tracer
+except ImportError:
+    _Tracer = ()
+
+_logger = logging.getLogger(__name__)
+
+# Closure constants with at least this many elements become jit arguments on
+# the fast path (see _hoist_closure_consts); smaller ones stay embedded.
+_HOIST_MIN_SIZE = 4096
 
 
 class _IdentityCacheKey:
@@ -67,7 +86,9 @@ def _partition_callable(fn):
     :func:`_combine_callable`, so large data are not embedded as constants.
 
     A plain function or closure flattens to ``[fn]``: ``dynamic`` is empty and
-    :func:`_combine_callable` returns ``fn`` itself (closure semantics).
+    :func:`_combine_callable` returns ``fn`` itself (closure semantics). On the
+    fast path such callables have their large constants hoisted instead
+    (:func:`_split_callable`).
 
     Only the fast-path jit boundaries use this split: the unbounded rwalk
     kernel (:func:`_make_rwalk_jax_kernel_cached`, hence
@@ -100,9 +121,118 @@ def _combine_callable(dynamic, static):
     return jax.tree_util.tree_unflatten(treedef, leaves)
 
 
-def _callable_leaves(loglike, prior_transform):
+def _hoist_closure_consts(fn, example):
+    """Trace ``fn`` on ``example`` and lift its large constants to arguments.
+
+    Returns ``(hoisted, rebuild)`` or ``None``. ``hoisted`` holds the jaxpr
+    constants with at least ``_HOIST_MIN_SIZE`` elements, as device arrays;
+    ``rebuild(hoisted)`` returns a callable that evaluates the traced jaxpr
+    with them (smaller constants stay embedded, so they still fold). A call
+    whose arguments do not match ``example`` runs ``fn`` itself. ``None``
+    (closure semantics) means there is nothing to hoist or tracing failed.
+    """
+    if _eval_jaxpr is None:
+        return None
+    try:
+        closed, out_shape = jax.make_jaxpr(fn, return_shape=True)(example)
+        consts = list(closed.consts)
+        if any(isinstance(c, _Tracer) for c in consts):
+            return None  # traced under an outer transformation: do not cache
+        constvars = closed.jaxpr.constvars
+        big = [
+            i
+            for i, (c, var) in enumerate(zip(consts, constvars, strict=True))
+            if np.size(c) >= _HOIST_MIN_SIZE and jnp.shape(c) == var.aval.shape
+        ]
+        hoisted = tuple(
+            jnp.asarray(consts[i], dtype=constvars[i].aval.dtype) for i in big
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure keeps closure semantics
+        _logger.debug("tinyns: not hoisting constants of %r: %r", fn, exc)
+        return None
+    if not big:
+        return None
+    for i in big:
+        consts[i] = None  # keep only the small constants alive here
+    in_avals = [
+        (leaf.shape, leaf.dtype) for leaf in jax.tree_util.tree_leaves(example)
+    ]
+    in_tree = jax.tree_util.tree_structure((example,))
+    out_tree = jax.tree_util.tree_structure(out_shape)
+
+    def rebuild(leaves):
+        all_consts = list(consts)
+        for i, leaf in zip(big, leaves, strict=True):
+            all_consts[i] = leaf
+
+        def hoisted_fn(*args, **kwargs):
+            flat, tree = jax.tree_util.tree_flatten(args)
+            if kwargs or tree != in_tree or [
+                (jnp.shape(x), jnp.result_type(x)) for x in flat
+            ] != in_avals:
+                return fn(*args, **kwargs)
+            out = _eval_jaxpr(closed.jaxpr, all_consts, *flat)
+            return jax.tree_util.tree_unflatten(out_tree, out)
+
+        return hoisted_fn
+
+    return hoisted, rebuild
+
+
+def _split_callable(fn, example):
+    """Return ``(dynamic, rebuild)`` with ``rebuild(dynamic)`` the callable.
+
+    Pytree callables split into their array leaves (:func:`_partition_callable`).
+    A callable without array leaves (a plain function or closure) is traced on
+    ``example`` (unless it is ``None``) and its large jaxpr constants become
+    ``dynamic`` (:func:`_hoist_closure_consts`); otherwise ``dynamic`` is empty and
+    ``rebuild`` returns ``fn`` itself.
+    """
+    dynamic, static = _partition_callable(fn)
+    if dynamic:
+        return dynamic, lambda leaves: _combine_callable(leaves, static)
+    hoisted = None if example is None else _hoist_closure_consts(fn, example)
+    if hoisted is None:
+        return (), lambda leaves: fn
+    return hoisted
+
+
+@lru_cache(maxsize=32)
+def _split_callables_cached(loglike, prior_transform, ndim: int):
+    loglike = _unwrap_cacheable_callable(loglike)
+    prior_transform = _unwrap_cacheable_callable(prior_transform)
+    u_example = jax.ShapeDtypeStruct((ndim,), jnp.result_type(float))
+    prior_split = _split_callable(prior_transform, u_example)
+    try:
+        theta_shape = jax.eval_shape(prior_transform, u_example)
+        theta_dtype = jnp.result_type(*jax.tree_util.tree_leaves(theta_shape))
+    except Exception:  # noqa: BLE001 - loglike then keeps closure semantics
+        loglike_split = _split_callable(loglike, None)
+    else:
+        theta_example = jax.ShapeDtypeStruct((ndim,), theta_dtype)
+        loglike_split = _split_callable(loglike, theta_example)
+    return loglike_split, prior_split
+
+
+def _split_callables(loglike, prior_transform, ndim: int):
+    """Return cached ``((dynamic, rebuild), (dynamic, rebuild))`` for the fast path.
+
+    ``loglike`` is traced on a theta of shape ``(ndim,)`` with the dtype
+    ``prior_transform`` produces, ``prior_transform`` on a u of shape
+    ``(ndim,)``. The split is cached per callable identity and ``ndim``, so
+    the dynamic leaves are the same objects on every call.
+    """
+    return _split_callables_cached(
+        _cacheable_callable(loglike), _cacheable_callable(prior_transform), int(ndim)
+    )
+
+
+def _callable_leaves(loglike, prior_transform, ndim: int):
     """Return the dynamic leaves of ``loglike`` then ``prior_transform``."""
-    return _partition_callable(loglike)[0] + _partition_callable(prior_transform)[0]
+    (loglike_dynamic, _), (prior_dynamic, _) = _split_callables(
+        loglike, prior_transform, ndim
+    )
+    return tuple(loglike_dynamic) + tuple(prior_dynamic)
 
 
 def _validate_theta_shape(theta, ndim: int):
@@ -741,13 +871,14 @@ def _make_rwalk_jax_kernel_cached(
     ``logl_min`` whenever any exist.
 
     ``loglike`` and ``prior_transform`` may be JAX pytrees (for example
-    ``jax.tree_util.Partial(fn, data)``). Their array leaves are then trailing
+    ``jax.tree_util.Partial(fn, data)``). Their array leaves, or the large
+    constants of a closure (see :func:`_split_callable`), are then trailing
     arguments of ``kernel``: call it as ``kernel(key, ..., max_batches,
-    *_callable_leaves(loglike, prior_transform))`` and the callables are rebuilt
-    inside the trace, so the arrays are jit arguments rather than baked-in
-    constants. Called without them, ``kernel`` closes over the callables
-    (closure semantics). Plain functions and closures have no array leaves,
-    take no trailing arguments and are traced exactly as before.
+    *_callable_leaves(loglike, prior_transform, ndim))`` and the callables are
+    rebuilt inside the trace, so the arrays are jit arguments rather than
+    baked-in constants. Called without them, ``kernel`` closes over the
+    callables (closure semantics). Callables with neither take no trailing
+    arguments and are traced exactly as before.
     """
 
     if proposal not in RWALK_PROPOSALS:
@@ -755,11 +886,12 @@ def _make_rwalk_jax_kernel_cached(
     live_cov = proposal == "live-cov"
     loglike_closure = _unwrap_cacheable_callable(loglike)
     prior_closure = _unwrap_cacheable_callable(prior_transform)
-    loglike_dynamic, loglike_static = _partition_callable(loglike_closure)
-    prior_dynamic, prior_static = _partition_callable(prior_closure)
+    (loglike_dynamic, loglike_rebuild), (prior_dynamic, prior_rebuild) = (
+        _split_callables(loglike_closure, prior_closure, ndim)
+    )
     nloglike_leaves = len(loglike_dynamic)
     nprior_leaves = len(prior_dynamic)
-    # Only the static halves are kept; the array leaves arrive as arguments.
+    # Only the rebuild functions are kept; the array leaves arrive as arguments.
     del loglike_dynamic, prior_dynamic
 
     @jax.jit
@@ -782,12 +914,12 @@ def _make_rwalk_jax_kernel_cached(
                 f"array leaves, got {len(callable_leaves)}"
             )
         loglike = (
-            _combine_callable(callable_leaves[:nloglike_leaves], loglike_static)
+            loglike_rebuild(callable_leaves[:nloglike_leaves])
             if callable_leaves and nloglike_leaves
             else loglike_closure
         )
         prior_transform = (
-            _combine_callable(callable_leaves[nloglike_leaves:], prior_static)
+            prior_rebuild(callable_leaves[nloglike_leaves:])
             if callable_leaves and nprior_leaves
             else prior_closure
         )
@@ -1109,10 +1241,10 @@ def draw_constrained_rwalk_jax(
 ):
     """Draw a constrained replacement with a compiled JAX rwalk kernel.
 
-    Array leaves of pytree ``loglike`` / ``prior_transform`` callables (see
-    :func:`_partition_callable`) are passed to the compiled kernel as arguments.
-    ``np.ndarray`` leaves are copied to the device on every call; use
-    ``jax.Array`` leaves to avoid that.
+    Array leaves of pytree ``loglike`` / ``prior_transform`` callables, and the
+    large constants of closures (see :func:`_split_callable`), are passed to
+    the compiled kernel as arguments. ``np.ndarray`` pytree leaves are copied
+    to the device on every call; use ``jax.Array`` leaves to avoid that.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -1170,7 +1302,7 @@ def draw_constrained_rwalk_jax(
         jnp.asarray(step_scale),
         jnp.asarray(min_accepts),
         jnp.asarray(max_batches, dtype=jnp.int32),
-        *_callable_leaves(loglike, prior_transform),
+        *_callable_leaves(loglike, prior_transform, ndim),
     )
     if return_info:
         batches = int(math.ceil(int(ncall) / batch_ncall))

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 (unreleased)
+
+- On the fast path, closures now get the pytree-callable treatment automatically. A `loglike` or `prior_transform` without array leaves is traced once (`jax.make_jaxpr`), and every jaxpr constant with at least 4096 elements (a captured `jax.Array` or `np.ndarray`, including operands of a nested `jax.jit` call) is passed to the compiled kernels as a jit argument; smaller constants stay embedded. On a 1-D GW likelihood with 2.5M-row arrays (H100), the closure form took two backend compiles of 74 s and 78 s (first block after 172 s), and the pytree form 5.3 s and 6.8 s (first block after 23 s). A hoisted closure lowers to a program the same size as the pytree form, so it should now match the pytree timings (not yet re-measured on the GPU). There is no API change. Closures with only small constants and plain functions are not traced into a new form and give bit-identical results to v0.2.0. A hoisted closure gives the same results as the equivalent `jax.tree_util.Partial`. If tracing fails, the callable keeps closure semantics and one debug-level log message is emitted per callable. Arrays captured inside the body of an inner `jax.jit` function stay embedded. Pytree callables remain the explicit form.
+- `walks` now defaults to 12 in 1-D. In a 20-seed sweep, 1-D was unbiased from 10 walks (bias 0.2 x `logzerr`); from 2-D on, the default stays `max(25, 6 * ndim)`.
+
 ## v0.2.0 (unreleased)
 
 - Added `rwalk_proposal="live-cov"`: each rwalk step is `step_scale * L @ z`, with `L` the Cholesky factor of the live-point covariance in the unit cube. Moves that leave the cube are rejected rather than reflected, and the step scale always adapts toward `rwalk_target_accept`. It is supported for unbounded `sample="rwalk"`, `kernel="jax"` with a fixed `replacement_chains`; other combinations raise `NotImplementedError`.

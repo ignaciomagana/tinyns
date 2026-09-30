@@ -174,17 +174,25 @@ Passing `rwalk_proposal="live-cov"` explicitly in those combinations raises
 With `kernel="jax"`, the initial live points are evaluated in one compiled
 pass.
 
-If your likelihood carries large arrays, pass it as a pytree callable, for
-example `jax.tree_util.Partial(loglike_fn, data)` with `loglike_fn(data, theta)`,
-so the data are passed to the compiled kernels as arguments instead of being
-embedded as constants (faster compiles, less memory). The same holds for
-`prior_transform`, and for equinox-style modules or registered dataclasses with
-`__call__`: their `jax.Array` / `np.ndarray` leaves become kernel arguments, and
-everything else stays static. Use `jax.Array` leaves so the data move to the
-device once. A plain function or closure has no array leaves and behaves
-exactly as before. This applies to the fast path (unbounded JAX rwalk, block
-and per-iteration modes, and the rescue ladder); the bounded, fused-bounded and
-`replacement_chain_schedule` kernels still close over the callables.
+Large arrays used by `loglike` or `prior_transform` are passed to the compiled
+kernels as arguments instead of being embedded as constants (faster compiles,
+less memory). A closure gets this automatically: tinyns traces it once, and
+every captured array with at least 4096 elements, `jax.Array` or `np.ndarray`
+and including operands of a nested `jax.jit` call, becomes a kernel argument,
+while smaller constants stay embedded, so a hoisted closure compiles the same
+program as the equivalent pytree callable. If tracing the closure fails, it
+keeps closure semantics. Arrays captured inside the body of
+an inner `jax.jit` function (rather than passed to it) stay embedded.
+
+A pytree callable is the explicit form, for example
+`jax.tree_util.Partial(loglike_fn, data)` with `loglike_fn(data, theta)`, or an
+equinox-style module or registered dataclass with `__call__`: its `jax.Array` /
+`np.ndarray` leaves become kernel arguments and everything else stays static.
+Use `jax.Array` leaves so the data move to the device once. Both forms apply to
+the fast path (unbounded JAX rwalk, block and per-iteration modes, the rescue
+ladder and the initial live-point pass, without `jax_vectorized`); the bounded,
+fused-bounded and `replacement_chain_schedule` kernels still close over the
+callables.
 
 `jax_block_size > 1` batches several nested-sampling replacement iterations
 into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,

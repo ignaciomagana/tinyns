@@ -1,4 +1,10 @@
-"""Pytree callables: array leaves are jit arguments on the fast path."""
+"""Pytree callables and closures: large arrays are jit arguments on the fast path.
+
+Pytree callables pass their array leaves; closures have their large jaxpr
+constants hoisted.
+"""
+
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -7,6 +13,7 @@ import pytest
 from jax import random
 
 import tinyns.run as run_mod
+import tinyns.samplers as samplers_mod
 from tinyns import NestedSampler
 from tinyns.run import run_static_nested
 from tinyns.samplers import (
@@ -84,8 +91,8 @@ def test_partition_round_trips_partial_leaves() -> None:
     assert rebuilt.keywords == {"scale": 2.5}
 
     prior = jax.tree_util.Partial(prior_fn, np_data)
-    assert len(_callable_leaves(fn, prior)) == 2
-    assert _callable_leaves(plain_loglike, plain_prior) == ()
+    assert len(_callable_leaves(fn, prior, NDIM)) == 2
+    assert _callable_leaves(plain_loglike, plain_prior, NDIM) == ()
     with pytest.raises(ValueError, match="dynamic callable leaves"):
         _combine_callable((), static)
 
@@ -104,6 +111,8 @@ def test_plain_function_and_equivalent_closure_are_bit_identical() -> None:
 
 @pytest.mark.parametrize("jax_block_size", [None, 1])
 def test_partial_loglike_with_large_array_matches_closure(jax_block_size) -> None:
+    # The closure's 200k-element constant is hoisted to a jit argument, so the
+    # two forms compile the same program and agree bit for bit.
     data = make_data(200_000)
     partial_loglike = jax.tree_util.Partial(loglike_fn, data)
     partial_prior = jax.tree_util.Partial(prior_fn, BOUNDS)
@@ -123,6 +132,8 @@ def test_partial_loglike_with_large_array_matches_closure(jax_block_size) -> Non
     closure_result = run_static_nested(
         random.PRNGKey(11), closure_loglike, closure_prior, NDIM, 40, **kwargs
     )
+    (hoisted,) = _callable_leaves(closure_loglike, closure_prior, NDIM)
+    assert hoisted is data
     assert_same_result(partial_result, closure_result)
 
 
@@ -170,7 +181,7 @@ def _lower_block_kernel_text(loglike, prior):
         jnp.asarray(0.5),
         jnp.asarray(1),
         jnp.asarray(10, dtype=jnp.int32),
-        *_callable_leaves(loglike, prior),
+        *_callable_leaves(loglike, prior, NDIM),
     )
     return lowered.as_text()
 
@@ -188,12 +199,6 @@ def test_block_kernel_hlo_does_not_embed_partial_arrays() -> None:
         }
         # Only the shape annotations differ; constants would add ~200k values.
         assert abs(len(texts[200_000]) - len(texts[1_000])) < 2_000
-
-        data = make_data(200_000)
-        closure_text = _lower_block_kernel_text(
-            lambda theta: loglike_fn(data, theta), prior
-        )
-        assert len(closure_text) > len(texts[200_000]) + 100_000
     finally:
         run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
         _make_rwalk_jax_kernel.cache_clear()
@@ -244,3 +249,189 @@ def test_partial_callables_run_on_closure_semantics_paths(kwargs) -> None:
         random.PRNGKey(2), loglike, prior, NDIM, 30, maxiter=20, **kwargs
     )
     assert np.isfinite(result.logz)
+
+
+# --- closures: large constants are hoisted ---
+
+
+def clear_caches():
+    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+    _make_rwalk_jax_kernel.cache_clear()
+    samplers_mod._split_callables_cached.cache_clear()
+
+
+@pytest.fixture
+def fresh_caches():
+    clear_caches()
+    yield
+    clear_caches()
+
+
+# Below _HOIST_MIN_SIZE a closure array stays an embedded constant.
+_SMALLEST_HOISTED = samplers_mod._HOIST_MIN_SIZE
+
+
+def closure_prior(u):
+    return prior_fn(BOUNDS, u)
+
+
+def make_closure(data):
+    def loglike(theta):
+        return loglike_fn(data, theta)
+
+    return loglike
+
+
+def run(loglike, prior=closure_prior, ndim=NDIM, **kwargs):
+    kwargs.setdefault("maxiter", 96)
+    kwargs.setdefault("dlogz", 0.0)
+    return run_static_nested(random.PRNGKey(11), loglike, prior, ndim, 40, **kwargs)
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_block_kernel_hlo_does_not_embed_closure_arrays(monkeypatch) -> None:
+    texts = {
+        n: _lower_block_kernel_text(make_closure(make_data(n)), closure_prior)
+        for n in (_SMALLEST_HOISTED, 200_000)
+    }
+    assert abs(len(texts[200_000]) - len(texts[_SMALLEST_HOISTED])) < 2_000
+
+    # With hoisting disabled the closure's array is a ~200k-value constant.
+    clear_caches()
+    monkeypatch.setattr(samplers_mod, "_HOIST_MIN_SIZE", 10**9)
+    embedded = _lower_block_kernel_text(make_closure(make_data(200_000)), closure_prior)
+    assert len(embedded) > len(texts[200_000]) + 100_000
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_small_constants_and_plain_functions_are_not_hoisted(monkeypatch) -> None:
+    small = jnp.linspace(0.1, 0.3, samplers_mod._HOIST_MIN_SIZE - 1)
+    small_np = np.linspace(0.1, 0.3, 50)
+
+    def small_closure(theta):
+        center = jnp.mean(small) + 0.0 * jnp.sum(small_np)
+        return -0.5 * jnp.sum(((theta - center) / 0.1) ** 2)
+
+    cases = [(plain_loglike, plain_prior), (small_closure, closure_prior)]
+    for loglike, prior in cases:
+        assert _callable_leaves(loglike, prior, NDIM) == ()
+    hoisting = [run(loglike, prior, maxiter=160) for loglike, prior in cases]
+
+    # No hoisting at all is the parent-branch behaviour: bit-identical output.
+    clear_caches()
+    monkeypatch.setattr(samplers_mod, "_eval_jaxpr", None)
+    for (loglike, prior), result in zip(cases, hoisting, strict=True):
+        assert_same_result(result, run(loglike, prior, maxiter=160))
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_numpy_closure_constant_is_hoisted() -> None:
+    data = np.asarray(make_data(200_000))
+    loglike = make_closure(data)
+    (hoisted,) = _callable_leaves(loglike, closure_prior, NDIM)
+    assert isinstance(hoisted, jax.Array) and hoisted.shape == data.shape
+    # Cached: the same object on every call, so jit arguments are stable.
+    assert _callable_leaves(loglike, closure_prior, NDIM)[0] is hoisted
+    texts = [
+        _lower_block_kernel_text(make_closure(np.asarray(make_data(n))), closure_prior)
+        for n in (_SMALLEST_HOISTED, 200_000)
+    ]
+    assert abs(len(texts[1]) - len(texts[0])) < 2_000
+    partial = jax.tree_util.Partial(loglike_fn, jnp.asarray(data))
+    assert_same_result(run(loglike), run(partial))
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_nested_jit_operand_is_hoisted() -> None:
+    inner = jax.jit(loglike_fn)
+
+    def make_nested(data):
+        def loglike(theta):
+            return inner(data, theta)
+
+        return loglike
+
+    data = make_data(200_000)
+    loglike = make_nested(data)
+    (hoisted,) = _callable_leaves(loglike, closure_prior, NDIM)
+    assert hoisted is data
+    texts = [
+        _lower_block_kernel_text(make_nested(make_data(n)), closure_prior)
+        for n in (_SMALLEST_HOISTED, 200_000)
+    ]
+    assert abs(len(texts[1]) - len(texts[0])) < 2_000
+    partial = jax.tree_util.Partial(loglike_fn, data)
+    assert_same_result(run(loglike), run(partial))
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_hoisted_one_dimensional_closure_and_prior() -> None:
+    # ndim=1 with a scalar-returning prior transform that also captures a
+    # large array: both callables are hoisted and still vmap over chains.
+    data = make_data(10_000)
+    bounds = jnp.concatenate([jnp.full(5_000, -1.0), jnp.full(5_000, 1.0)])
+
+    def prior(u):
+        return jnp.min(bounds) + (jnp.max(bounds) - jnp.min(bounds)) * u[0]
+
+    loglike = make_closure(data)
+    assert len(_callable_leaves(loglike, prior, 1)) == 2
+    result = run(loglike, prior, ndim=1)
+    partial_prior = jax.tree_util.Partial(
+        lambda b, u: jnp.min(b) + (jnp.max(b) - jnp.min(b)) * u[0], bounds
+    )
+    partial = jax.tree_util.Partial(loglike_fn, data)
+    assert_same_result(result, run(partial, partial_prior, ndim=1))
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_jax_vectorized_closure_falls_back_to_closure_call() -> None:
+    data = make_data(10_000)
+
+    def vectorized(theta):
+        center = jnp.min(data)
+        precision = jnp.max(data)
+        return -0.5 * jnp.sum(((theta - center) * precision) ** 2, axis=-1)
+
+    result = run(
+        vectorized, lambda u: -1.0 + 2.0 * u, maxiter=20, jax_vectorized=True
+    )
+    assert np.isfinite(result.logz)
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_make_jaxpr_failure_falls_back_to_closure_semantics(
+    monkeypatch, caplog
+) -> None:
+    data = make_data(200_000)
+    loglike = make_closure(data)
+    expected = run(loglike, maxiter=40)
+
+    clear_caches()
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("no jaxpr today")
+
+    monkeypatch.setattr(samplers_mod.jax, "make_jaxpr", broken)
+    with caplog.at_level(logging.DEBUG, logger="tinyns.samplers"):
+        assert _callable_leaves(loglike, closure_prior, NDIM) == ()
+        result = run(loglike, maxiter=40)
+    assert_same_result(result, expected)
+    messages = [r for r in caplog.records if "not hoisting" in r.getMessage()]
+    # One message per callable (loglike and prior), not one per iteration.
+    assert len(messages) == 2
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_hoisted_closure_checkpoint_resume_matches_uninterrupted(tmp_path) -> None:
+    path = tmp_path / "closure.checkpoint.npz"
+    loglike = make_closure(make_data(5_000))
+    assert len(_callable_leaves(loglike, closure_prior, NDIM)) == 1
+    sampler = NestedSampler(loglike, closure_prior, NDIM, nlive=30)
+
+    full = sampler.run(21, maxiter=64, dlogz=0.0)
+    sampler.run(21, maxiter=32, dlogz=0.0, checkpoint_path=path)
+    resumed = sampler.resume(path, maxiter=64, dlogz=0.0)
+
+    assert resumed.metadata["resumed_from_checkpoint"] is True
+    assert_same_result(resumed, full)
