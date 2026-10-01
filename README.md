@@ -393,9 +393,10 @@ default.
 
 ## Limitations
 
-`tinyns` is an early v0.1-oriented implementation for correctness experiments
-and low-dimensional examples. It is intentionally not a probabilistic
-programming language.
+`tinyns` is an early (v0.2) implementation. It has been validated against
+dynesty and analytic evidences on 1-18 dimensional targets, including
+gravitational-wave population likelihoods. It is intentionally not a
+probabilistic programming language.
 
 - Static nested sampling only.
 - No dynamic nested sampling.
@@ -406,13 +407,21 @@ programming language.
   schedules use isotropic proposals.
 - Unbiased evidence needs `walks` of about 5-6 x `ndim`, so likelihood calls
   per iteration grow linearly with dimension.
+- Strongly curved posteriors need more walks than that default. On a 10-D
+  Rosenbrock-like target, `walks=60` (6 x `ndim`) biased logZ by +0.26 nats,
+  and about 1000 walks were needed. If a new model's posterior may be strongly
+  curved, check logZ against a run with several times more `walks`.
+- The reported `logzerr` (`sqrt(H / nlive)`, and `logz_bootstrap()`) covers
+  the prior-volume path. It does not cover residual chain correlation. In 20-seed
+  ensembles, the seed-to-seed scatter matched `logzerr` in 1-D (ratio 0.94) and
+  was about 1.3x `logzerr` at 13-D with the default walks (1.1x with twice the
+  walks). At high dimension, treat `logzerr` as up to about 25% optimistic, or
+  raise `walks`.
 - Multiellipsoid bounding is experimental.
 - No full vectorized `rwalk` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
 - Replacement attempts are capped by `max_attempts`; hitting the cap returns
   `success=False` with a partial result rather than raising during the run.
-- Evidence and live-point bookkeeping are included, but error estimates are
-  lightweight diagnostics for this toy implementation.
 
 ## Additional examples
 
