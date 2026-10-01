@@ -194,6 +194,18 @@ ladder and the initial live-point pass, without `jax_vectorized`); the bounded,
 fused-bounded and `replacement_chain_schedule` kernels still close over the
 callables.
 
+For a campaign over mock datasets in one process, pass
+`jax.tree_util.Partial(loglike_fn, data_i)`: pytree callables with the same
+structure and same-shaped leaves reuse one compiled kernel, while each closure
+compiles its own. tinyns keeps no reference to a finished run's data, so a
+dataset is freed once you drop it. `result.metadata` reports `wall_time_s`,
+`compile_s` (time to the first block) and `mean_ms_per_call` (after it).
+
+Separate processes (array jobs, one dataset each) can share compiles through
+JAX's persistent cache: call
+`jax.config.update("jax_compilation_cache_dir", "/path/to/cache")` before the
+first run, with the same path in every process (compiles under 1 s are not stored).
+
 `jax_block_size > 1` batches several nested-sampling replacement iterations
 into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,
 which usually gives a large speedup for cheap or moderately expensive JAX

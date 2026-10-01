@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
+import weakref
 from functools import lru_cache
 
 import jax
@@ -43,33 +45,40 @@ _logger = logging.getLogger(__name__)
 _HOIST_MIN_SIZE = 4096
 
 
-class _IdentityCacheKey:
-    """Hash an otherwise unhashable object by identity for internal caches."""
+class _CallableSpec:
+    """Hashable, data-free stand-in for a fast-path callable.
 
-    __slots__ = ("value",)
+    The compiled fast-path kernels are cached on specs, not on callables. A
+    kernel takes the callable's ``nleaves`` dynamic leaves as jit arguments and
+    ``rebuild(leaves)`` returns the callable inside the trace. The spec of a
+    pytree callable is keyed on its structure, the static part from
+    :func:`_partition_callable`: pytrees that differ only in their array leaves
+    (``Partial(loglike_fn, data_i)`` over mock datasets) share one kernel, and
+    JAX's jit cache keys the compiled program on the leaves' shapes and dtypes.
+    Any other callable gets a spec of its own (``key=None``: compared by
+    identity) that holds the callable only weakly.
+    """
 
-    def __init__(self, value):
-        self.value = value
+    __slots__ = ("key", "nleaves", "rebuild")
+
+    def __init__(self, nleaves: int, rebuild, key=None):
+        self.nleaves = int(nleaves)
+        self.rebuild = rebuild
+        self.key = object() if key is None else key
 
     def __hash__(self) -> int:
-        return id(self.value)
+        return hash(self.key)
 
     def __eq__(self, other) -> bool:
-        return (
-            isinstance(other, _IdentityCacheKey) and self.value is other.value
-        )
+        return isinstance(other, _CallableSpec) and self.key == other.key
 
 
-def _cacheable_callable(value):
+def _weak_ref(obj, callback):
+    """Return ``weakref.ref(obj, callback)``, or a strong reference if unsupported."""
     try:
-        hash(value)
-    except TypeError:
-        return _IdentityCacheKey(value)
-    return value
-
-
-def _unwrap_cacheable_callable(value):
-    return value.value if isinstance(value, _IdentityCacheKey) else value
+        return weakref.ref(obj, callback)
+    except TypeError:  # kept alive, as every callable was before v0.2.3
+        return lambda: obj
 
 
 def _is_dynamic_leaf(leaf) -> bool:
@@ -121,24 +130,28 @@ def _combine_callable(dynamic, static):
     return jax.tree_util.tree_unflatten(treedef, leaves)
 
 
-def _hoist_closure_consts(fn, example):
-    """Trace ``fn`` on ``example`` and lift its large constants to arguments.
+def _hoist_closure_consts(ref, example):
+    """Trace the callable ``ref()`` on ``example`` and lift its large constants.
 
     Returns ``(hoisted, rebuild)`` or ``None``. ``hoisted`` holds the jaxpr
     constants with at least ``_HOIST_MIN_SIZE`` elements, as device arrays;
     ``rebuild(hoisted)`` returns a callable that evaluates the traced jaxpr
     with them (smaller constants stay embedded, so they still fold). A call
-    whose arguments do not match ``example`` runs ``fn`` itself. ``None``
-    (closure semantics) means there is nothing to hoist or tracing failed.
+    whose arguments do not match ``example`` runs the callable itself.
+    ``rebuild`` keeps the jaxpr, the small constants and ``ref`` (a weak
+    reference), never the callable or the hoisted arrays. ``None`` (closure
+    semantics) means there is nothing to hoist or tracing failed.
     """
     if _eval_jaxpr is None:
         return None
+    fn = ref()
     try:
         closed, out_shape = jax.make_jaxpr(fn, return_shape=True)(example)
         consts = list(closed.consts)
         if any(isinstance(c, _Tracer) for c in consts):
             return None  # traced under an outer transformation: do not cache
-        constvars = closed.jaxpr.constvars
+        jaxpr = closed.jaxpr
+        constvars = jaxpr.constvars
         big = [
             i
             for i, (c, var) in enumerate(zip(consts, constvars, strict=True))
@@ -170,8 +183,8 @@ def _hoist_closure_consts(fn, example):
             if kwargs or tree != in_tree or [
                 (jnp.shape(x), jnp.result_type(x)) for x in flat
             ] != in_avals:
-                return fn(*args, **kwargs)
-            out = _eval_jaxpr(closed.jaxpr, all_consts, *flat)
+                return ref()(*args, **kwargs)
+            out = _eval_jaxpr(jaxpr, all_consts, *flat)
             return jax.tree_util.tree_unflatten(out_tree, out)
 
         return hoisted_fn
@@ -179,52 +192,84 @@ def _hoist_closure_consts(fn, example):
     return hoisted, rebuild
 
 
-def _split_callable(fn, example):
-    """Return ``(dynamic, rebuild)`` with ``rebuild(dynamic)`` the callable.
+# Splits of callables that are not keyed on their structure (closures, plain
+# functions), cached by identity: (id(fn), key) -> (weakref to fn, split).
+# A split never references its callable and the weakref callback drops the
+# entry when the callable is garbage collected, so no dataset outlives it.
+_IDENTITY_SPLITS: dict = {}
 
-    Pytree callables split into their array leaves (:func:`_partition_callable`).
+
+def _split_callable(fn, key, example):
+    """Return ``(dynamic, spec)`` with ``spec.rebuild(dynamic)`` the callable.
+
+    A pytree callable with array leaves splits into those leaves
+    (:func:`_partition_callable`) and a spec keyed on everything else,
+    including the types of the static leaves (``1`` and ``1.0`` trace
+    differently). Nothing is cached, so the leaves are not retained.
+
     A callable without array leaves (a plain function or closure) is traced on
-    ``example`` (unless it is ``None``) and its large jaxpr constants become
-    ``dynamic`` (:func:`_hoist_closure_consts`); otherwise ``dynamic`` is empty and
-    ``rebuild`` returns ``fn`` itself.
+    ``example()`` (unless it returns ``None``) and its large jaxpr constants
+    become ``dynamic`` (:func:`_hoist_closure_consts`); otherwise ``dynamic``
+    is empty and ``spec.rebuild`` returns the callable itself. That split is
+    cached per callable identity and ``key`` (a tuple of plain values that
+    determines ``example()``) for as long as the callable is alive, so the
+    hoisted leaves and the spec are the same objects on every call.
     """
     dynamic, static = _partition_callable(fn)
     if dynamic:
-        return dynamic, lambda leaves: _combine_callable(leaves, static)
-    hoisted = None if example is None else _hoist_closure_consts(fn, example)
-    if hoisted is None:
-        return (), lambda leaves: fn
-    return hoisted
-
-
-@lru_cache(maxsize=32)
-def _split_callables_cached(loglike, prior_transform, ndim: int):
-    loglike = _unwrap_cacheable_callable(loglike)
-    prior_transform = _unwrap_cacheable_callable(prior_transform)
-    u_example = jax.ShapeDtypeStruct((ndim,), jnp.result_type(float))
-    prior_split = _split_callable(prior_transform, u_example)
-    try:
-        theta_shape = jax.eval_shape(prior_transform, u_example)
-        theta_dtype = jnp.result_type(*jax.tree_util.tree_leaves(theta_shape))
-    except Exception:  # noqa: BLE001 - loglike then keeps closure semantics
-        loglike_split = _split_callable(loglike, None)
+        spec_key = (*static, tuple(type(leaf) for leaf in static[2]))
+        try:
+            hash(spec_key)
+        except TypeError:
+            pass  # unhashable static leaves: split by identity below
+        else:
+            rebuild = functools.partial(_combine_callable, static=static)
+            return dynamic, _CallableSpec(len(dynamic), rebuild, spec_key)
+    cache_key = (id(fn), key)
+    entry = _IDENTITY_SPLITS.get(cache_key)
+    if entry is not None and entry[0]() is fn:
+        return entry[1]
+    # Bound now: the callback may run at interpreter shutdown, after globals.
+    ref = _weak_ref(fn, lambda _, pop=_IDENTITY_SPLITS.pop: pop(cache_key, None))
+    if dynamic:
+        rebuild = functools.partial(_combine_callable, static=static)
+        split = dynamic, _CallableSpec(len(dynamic), rebuild)
     else:
-        theta_example = jax.ShapeDtypeStruct((ndim,), theta_dtype)
-        loglike_split = _split_callable(loglike, theta_example)
-    return loglike_split, prior_split
+        example = example()
+        hoisted = None if example is None else _hoist_closure_consts(ref, example)
+        if hoisted is None:
+            split = (), _CallableSpec(0, lambda leaves: ref())
+        else:
+            split = hoisted[0], _CallableSpec(len(hoisted[0]), hoisted[1])
+    _IDENTITY_SPLITS[cache_key] = (ref, split)
+    return split
 
 
 def _split_callables(loglike, prior_transform, ndim: int):
-    """Return cached ``((dynamic, rebuild), (dynamic, rebuild))`` for the fast path.
+    """Return ``((dynamic, spec), (dynamic, spec))`` for the fast path.
 
     ``loglike`` is traced on a theta of shape ``(ndim,)`` with the dtype
     ``prior_transform`` produces, ``prior_transform`` on a u of shape
-    ``(ndim,)``. The split is cached per callable identity and ``ndim``, so
-    the dynamic leaves are the same objects on every call.
+    ``(ndim,)`` (see :func:`_split_callable`).
     """
-    return _split_callables_cached(
-        _cacheable_callable(loglike), _cacheable_callable(prior_transform), int(ndim)
+    u_example = jax.ShapeDtypeStruct((int(ndim),), jnp.result_type(float))
+    key = (int(ndim), u_example.dtype.name)
+
+    def theta_example():
+        try:
+            theta_shape = jax.eval_shape(prior_transform, u_example)
+            theta_dtype = jnp.result_type(*jax.tree_util.tree_leaves(theta_shape))
+        except Exception:  # noqa: BLE001 - loglike then keeps closure semantics
+            return None
+        return jax.ShapeDtypeStruct((int(ndim),), theta_dtype)
+
+    return (
+        _split_callable(loglike, key, theta_example),
+        _split_callable(prior_transform, key, lambda: u_example),
     )
+
+
+_split_callables.cache_clear = _IDENTITY_SPLITS.clear
 
 
 def _callable_leaves(loglike, prior_transform, ndim: int):
@@ -233,6 +278,14 @@ def _callable_leaves(loglike, prior_transform, ndim: int):
         loglike, prior_transform, ndim
     )
     return tuple(loglike_dynamic) + tuple(prior_dynamic)
+
+
+def _callable_specs(loglike, prior_transform, ndim: int):
+    """Return the :class:`_CallableSpec` of ``loglike`` and ``prior_transform``."""
+    (_, loglike_spec), (_, prior_spec) = _split_callables(
+        loglike, prior_transform, ndim
+    )
+    return loglike_spec, prior_spec
 
 
 def _validate_theta_shape(theta, ndim: int):
@@ -834,8 +887,8 @@ def live_cov_cholesky(live_u):
 
 @lru_cache(maxsize=32)
 def _make_rwalk_jax_kernel_cached(
-    loglike,
-    prior_transform,
+    loglike_spec,
+    prior_spec,
     ndim: int,
     walks: int,
     replacement_chains: int,
@@ -871,15 +924,15 @@ def _make_rwalk_jax_kernel_cached(
     correlated steps). Its chains start from live points strictly above
     ``logl_min`` whenever any exist.
 
-    ``loglike`` and ``prior_transform`` may be JAX pytrees (for example
-    ``jax.tree_util.Partial(fn, data)``). Their array leaves, or the large
-    constants of a closure (see :func:`_split_callable`), are then trailing
-    arguments of ``kernel``: call it as ``kernel(key, ..., max_batches,
+    The callables arrive as :class:`_CallableSpec` objects (``loglike_spec``,
+    ``prior_spec``; see :func:`_make_rwalk_jax_kernel`), so the cache holds
+    no data. Their array leaves (pytree callables) or large constants
+    (closures, see :func:`_split_callable`) are trailing arguments of
+    ``kernel``: call it as ``kernel(key, ..., max_batches,
     *_callable_leaves(loglike, prior_transform, ndim))`` and the callables are
     rebuilt inside the trace, so the arrays are jit arguments rather than
-    baked-in constants. Called without them, ``kernel`` closes over the
-    callables (closure semantics). Callables with neither take no trailing
-    arguments and are traced exactly as before.
+    baked-in constants. Callables with neither take no trailing arguments and
+    are traced exactly as before.
     """
 
     if proposal not in RWALK_PROPOSALS:
@@ -888,15 +941,8 @@ def _make_rwalk_jax_kernel_cached(
     # With one unbatched chain, out-of-cube live-cov proposals skip the
     # likelihood (lax.cond); under vmap a cond would evaluate both branches.
     skip_out_of_cube = live_cov and replacement_chains == 1 and not jax_vectorized
-    loglike_closure = _unwrap_cacheable_callable(loglike)
-    prior_closure = _unwrap_cacheable_callable(prior_transform)
-    (loglike_dynamic, loglike_rebuild), (prior_dynamic, prior_rebuild) = (
-        _split_callables(loglike_closure, prior_closure, ndim)
-    )
-    nloglike_leaves = len(loglike_dynamic)
-    nprior_leaves = len(prior_dynamic)
-    # Only the rebuild functions are kept; the array leaves arrive as arguments.
-    del loglike_dynamic, prior_dynamic
+    nloglike_leaves = loglike_spec.nleaves
+    nleaves = loglike_spec.nleaves + prior_spec.nleaves
 
     @jax.jit
     def kernel(
@@ -909,24 +955,13 @@ def _make_rwalk_jax_kernel_cached(
         max_batches,
         *callable_leaves,
     ):
-        # No trailing leaves: closure semantics (the arrays become constants).
-        if callable_leaves and len(callable_leaves) != (
-            nloglike_leaves + nprior_leaves
-        ):
+        if len(callable_leaves) != nleaves:
             raise ValueError(
-                f"kernel expects {nloglike_leaves + nprior_leaves} callable "
-                f"array leaves, got {len(callable_leaves)}"
+                f"kernel expects {nleaves} callable array leaves, "
+                f"got {len(callable_leaves)}"
             )
-        loglike = (
-            loglike_rebuild(callable_leaves[:nloglike_leaves])
-            if callable_leaves and nloglike_leaves
-            else loglike_closure
-        )
-        prior_transform = (
-            prior_rebuild(callable_leaves[nloglike_leaves:])
-            if callable_leaves and nprior_leaves
-            else prior_closure
-        )
+        loglike = loglike_spec.rebuild(callable_leaves[:nloglike_leaves])
+        prior_transform = prior_spec.rebuild(callable_leaves[nloglike_leaves:])
         nlive = live_u.shape[0]
         chol = live_cov_cholesky(live_u) if live_cov else None
         if live_cov:
@@ -1207,10 +1242,13 @@ def _make_rwalk_jax_kernel(
     jax_vectorized: bool,
     proposal: str = "isotropic",
 ):
-    """Return a cached rwalk kernel for hashable or unhashable callables."""
+    """Return the cached rwalk kernel for these callables' specs.
+
+    Pytree callables with the same structure share one kernel; any other
+    callable is keyed by identity (see :class:`_CallableSpec`).
+    """
     return _make_rwalk_jax_kernel_cached(
-        _cacheable_callable(loglike),
-        _cacheable_callable(prior_transform),
+        *_callable_specs(loglike, prior_transform, ndim),
         ndim,
         walks,
         replacement_chains,

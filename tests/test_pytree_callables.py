@@ -4,7 +4,10 @@ Pytree callables pass their array leaves; closures have their large jaxpr
 constants hoisted.
 """
 
+import gc
+import hashlib
 import logging
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -257,7 +260,8 @@ def test_partial_callables_run_on_closure_semantics_paths(kwargs) -> None:
 def clear_caches():
     run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
     _make_rwalk_jax_kernel.cache_clear()
-    samplers_mod._split_callables_cached.cache_clear()
+    run_mod._make_live_points_kernel.cache_clear()
+    samplers_mod._split_callables.cache_clear()
 
 
 @pytest.fixture
@@ -435,3 +439,157 @@ def test_hoisted_closure_checkpoint_resume_matches_uninterrupted(tmp_path) -> No
 
     assert resumed.metadata["resumed_from_checkpoint"] is True
     assert_same_result(resumed, full)
+
+
+# --- campaigns: one compile per structure, no retained datasets (v0.2.3) ---
+
+
+@pytest.fixture
+def backend_compiles():
+    """Count XLA backend compiles while the test runs."""
+    events = []
+
+    def listener(event, duration, **kwargs):
+        if event == "/jax/core/compile/backend_compile_duration":
+            events.append(duration)
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    yield events
+    unregister = getattr(
+        jax._src.monitoring, "_unregister_event_duration_listener_by_callback", None
+    )
+    if unregister is not None:
+        unregister(listener)
+
+
+def shifted_data(i, n=10_000):
+    return make_data(n) + 0.05 * i
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_same_shape_partials_share_one_compiled_block_kernel(backend_compiles) -> None:
+    results, compiles = [], []
+    for i in range(4):
+        before = len(backend_compiles)
+        loglike = jax.tree_util.Partial(loglike_fn, shifted_data(i))
+        results.append(run(loglike, plain_prior))
+        compiles.append(len(backend_compiles) - before)
+    # Dataset 0 compiles everything; datasets 1-3 reuse the block kernel and
+    # the live-point pass (v0.2.2 compiled both again for every dataset).
+    assert compiles[0] > 0 and compiles[1:] == [0, 0, 0]
+    info = run_mod._make_static_jax_rwalk_block_kernel.cache_info()
+    assert info.misses == 1 and info.currsize == 1
+    assert len({result.logz for result in results}) == 4
+
+    for i, result in enumerate(results):
+        clear_caches()  # an independent fresh run compiles its own kernels
+        loglike = jax.tree_util.Partial(loglike_fn, shifted_data(i))
+        assert_same_result(result, run(loglike, plain_prior))
+
+
+def make_closure_prior(bounds):
+    def prior(u):
+        return prior_fn(bounds[:, :NDIM], u)
+
+    return prior
+
+
+@pytest.mark.parametrize("form", ["partial", "closure"])
+@pytest.mark.usefixtures("fresh_caches")
+def test_finished_runs_do_not_keep_datasets_alive(form) -> None:
+    refs = []
+    for i in range(4):
+        data = shifted_data(i)
+        bounds = BOUNDS + 0.0  # a fresh array per dataset
+        refs += [weakref.ref(data), weakref.ref(bounds)]
+        if form == "partial":
+            loglike = jax.tree_util.Partial(loglike_fn, data)
+            prior = jax.tree_util.Partial(prior_fn, bounds)
+        else:  # both closures have hoisted constants
+            loglike = make_closure(data)
+            prior = make_closure_prior(jnp.tile(bounds, (1, _SMALLEST_HOISTED)))
+            refs.append(weakref.ref(prior))
+        result = run(loglike, prior, maxiter=64)
+        assert np.isfinite(result.logz)
+        del data, bounds, loglike, prior, result
+    gc.collect()
+    assert [ref() for ref in refs] == [None] * len(refs)
+    assert not samplers_mod._IDENTITY_SPLITS
+
+
+# Fixed-seed fingerprints of tinyns v0.2.2 (ae330f2) on CPU with jax 0.4.34:
+# (logz.hex(), ncall, sha256[:16] of samples, samples_u and logl).
+V022_FINGERPRINTS = {
+    "block": (
+        "-0x1.122a400000000p+2",
+        7405,
+        "ea9e454c31e2785c",
+        "b3ec3331262f69b9",
+        "b6ff6462d6dc00fa",
+    ),
+    "per_iteration": (
+        "-0x1.fc245c0000000p+1",
+        6332,
+        "fee5bedf1b27260b",
+        "a670633426560bdb",
+        "b880a8923f7d8971",
+    ),
+    "small_closure": (
+        "-0x1.122a400000000p+2",
+        7405,
+        "ea9e454c31e2785c",
+        "b3ec3331262f69b9",
+        "47b56e8a8af6eb32",
+    ),
+}
+SMALL = jnp.linspace(0.1, 0.3, 50)
+
+
+def small_closure_loglike(theta):
+    return -0.5 * jnp.sum(((theta - jnp.mean(SMALL)) / 0.1) ** 2)
+
+
+def fingerprint(result):
+    def digest(x):
+        return hashlib.sha256(np.ascontiguousarray(x).tobytes()).hexdigest()[:16]
+
+    return (
+        float(result.logz).hex(),
+        result.ncall,
+        digest(result.samples),
+        digest(result.samples_u),
+        digest(result.logl),
+    )
+
+
+@pytest.mark.skipif(
+    jax.__version__ != "0.4.34" or jax.default_backend() != "cpu",
+    reason="fingerprints were recorded with jax 0.4.34 on CPU",
+)
+@pytest.mark.parametrize("case", sorted(V022_FINGERPRINTS))
+def test_plain_functions_match_v022_bit_for_bit(case) -> None:
+    loglike = small_closure_loglike if case == "small_closure" else plain_loglike
+    kwargs = {"jax_block_size": 1} if case == "per_iteration" else {}
+    result = run_static_nested(
+        random.PRNGKey(7), loglike, plain_prior, NDIM, 50, maxiter=300, **kwargs
+    )
+    assert fingerprint(result) == V022_FINGERPRINTS[case]
+
+
+@pytest.mark.parametrize("jax_block_size", [1, 32])
+def test_wall_time_telemetry(jax_block_size, capsys) -> None:
+    result = run_static_nested(
+        random.PRNGKey(3),
+        plain_loglike,
+        plain_prior,
+        NDIM,
+        30,
+        maxiter=96,
+        dlogz=0.0,
+        jax_block_size=jax_block_size,
+        progress=True,
+    )
+    metadata = result.metadata
+    assert metadata["wall_time_s"] > metadata["compile_s"] > 0.0
+    assert metadata["mean_ms_per_call"] > 0.0
+    assert "calls/s=" in capsys.readouterr().out
