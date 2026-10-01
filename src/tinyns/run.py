@@ -22,12 +22,11 @@ from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
     RWALK_PROPOSALS,
-    _cacheable_callable,
     _callable_leaves,
+    _callable_specs,
     _evaluate_jax_batch,
-    _make_rwalk_jax_kernel,
+    _make_rwalk_jax_kernel_cached,
     _split_callables,
-    _unwrap_cacheable_callable,
     draw_constrained_multi_bound_jax,
     draw_constrained_multi_bound_rwalk_jax,
     draw_constrained_prior,
@@ -142,16 +141,25 @@ def _evaluate_live_points_jax(
         [live_u, jnp.broadcast_to(live_u[:1], (pad, ndim))], axis=0
     ).reshape((nchunks, chunk_size, ndim))
 
-    (loglike_dynamic, loglike_rebuild), (prior_dynamic, prior_rebuild) = (
+    (loglike_dynamic, loglike_spec), (prior_dynamic, prior_spec) = (
         _split_callables(loglike, prior_transform, ndim)
     )
     if callable_leaves is None:
         callable_leaves = tuple(loglike_dynamic) + tuple(prior_dynamic)
-    nloglike_leaves = len(loglike_dynamic)
+    evaluate = _make_live_points_kernel(loglike_spec, prior_spec, int(ndim))
+    theta, logl = evaluate(padded, *callable_leaves)
+    theta = theta.reshape((nchunks * chunk_size,) + theta.shape[2:])[:nlive]
+    return theta, logl.reshape((-1,))[:nlive]
+
+
+@functools.lru_cache(maxsize=32)
+def _make_live_points_kernel(loglike_spec, prior_spec, ndim: int):
+    """Return the cached jitted pass of :func:`_evaluate_live_points_jax`."""
+    nloglike_leaves = loglike_spec.nleaves
 
     def evaluate(u, *leaves):
-        loglike_fn = loglike_rebuild(leaves[:nloglike_leaves])
-        prior_fn = prior_rebuild(leaves[nloglike_leaves:])
+        loglike_fn = loglike_spec.rebuild(leaves[:nloglike_leaves])
+        prior_fn = prior_spec.rebuild(leaves[nloglike_leaves:])
 
         def evaluate_chunk(u_chunk):
             return _evaluate_jax_batch(
@@ -160,9 +168,7 @@ def _evaluate_live_points_jax(
 
         return lax.map(evaluate_chunk, u)
 
-    theta, logl = jax.jit(evaluate)(padded, *callable_leaves)
-    theta = theta.reshape((nchunks * chunk_size,) + theta.shape[2:])[:nlive]
-    return theta, logl.reshape((-1,))[:nlive]
+    return jax.jit(evaluate)
 
 
 def _remaining_delta_logz(logz_dead, logx_final, live_logl):
@@ -260,8 +266,8 @@ def _update_adaptive_step_scale(
 
 @functools.lru_cache(maxsize=32)
 def _make_static_jax_rwalk_block_kernel_cached(
-    loglike,
-    prior_transform,
+    loglike_spec,
+    prior_spec,
     ndim: int,
     walks: int,
     replacement_chains: int,
@@ -270,24 +276,24 @@ def _make_static_jax_rwalk_block_kernel_cached(
 ):
     """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel.
 
-    The returned ``block_kernel`` takes the array leaves of pytree callables
-    and the large constants of closures
-    (``*_callable_leaves(loglike, prior_transform, ndim)``) as trailing
-    arguments and threads them to the rwalk kernel, so they are jit arguments
-    rather than compiled-in constants. Callables with neither take no trailing
-    arguments.
+    The cache is keyed on the callables' specs (see
+    :class:`tinyns.samplers._CallableSpec`), so pytree callables that differ
+    only in their array leaves share one compiled kernel. The returned
+    ``block_kernel`` takes the array leaves of pytree callables and the large
+    constants of closures (``*_callable_leaves(loglike, prior_transform,
+    ndim)``) as trailing arguments and threads them to the rwalk kernel, so
+    they are jit arguments rather than compiled-in constants. Callables with
+    neither take no trailing arguments.
     """
 
-    loglike = _unwrap_cacheable_callable(loglike)
-    prior_transform = _unwrap_cacheable_callable(prior_transform)
     ndim = int(ndim)
     walks = int(walks)
     replacement_chains = int(replacement_chains)
     block_size = int(block_size)
     batch_ncall = walks * replacement_chains
-    rwalk_kernel = _make_rwalk_jax_kernel(
-        loglike,
-        prior_transform,
+    rwalk_kernel = _make_rwalk_jax_kernel_cached(
+        loglike_spec,
+        prior_spec,
         ndim,
         walks,
         replacement_chains,
@@ -501,10 +507,9 @@ def _make_static_jax_rwalk_block_kernel(
     block_size: int,
     proposal: str = "isotropic",
 ):
-    """Return a cached block kernel for hashable or unhashable callables."""
+    """Return the cached block kernel for these callables' specs."""
     return _make_static_jax_rwalk_block_kernel_cached(
-        _cacheable_callable(loglike),
-        _cacheable_callable(prior_transform),
+        *_callable_specs(loglike, prior_transform, ndim),
         ndim,
         walks,
         replacement_chains,
@@ -704,6 +709,7 @@ def _make_run_state(
     bound_nellipsoids: list[int] | None = None,
     rwalk_seed: str = "live",
     bound_seed_kernel: str = "python",
+    calls_per_s: float | None = None,
 ) -> dict[str, object]:
     if replacement_ncall:
         replacement_mean_ncall_so_far = float(
@@ -747,6 +753,7 @@ def _make_run_state(
         "logz": float(logz),
         "dlogz": float(dlogz),
         "ncall": int(ncall),
+        "calls_per_s": calls_per_s,
         "logl_min": float(logl_min),
         "logl_live_max": float(logl_live_max),
         "sample": str(sample),
@@ -778,6 +785,8 @@ def _make_run_state(
 def _format_progress_line(state: dict[str, object]) -> str:
     """Format one dependency-free progress line for a run state."""
 
+    rate = state.get("calls_per_s")
+    rate_text = "n/a" if rate is None else f"{float(rate):.3g}"
     repl = state.get("replacement_mean_ncall_so_far")
     repl_text = "n/a" if repl is None else f"{float(repl):.1f}"
     batches = state.get("replacement_mean_batches_so_far")
@@ -832,6 +841,7 @@ def _format_progress_line(state: dict[str, object]) -> str:
         f"logz={float(state['logz']):.3f} "
         f"dlogz={float(state['dlogz']):.3f} "
         f"ncall={int(state['ncall'])} "
+        f"calls/s={rate_text} "
         f"logl_min={float(state['logl_min']):.3g} "
         f"logl_live_max={float(state['logl_live_max']):.3g} "
         f"repl_ncall={repl_text} "
@@ -1205,6 +1215,11 @@ def run_static_nested(
         if initial_state is not None
         else {}
     )
+
+    # Wall-time telemetry: the first block (or iteration) carries the compiles,
+    # so throughput is measured from its end.
+    sampling_start = time.perf_counter()
+    first_block = None  # (seconds since sampling_start, ncall) after block 1
 
     # Array leaves of pytree callables and large closure constants, placed on
     # the device once per run and passed to the compiled fast-path kernels as
@@ -1588,7 +1603,17 @@ def run_static_nested(
         logl_min: float,
         logl_live_max: float,
     ) -> dict[str, object]:
-        """Assemble a run-state dict, closing over the constant config args."""
+        """Assemble a run-state dict, closing over the constant config args.
+
+        Called once per finished block (or iteration); the first call marks
+        the end of the first block for the wall-time telemetry.
+        """
+        nonlocal first_block
+        elapsed = time.perf_counter() - sampling_start
+        if first_block is None:
+            first_block = (elapsed, ncall)
+        calls = ncall - first_block[1]
+        seconds = elapsed - first_block[0]
         return _make_run_state(
             iteration=iteration,
             logz=logz,
@@ -1614,6 +1639,7 @@ def run_static_nested(
             bound_nellipsoids=bound_nellipsoid_history,
             rwalk_seed=rwalk_seed,
             bound_seed_kernel=bound_seed_kernel,
+            calls_per_s=calls / seconds if calls > 0 and seconds > 0 else None,
         )
 
     # A resumed run may already be terminal: converged, or checkpointed at
@@ -2645,6 +2671,15 @@ def run_static_nested(
                 maybe_checkpoint(final=True)
                 break
 
+    wall_time_s = time.perf_counter() - sampling_start
+    compile_s = None if first_block is None else first_block[0]
+    calls_after_first_block = 0 if first_block is None else ncall - first_block[1]
+    mean_ms_per_call = (
+        1000.0 * (wall_time_s - compile_s) / calls_after_first_block
+        if calls_after_first_block > 0
+        else None
+    )
+
     live_logwt = logx_final - math.log(nlive) + live_logl
 
     dead_u_arr = jnp.asarray(dead_u_storage[:iteration])
@@ -2755,6 +2790,11 @@ def run_static_nested(
             **adaptive_metadata,
             "sample": sample,
             "kernel": kernel,
+            # Wall time of this call (a resume counts only its own part); the
+            # first block includes the compiles, so the per-call cost skips it.
+            "wall_time_s": float(wall_time_s),
+            "compile_s": compile_s,
+            "mean_ms_per_call": mean_ms_per_call,
             "jax_block_size": int(jax_block_size),
             "jax_block_mode": bool(jax_block_size > 1),
             "jax_block_bound_fixed": bool(jax_block_size > 1 and bound != "none"),

@@ -1156,7 +1156,7 @@ def test_static_jax_block_kernel_cache_is_bounded() -> None:
         return u
 
     run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-    run_mod._make_rwalk_jax_kernel.cache_clear()
+    run_mod._make_rwalk_jax_kernel_cached.cache_clear()
     try:
         for offset in range(40):
             def loglike(theta, offset=offset):
@@ -1177,7 +1177,7 @@ def test_static_jax_block_kernel_cache_is_bounded() -> None:
         assert cache_info.misses == 40
     finally:
         run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-        run_mod._make_rwalk_jax_kernel.cache_clear()
+        run_mod._make_rwalk_jax_kernel_cached.cache_clear()
 
 
 def test_jax_block_partial_failure_after_convergence_reports_success(
@@ -1508,7 +1508,7 @@ def test_jax_block_stops_scanning_after_first_failed_replacement(monkeypatch) ->
 
         return kernel
 
-    monkeypatch.setattr(run_mod, "_make_rwalk_jax_kernel", make_rwalk_kernel)
+    monkeypatch.setattr(run_mod, "_make_rwalk_jax_kernel_cached", make_rwalk_kernel)
     run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
     kernel = run_mod._make_static_jax_rwalk_block_kernel(
         lambda theta: theta[0],
