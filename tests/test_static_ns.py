@@ -1820,3 +1820,27 @@ def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None
     assert result.metadata["rwalk_adaptation_updates"] > 0
     assert math.isfinite(result.metadata["rwalk_observed_accept_mean"])
     assert result.metadata["rwalk_observed_accept_source"] == "move_acceptance"
+
+
+def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
+    """ncall counts real likelihood calls; out-of-cube proposals are not evaluated."""
+    import jax
+
+    calls = []
+
+    def loglike(theta):
+        jax.debug.callback(lambda: calls.append(1))
+        # mass near the cube corner, so many proposals leave the cube
+        return -0.5 * jnp.sum(((theta - 0.05) / 0.05) ** 2)
+
+    def prior_transform(u):
+        return u
+
+    result = run_static_nested(
+        random.PRNGKey(7), loglike, prior_transform, 3, 100, walks=25, maxiter=640
+    )
+    jax.effects_barrier()
+    metadata = result.metadata
+    assert metadata["rwalk_proposal"] == "live-cov"
+    assert len(calls) == result.ncall
+    assert result.ncall < 100 + metadata["total_rwalk_proposals"]

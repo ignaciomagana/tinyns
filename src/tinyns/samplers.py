@@ -853,14 +853,15 @@ def _make_rwalk_jax_kernel_cached(
     2. ``new_u`` -- the accepted replacement point in unit-cube coordinates.
     3. ``new_theta`` -- the prior-transformed replacement point.
     4. ``new_logl`` -- the log-likelihood of ``new_theta``.
-    5. ``ncall`` -- total likelihood evaluations spent (batches x walks x
-       ``replacement_chains``).
+    5. ``ncall`` -- likelihood evaluations actually made. This is batches x
+       walks x ``replacement_chains``, except that a single unbatched live-cov
+       chain skips (and does not count) proposals that leave the unit cube.
     6. ``accepted`` -- whether an in-constraint move was found before the batch
        budget was exhausted.
     7. ``accepted_move_count`` -- accepted proposals summed over all chains and
        batches (rwalk-acceptance numerator).
-    8. ``total_proposal_count`` -- total proposals attempted; equals ``ncall``
-       and is the rwalk-acceptance denominator.
+    8. ``total_proposal_count`` -- total proposals attempted (batches x walks x
+       ``replacement_chains``), the rwalk-acceptance denominator.
 
     ``proposal="isotropic"`` steps by ``step_scale * N(0, I)`` in the unit cube
     and reflects at the cube faces. ``proposal="live-cov"`` steps by
@@ -884,6 +885,9 @@ def _make_rwalk_jax_kernel_cached(
     if proposal not in RWALK_PROPOSALS:
         raise ValueError(f"proposal must be one of {RWALK_PROPOSALS}")
     live_cov = proposal == "live-cov"
+    # With one unbatched chain, out-of-cube live-cov proposals skip the
+    # likelihood (lax.cond); under vmap a cond would evaluate both branches.
+    skip_out_of_cube = live_cov and replacement_chains == 1 and not jax_vectorized
     loglike_closure = _unwrap_cacheable_callable(loglike)
     prior_closure = _unwrap_cacheable_callable(prior_transform)
     (loglike_dynamic, loglike_rebuild), (prior_dynamic, prior_rebuild) = (
@@ -962,6 +966,7 @@ def _make_rwalk_jax_kernel_cached(
                 best_logl,
                 accepted_move_count,
                 batch_index,
+                n_evals,
             ) = state
 
             key, seed_key = random.split(key)
@@ -987,6 +992,7 @@ def _make_rwalk_jax_kernel_cached(
                 (replacement_chains,), -jnp.inf, live_logl.dtype
             )
             accepted_moves = jnp.zeros((replacement_chains,), dtype=jnp.int32)
+            batch_evals = jnp.asarray(0, dtype=jnp.int32)
 
             def one_step(carry, _):
                 (
@@ -998,6 +1004,7 @@ def _make_rwalk_jax_kernel_cached(
                     attempt_best_theta,
                     attempt_best_logl,
                     accepted_moves,
+                    batch_evals,
                 ) = carry
                 key, proposal_key = random.split(key)
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
@@ -1007,13 +1014,34 @@ def _make_rwalk_jax_kernel_cached(
                     u_prop = jnp.clip(u_raw, 0.0, 1.0)
                 else:
                     u_prop = reflect_unit_cube(current_u + step_scale * z)
-                theta_prop, logl_prop = _evaluate_jax_batch(
-                    loglike,
-                    prior_transform,
-                    u_prop,
-                    ndim,
-                    jax_vectorized=jax_vectorized,
-                )
+                if skip_out_of_cube:
+
+                    def evaluate(u):
+                        theta, logl = _evaluate_jax_batch(
+                            loglike, prior_transform, u, ndim, jax_vectorized=False
+                        )
+                        return (
+                            theta.astype(current_theta.dtype),
+                            logl.astype(current_logl.dtype),
+                        )
+
+                    def skip(u):
+                        del u
+                        return current_theta, jnp.full_like(current_logl, -jnp.inf)
+
+                    theta_prop, logl_prop = lax.cond(in_cube[0], evaluate, skip, u_prop)
+                    batch_evals = batch_evals + in_cube[0].astype(jnp.int32)
+                else:
+                    theta_prop, logl_prop = _evaluate_jax_batch(
+                        loglike,
+                        prior_transform,
+                        u_prop,
+                        ndim,
+                        jax_vectorized=jax_vectorized,
+                    )
+                    batch_evals = batch_evals + jnp.asarray(
+                        replacement_chains, dtype=jnp.int32
+                    )
 
                 if live_cov:
                     # Out-of-cube moves never count as the fallback best point.
@@ -1042,6 +1070,7 @@ def _make_rwalk_jax_kernel_cached(
                     attempt_best_theta,
                     attempt_best_logl,
                     accepted_moves,
+                    batch_evals,
                 ), None
 
             (
@@ -1054,6 +1083,7 @@ def _make_rwalk_jax_kernel_cached(
                     attempt_best_theta,
                     attempt_best_logl,
                     accepted_moves,
+                    batch_evals,
                 ),
                 _,
             ) = lax.scan(
@@ -1067,6 +1097,7 @@ def _make_rwalk_jax_kernel_cached(
                     attempt_best_theta,
                     attempt_best_logl,
                     accepted_moves,
+                    batch_evals,
                 ),
                 xs=None,
                 length=walks,
@@ -1100,6 +1131,7 @@ def _make_rwalk_jax_kernel_cached(
                 accepted_moves, dtype=accepted_move_count.dtype
             )
             batch_index = batch_index + jnp.asarray(1, dtype=jnp.int32)
+            n_evals = n_evals + batch_evals.astype(n_evals.dtype)
             return (
                 key,
                 ncall,
@@ -1113,6 +1145,7 @@ def _make_rwalk_jax_kernel_cached(
                 best_logl,
                 accepted_move_count,
                 batch_index,
+                n_evals,
             )
 
         (
@@ -1128,6 +1161,7 @@ def _make_rwalk_jax_kernel_cached(
             best_logl,
             accepted_move_count,
             _batch_index,
+            n_evals,
         ) = lax.while_loop(
             cond,
             body,
@@ -1144,6 +1178,7 @@ def _make_rwalk_jax_kernel_cached(
                 initial_best_logl,
                 initial_accepted_move_count,
                 initial_batch_index,
+                jnp.asarray(0, dtype=jnp.int32),
             ),
         )
         new_u = jnp.where(done, out_u, best_u)
@@ -1154,7 +1189,7 @@ def _make_rwalk_jax_kernel_cached(
             new_u,
             new_theta,
             new_logl,
-            ncall,
+            n_evals,
             accepted,
             accepted_move_count,
             ncall,
@@ -1305,7 +1340,7 @@ def draw_constrained_rwalk_jax(
         *_callable_leaves(loglike, prior_transform, ndim),
     )
     if return_info:
-        batches = int(math.ceil(int(ncall) / batch_ncall))
+        batches = int(math.ceil(int(total_proposal_count) / batch_ncall))
         observed_acceptance = (
             float(accepted_move_count) / float(total_proposal_count)
             if int(total_proposal_count) > 0

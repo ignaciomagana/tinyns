@@ -346,7 +346,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     *callable_leaves,
                 )
                 replacement_batches_used = (
-                    replacement_ncall
+                    total_proposal_count
                     + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
                 ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
                 replacement_chains_used = replacement_batches_used * jnp.asarray(
