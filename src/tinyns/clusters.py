@@ -282,7 +282,6 @@ class ClusterTracker:
             "counts": [],  # [iteration, number of clusters], at changes only
             "iters": [],  # iteration of every update
             "modes": {},  # per cluster id: populations and evidence per update
-            "min_population": None,
             "swap": [0, 0],  # accepted, proposed
         }
         if arrays is not None:
@@ -337,17 +336,13 @@ class ClusterTracker:
             log["counts"].append([iteration, k])
         log["iters"].append(iteration)
         population = np.bincount(labels, minlength=k)
-        if k > 1:
-            log["min_population"] = int(
-                min(population.min(), log["min_population"] or len(u))
-            )
         for c, cid in enumerate(log["ids"]):
             mode = log["modes"].setdefault(
                 str(cid),
                 {"start": len(log["iters"]) - 1, "n": [], "swap": [], "logz": []},
             )
             mode["n"].append(int(population[c]))
-            mode["swap"].append(bool(self.eligible[c]))
+            mode["swap"].append(bool(self.eligible[c] and self._frames is not None))
 
     def _track(self, u):
         """Relabel the live points: warm-started hard EM, merges, then splits."""
@@ -405,9 +400,10 @@ class ClusterTracker:
         fit = self.fit = _fit(self.u, self.labels, k)
         share = np.exp(fit["logdet"] - _logsumexp(fit["logdet"]))  # of the volume
         eligible = (n * share >= ELIGIBLE_PER_DIM * ndim) & (fit["count"] > ndim)
+        eligible[np.argmax(fit["count"])] = True  # the bulk always takes part
+        self.eligible = eligible
         if eligible.sum() < 2:
             return
-        self.eligible = eligible
 
         def pad(x):
             out = np.zeros((MAX_CLUSTERS,) + x.shape[1:], dtype=x.dtype)
@@ -442,57 +438,66 @@ class ClusterTracker:
     def summary(self, dead_u, dead_logwt, live_u, live_logwt):
         """Return the cluster telemetry for ``result.metadata``.
 
-        With two or more clusters at the end, ``cluster_modes`` lists for each
-        its posterior mass, its smallest population and ``urn_logit_sd``: the
-        scatter of ``logit(mass)`` that the random walk of its population
-        would cause without the swap, from the run's own populations between
-        the cluster's detection and its posterior median. ``swap_fraction`` is
+        ``cluster_modes`` lists every cluster that ever shared the live set
+        with another one: its posterior ``mass``, its smallest population
+        between its detection and its posterior median, and ``urn_logit_sd``,
+        the scatter of ``logit(mass)`` that the random walk of its population
+        would cause without the swap, from the run's own populations over the
+        same stretch (section 7 of the multimodal study). ``swap_fraction`` is
         the part of that stretch during which the cluster could swap; near 1
         the actual scatter is several times smaller than ``urn_logit_sd``.
         """
-        log = self.log
-        out = {
-            "cluster_count_history": [list(pair) for pair in log["counts"]],
-            "cluster_min_population": log["min_population"],
-            "cluster_swap_accepts": int(log["swap"][0]),
-            "cluster_swap_proposals": int(log["swap"][1]),
-            "cluster_modes": [],
-        }
-        if self.fit is None:
-            return out
-        nlive = len(live_u)
+        log, nlive = self.log, len(live_u)
         edges = log["iters"] + [len(dead_logwt)]
-        steps = np.diff(edges)
-        tail_logwt = np.concatenate([dead_logwt[edges[-2] :], live_logwt])
-        which = _assign(self.fit, np.concatenate([dead_u[edges[-2] :], live_u]))
         logz = _logsumexp(np.concatenate([dead_logwt, live_logwt]))
+        # Mass per update interval: the last one also holds the live points.
+        tail_logwt = np.concatenate([dead_logwt[edges[-2] :], live_logwt])
         total = [_logsumexp(dead_logwt[a:b]) for a, b in itertools.pairwise(edges)]
         total = np.exp(np.array(total[:-1] + [_logsumexp(tail_logwt)]) - logz)
-
-        def to_median(z):  # update intervals up to the posterior median of z
-            return slice(int(np.searchsorted(np.cumsum(z), 0.5 * z.sum())) + 1)
-
-        for c, cid in enumerate(log["ids"]):
-            mode = log["modes"][str(cid)]
-            own = mode["logz"] + [_logsumexp(tail_logwt[which == c])]
-            own = np.exp(np.array(own) - logz)
-            other = total[mode["start"] :] - own
+        tail = np.zeros(len(tail_logwt), dtype=int)
+        if self.fit is not None:
+            tail = _assign(self.fit, np.concatenate([dead_u[edges[-2] :], live_u]))
+        tail_logz = {cid: _logsumexp(tail_logwt[tail == c]) for c, cid in
+                     enumerate(log["ids"])}
+        modes = []
+        for cid, mode in log["modes"].items():
             n = np.array(mode["n"], dtype=float)
+            alive = len(mode["logz"]) < len(n)  # still a cluster at the end
+            own = mode["logz"] + ([tail_logz[int(cid)]] if alive else [])
+            own = np.exp(np.array(own) - logz)
             shared = (n > 0) & (n < nlive)  # another cluster exists
-            entry = {"mass": float(own.sum()), "min_population": int(n.min())}
-            if shared.any():
-                first = int(np.argmax(shared))
-                g = np.clip(n / nlive, 0.5 / nlive, 1 - 0.5 / nlive)
-                rate = np.where(shared, 2.0 * steps[mode["start"] :] / nlive**2, 0.0)
-                variance = (
-                    1.0 / n[first]
-                    + 1.0 / (nlive - n[first])
-                    + (rate * (1 - g) / g)[to_median(own)].sum()
-                    + (rate * g / (1 - g))[to_median(other)].sum()
-                )
-                entry["urn_logit_sd"] = float(np.sqrt(variance))
-                entry["swap_fraction"] = float(
-                    np.mean(mode["swap"][first:][to_median(own[first:])])
-                )
-            out["cluster_modes"].append(entry)
-        return out
+            if not shared.any():
+                continue
+            first = int(np.argmax(shared))
+            stop = first + 1 + int(np.searchsorted(np.cumsum(own[first:]),
+                                                   0.5 * own[first:].sum()))
+            other = total[mode["start"] :][: len(n)] - own
+            stop_other = int(np.searchsorted(np.cumsum(other), 0.5 * other.sum())) + 1
+            g = np.clip(n / nlive, 0.5 / nlive, 1 - 0.5 / nlive)
+            steps = np.diff(edges)[mode["start"] :][: len(n)]
+            rate = np.where(shared, 2.0 * steps / nlive**2, 0.0)
+            variance = (
+                1.0 / n[first]
+                + 1.0 / (nlive - n[first])
+                + (rate * (1 - g) / g)[first:stop].sum()
+                + (rate * g / (1 - g))[first:stop_other].sum()
+            )
+            modes.append(
+                {
+                    "id": int(cid),
+                    "first_iteration": int(edges[mode["start"] + first]),
+                    "mass": float(own.sum()),
+                    "min_population": int(n[first:stop].min()),
+                    "urn_logit_sd": float(np.sqrt(variance)),
+                    "swap_fraction": float(np.mean(mode["swap"][first:stop])),
+                }
+            )
+        return {
+            "cluster_count_history": [list(pair) for pair in log["counts"]],
+            "cluster_min_population": min(
+                (m["min_population"] for m in modes), default=None
+            ),
+            "cluster_swap_accepts": int(log["swap"][0]),
+            "cluster_swap_proposals": int(log["swap"][1]),
+            "cluster_modes": modes,
+        }

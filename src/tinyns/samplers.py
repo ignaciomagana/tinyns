@@ -23,6 +23,7 @@ from tinyns.bounds import (
     sample_jax_ellipsoid_bound_corrected,
     sample_single_ellipsoid,
 )
+from tinyns.clusters import loo_frames, swap_step
 from tinyns.math import reflect_unit_cube
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -894,6 +895,7 @@ def _make_rwalk_jax_kernel_cached(
     replacement_chains: int,
     jax_vectorized: bool,
     proposal: str = "isotropic",
+    cluster_swap: bool = False,
 ):
     """Return a cached compiled retrying constrained rwalk kernel.
 
@@ -933,6 +935,13 @@ def _make_rwalk_jax_kernel_cached(
     rebuilt inside the trace, so the arrays are jit arguments rather than
     baked-in constants. Callables with neither take no trailing arguments and
     are traced exactly as before.
+
+    ``cluster_swap=True`` (single unbatched live-cov chain only) makes a
+    fraction of the chain steps affine swaps between cluster frames (see
+    :mod:`tinyns.clusters`). The kernel then takes the cluster frames as an
+    extra argument before the callable leaves and returns a ninth output,
+    ``[accepted swaps, proposed swaps]``; the swap steps are included in
+    ``accepted_move_count`` and ``total_proposal_count``.
     """
 
     if proposal not in RWALK_PROPOSALS:
@@ -941,6 +950,8 @@ def _make_rwalk_jax_kernel_cached(
     # With one unbatched chain, out-of-cube live-cov proposals skip the
     # likelihood (lax.cond); under vmap a cond would evaluate both branches.
     skip_out_of_cube = live_cov and replacement_chains == 1 and not jax_vectorized
+    if cluster_swap and not skip_out_of_cube:
+        raise ValueError("cluster_swap needs a single unbatched live-cov chain")
     nloglike_leaves = loglike_spec.nleaves
     nleaves = loglike_spec.nleaves + prior_spec.nleaves
 
@@ -955,6 +966,8 @@ def _make_rwalk_jax_kernel_cached(
         max_batches,
         *callable_leaves,
     ):
+        if cluster_swap:
+            clusters, *callable_leaves = callable_leaves
         if len(callable_leaves) != nleaves:
             raise ValueError(
                 f"kernel expects {nleaves} callable array leaves, "
@@ -1002,6 +1015,7 @@ def _make_rwalk_jax_kernel_cached(
                 accepted_move_count,
                 batch_index,
                 n_evals,
+                *swap_counts,
             ) = state
 
             key, seed_key = random.split(key)
@@ -1021,6 +1035,8 @@ def _make_rwalk_jax_kernel_cached(
                 jax_vectorized=jax_vectorized,
             )
             current_logl = live_logl[seed_idx]
+            if cluster_swap:
+                frames = loo_frames(clusters, seed_idx[0], current_u[0])
             attempt_best_u = current_u
             attempt_best_theta = current_theta
             attempt_best_logl = jnp.full(
@@ -1045,7 +1061,16 @@ def _make_rwalk_jax_kernel_cached(
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
                 if live_cov:
                     u_raw = current_u + step_scale * (z @ chol.T)
+                    if cluster_swap:
+                        swap_u, swap_ok, is_swap = swap_step(
+                            random.fold_in(proposal_key, 1), current_u[0], frames
+                        )
+                        u_raw = jnp.where(is_swap, swap_u[None, :], u_raw)
                     in_cube = jnp.all((u_raw >= 0.0) & (u_raw <= 1.0), axis=1)
+                    if cluster_swap:
+                        # A swap that fails its likelihood-free tests is
+                        # rejected without a call, like an out-of-cube step.
+                        in_cube = in_cube & (swap_ok | ~is_swap)
                     u_prop = jnp.clip(u_raw, 0.0, 1.0)
                 else:
                     u_prop = reflect_unit_cube(current_u + step_scale * z)
@@ -1106,7 +1131,7 @@ def _make_rwalk_jax_kernel_cached(
                     attempt_best_logl,
                     accepted_moves,
                     batch_evals,
-                ), None
+                ), (jnp.stack([is_swap & accept[0], is_swap]) if cluster_swap else None)
 
             (
                 (
@@ -1120,7 +1145,7 @@ def _make_rwalk_jax_kernel_cached(
                     accepted_moves,
                     batch_evals,
                 ),
-                _,
+                swap_steps,
             ) = lax.scan(
                 one_step,
                 (
@@ -1173,6 +1198,10 @@ def _make_rwalk_jax_kernel_cached(
             )
             batch_index = batch_index + jnp.asarray(1, dtype=jnp.int32)
             n_evals = n_evals + batch_evals.astype(n_evals.dtype)
+            if cluster_swap:
+                swap_counts = [
+                    swap_counts[0] + jnp.sum(swap_steps, axis=0, dtype=jnp.int32)
+                ]
             return (
                 key,
                 ncall,
@@ -1187,6 +1216,7 @@ def _make_rwalk_jax_kernel_cached(
                 accepted_move_count,
                 batch_index,
                 n_evals,
+                *swap_counts,
             )
 
         (
@@ -1203,6 +1233,7 @@ def _make_rwalk_jax_kernel_cached(
             accepted_move_count,
             _batch_index,
             n_evals,
+            *swap_counts,
         ) = lax.while_loop(
             cond,
             body,
@@ -1220,6 +1251,7 @@ def _make_rwalk_jax_kernel_cached(
                 initial_accepted_move_count,
                 initial_batch_index,
                 jnp.asarray(0, dtype=jnp.int32),
+                *([jnp.zeros(2, dtype=jnp.int32)] if cluster_swap else []),
             ),
         )
         new_u = jnp.where(done, out_u, best_u)
@@ -1234,6 +1266,7 @@ def _make_rwalk_jax_kernel_cached(
             accepted,
             accepted_move_count,
             ncall,
+            *swap_counts,
         )
 
     return kernel

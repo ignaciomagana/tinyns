@@ -48,6 +48,7 @@ _OPTION_NAMES = (
     "jax_block_size",
     "rwalk_adaptive_step_scale",
     "rwalk_target_accept",
+    "cluster_swap",
 )
 _RUN_PARAMETERS = inspect.signature(run_static_nested).parameters
 _OPTION_DEFAULTS = {name: _RUN_PARAMETERS[name].default for name in _OPTION_NAMES}
@@ -80,6 +81,7 @@ _OLD_CHECKPOINT_DEFAULTS = {
     "jax_block_size": 1,
     "rwalk_adaptive_step_scale": False,
     "rwalk_target_accept": 0.25,
+    "cluster_swap": False,
 }
 
 
@@ -115,7 +117,10 @@ class NestedSampler:
         the fast path: ``kernel="jax"``, ``rwalk_proposal="live-cov"``,
         ``jax_block_size=32``, ``walks=max(25, 6 * ndim)`` (12 for ``ndim=1``)
         and an initial ``step_scale=0.5`` that is adapted toward
-        ``rwalk_target_accept``.
+        ``rwalk_target_accept``. On that path ``cluster_swap=True`` lets the
+        chains swap between tracked clusters of the live points, which keeps
+        the weights of separated modes from drifting; pass
+        ``cluster_swap=False`` to opt out.
         Where live-cov is unsupported (``kernel="python"``, a bound, or a
         ``replacement_chain_schedule``) the defaults fall back to
         ``rwalk_proposal="isotropic"``, ``step_scale=0.1`` and
@@ -360,6 +365,7 @@ class NestedSampler:
                 or options["rwalk_proposal"] == "live-cov"
             ),
             "rwalk_target_accept": float(options["rwalk_target_accept"]),
+            "cluster_swap": bool(options["cluster_swap"]),
         }
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
