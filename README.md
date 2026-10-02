@@ -412,7 +412,12 @@ for any cluster frames. It pulls the populations toward the modes' true
 volumes, while the rwalk keeps the global live covariance.
 `cluster_swap=False` turns it off.
 
-SWAP_RESULTS_PLACEHOLDER
+On two-mode Gaussian targets with a 6% minor mode (nlive 500, 20 seeds per
+cell), the seed scatter of the minor mode's mass in logit units went from
+0.46 to 0.15 at 4-D, 0.83 to 0.16 at 10-D and 1.28 to 0.58 at 18-D. The mean
+stayed on the truth (0.060, 0.057 and 0.070 +/- 0.009), and logZ did not
+change. Runs made 2% to 5% fewer likelihood calls. The host-side clustering
+costs about 12 ms per update at 13-D, one update every 128 iterations.
 
 Limits:
 
@@ -421,7 +426,8 @@ Limits:
   stays off and the weights drift as before. Raise `nlive`.
 - The frames are ellipsoids. Curved or truncated modes lower the swap
   acceptance, and the result moves back toward the drift, but stays valid.
-- A unimodal run never switches the swap on and is bit-identical to v0.2.4.
+- A unimodal run does not switch the swap on (the clustering made no false
+  split in our tests) and is then bit-identical to v0.2.4.
 
 If the weight of a small or non-ellipsoidal mode matters, split the prior into
 one region per mode and run each, or run several seeds and compare.
