@@ -195,7 +195,7 @@ def test_draw_constrained_rwalk_rejects_invalid_parameters_and_shapes() -> None:
             live_u,
             live_logl,
             2,
-            min_accepts=0,
+            min_accepts=-1,
         )
 
 
@@ -560,7 +560,7 @@ def test_draw_constrained_rwalk_jax_rejects_invalid_min_accepts() -> None:
             jnp.full((2, 2), 0.5),
             jnp.zeros(2),
             2,
-            min_accepts=0,
+            min_accepts=-1,
         )
 
 
@@ -1259,3 +1259,40 @@ def test_draw_constrained_multi_bound_jax_failure_fallback_is_finite_and_safe():
     assert bool(jnp.all((u >= 0.0) & (u <= 1.0)))
     assert bool(jnp.all((theta >= 0.0) & (theta <= 1.0)))
     assert jnp.isfinite(logl)
+
+
+def test_rwalk_jax_unmoved_chain_returns_seed_by_default() -> None:
+    """With min_accepts=0 a chain that cannot move is kept as a copy of its seed."""
+    import jax.numpy as jnp
+    from jax import random
+
+    from tinyns.samplers import draw_constrained_rwalk_jax
+
+    live_u = jnp.asarray([[0.2, 0.2], [0.5, 0.5], [0.8, 0.8]])
+    live_logl = jnp.asarray([0.0, 1.0, 2.0])
+
+    def loglike(theta):
+        # only the exact live points are inside the constraint
+        hit = jnp.any(jnp.all(jnp.isclose(theta, live_u), axis=1))
+        return jnp.where(hit, jnp.sum(theta) * 2.0 - 0.8 * 2.0 + 2.0 - 1.2 * 0.0, -10.0)
+
+    def prior_transform(u):
+        return u
+
+    kwargs = dict(walks=6, step_scale=0.3, max_attempts=60, proposal="live-cov")
+    out = draw_constrained_rwalk_jax(
+        random.PRNGKey(0), loglike, prior_transform, 0.5, live_u, live_logl, 2,
+        return_info=True, **kwargs,
+    )
+    _, new_u, _, new_logl, _, accepted, info = out
+    assert accepted is True
+    assert info["accepted_rwalk_moves"] == 0
+    assert bool(jnp.any(jnp.all(new_u == live_u[1:], axis=1)))  # a seed above logl_min
+    assert new_logl > 0.5
+
+    # the old rule (min_accepts=1) keeps retrying and reports failure
+    out_old = draw_constrained_rwalk_jax(
+        random.PRNGKey(0), loglike, prior_transform, 0.5, live_u, live_logl, 2,
+        min_accepts=1, **kwargs,
+    )
+    assert out_old[5] is False

@@ -190,7 +190,7 @@ def test_nested_sampler_rwalk_gaussian_returns_finite_logz() -> None:
 
 
 def test_nested_sampler_rejects_invalid_min_accepts_on_run() -> None:
-    sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=20, min_accepts=0)
+    sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=20, min_accepts=-1)
 
     with pytest.raises(ValueError, match="min_accepts"):
         sampler.run(key=np.array([3, 4], dtype=np.uint32), maxiter=1)

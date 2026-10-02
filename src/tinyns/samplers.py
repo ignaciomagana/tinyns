@@ -366,9 +366,9 @@ def _validate_min_accepts(min_accepts: int) -> None:
     if (
         not isinstance(min_accepts, int)
         or isinstance(min_accepts, bool)
-        or min_accepts <= 0
+        or min_accepts < 0
     ):
-        raise ValueError("min_accepts must be a positive integer")
+        raise ValueError("min_accepts must be a non-negative integer")
 
 
 def _bound_info(bound, bound_draws, unit_cube_survivors, ncall, overlap_rejections):
@@ -1147,7 +1147,13 @@ def _make_rwalk_jax_kernel_cached(
             )
             best_logl = jnp.where(is_global_best, batch_best_logl, best_logl)
 
-            success_mask = accepted_moves >= min_accepts
+            # A chain succeeds once it made min_accepts moves and ends inside the
+            # constraint. With min_accepts=0 (default) an unmoved chain is kept as
+            # a copy of its seed, provided the seed is strictly above logl_min;
+            # discarding unmoved chains would under-sample hard-to-move regions.
+            success_mask = (accepted_moves >= min_accepts) & jnp.where(
+                accepted_moves > 0, current_logl >= logl_min, current_logl > logl_min
+            )
             any_success = jnp.any(success_mask)
             key, select_key = random.split(key)
             selection_scores = jnp.where(
@@ -1306,7 +1312,7 @@ def draw_constrained_rwalk_jax(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
     replacement_chains: int = 1,
     jax_vectorized: bool = False,
     return_info: bool = False,
@@ -1549,7 +1555,7 @@ def draw_constrained_single_bound_rwalk_jax(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
     bound_batch_size: int = 128,
@@ -1599,7 +1605,7 @@ def draw_constrained_multi_bound_rwalk_jax(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
     bound_batch_size: int = 128,
@@ -1657,7 +1663,7 @@ def draw_constrained_rwalk_jax_adaptive(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
     replacement_chain_schedule=(1, 4, 16, 64),
     jax_vectorized: bool = False,
 ):
@@ -1786,7 +1792,7 @@ def draw_constrained_rwalk_jax_adaptive_from_seed(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
     replacement_chain_schedule=(1, 4, 16, 64),
     jax_vectorized: bool = False,
 ):
@@ -1824,14 +1830,16 @@ def draw_constrained_rwalk(
     walks: int = 25,
     step_scale: float = 0.1,
     max_attempts: int = 10_000,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
 ):
     """Draw a constrained replacement with a reflected random walk.
 
     A live point is chosen as the seed, then ``walks`` reflected Gaussian
     transition proposals are attempted per replacement attempt. The copied live
-    seed does not count toward ``min_accepts``; ``min_accepts`` is a minimum
-    accepted-move sanity check after the full update length, not a chain length.
+    seed does not count toward ``min_accepts``. With the default
+    ``min_accepts=0`` a chain that never moves returns its seed (when the seed
+    is strictly above ``logl_min``); ``min_accepts >= 1`` instead retries until
+    a chain makes that many moves, which under-samples hard-to-move regions.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -1888,7 +1896,12 @@ def draw_constrained_rwalk(
                 current_logl = logl_prop
                 accepted_moves += 1
 
-        if accepted_moves >= min_accepts:
+        # Same rule as the JAX kernel: an unmoved chain is kept only if its
+        # seed is strictly above logl_min.
+        inside = (
+            current_logl >= logl_min if accepted_moves > 0 else current_logl > logl_min
+        )
+        if accepted_moves >= min_accepts and inside:
             return new_key, current_u, current_theta, current_logl, ncall, True
 
     return new_key, best_u, best_theta, best_logl, ncall, False
