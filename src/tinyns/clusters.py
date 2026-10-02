@@ -148,8 +148,10 @@ def swap_step(key, u, frames):
 
 
 def _ridge(cov):
-    ndim = len(cov)
-    return cov + 1e-12 * max(np.trace(cov) / ndim, 1e-300) * np.eye(ndim)
+    """Add a relative ridge to a (stack of) covariance matrices."""
+    ndim = cov.shape[-1]
+    scale = np.maximum(np.trace(cov, axis1=-2, axis2=-1) / ndim, 1e-300)
+    return cov + 1e-12 * scale[..., None, None] * np.eye(ndim)
 
 
 def _logsumexp(x):
@@ -161,27 +163,22 @@ def _fit(u, labels, k):
 
     Returns each cluster's mean, scatter matrix, count, and the Cholesky
     factor of its covariance shrunk toward the scale-matched pooled
-    within-cluster covariance.
+    within-cluster covariance (the pooled one for clusters of one point).
     """
     ndim = u.shape[1]
-    mu, scat, count = np.zeros((k, ndim)), np.zeros((k, ndim, ndim)), np.zeros(k)
-    for c in range(k):
-        members = u[labels == c]
-        count[c] = len(members)
-        if len(members):
-            mu[c] = members.mean(0)
-            scat[c] = (members - mu[c]).T @ (members - mu[c])
+    member = (labels == np.arange(k)[:, None]).astype(u.dtype)  # (k, n)
+    count = member.sum(1)
+    mu = member @ u / np.maximum(count, 1)[:, None]
+    dev = u - mu[:, None, :]
+    scat = (dev * member[:, :, None]).transpose(0, 2, 1) @ dev
     pooled = _ridge(scat.sum(0) / max(count.sum() - k, 1))
     pinv = np.linalg.inv(pooled)
-    chol = np.empty_like(scat)
-    for c in range(k):
-        cov = pooled
-        if count[c] > 1:
-            dof = count[c] - 1
-            kappa = max(np.trace(pinv @ scat[c]) / (ndim * dof), 1e-6)
-            rho = SHRINK * ndim / (dof + SHRINK * ndim)
-            cov = _ridge((1 - rho) * scat[c] / dof + rho * kappa * pooled)
-        chol[c] = np.linalg.cholesky(cov)
+    dof = np.maximum(count - 1, 1)[:, None, None]
+    kappa = np.maximum(np.trace(pinv @ scat, axis1=1, axis2=2)[:, None, None]
+                       / (ndim * dof), 1e-6)
+    rho = SHRINK * ndim / (dof + SHRINK * ndim)
+    cov = _ridge((1 - rho) * scat / dof + rho * kappa * pooled)
+    chol = np.linalg.cholesky(np.where(count[:, None, None] > 1, cov, pooled))
     logdet = np.log(np.diagonal(chol, axis1=1, axis2=2)).sum(1)
     return {
         "mu": mu,
@@ -196,13 +193,12 @@ def _fit(u, labels, k):
 
 def _assign(fit, x):
     """Return the best cluster of each row of ``x`` (hard-EM classification)."""
-    score = np.full((len(fit["count"]), len(x)), np.inf)
-    total = fit["count"].sum()
-    for c, n in enumerate(fit["count"]):
-        if n:
-            z = np.linalg.solve(fit["chol"][c], (x - fit["mu"][c]).T)
-            score[c] = (z * z).sum(0) + 2 * fit["logdet"][c] - 2 * np.log(n / total)
-    return np.argmin(score, axis=0)
+    count = fit["count"]
+    z = (x - fit["mu"][:, None, :]) @ np.linalg.inv(fit["chol"]).transpose(0, 2, 1)
+    with np.errstate(divide="ignore"):
+        log_weight = np.log(count / count.sum())
+    score = (z * z).sum(2) + (2 * fit["logdet"] - 2 * log_weight)[:, None]
+    return np.argmin(np.where(count[:, None] > 0, score, np.inf), axis=0)
 
 
 def _refine(u, labels, k, iters):
