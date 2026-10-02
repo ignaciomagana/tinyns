@@ -886,7 +886,7 @@ def run_static_nested(
     batch_size: int = 128,
     walks: int | None = None,
     step_scale: float | None = None,
-    min_accepts: int = 1,
+    min_accepts: int = 0,
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
     rwalk_proposal: str | None = None,
@@ -1059,9 +1059,9 @@ def run_static_nested(
     if (
         not isinstance(min_accepts, int)
         or isinstance(min_accepts, bool)
-        or min_accepts <= 0
+        or min_accepts < 0
     ):
-        raise ValueError("min_accepts must be a positive integer")
+        raise ValueError("min_accepts must be a non-negative integer")
     if (
         not isinstance(jax_block_size, int)
         or isinstance(jax_block_size, bool)

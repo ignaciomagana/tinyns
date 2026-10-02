@@ -293,7 +293,7 @@ For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python
 For local constrained samplers, step-count parameters are decorrelation lengths:
 
 - `walks`: number of random-walk proposals per replacement attempt for `rwalk` (default `max(25, 6 * ndim)`, 12 in 1-D)
-- `min_accepts`: minimum number of accepted constrained rwalk moves required for the replacement to be considered valid
+- `min_accepts`: accepted rwalk moves a chain must make before it is kept (default `0`: no retry; see below)
 
 The sampler does not return merely after the first accepted local move; it runs the requested local update length.
 
@@ -383,15 +383,17 @@ The analytic Gaussian targets show good evidence calibration in the current vali
 
 ### `min_accepts`
 
-For `rwalk`, `min_accepts` requires multiple accepted
-constrained moves before returning a replacement. The default is
-`min_accepts=1`.
+The default is `min_accepts=0`: each replacement runs one chain of `walks`
+proposals and keeps wherever it ends. A chain that never moved returns a copy
+of its seed (a live point strictly above the threshold); that happens in about
+1% of replacements at 25 walks and under 0.1% at 108.
 
-Increasing `min_accepts` can increase likelihood-call cost and is not guaranteed
-to improve evidence calibration. In the current validation suite,
-`min_accepts=3` did not generally improve calibration and made several runs
-worse. Treat it as an experimental diagnostic knob rather than a recommended
-default.
+`min_accepts >= 1` restores the old rule: discard chains with fewer accepted
+moves and retry. That rule is biased. Chains fail to move more often in regions
+the proposal fits poorly (a minor mode, a narrow ridge), so retrying
+under-samples them. On two-mode targets with a true 6% minor mode, the old
+default `min_accepts=1` gave 2.9% at 4-D (logZ bias +0.13 nats) and 1.7% at
+10-D; the new default gives 6.3% and 6.7%.
 
 ## Design philosophy
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.4 (2026-10-02)
+
+- **Changed default**: `min_accepts=0` (was 1). A replacement chain that never moved is now kept as a copy of its seed, instead of being discarded and retried. The retry rule was biased: chains fail to move more often where the proposal fits poorly, so retrying under-sampled those regions. Measured with tinyns itself on two-mode Gaussian targets with a true 6% minor mode (nlive 500): at 4-D the old rule gave 2.9% +/- 0.3% and a logZ bias of +0.13 +/- 0.03, the new default 6.3% +/- 0.4% and +0.02 +/- 0.03 (40 seeds each); at 10-D, 1.7% +/- 0.6% against 6.7% +/- 1.7% (18 seeds each). Call counts are unchanged. A kept chain must still end inside the constraint, and an unmoved chain only counts if its seed is strictly above the threshold. Pass `min_accepts=1` for the old behaviour; checkpoints written with the old default need `min_accepts=1` to resume.
+
 ## v0.2.3 (2026-10-01)
 
 - A loop over mock datasets no longer recompiles for every dataset. The fast-path kernel caches (block kernel, rwalk kernel and the initial live-point pass) were keyed on the identity of `loglike` and `prior_transform`, so each `jax.tree_util.Partial(loglike_fn, data_i)` built and compiled a new block kernel. They are now keyed on the callable's structure: a pytree callable's treedef and static leaves, with its array leaves passed as jit arguments, so JAX's jit cache keys the compiled program on their shapes and dtypes. On CPU, four `Partial` datasets of the same shape (1-D, 10k points, fixed `maxiter`) took 2 backend compiles for every new dataset in v0.2.2 (block kernel and live-point pass) and none in v0.2.3. Each result is bit-identical to a fresh run on that dataset. The live-point pass is now cached too; v0.2.2 compiled it again on every run, even for the same callable.
