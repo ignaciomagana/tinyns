@@ -448,6 +448,15 @@ class ClusterTracker:
         the actual scatter is several times smaller than ``urn_logit_sd``.
         """
         log, nlive = self.log, len(live_u)
+        out = {
+            "cluster_count_history": [list(pair) for pair in log["counts"]],
+            "cluster_min_population": None,
+            "cluster_swap_accepts": int(log["swap"][0]),
+            "cluster_swap_proposals": int(log["swap"][1]),
+            "cluster_modes": [],
+        }
+        if not log["iters"]:  # never clustered (e.g. resumed at the end)
+            return out
         edges = log["iters"] + [len(dead_logwt)]
         logz = _logsumexp(np.concatenate([dead_logwt, live_logwt]))
         # Mass per update interval: the last one also holds the live points.
@@ -492,12 +501,8 @@ class ClusterTracker:
                     "swap_fraction": float(np.mean(mode["swap"][first:stop])),
                 }
             )
-        return {
-            "cluster_count_history": [list(pair) for pair in log["counts"]],
-            "cluster_min_population": min(
-                (m["min_population"] for m in modes), default=None
-            ),
-            "cluster_swap_accepts": int(log["swap"][0]),
-            "cluster_swap_proposals": int(log["swap"][1]),
-            "cluster_modes": modes,
-        }
+        out["cluster_modes"] = modes
+        out["cluster_min_population"] = min(
+            (m["min_population"] for m in modes), default=None
+        )
+        return out
