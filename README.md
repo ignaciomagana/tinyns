@@ -421,9 +421,11 @@ costs about 12 ms per update at 13-D, one update every 128 iterations.
 
 Limits:
 
-- A minor mode needs its volume share to predict at least about 3 x `ndim`
-  live points (`nlive * V_minor / V_total >= 3 * ndim`); below that the swap
-  stays off and the weights drift as before. Raise `nlive`.
+- A minor mode needs its volume share to predict at least about 2 x `ndim`
+  live points (`nlive * V_minor / V_total >= 2 * ndim`); below that the swap
+  stays off and the weights drift as before. Raise `nlive`: the mode is
+  reliably resolved once it holds about 3 x `ndim` live points when it is
+  first detected.
 - The frames are ellipsoids. Curved or truncated modes lower the swap
   acceptance, and the result moves back toward the drift, but stays valid.
 - A unimodal run does not switch the swap on (the clustering made no false

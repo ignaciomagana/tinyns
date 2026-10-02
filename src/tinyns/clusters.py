@@ -45,10 +45,13 @@ MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
 # with a prior weight of 0.1 d points. More shrinkage inflates the frame of a
 # small cluster and kills the swap acceptance.
 SHRINK = 0.1
-# A cluster swaps only if its volume share predicts at least 3 d live points.
+# A cluster swaps only if its volume share predicts at least 2 d live points.
 # The test must not use the cluster's live count: that would switch the swap
-# on only while the cluster is over-populated, and so drain it.
-ELIGIBLE_PER_DIM = 3.0
+# on only while the cluster is over-populated, and so drain it. 2 d matches the
+# prototype; 3 d switched the swap off too early at 18-D (logit sd of the minor
+# mass 0.52 vs 0.39 over 40/200 seeds), and below about 2 d the swap drains
+# small clusters.
+ELIGIBLE_PER_DIM = 2.0
 
 
 # --- kernel side (JAX) ---
