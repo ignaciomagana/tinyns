@@ -31,35 +31,13 @@ def loglike(theta):
     return -0.5 * (x / 1.8) ** 2 - 0.5 * (banana / 0.35) ** 2
 
 
-def run_sampler(sample, key):
-    """Run one constrained sampler configuration and print diagnostics."""
+def main():
+    sampler = NestedSampler(loglike, prior_transform, ndim=NDIM, nlive=NLIVE)
+    result = sampler.run(jax.random.PRNGKey(73), dlogz=0.5, maxiter=600)
 
-    kwargs = {
-        "sample": sample,
-        "nlive": NLIVE,
-        "step_scale": 0.12,
-    }
-    if sample == "rwalk":
-        kwargs["walks"] = 15
-    try:
-        sampler = NestedSampler(loglike, prior_transform, ndim=NDIM, **kwargs)
-    except ValueError as exc:
-        print(f"\n=== sample={sample!r} unavailable: {exc} ===")
-        return
-
-    result = sampler.run(key, dlogz=0.5, maxiter=600)
-
-    print(f"\n=== sample={sample!r} ===")
     print(result.summary())
     print(f"diagnostics: {result.diagnostics()}")
     print("note: no analytic evidence is assumed for this stress test.")
-
-
-def main():
-    key = jax.random.PRNGKey(73)
-    sample_keys = jax.random.split(key, 1)
-    for sample, sample_key in zip(("rwalk",), sample_keys, strict=True):
-        run_sampler(sample, sample_key)
 
 
 if __name__ == "__main__":
