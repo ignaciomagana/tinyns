@@ -8,11 +8,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import random
+from tests.helpers import run_ns
 
 from tinyns import NestedSampler, clusters, core
 from tinyns.callables import _callable_specs
 from tinyns.core import _chain_kernel
-from tinyns.run import run_static_nested
 from tinyns.state import load_checkpoint_npz
 
 # --- the swap kernel leaves the constrained prior invariant ---
@@ -236,12 +236,12 @@ def test_unimodal_runs_match_v024_bit_for_bit(case, monkeypatch) -> None:
     swap_flags = []
     step = core.step
 
-    def spy(*args, extras=None):
+    def spy(*args, extras=None, **kw):
         swap_flags.append(extras is not None)
-        return step(*args, extras=extras)
+        return step(*args, extras=extras, **kw)
 
     monkeypatch.setattr(core, "step", spy)
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(11), loglike, lambda u: u, ndim, nlive, **kwargs
     )
     assert result.metadata["cluster_swap"] is True
@@ -311,7 +311,7 @@ def test_cluster_swap_needs_a_single_replacement_chain() -> None:
         NestedSampler(
             plain2, lambda u: u, 2, nlive=20, cluster_swap=True, replacement_chains=2
         )
-    result = run_static_nested(
+    result = run_ns(
         0, plain2, lambda u: u, 2, 20, maxiter=40, replacement_chains=2
     )
     assert result.metadata["cluster_swap"] is False

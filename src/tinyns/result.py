@@ -96,6 +96,69 @@ def _npz_scalar(value):
     raise ValueError("expected scalar value in result .npz file")
 
 
+def _logzerr_diagnostics(
+    logwt,
+    logl,
+    logz: float,
+    nlive: int,
+    nlive_final: int,
+) -> tuple[float, dict[str, object]]:
+    """Return ``logzerr`` and diagnostics for nonfinite inputs."""
+
+    logwt = jnp.asarray(logwt)
+    logl = jnp.asarray(logl)
+    npoints = int(logwt.size)
+    nlive_final = max(0, min(int(nlive_final), npoints))
+    ndead = npoints - nlive_final
+
+    finite_logl = jnp.isfinite(logl)
+    finite_logwt = jnp.isfinite(logwt)
+    finite_pair = finite_logl & finite_logwt
+    diagnostics: dict[str, object] = {
+        "logzerr_status": "ok",
+        "information_H": math.nan,
+        "n_nonfinite_logl": int(jnp.sum(~finite_logl)),
+        "n_nonfinite_logwt": int(jnp.sum(~finite_logwt)),
+        "n_nonfinite_weights": 0,
+        "n_dead_finite": int(jnp.sum(finite_pair[:ndead])),
+        "n_live_finite": int(jnp.sum(finite_pair[ndead:])),
+    }
+
+    if nlive <= 0:
+        diagnostics["logzerr_status"] = "invalid_nlive"
+        return math.nan, diagnostics
+    if not math.isfinite(float(logz)):
+        diagnostics["logzerr_status"] = "nonfinite_logz"
+        return math.nan, diagnostics
+
+    raw_weights = jnp.exp(logwt - logz)
+    finite_weights = jnp.isfinite(raw_weights)
+    diagnostics["n_nonfinite_weights"] = int(jnp.sum(~finite_weights))
+    if diagnostics["n_nonfinite_weights"]:
+        diagnostics["logzerr_status"] = "nonfinite_posterior_weights"
+        return math.nan, diagnostics
+
+    contributing = (raw_weights > 0.0) & finite_logl
+    if bool(jnp.any((raw_weights > 0.0) & ~finite_logl)):
+        diagnostics["logzerr_status"] = "nonfinite_weighted_logl"
+        return math.nan, diagnostics
+    if not bool(jnp.any(contributing)):
+        diagnostics["logzerr_status"] = "no_finite_weighted_samples"
+        diagnostics["information_H"] = 0.0
+        return math.nan, diagnostics
+
+    information = jnp.sum(
+        jnp.where(contributing, raw_weights * (logl - logz), 0.0)
+    )
+    information = jnp.maximum(information, 0.0)
+    diagnostics["information_H"] = float(information)
+    if not math.isfinite(float(information)):
+        diagnostics["logzerr_status"] = "nonfinite_information_H"
+        return math.nan, diagnostics
+
+    return float(jnp.sqrt(information / nlive)), diagnostics
+
+
 @dataclass(frozen=True)
 class LogZBootstrap:
     """Simulated-weights (jittered) log-evidence realizations.
@@ -210,6 +273,10 @@ class NestedSamplingResult:
 
     metadata: dict[str, Any] | None = None
     """Additional implementation-specific metadata."""
+
+    logl_birth: ArrayLike | None = None
+    """Likelihood contour each sample was born above (``-inf`` for the initial
+    live points; ``NaN`` where unknown), aligned with ``logl``."""
 
     def log_weights(self):
         """Return posterior weights normalized in log space."""
@@ -630,6 +697,11 @@ class NestedSamplingResult:
             message=np.asarray(str(self.message)),
             metadata_json=np.asarray(metadata_json),
             format_version=np.asarray(_RESULT_NPZ_FORMAT_VERSION),
+            **(
+                {}
+                if self.logl_birth is None
+                else {"logl_birth": np.asarray(self.logl_birth)}
+            ),
         )
 
     @classmethod
@@ -666,6 +738,9 @@ class NestedSamplingResult:
                 success=bool(_npz_scalar(data["success"])),
                 message=str(_npz_scalar(data["message"])),
                 metadata=metadata,
+                logl_birth=(
+                    jnp.asarray(data["logl_birth"]) if "logl_birth" in keys else None
+                ),
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -684,6 +759,7 @@ class NestedSamplingResult:
             "success": self.success,
             "message": self.message,
             "metadata": None if self.metadata is None else dict(self.metadata),
+            "logl_birth": self.logl_birth,
         }
 
     def to_numpy(self) -> dict[str, object]:
@@ -702,6 +778,9 @@ class NestedSamplingResult:
             "success": bool(self.success),
             "message": str(self.message),
             "metadata": None if self.metadata is None else dict(self.metadata),
+            "logl_birth": (
+                None if self.logl_birth is None else np.asarray(self.logl_birth)
+            ),
         }
 
     def to_dynesty_dict(self) -> dict[str, object]:

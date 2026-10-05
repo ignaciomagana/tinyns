@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import difflib
 from typing import Any
 
+from tinyns import loop
 from tinyns.core import Config
 from tinyns.result import NestedSamplingResult
-from tinyns.run import run_static_nested
 from tinyns.state import load_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -79,8 +80,8 @@ class NestedSampler:
         self.prior_transform = prior_transform
         self.ndim = ndim
         self.nlive = nlive
-        # Resolved options, forwarded to run_static_nested and checkpointed.
-        config = Config(
+        # The resolved options; checkpointed and checked on resume.
+        self._config = Config(
             ndim,
             nlive,
             walks=walks,
@@ -88,10 +89,6 @@ class NestedSampler:
             block_size=block_size,
             cluster_swap=cluster_swap,
         )
-        self._options = {
-            name: getattr(config, name)
-            for name in ("walks", "replacement_chains", "block_size", "cluster_swap")
-        }
 
     def run(
         self,
@@ -108,12 +105,11 @@ class NestedSampler:
     ) -> NestedSamplingResult:
         """Run nested sampling and return a :class:`NestedSamplingResult`."""
 
-        return run_static_nested(
-            key,
+        return loop.run(
+            self._config,
             self.loglike,
             self.prior_transform,
-            self.ndim,
-            self.nlive,
+            key,
             dlogz=dlogz,
             maxiter=maxiter,
             progress=progress,
@@ -122,11 +118,10 @@ class NestedSampler:
             callback_interval=callback_interval,
             checkpoint_path=checkpoint_path,
             checkpoint_interval=checkpoint_interval,
-            **self._options,
         )
 
     def _checkpoint_config(self) -> dict[str, object]:
-        return {"ndim": int(self.ndim), "nlive": int(self.nlive), **self._options}
+        return dataclasses.asdict(self._config)
 
     def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
         for name, current_value in self._checkpoint_config().items():
@@ -162,12 +157,11 @@ class NestedSampler:
         output_path = (
             checkpoint_path if checkpoint_path_out is None else checkpoint_path_out
         )
-        return run_static_nested(
-            state.key,
+        return loop.run(
+            self._config,
             self.loglike,
             self.prior_transform,
-            self.ndim,
-            self.nlive,
+            None,
             dlogz=dlogz,
             maxiter=maxiter,
             progress=progress,
@@ -176,6 +170,5 @@ class NestedSampler:
             callback_interval=callback_interval,
             checkpoint_path=output_path,
             checkpoint_interval=checkpoint_interval,
-            initial_state=state,
-            **self._options,
+            resume_state=state,
         )

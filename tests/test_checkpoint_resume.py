@@ -5,9 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import tinyns.run as run_mod
-from tinyns import NestedSampler
-from tinyns.run import run_static_nested
+import tinyns.loop as loop_mod
+from tinyns import NestedSampler, core
 from tinyns.state import load_checkpoint_npz
 
 
@@ -164,7 +163,7 @@ def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
     resumed = sampler.resume(path, maxiter=8, dlogz=0.0)
 
     assert len(state.telemetry["replacement_batches"]) == 4
-    assert len(state.telemetry["rwalk_proposal_history"]) == 4
+    assert state.telemetry["rwalk_proposals"] > 0
     assert resumed.ncall == full.ncall
     assert resumed.metadata["replacement_ncall"] == full.metadata[
         "replacement_ncall"
@@ -252,15 +251,14 @@ def test_resume_rejects_inconsistent_dead_count(tmp_path):
     state.dead_logwt = state.dead_logwt[:-1]
 
     with pytest.raises(ValueError, match="dead point count.*iteration"):
-        run_static_nested(
-            state.key,
+        loop_mod.run(
+            core.Config(2, 20, walks=5, block_size=1),
             loglike,
             prior_transform,
-            ndim=2,
-            nlive=20,
+            None,
             dlogz=0.0,
             maxiter=5,
-            initial_state=state,
+            resume_state=state,
         )
 
 
@@ -319,11 +317,10 @@ def test_checkpoint_config_and_telemetry_keys(tmp_path):
     }
     assert set(state.telemetry) == {
         "replacement_batches",
-        "rwalk_accepted_move_history",
-        "rwalk_proposal_history",
+        "rwalk_moves",
+        "rwalk_proposals",
         "adaptive_scale_history",
         "adaptive_accept_history",
-        "adaptive_updates",
     }
 
 
@@ -337,13 +334,13 @@ def _rewrite_checkpoint_array(path, name, value):
 
 def test_block_mode_writes_intermediate_checkpoints(tmp_path, monkeypatch):
     saves = []
-    original_save = run_mod.save_checkpoint_npz
+    original_save = loop_mod.save_checkpoint_npz
 
     def recording_save(path, state, config):
         saves.append((int(state.iteration), bool(state.success)))
         return original_save(path, state, config)
 
-    monkeypatch.setattr(run_mod, "save_checkpoint_npz", recording_save)
+    monkeypatch.setattr(loop_mod, "save_checkpoint_npz", recording_save)
 
     path = tmp_path / "block.checkpoint.npz"
     # Block advances iteration by 8; with interval 10 the new cadence saves at
@@ -423,13 +420,13 @@ def test_resume_at_maxiter_without_convergence_reports_maxiter_per_iteration(
     tmp_path, monkeypatch
 ):
     captured = []
-    original_save = run_mod.save_checkpoint_npz
+    original_save = loop_mod.save_checkpoint_npz
 
     def recording_save(path, state, config):
         captured.append(state)
         return original_save(path, state, config)
 
-    monkeypatch.setattr(run_mod, "save_checkpoint_npz", recording_save)
+    monkeypatch.setattr(loop_mod, "save_checkpoint_npz", recording_save)
 
     path = tmp_path / "midrun.checkpoint.npz"
     make_sampler().run(
@@ -441,15 +438,14 @@ def test_resume_at_maxiter_without_convergence_reports_maxiter_per_iteration(
     state = next(s for s in captured if s.iteration == 3)
     assert state.success is True
 
-    result = run_static_nested(
-        state.key,
+    result = loop_mod.run(
+        core.Config(2, 20, walks=5, block_size=1),
         loglike,
         prior_transform,
-        ndim=2,
-        nlive=20,
+        None,
         dlogz=0.1,
         maxiter=3,
-        initial_state=state,
+        resume_state=state,
     )
 
     assert result.success is False
@@ -513,4 +509,5 @@ def test_default_kwargs_checkpoint_round_trip(tmp_path):
     np.testing.assert_allclose(resumed.logl, full.logl)
     assert resumed.ncall == full.ncall
     assert resumed.logz == pytest.approx(full.logz)
+    np.testing.assert_array_equal(resumed.logl_birth, full.logl_birth)
 
