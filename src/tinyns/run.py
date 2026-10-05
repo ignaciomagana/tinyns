@@ -14,122 +14,73 @@ from jax import lax, random
 from jax.scipy.special import logsumexp
 
 from tinyns.clusters import ClusterTracker
-from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
-    RWALK_PROPOSALS,
     _callable_leaves,
     _callable_specs,
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel_cached,
     _split_callables,
-    draw_constrained_prior,
-    draw_constrained_prior_vectorized,
-    draw_constrained_rwalk,
-    draw_constrained_rwalk_jax,
-    draw_constrained_rwalk_jax_adaptive,
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
+# The live-cov step is ``scale * L z``. The scale starts at 0.5 and, after
+# every block, moves in log space toward 25% move acceptance. It is a
+# dimensionless O(1) factor (the step already follows the contracting live
+# set), so the update can chase it fast.
+_INITIAL_SCALE = 0.5
+_TARGET_ACCEPT = 0.25
+_SCALE_RATE = 0.5
+_MIN_SCALE = 1e-3
+_MAX_SCALE = 10.0
+# Likelihood-call budget of one replacement: a batch of ``walks`` steps on
+# each of ``replacement_chains`` chains is retried until one chain ends above
+# the threshold, at most ``max(1, 10_000 // (walks * replacement_chains))``
+# times. Chains start strictly above the threshold, so only a likelihood
+# plateau exhausts it.
+_MAX_REPLACEMENT_CALLS = 10_000
 
-def _resolve_defaults(ndim: int, sample: str, options) -> dict:
-    """Resolve the ``None`` (fast-path) defaults of the rwalk options.
 
-    ``kernel`` defaults to ``"jax"`` for ``sample="rwalk"``. Where live-cov is
-    supported (JAX rwalk with a fixed ``replacement_chains``) the
-    proposal defaults to ``"live-cov"`` and ``jax_block_size`` to 32 (1 with
-    ``jax_vectorized``); elsewhere they fall back to ``"isotropic"`` and 1. An
-    explicit ``"live-cov"`` is not overridden, so an unsupported combination
-    still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for
-    ``ndim=1``) and the initial ``step_scale`` to 0.5 for live-cov, 0.1 for
-    isotropic. Explicit values pass through unchanged. ``cluster_swap``
-    defaults to True where the swap move is supported (live-cov block mode
-    with one replacement chain) and to False elsewhere; an explicit True
-    where it is unsupported raises.
+def _positive_int(name: str, value) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _resolve_options(
+    ndim: int,
+    *,
+    walks: int | None,
+    replacement_chains: int,
+    block_size: int,
+    cluster_swap: bool | None,
+) -> dict:
+    """Validate the sampler options and resolve their ``None`` defaults.
+
+    ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for ``ndim=1``).
+    ``cluster_swap`` defaults to True with one replacement chain, the only
+    configuration that supports it, and to False otherwise; an explicit True
+    with more chains raises.
     """
 
-    kernel = options["kernel"]
-    if kernel is None:
-        kernel = "jax" if sample == "rwalk" else "python"
-    fast_path = (
-        sample == "rwalk"
-        and kernel == "jax"
-        and options["replacement_chain_schedule"] is None
-    )
-    proposal = options["rwalk_proposal"]
-    if proposal is None:
-        proposal = "live-cov" if fast_path else "isotropic"
-    step_scale = options["step_scale"]
-    if step_scale is None:
-        step_scale = 0.5 if proposal == "live-cov" else 0.1
-    walks = options["walks"]
     if walks is None:
         # 1-D needs far fewer walks for unbiased logZ (validated to 10);
         # from 2-D on, max(25, 6 * ndim) (see CHANGELOG, v0.2.0 / v0.2.1).
         walks = 12 if int(ndim) == 1 else max(25, 6 * int(ndim))
-    jax_block_size = options["jax_block_size"]
-    if jax_block_size is None:
-        jax_block_size = 32 if fast_path and not options["jax_vectorized"] else 1
-    swap_supported = (
-        fast_path
-        and proposal == "live-cov"
-        and options["replacement_chains"] == 1
-        and isinstance(jax_block_size, int)
-        and jax_block_size > 1
-    )
-    cluster_swap = options["cluster_swap"]
+    _positive_int("walks", walks)
+    _positive_int("replacement_chains", replacement_chains)
+    _positive_int("block_size", block_size)
     if cluster_swap is None:
-        cluster_swap = swap_supported
-    elif cluster_swap and not swap_supported:
-        raise NotImplementedError(
-            "cluster_swap=True is supported only for sample='rwalk', "
-            "kernel='jax', rwalk_proposal='live-cov', replacement_chains=1 "
-            "and jax_block_size > 1"
-        )
+        cluster_swap = replacement_chains == 1
+    elif cluster_swap and replacement_chains != 1:
+        raise NotImplementedError("cluster_swap=True needs replacement_chains=1")
     return {
-        "kernel": kernel,
         "walks": walks,
-        "step_scale": step_scale,
-        "rwalk_proposal": proposal,
-        "jax_block_size": jax_block_size,
+        "replacement_chains": replacement_chains,
+        "block_size": block_size,
         "cluster_swap": bool(cluster_swap),
     }
-
-
-def _as_points(array, ndim: int):
-    """Return an array with trailing dimension ``ndim`` for sample points."""
-
-    array = jnp.asarray(array)
-    if ndim == 1 and array.ndim == 1:
-        return array.reshape((-1, 1))
-    if array.shape[-1:] != (ndim,):
-        raise ValueError(f"point arrays must have trailing shape ({ndim},)")
-    return array
-
-
-def _as_point(array, ndim: int):
-    """Return a single point with shape ``(ndim,)``."""
-
-    array = jnp.asarray(array)
-    if ndim == 1 and array.shape == ():
-        return array.reshape((1,))
-    if array.shape != (ndim,):
-        raise ValueError(f"point must have shape ({ndim},)")
-    return array
-
-
-def _evaluate_live_points(loglike, theta_live, *, vectorized: bool):
-    if vectorized:
-        logl = jnp.asarray(loglike(theta_live), dtype=float).reshape((-1,))
-        expected_shape = (theta_live.shape[0],)
-        if logl.shape != expected_shape:
-            raise ValueError(
-                "vectorized loglike must return one value per live point; "
-                f"expected shape {expected_shape}, got {logl.shape}"
-            )
-        return logl
-    return jnp.asarray([float(loglike(theta)) for theta in theta_live], dtype=float)
 
 
 def _evaluate_live_points_jax(
@@ -172,9 +123,7 @@ def _make_live_points_kernel(loglike_spec, prior_spec, ndim: int):
         prior_fn = prior_spec.rebuild(leaves[nloglike_leaves:])
 
         def evaluate_chunk(u_chunk):
-            return _evaluate_jax_batch(
-                loglike_fn, prior_fn, u_chunk, ndim, jax_vectorized=False
-            )
+            return _evaluate_jax_batch(loglike_fn, prior_fn, u_chunk, ndim)
 
         return lax.map(evaluate_chunk, u)
 
@@ -189,11 +138,6 @@ def _remaining_delta_logz(logz_dead, logx_final, live_logl):
     logz_remain = float(logx_final) + float(jnp.max(live_logl))
     return float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
 
-
-def _transform_live_points(prior_transform, u_live, ndim: int, *, vectorized: bool):
-    if vectorized:
-        return _as_points(prior_transform(u_live), ndim)
-    return jnp.stack([_as_point(prior_transform(u), ndim) for u in u_live])
 
 
 def _logzerr_diagnostics(
@@ -259,19 +203,13 @@ def _logzerr_diagnostics(
     return float(jnp.sqrt(information / nlive)), diagnostics
 
 
-def _update_adaptive_step_scale(
-    current_step_scale: float,
-    observed_accept: float,
-    target_accept: float,
-    rate: float,
-    min_step_scale: float,
-    max_step_scale: float,
-) -> float:
-    """Return a log-space adaptive rwalk step scale, clamped to bounds."""
-    log_scale = math.log(float(current_step_scale))
-    delta = float(rate) * float(np.clip(observed_accept - target_accept, -0.5, 0.5))
+
+def _update_scale(current_scale: float, observed_accept: float) -> float:
+    """Return the log-space adapted live-cov step scale, clamped to bounds."""
+    log_scale = math.log(float(current_scale))
+    delta = _SCALE_RATE * float(np.clip(observed_accept - _TARGET_ACCEPT, -0.5, 0.5))
     new_scale = math.exp(log_scale + delta)
-    return float(np.clip(new_scale, min_step_scale, max_step_scale))
+    return float(np.clip(new_scale, _MIN_SCALE, _MAX_SCALE))
 
 
 @functools.lru_cache(maxsize=32)
@@ -282,10 +220,9 @@ def _make_static_jax_rwalk_block_kernel_cached(
     walks: int,
     replacement_chains: int,
     block_size: int,
-    proposal: str = "isotropic",
     cluster_swap: bool = False,
 ):
-    """Return a cached jitted fixed-chain JAX rwalk block kernel.
+    """Return a cached jitted block kernel: ``block_size`` NS iterations.
 
     The cache is keyed on the callables' specs (see
     :class:`tinyns.samplers._CallableSpec`), so pytree callables that differ
@@ -295,6 +232,9 @@ def _make_static_jax_rwalk_block_kernel_cached(
     ndim)``) as trailing arguments and threads them to the rwalk kernel, so
     they are jit arguments rather than compiled-in constants. Callables with
     neither take no trailing arguments.
+
+    After a failed replacement the remaining iterations of the block are
+    skipped: they neither touch the live set nor advance the key.
 
     With ``cluster_swap=True`` the chains also propose affine swaps between
     clusters (see :mod:`tinyns.clusters`): ``block_kernel`` takes the cluster
@@ -314,8 +254,6 @@ def _make_static_jax_rwalk_block_kernel_cached(
         ndim,
         walks,
         replacement_chains,
-        False,
-        proposal,
         cluster_swap,
     )
 
@@ -327,8 +265,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
         logz_dead,
         start_iteration,
         nlive,
-        step_scale,
-        min_accepts,
+        scale,
         max_batches,
         *callable_leaves,
     ):
@@ -371,8 +308,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     logl_worst,
                     live_u,
                     live_logl,
-                    jnp.asarray(step_scale),
-                    jnp.asarray(min_accepts),
+                    jnp.asarray(scale),
                     jnp.asarray(max_batches, dtype=jnp.int32),
                     *([{**clusters, "labels": labels[0]}] if cluster_swap else []),
                     *callable_leaves,
@@ -383,9 +319,6 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     total_proposal_count
                     + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
                 ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
-                replacement_chains_used = replacement_batches_used * jnp.asarray(
-                    replacement_chains, dtype=jnp.int32
-                )
                 insertion_index = (
                     jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
                 ).astype(jnp.int32)
@@ -412,13 +345,9 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     replacement_ncall,
                     insertion_index,
                     replacement_batches_used,
-                    replacement_chains_used,
                     accepted,
                     accepted_move_count,
                     total_proposal_count,
-                    new_u,
-                    new_theta,
-                    new_logl,
                     *swap_counts,
                 )
 
@@ -445,13 +374,9 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     zero,
                     zero,
                     zero,
-                    zero,
                     jnp.asarray(False),
                     zero,
                     zero,
-                    dead_u,
-                    dead_theta,
-                    logl_worst,
                     *([jnp.zeros(2, dtype=jnp.int32)] if cluster_swap else []),
                 )
 
@@ -485,23 +410,6 @@ def _make_static_jax_rwalk_block_kernel_cached(
             ),
             jnp.arange(block_size, dtype=jnp.int32),
         )
-        (
-            dead_u_block,
-            dead_theta_block,
-            dead_logl_block,
-            dead_logwt_block,
-            replacement_ncall_block,
-            insertion_indices_block,
-            replacement_batches_block,
-            replacement_chains_used_block,
-            accepted_block,
-            accepted_move_count_block,
-            total_proposal_count_block,
-            new_u_block,
-            new_theta_block,
-            new_logl_block,
-            *swap_block,
-        ) = block
         logx_final_new = -(
             jnp.asarray(start_iteration, dtype=jnp.float32)
             + jnp.asarray(block_size, dtype=jnp.float32)
@@ -511,23 +419,9 @@ def _make_static_jax_rwalk_block_kernel_cached(
             new_live_u,
             new_live_theta,
             new_live_logl,
-            dead_u_block,
-            dead_theta_block,
-            dead_logl_block,
-            dead_logwt_block,
-            replacement_ncall_block,
-            insertion_indices_block,
-            replacement_batches_block,
-            replacement_chains_used_block,
-            accepted_block,
-            accepted_move_count_block,
-            total_proposal_count_block,
-            new_u_block,
-            new_theta_block,
-            new_logl_block,
+            *block,
             logz_dead_new,
             logx_final_new,
-            *swap_block,
         )
 
     return jax.jit(block_kernel)
@@ -540,7 +434,6 @@ def _make_static_jax_rwalk_block_kernel(
     walks: int,
     replacement_chains: int,
     block_size: int,
-    proposal: str = "isotropic",
     cluster_swap: bool = False,
 ):
     """Return the cached block kernel for these callables' specs."""
@@ -550,7 +443,6 @@ def _make_static_jax_rwalk_block_kernel(
         walks,
         replacement_chains,
         block_size,
-        proposal,
         cluster_swap,
     )
 
@@ -571,17 +463,12 @@ def _make_run_state(
     ncall: int,
     logl_min: float,
     logl_live_max: float,
-    sample: str,
     nlive: int,
     ndim: int,
     replacement_ncall: list[int],
     replacement_failures: int,
     replacement_batches: list[int] | None = None,
-    replacement_chains_used: list[int] | None = None,
-    replacement_chain_usage_counts: dict[str, int] | None = None,
-    replacement_chain_schedule=None,
     replacement_chains: int | None = None,
-    kernel: str | None = None,
     walks: int | None = None,
     calls_per_s: float | None = None,
 ) -> dict[str, object]:
@@ -599,16 +486,6 @@ def _make_run_state(
     else:
         replacement_mean_batches_so_far = None
         replacement_max_batches_so_far = None
-    if replacement_chains_used:
-        replacement_mean_chains_used_so_far = float(
-            sum(replacement_chains_used) / len(replacement_chains_used)
-        )
-        replacement_max_chains_used_so_far = int(max(replacement_chains_used))
-    else:
-        replacement_mean_chains_used_so_far = None
-        replacement_max_chains_used_so_far = None
-    replacement_chain_usage_counts_so_far = dict(replacement_chain_usage_counts or {})
-    adaptive_replacement_chains = replacement_chain_schedule is not None
     return {
         "iter": int(iteration),
         "logz": float(logz),
@@ -617,19 +494,12 @@ def _make_run_state(
         "calls_per_s": calls_per_s,
         "logl_min": float(logl_min),
         "logl_live_max": float(logl_live_max),
-        "sample": str(sample),
         "nlive": int(nlive),
         "ndim": int(ndim),
         "replacement_mean_ncall_so_far": replacement_mean_ncall_so_far,
         "replacement_mean_batches_so_far": replacement_mean_batches_so_far,
         "replacement_max_batches_so_far": replacement_max_batches_so_far,
-        "replacement_mean_chains_used_so_far": replacement_mean_chains_used_so_far,
-        "replacement_max_chains_used_so_far": replacement_max_chains_used_so_far,
-        "replacement_chain_usage_counts_so_far": replacement_chain_usage_counts_so_far,
-        "adaptive_replacement_chains": adaptive_replacement_chains,
         "replacement_chains": replacement_chains,
-        "replacement_chain_schedule": replacement_chain_schedule,
-        "kernel": kernel,
         "walks": walks,
         "replacement_failures": int(replacement_failures),
     }
@@ -644,21 +514,6 @@ def _format_progress_line(state: dict[str, object]) -> str:
     repl_text = "n/a" if repl is None else f"{float(repl):.1f}"
     batches = state.get("replacement_mean_batches_so_far")
     batches_text = "n/a" if batches is None else f"{float(batches):.2f}"
-    chains = state.get("replacement_mean_chains_used_so_far")
-    chains_text = "n/a" if chains is None else f"{float(chains):.1f}"
-    usage_counts = state.get("replacement_chain_usage_counts_so_far") or {}
-    usage_text = ""
-    if state.get("adaptive_replacement_chains") and usage_counts:
-        nonzero = [
-            (str(chain_count), int(count))
-            for chain_count, count in usage_counts.items()
-            if int(count) > 0
-        ]
-        nonzero.sort(key=lambda item: int(item[0]))
-        usage = ",".join(f"{chain_count}:{count}" for chain_count, count in nonzero[:4])
-        if len(nonzero) > 4:
-            usage += ",..."
-        usage_text = f" usage={usage}" if usage else ""
     return (
         f"iter={int(state['iter']):05d} "
         f"logz={float(state['logz']):.3f} "
@@ -668,10 +523,7 @@ def _format_progress_line(state: dict[str, object]) -> str:
         f"logl_min={float(state['logl_min']):.3g} "
         f"logl_live_max={float(state['logl_live_max']):.3g} "
         f"repl_ncall={repl_text} "
-        f"repl_batches={batches_text} "
-        f"repl_chains={chains_text}"
-        f"{usage_text} "
-        f"sample={state['sample']}"
+        f"repl_batches={batches_text}"
     )
 
 
@@ -688,6 +540,7 @@ class _ProgressPrinter:
         self._last_len = 0 if final else len(line)
 
 
+
 def run_static_nested(
     key: PRNGKeyLike,
     loglike: LogLikelihood,
@@ -697,104 +550,44 @@ def run_static_nested(
     *,
     dlogz: float = 0.1,
     maxiter: int | None = None,
-    sample: str = "rwalk",
-    kernel: str | None = None,
-    vectorized: bool = False,
-    max_attempts: int | None = 10_000,
     progress: bool = False,
     progress_interval: int = 100,
     callback=None,
     callback_interval: int = 100,
-    batch_size: int = 128,
     walks: int | None = None,
-    step_scale: float | None = None,
-    min_accepts: int = 0,
     replacement_chains: int = 1,
-    replacement_chain_schedule=None,
-    rwalk_proposal: str | None = None,
-    jax_vectorized: bool = False,
-    jax_block_size: int | None = None,
-    rwalk_adaptive_step_scale: bool = False,
-    rwalk_target_accept: float = 0.25,
+    block_size: int = 32,
     cluster_swap: bool | None = None,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
 ):
-    """Run a simple static nested-sampling loop.
+    """Run static nested sampling with the live-cov rwalk.
 
-    The replacement ``sample`` strategy may be ``"rwalk"`` (default) or
-    ``"prior"``. ``None`` options (``kernel``, ``walks``, ``step_scale``,
-    ``rwalk_proposal``, ``jax_block_size``) resolve to the fast path where it
-    is supported; see :func:`_resolve_defaults`.
+    ``loglike`` and ``prior_transform`` must be JAX-traceable scalar functions
+    (one point in, one point or one value out); they are ``jax.vmap``-ped
+    where needed. Every ``block_size`` iterations run as one jitted block.
+    ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for ``ndim=1``).
 
-    ``cluster_swap`` (default: on where supported) tracks clusters of the live
-    points between blocks and, once two clusters are large enough, lets the
-    chains swap between them so that mode weights do not drift with the seed
-    (see :mod:`tinyns.clusters`). Pass ``cluster_swap=False`` to opt out.
+    ``cluster_swap`` (default: on with one replacement chain) tracks clusters
+    of the live points between blocks and, once two clusters are large
+    enough, lets the chains swap between them so that mode weights do not
+    drift with the seed (see :mod:`tinyns.clusters`). Pass
+    ``cluster_swap=False`` to opt out.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
     if nlive <= 0:
         raise ValueError("nlive must be a positive integer")
-    resolved = _resolve_defaults(
+    options = _resolve_options(
         ndim,
-        sample,
-        {
-            "kernel": kernel,
-            "replacement_chain_schedule": replacement_chain_schedule,
-            "jax_vectorized": jax_vectorized,
-            "walks": walks,
-            "step_scale": step_scale,
-            "rwalk_proposal": rwalk_proposal,
-            "jax_block_size": jax_block_size,
-            "replacement_chains": replacement_chains,
-            "cluster_swap": cluster_swap,
-        },
+        walks=walks,
+        replacement_chains=replacement_chains,
+        block_size=block_size,
+        cluster_swap=cluster_swap,
     )
-    kernel = resolved["kernel"]
-    walks = resolved["walks"]
-    step_scale = resolved["step_scale"]
-    rwalk_proposal = resolved["rwalk_proposal"]
-    jax_block_size = resolved["jax_block_size"]
-    cluster_swap = resolved["cluster_swap"]
-    if sample not in {"prior", "rwalk"}:
-        raise ValueError("sample must be one of {'prior', 'rwalk'}")
-    if kernel not in {"python", "jax"}:
-        raise ValueError("kernel must be one of {'python', 'jax'}")
-    if rwalk_adaptive_step_scale and not (sample == "rwalk" and kernel == "jax"):
-        raise ValueError(
-            "rwalk_adaptive_step_scale=True is supported only for "
-            "sample='rwalk', kernel='jax'"
-        )
-    if not (0.0 < float(rwalk_target_accept) < 1.0):
-        raise ValueError("rwalk_target_accept must be between 0 and 1")
-    if rwalk_proposal not in RWALK_PROPOSALS:
-        raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
-    if rwalk_proposal == "live-cov":
-        # live-cov steps are a dimensionless multiple of the live covariance;
-        # the multiple is always adapted to the target acceptance.
-        rwalk_adaptive_step_scale = True
-    if rwalk_proposal == "live-cov" and not (
-        sample == "rwalk" and kernel == "jax" and replacement_chain_schedule is None
-    ):
-        raise NotImplementedError(
-            "rwalk_proposal='live-cov' is supported only for sample='rwalk', "
-            "kernel='jax' and a fixed replacement_chains"
-        )
-    if kernel == "jax" and sample not in {"rwalk"}:
-        raise NotImplementedError(
-            'kernel="jax" is currently only supported with sample="rwalk"'
-        )
-    if sample == "rwalk" and vectorized:
-        raise NotImplementedError(
-            "vectorized rwalk is not implemented yet; use vectorized=False "
-            'with sample="rwalk"'
-        )
-    if max_attempts is None:
-        max_attempts = max(10_000, int(walks) * int(replacement_chains))
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be a positive integer")
+    walks = options["walks"]
+    cluster_swap = options["cluster_swap"]
     if progress_interval <= 0:
         raise ValueError("progress_interval must be a positive integer")
     if callback_interval <= 0:
@@ -803,77 +596,6 @@ def run_static_nested(
         raise TypeError("callback must be callable")
     if checkpoint_path is not None and checkpoint_interval <= 0:
         raise ValueError("checkpoint_interval must be a positive integer")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be a positive integer")
-    if (
-        not isinstance(min_accepts, int)
-        or isinstance(min_accepts, bool)
-        or min_accepts < 0
-    ):
-        raise ValueError("min_accepts must be a non-negative integer")
-    if (
-        not isinstance(jax_block_size, int)
-        or isinstance(jax_block_size, bool)
-        or jax_block_size <= 0
-    ):
-        raise ValueError("jax_block_size must be a positive integer")
-    if jax_block_size > 1:
-        if not (sample == "rwalk" and kernel == "jax"):
-            raise NotImplementedError(
-                "jax_block_size > 1 is supported only for sample='rwalk', kernel='jax'"
-            )
-        if jax_vectorized:
-            raise NotImplementedError(
-                "jax_block_size > 1 does not support jax_vectorized"
-            )
-    if (
-        not isinstance(replacement_chains, int)
-        or isinstance(replacement_chains, bool)
-        or replacement_chains <= 0
-    ):
-        raise ValueError("replacement_chains must be a positive integer")
-    if replacement_chains != 1 and not (sample == "rwalk" and kernel == "jax"):
-        raise NotImplementedError(
-            "replacement_chains is currently supported only for "
-            "sample='rwalk', kernel='jax'"
-        )
-    if (
-        sample == "rwalk"
-        and kernel == "jax"
-        and int(walks) * int(replacement_chains) > int(max_attempts)
-    ):
-        raise ValueError("max_attempts must be at least walks * replacement_chains")
-    if replacement_chain_schedule is not None:
-        if not (sample == "rwalk" and kernel == "jax"):
-            raise NotImplementedError(
-                "replacement_chain_schedule is currently supported only for "
-                "sample='rwalk', kernel='jax'"
-            )
-        if jax_block_size > 1:
-            raise ValueError(
-                "replacement_chain_schedule is not supported with "
-                "jax_block_size > 1; use jax_block_size=1 for adaptive "
-                "replacement-chain schedules"
-            )
-        try:
-            replacement_chain_schedule = tuple(replacement_chain_schedule)
-        except TypeError as exc:
-            raise ValueError(
-                "replacement_chain_schedule must be a non-empty sequence "
-                "of positive integers"
-            ) from exc
-        if not replacement_chain_schedule or any(
-            not isinstance(value, int) or isinstance(value, bool) or value <= 0
-            for value in replacement_chain_schedule
-        ):
-            raise ValueError(
-                "replacement_chain_schedule must be a non-empty sequence "
-                "of positive integers"
-            )
-        if max(replacement_chain_schedule) * int(walks) > int(max_attempts):
-            raise ValueError(
-                "max_attempts must be at least max(replacement_chain_schedule) * walks"
-            )
     if maxiter is not None and (
         not isinstance(maxiter, int)
         or isinstance(maxiter, bool)
@@ -883,37 +605,9 @@ def run_static_nested(
     if maxiter is None:
         maxiter = 10_000 * ndim
 
-    jax_block_cached = bool(jax_block_size > 1)
-    jax_block_kernel = "fixed-rwalk-cached" if jax_block_size > 1 else None
-    jax_block_impl = "lax-scan-unbounded" if jax_block_size > 1 else None
-
-    config = {
-        "ndim": int(ndim),
-        "nlive": int(nlive),
-        "sample": str(sample),
-        "kernel": str(kernel),
-        "vectorized": bool(vectorized),
-        "max_attempts": int(max_attempts),
-        "batch_size": int(batch_size),
-        "walks": int(walks),
-        "step_scale": float(step_scale),
-        "min_accepts": int(min_accepts),
-        "replacement_chains": int(replacement_chains),
-        "rwalk_proposal": str(rwalk_proposal),
-        "replacement_chain_schedule": (
-            None
-            if replacement_chain_schedule is None
-            else list(replacement_chain_schedule)
-        ),
-        "jax_vectorized": bool(jax_vectorized),
-        "jax_block_size": int(jax_block_size),
-        "jax_block_cached": jax_block_cached,
-        "jax_block_kernel": jax_block_kernel,
-        "jax_block_impl": jax_block_impl,
-        "rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale),
-        "rwalk_target_accept": float(rwalk_target_accept),
-        "cluster_swap": bool(cluster_swap),
-    }
+    config = {"ndim": int(ndim), "nlive": int(nlive), **options}
+    batch_ncall = int(walks) * int(replacement_chains)
+    max_batches = max(1, _MAX_REPLACEMENT_CALLS // batch_ncall)
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
     )
@@ -924,62 +618,36 @@ def run_static_nested(
         else {}
     )
 
-    # Wall-time telemetry: the first block (or iteration) carries the compiles,
-    # so throughput is measured from its end.
+    # Wall-time telemetry: the first block carries the compiles, so
+    # throughput is measured from its end.
     sampling_start = time.perf_counter()
     first_block = None  # (seconds since sampling_start, ncall) after block 1
 
     # Array leaves of pytree callables and large closure constants, placed on
-    # the device once per run and passed to the compiled fast-path kernels as
-    # arguments (empty for callables with neither).
-    callable_leaves = (
-        tuple(
-            jnp.asarray(leaf)
-            for leaf in _callable_leaves(loglike, prior_transform, ndim)
-        )
-        if kernel == "jax"
-        else ()
+    # the device once per run and passed to the compiled kernels as arguments
+    # (empty for callables with neither).
+    callable_leaves = tuple(
+        jnp.asarray(leaf) for leaf in _callable_leaves(loglike, prior_transform, ndim)
     )
 
     if initial_state is None:
         key = random.PRNGKey(int(key)) if isinstance(key, int) else key
         key, init_key = random.split(key)
         live_u = random.uniform(init_key, shape=(nlive, ndim))
-        if kernel == "jax" and jax_vectorized:
-            live_theta, live_logl = _evaluate_jax_batch(
-                loglike,
-                prior_transform,
-                live_u,
-                ndim,
-                jax_vectorized=True,
-            )
-        elif kernel == "jax":
-            live_theta, live_logl = _evaluate_live_points_jax(
-                loglike,
-                prior_transform,
-                live_u,
-                ndim,
-                chunk_size=replacement_chains,
-                callable_leaves=callable_leaves,
-            )
-        else:
-            live_theta = _transform_live_points(
-                prior_transform, live_u, ndim, vectorized=vectorized
-            )
-            live_logl = _evaluate_live_points(
-                loglike, live_theta, vectorized=vectorized
-            )
+        live_theta, live_logl = _evaluate_live_points_jax(
+            loglike,
+            prior_transform,
+            live_u,
+            ndim,
+            chunk_size=replacement_chains,
+            callable_leaves=callable_leaves,
+        )
         ncall = nlive
         logz_dead = -math.inf
         replacement_ncall = []
         insertion_indices = []
         replacement_failures = 0
         replacement_batches = []
-        replacement_chains_used = []
-        replacement_chain_usage_counts = {}
-        success = True
-        message = "converged"
-        stopped_by_callback = False
         logx_final = 0.0
         iteration = 0
     else:
@@ -1005,19 +673,6 @@ def run_static_nested(
             int(value)
             for value in restored_telemetry.get("replacement_batches", [])
         ]
-        replacement_chains_used = [
-            int(value)
-            for value in restored_telemetry.get("replacement_chains_used", [])
-        ]
-        replacement_chain_usage_counts = {
-            str(chain_count): int(count)
-            for chain_count, count in restored_telemetry.get(
-                "replacement_chain_usage_counts", {}
-            ).items()
-        }
-        success = True
-        message = "converged"
-        stopped_by_callback = False
         iteration = int(initial_state.iteration)
         if maxiter < iteration:
             raise ValueError(
@@ -1028,6 +683,9 @@ def run_static_nested(
                 "checkpoint dead point count must match checkpoint iteration; "
                 f"got {checkpoint_dead_count} dead points and iteration={iteration}"
             )
+    success = True
+    message = "converged"
+    stopped_by_callback = False
 
     dead_u_storage = np.empty((maxiter, ndim), dtype=np.asarray(live_u).dtype)
     dead_theta_storage = np.empty((maxiter, ndim), dtype=np.asarray(live_theta).dtype)
@@ -1054,48 +712,17 @@ def run_static_nested(
         int(value)
         for value in restored_telemetry.get("rwalk_proposal_history", [])
     ]
-    replacement_rescue_attempts = int(
-        restored_telemetry.get("replacement_rescue_attempts", 0)
-    )
-    replacement_rescue_successes = int(
-        restored_telemetry.get("replacement_rescue_successes", 0)
-    )
-    replacement_rescue_failures = int(
-        restored_telemetry.get("replacement_rescue_failures", 0)
-    )
-    replacement_rescue_stage_counts = {str(stage): 0 for stage in range(1, 5)}
-    replacement_rescue_stage_counts.update(
-        {
-            str(stage): int(count)
-            for stage, count in restored_telemetry.get(
-                "replacement_rescue_stage_counts", {}
-            ).items()
-        }
-    )
-    replacement_rescue_ncall = int(
-        restored_telemetry.get("replacement_rescue_ncall", 0)
-    )
-    replacement_rescue_max_stage = restored_telemetry.get(
-        "replacement_rescue_max_stage"
-    )
-    if replacement_rescue_max_stage is not None:
-        replacement_rescue_max_stage = int(replacement_rescue_max_stage)
-    replacement_rescue_last_message = restored_telemetry.get(
-        "replacement_rescue_last_message"
-    )
-    effective_step_scale = float(step_scale)
+    scale = _INITIAL_SCALE
     if initial_state is not None:
-        restored_step_scale = getattr(initial_state, "effective_step_scale", None)
-        if restored_step_scale is not None and math.isfinite(
-            float(restored_step_scale)
-        ):
-            effective_step_scale = float(restored_step_scale)
+        restored_scale = getattr(initial_state, "scale", None)
+        if restored_scale is not None and math.isfinite(float(restored_scale)):
+            scale = float(restored_scale)
     adaptive_scale_history = [
         float(value)
         for value in restored_telemetry.get("adaptive_scale_history", [])
     ]
-    if not adaptive_scale_history or adaptive_scale_history[-1] != effective_step_scale:
-        adaptive_scale_history.append(effective_step_scale)
+    if not adaptive_scale_history or adaptive_scale_history[-1] != scale:
+        adaptive_scale_history.append(scale)
     adaptive_accept_history = [
         float(value)
         for value in restored_telemetry.get("adaptive_accept_history", [])
@@ -1109,33 +736,14 @@ def run_static_nested(
     if cluster_swap:
         stored = getattr(initial_state, "clusters", None) or {}
         tracker = ClusterTracker(nlive, stored.get("arrays"), stored.get("log"))
-    if rwalk_proposal == "live-cov":
-        # The live-cov step already follows the contracting live set, so the
-        # scale is a dimensionless O(1) factor that the update can chase fast.
-        adaptive_rate = 0.5
-        adaptive_min_step_scale = 1e-3
-        adaptive_max_step_scale = 10.0
-    else:
-        adaptive_rate = 0.05
-        adaptive_min_step_scale = 1e-4
-        adaptive_max_step_scale = 0.5
 
-    def update_adaptive_scale(observed_accept: float) -> None:
-        nonlocal effective_step_scale, adaptive_updates
-        if not rwalk_adaptive_step_scale:
-            return
+    def update_scale(observed_accept: float) -> None:
+        nonlocal scale, adaptive_updates
         if not math.isfinite(float(observed_accept)):
             return
         adaptive_accept_history.append(float(observed_accept))
-        effective_step_scale = _update_adaptive_step_scale(
-            effective_step_scale,
-            float(observed_accept),
-            float(rwalk_target_accept),
-            adaptive_rate,
-            adaptive_min_step_scale,
-            adaptive_max_step_scale,
-        )
-        adaptive_scale_history.append(effective_step_scale)
+        scale = _update_scale(scale, float(observed_accept))
+        adaptive_scale_history.append(scale)
         adaptive_updates += 1
 
     def current_state() -> NestedRunState:
@@ -1158,7 +766,7 @@ def run_static_nested(
             success=success,
             message=message,
             stopped_by_callback=stopped_by_callback,
-            effective_step_scale=effective_step_scale,
+            scale=scale,
             clusters=(
                 None
                 if tracker is None
@@ -1166,23 +774,10 @@ def run_static_nested(
             ),
             telemetry={
                 "replacement_batches": list(replacement_batches),
-                "replacement_chains_used": list(replacement_chains_used),
-                "replacement_chain_usage_counts": dict(
-                    replacement_chain_usage_counts
-                ),
                 "rwalk_accepted_move_history": list(
                     rwalk_accepted_move_history
                 ),
                 "rwalk_proposal_history": list(rwalk_proposal_history),
-                "replacement_rescue_attempts": int(replacement_rescue_attempts),
-                "replacement_rescue_successes": int(replacement_rescue_successes),
-                "replacement_rescue_failures": int(replacement_rescue_failures),
-                "replacement_rescue_stage_counts": dict(
-                    replacement_rescue_stage_counts
-                ),
-                "replacement_rescue_ncall": int(replacement_rescue_ncall),
-                "replacement_rescue_max_stage": replacement_rescue_max_stage,
-                "replacement_rescue_last_message": replacement_rescue_last_message,
                 "adaptive_scale_history": list(adaptive_scale_history),
                 "adaptive_accept_history": list(adaptive_accept_history),
                 "adaptive_updates": int(adaptive_updates),
@@ -1210,8 +805,8 @@ def run_static_nested(
     ) -> dict[str, object]:
         """Assemble a run-state dict, closing over the constant config args.
 
-        Called once per finished block (or iteration); the first call marks
-        the end of the first block for the wall-time telemetry.
+        Called once per finished block; the first call marks the end of the
+        first block for the wall-time telemetry.
         """
         nonlocal first_block
         elapsed = time.perf_counter() - sampling_start
@@ -1226,26 +821,20 @@ def run_static_nested(
             ncall=ncall,
             logl_min=logl_min,
             logl_live_max=logl_live_max,
-            sample=sample,
             nlive=nlive,
             ndim=ndim,
             replacement_ncall=replacement_ncall,
             replacement_failures=replacement_failures,
             replacement_batches=replacement_batches,
-            replacement_chains_used=replacement_chains_used,
-            replacement_chain_usage_counts=replacement_chain_usage_counts,
-            replacement_chain_schedule=replacement_chain_schedule,
             replacement_chains=replacement_chains,
-            kernel=kernel,
             walks=walks,
             calls_per_s=calls / seconds if calls > 0 and seconds > 0 else None,
         )
 
     # A resumed run may already be terminal: converged, or checkpointed at
-    # iteration >= maxiter without converging. Label it here so neither loop
-    # (block mode's `while`, per-iteration's empty `range`) is entered or
-    # skipped with the stale neutral `success=True, message="converged"`
-    # initial values.
+    # iteration >= maxiter without converging. Label it here so the loop is
+    # not entered and the result does not carry the neutral
+    # `success=True, message="converged"` initial values.
     resumed_terminal = False
     if iteration > 0:
         delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
@@ -1261,718 +850,177 @@ def run_static_nested(
             maybe_checkpoint(final=True)
             resumed_terminal = True
 
-    if resumed_terminal:
-        pass
-    elif jax_block_size > 1:
-        while iteration < maxiter:
-            if iteration > 0:
-                delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
-                final_delta_logz = delta_logz
-                if delta_logz < dlogz:
-                    success = True
-                    message = "converged"
-                    maybe_checkpoint(final=True)
-                    break
-            block_size_now = min(int(jax_block_size), maxiter - iteration)
-            logz_dead_before_block = logz_dead
-            live_u_before_block = live_u
-            live_theta_before_block = live_theta
-            live_logl_before_block = live_logl
-            swap_block = ()
-            batch_ncall = int(walks) * int(replacement_chains)
-            max_batches = int(max_attempts) // batch_ncall
-            frames = None
-            if tracker is not None:
-                host_start = time.perf_counter()
-                frames = tracker.frames(
-                    live_u, iteration, dead_u_storage, dead_logwt_storage
-                )
-                cluster_host_s += time.perf_counter() - host_start
-            block_kernel = _make_static_jax_rwalk_block_kernel(
-                loglike,
-                prior_transform,
-                int(ndim),
-                int(walks),
-                int(replacement_chains),
-                int(block_size_now),
-                rwalk_proposal,
-                frames is not None,
-            )
-            result = block_kernel(
-                key,
-                live_u,
-                live_theta,
-                live_logl,
-                jnp.asarray(logz_dead),
-                jnp.asarray(iteration, dtype=jnp.int32),
-                jnp.asarray(nlive, dtype=jnp.int32),
-                jnp.asarray(
-                    effective_step_scale if rwalk_adaptive_step_scale else step_scale
-                ),
-                jnp.asarray(min_accepts),
-                jnp.asarray(max_batches, dtype=jnp.int32),
-                *([] if frames is None else [frames]),
-                *callable_leaves,
-            )
-            (
-                key,
-                live_u,
-                live_theta,
-                live_logl,
-                dead_u_block,
-                dead_theta_block,
-                dead_logl_block,
-                dead_logwt_block,
-                replacement_ncall_block,
-                insertion_indices_block,
-                replacement_batches_block,
-                replacement_chains_used_block,
-                accepted_block,
-                accepted_move_count_block,
-                total_proposal_count_block,
-                new_u_block,
-                new_theta_block,
-                new_logl_block,
-                logz_dead,
-                logx_final,
-                *swap_block,
-            ) = result
-            block_start = iteration
-            block_accepted = [bool(x) for x in np.asarray(accepted_block)]
-            failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
-            full_dead_u_block = dead_u_block
-            full_dead_theta_block = dead_theta_block
-            full_dead_logl_block = dead_logl_block
-            full_dead_logwt_block = dead_logwt_block
-            full_replacement_ncall_block = replacement_ncall_block
-            full_replacement_batches_block = replacement_batches_block
-            full_replacement_chains_used_block = replacement_chains_used_block
-            full_accepted_move_count_block = accepted_move_count_block
-            full_total_proposal_count_block = total_proposal_count_block
-            if failed_offsets:
-                replacement_failures += 1
-                success = False
-                message = (
-                    f"max_attempts={max_attempts} hit during constrained rwalk draw"
-                )
-                partial_block_failure_offset = int(failed_offsets[0])
-                partial_block_failure_message = message
-                block_size_now = failed_offsets[0]
-                failed_calls = int(
-                    np.asarray(full_replacement_ncall_block)[
-                        partial_block_failure_offset
-                    ]
-                )
-                ncall += failed_calls
-                live_u = live_u_before_block
-                live_theta = live_theta_before_block
-                live_logl = live_logl_before_block
-                for prior_offset in range(block_size_now):
-                    prior_worst = int(jnp.argmin(live_logl))
-                    live_u = live_u.at[prior_worst].set(new_u_block[prior_offset])
-                    live_theta = live_theta.at[prior_worst].set(
-                        new_theta_block[prior_offset]
-                    )
-                    live_logl = live_logl.at[prior_worst].set(
-                        new_logl_block[prior_offset]
-                    )
-            block_stop = iteration + block_size_now
-            if failed_offsets:
-                logz_dead = float(logz_dead_before_block)
-                for logwt_value in np.asarray(dead_logwt_block[:block_size_now]):
-                    logz_dead = float(jnp.logaddexp(logz_dead, float(logwt_value)))
-                logx_final = -block_stop / int(nlive)
-            dead_u_block = dead_u_block[:block_size_now]
-            dead_theta_block = dead_theta_block[:block_size_now]
-            dead_logl_block = dead_logl_block[:block_size_now]
-            dead_logwt_block = dead_logwt_block[:block_size_now]
-            replacement_ncall_block = replacement_ncall_block[:block_size_now]
-            insertion_indices_block = insertion_indices_block[:block_size_now]
-            replacement_batches_block = replacement_batches_block[:block_size_now]
-            replacement_chains_used_block = replacement_chains_used_block[
-                :block_size_now
-            ]
-            accepted_move_count_block = accepted_move_count_block[:block_size_now]
-            total_proposal_count_block = total_proposal_count_block[:block_size_now]
-            if swap_block:
-                # The rwalk telemetry and the step-scale adaptation count
-                # rwalk steps only; swaps are counted on their own.
-                swaps = np.asarray(swap_block[0])[:block_size_now]
-                accepted_move_count_block = (
-                    np.asarray(accepted_move_count_block) - swaps[:, 0]
-                )
-                total_proposal_count_block = (
-                    np.asarray(total_proposal_count_block) - swaps[:, 1]
-                )
-                tracker.log["swap"] = [
-                    int(a + b)
-                    for a, b in zip(tracker.log["swap"], swaps.sum(0), strict=True)
-                ]
-            dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
-            dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
-            dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
-            dead_logwt_storage[block_start:block_stop] = np.asarray(dead_logwt_block)
-            block_ncalls = [int(x) for x in np.asarray(replacement_ncall_block)]
-            replacement_ncall.extend(block_ncalls)
-            insertion_indices.extend(
-                int(x) for x in np.asarray(insertion_indices_block)
-            )
-            ncall += int(sum(block_ncalls))
-            block_batches = [int(x) for x in np.asarray(replacement_batches_block)]
-            block_chains_used = [
-                int(x) for x in np.asarray(replacement_chains_used_block)
-            ]
-            replacement_batches.extend(block_batches)
-            replacement_chains_used.extend(block_chains_used)
-            rwalk_accepted_move_history.extend(
-                int(x) for x in np.asarray(accepted_move_count_block)
-            )
-            rwalk_proposal_history.extend(
-                int(x) for x in np.asarray(total_proposal_count_block)
-            )
-            total_moves = int(np.sum(np.asarray(accepted_move_count_block)))
-            total_proposals = int(np.sum(np.asarray(total_proposal_count_block)))
-            if total_proposals > 0:
-                update_adaptive_scale(total_moves / total_proposals)
-            if replacement_chain_schedule is None:
-                chain_count = str(int(replacement_chains))
-                replacement_chain_usage_counts[chain_count] = (
-                    replacement_chain_usage_counts.get(chain_count, 0)
-                    + sum(block_batches)
-                )
-            else:
-                schedule = [int(c) for c in replacement_chain_schedule]
-                for batches_used in block_batches:
-                    for batch_index in range(batches_used):
-                        chain_count = str(
-                            schedule[batch_index]
-                            if batch_index < len(schedule)
-                            else schedule[-1]
-                        )
-                        replacement_chain_usage_counts[chain_count] = (
-                            replacement_chain_usage_counts.get(chain_count, 0) + 1
-                        )
-            iteration = block_stop
-            maybe_checkpoint()
-            if failed_offsets:
-                delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
-                final_delta_logz = delta_logz
-                partial_block_failure_delta_logz = float(delta_logz)
-                if iteration > 0 and delta_logz < dlogz:
-                    success = True
-                    message = "converged after partial block before replacement failure"
-                    terminated_after_partial_block_failure = True
-                    maybe_checkpoint(final=True)
-                    break
-
-                rescue_success = False
-                if (
-                    replacement_chain_schedule is None
-                    and int(max_attempts) > int(walks) * int(replacement_chains)
-                ):
-                    fail_offset = int(failed_offsets[0])
-                    rescue_live_u = live_u
-                    rescue_live_theta = live_theta
-                    rescue_live_logl = live_logl
-                    rescue_worst = int(jnp.argmin(rescue_live_logl))
-                    rescue_logl_min = float(full_dead_logl_block[fail_offset])
-                    rescue_schedule = (
-                        (
-                            1,
-                            0.75,
-                            max(int(walks) * 2, int(walks) + 1),
-                            int(replacement_chains),
-                            int(min_accepts),
-                        ),
-                        (
-                            2,
-                            0.5,
-                            max(int(walks) * 3, int(walks) + 1),
-                            max(int(replacement_chains) * 2, int(replacement_chains)),
-                            int(min_accepts),
-                        ),
-                        (
-                            3,
-                            0.35,
-                            max(int(walks) * 4, int(walks) + 1),
-                            max(int(replacement_chains) * 2, int(replacement_chains)),
-                            max(1, int(min_accepts) // 2),
-                        ),
-                        (
-                            4,
-                            0.25,
-                            max(int(walks) * 5, int(walks) + 1),
-                            max(int(replacement_chains) * 4, int(replacement_chains)),
-                            1,
-                        ),
-                    )
-                    rescue_calls_total = 0
-                    rescue_batches_total = 0
-                    rescue_chains_used_total = 0
-                    rescue_accepted_moves_total = 0
-                    rescue_proposals_total = 0
-                    rescue_chain_usage_counts: dict[str, int] = {}
-                    for (
-                        stage,
-                        scale_factor,
-                        stage_walks,
-                        stage_chains,
-                        stage_min_accepts,
-                    ) in rescue_schedule:
-                        replacement_rescue_attempts += 1
-                        replacement_rescue_stage_counts[str(stage)] += 1
-                        replacement_rescue_max_stage = int(stage)
-                        stage_max_attempts = max(
-                            int(max_attempts), int(stage_walks) * int(stage_chains)
-                        )
-                        rescue_result = draw_constrained_rwalk_jax(
-                            key,
-                            loglike,
-                            prior_transform,
-                            rescue_logl_min,
-                            rescue_live_u,
-                            rescue_live_logl,
-                            ndim,
-                            walks=int(stage_walks),
-                            step_scale=float(
-                                effective_step_scale
-                                if rwalk_adaptive_step_scale
-                                else step_scale
-                            )
-                            * float(scale_factor),
-                            max_attempts=stage_max_attempts,
-                            min_accepts=int(stage_min_accepts),
-                            replacement_chains=int(stage_chains),
-                            return_info=True,
-                            proposal=rwalk_proposal,
-                        )
-                        if len(rescue_result) == 7:
-                            (
-                                key,
-                                rescued_u,
-                                rescued_theta,
-                                rescued_logl,
-                                rescue_calls,
-                                rescue_accepted,
-                                rescue_info,
-                            ) = rescue_result
-                        else:
-                            (
-                                key,
-                                rescued_u,
-                                rescued_theta,
-                                rescued_logl,
-                                rescue_calls,
-                                rescue_accepted,
-                            ) = rescue_result
-                            rescue_info = {}
-                        rescue_calls = int(rescue_calls)
-                        replacement_rescue_ncall += rescue_calls
-                        rescue_calls_total += rescue_calls
-                        default_batches = int(
-                            math.ceil(
-                                rescue_calls
-                                / (int(stage_walks) * int(stage_chains))
-                            )
-                        )
-                        rescue_batches_total += int(
-                            rescue_info.get("replacement_batches", default_batches)
-                        )
-                        rescue_chains_used_total += int(
-                            rescue_info.get(
-                                "replacement_chains_used",
-                                int(stage_chains) * default_batches,
-                            )
-                        )
-                        rescue_accepted_moves_total += int(
-                            rescue_info.get(
-                                "accepted_rwalk_moves",
-                                rescue_info.get("accepted_move_count", 0),
-                            )
-                        )
-                        rescue_proposals_total += int(
-                            rescue_info.get(
-                                "total_rwalk_proposals",
-                                rescue_info.get("total_proposal_count", rescue_calls),
-                            )
-                        )
-                        stage_chain_usage = rescue_info.get(
-                            "replacement_chain_usage_counts"
-                        )
-                        if stage_chain_usage is None:
-                            stage_chain_usage = {
-                                str(int(stage_chains)): default_batches
-                            }
-                        for chain_count, count in stage_chain_usage.items():
-                            rescue_chain_usage_counts[str(chain_count)] = (
-                                rescue_chain_usage_counts.get(str(chain_count), 0)
-                                + int(count)
-                            )
-                        if bool(rescue_accepted):
-                            replacement_rescue_successes += 1
-                            rescue_success = True
-                            success = True
-                            message = "converged"
-                            replacement_rescue_last_message = (
-                                f"replacement rescue stage {stage} succeeded"
-                            )
-                            fail_stop = block_start + fail_offset + 1
-                            dead_u_storage[block_start:fail_stop] = np.asarray(
-                                full_dead_u_block[: fail_offset + 1]
-                            )
-                            dead_theta_storage[block_start:fail_stop] = np.asarray(
-                                full_dead_theta_block[: fail_offset + 1]
-                            )
-                            dead_logl_storage[block_start:fail_stop] = np.asarray(
-                                full_dead_logl_block[: fail_offset + 1]
-                            )
-                            dead_logwt_storage[block_start:fail_stop] = np.asarray(
-                                full_dead_logwt_block[: fail_offset + 1]
-                            )
-                            failed_accepted_moves = 0
-                            if full_accepted_move_count_block is not None:
-                                failed_accepted_moves = int(
-                                    full_accepted_move_count_block[fail_offset]
-                                )
-                            failed_proposals = failed_calls
-                            if full_total_proposal_count_block is not None:
-                                failed_proposals = int(
-                                    full_total_proposal_count_block[fail_offset]
-                                )
-                            rwalk_accepted_move_history.append(
-                                failed_accepted_moves + rescue_accepted_moves_total
-                            )
-                            rwalk_proposal_history.append(
-                                failed_proposals + rescue_proposals_total
-                            )
-                            replacement_ncall.append(
-                                failed_calls + rescue_calls_total
-                            )
-                            replacement_batches.append(
-                                int(full_replacement_batches_block[fail_offset])
-                                + rescue_batches_total
-                            )
-                            replacement_chains_used.append(
-                                int(full_replacement_chains_used_block[fail_offset])
-                                + rescue_chains_used_total
-                            )
-                            for chain_count, count in rescue_chain_usage_counts.items():
-                                replacement_chain_usage_counts[chain_count] = (
-                                    replacement_chain_usage_counts.get(chain_count, 0)
-                                    + int(count)
-                                )
-                            insertion_indices.append(
-                                int(
-                                    jnp.sum(rescue_live_logl <= rescued_logl)
-                                    - (rescue_live_logl[rescue_worst] <= rescued_logl)
-                                )
-                            )
-                            logz_dead = float(
-                                jnp.logaddexp(
-                                    logz_dead, float(full_dead_logwt_block[fail_offset])
-                                )
-                            )
-                            logx_final = -fail_stop / int(nlive)
-                            rescue_live_u = rescue_live_u.at[rescue_worst].set(
-                                rescued_u
-                            )
-                            rescue_live_theta = rescue_live_theta.at[rescue_worst].set(
-                                rescued_theta
-                            )
-                            rescue_live_logl = rescue_live_logl.at[rescue_worst].set(
-                                rescued_logl
-                            )
-                            live_u, live_theta, live_logl = (
-                                rescue_live_u,
-                                rescue_live_theta,
-                                rescue_live_logl,
-                            )
-                            iteration = fail_stop
-                            attempted_proposals = (
-                                failed_proposals + rescue_proposals_total
-                            )
-                            if attempted_proposals > 0:
-                                update_adaptive_scale(
-                                    (
-                                        failed_accepted_moves
-                                        + rescue_accepted_moves_total
-                                    )
-                                    / attempted_proposals
-                                )
-                            break
-                    ncall += rescue_calls_total
-                    if not rescue_success:
-                        replacement_rescue_failures += 1
-                        replacement_rescue_last_message = (
-                            "replacement rescue failed after "
-                            f"{replacement_rescue_attempts} attempts; {message}"
-                        )
-                if not rescue_success:
-                    break
-
+    while not resumed_terminal and iteration < maxiter:
+        if iteration > 0:
             delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
             final_delta_logz = delta_logz
-            final_iteration = delta_logz < dlogz or iteration == maxiter
-            if iteration == maxiter and delta_logz >= dlogz:
-                success = False
-                message = f"maxiter={maxiter} reached"
-            state = build_state(
-                iteration=iteration,
-                logz=logz_dead,
-                dlogz=delta_logz,
-                ncall=ncall,
-                logl_min=float(
-                    dead_logl_block[-1]
-                    if len(dead_logl_block)
-                    else dead_logl_storage[iteration - 1]
-                ),
-                logl_live_max=float(jnp.max(live_logl)),
-            )
-            if callback is not None and (
-                iteration == 1 or iteration % callback_interval == 0 or final_iteration
-            ):
-                if callback(state) is False:
-                    success = False
-                    message = "stopped by callback"
-                    stopped_by_callback = True
-                    final_iteration = True
-            if progress_printer is not None and (
-                iteration == 1 or iteration % progress_interval == 0 or final_iteration
-            ):
-                progress_printer.print(
-                    _format_progress_line(state), final=final_iteration
-                )
-            if final_iteration:
+            if delta_logz < dlogz:
+                success = True
+                message = "converged"
                 maybe_checkpoint(final=True)
                 break
-    else:
-        for i in range(iteration, maxiter):
-            worst = int(jnp.argmin(live_logl))
-            logl_worst = float(live_logl[worst])
-            logx_prev = -i / nlive
-            logx_new = -(i + 1) / nlive
-            logwidth = logdiffexp(logx_prev, logx_new)
-            logwt = float(logwidth + logl_worst)
-
-            dead_u_storage[i] = np.asarray(live_u[worst])
-            dead_theta_storage[i] = np.asarray(live_theta[worst])
-            dead_logl_storage[i] = logl_worst
-            dead_logwt_storage[i] = logwt
-            logz_dead = float(jnp.logaddexp(logz_dead, logwt))
-            logx_final = logx_new
-
-            if sample == "prior":
-                if vectorized:
-                    (
-                        key,
-                        new_u,
-                        new_theta,
-                        new_logl,
-                        calls,
-                        accepted,
-                    ) = draw_constrained_prior_vectorized(
-                        key,
-                        loglike,
-                        prior_transform,
-                        logl_worst,
-                        ndim,
-                        batch_size=batch_size,
-                        max_attempts=max_attempts,
-                    )
-                else:
-                    (
-                        key,
-                        new_u,
-                        new_theta,
-                        new_logl,
-                        calls,
-                        accepted,
-                    ) = draw_constrained_prior(
-                        key,
-                        loglike,
-                        prior_transform,
-                        logl_worst,
-                        ndim,
-                        max_attempts=max_attempts,
-                    )
-            elif sample == "rwalk":
-                rwalk_draw = (
-                    draw_constrained_rwalk_jax_adaptive
-                    if kernel == "jax" and replacement_chain_schedule is not None
-                    else (
-                        draw_constrained_rwalk_jax
-                        if kernel == "jax"
-                        else draw_constrained_rwalk
-                    )
-                )
-                draw_result = rwalk_draw(
-                    key,
-                    loglike,
-                    prior_transform,
-                    logl_worst,
-                    live_u,
-                    live_logl,
-                    ndim,
-                    walks=walks,
-                    step_scale=effective_step_scale
-                    if rwalk_adaptive_step_scale
-                    else step_scale,
-                    max_attempts=max_attempts,
-                    min_accepts=min_accepts,
-                    **(
-                        {
-                            "jax_vectorized": jax_vectorized,
-                            **(
-                                {"return_info": True, "proposal": rwalk_proposal}
-                                if replacement_chain_schedule is None
-                                else {}
-                            ),
-                        }
-                        if kernel == "jax"
-                        else {}
-                    ),
-                    **(
-                        {"replacement_chain_schedule": replacement_chain_schedule}
-                        if kernel == "jax" and replacement_chain_schedule is not None
-                        else (
-                            {"replacement_chains": replacement_chains}
-                            if kernel == "jax"
-                            else {}
-                        )
-                    ),
-                )
-                if len(draw_result) == 7:
-                    (
-                        key,
-                        new_u,
-                        new_theta,
-                        new_logl,
-                        calls,
-                        accepted,
-                        replacement_info,
-                    ) = draw_result
-                    replacement_batches.append(
-                        int(replacement_info["replacement_batches"])
-                    )
-                    replacement_chains_used.append(
-                        int(replacement_info["replacement_chains_used"])
-                    )
-                    for chain_count, count in replacement_info[
-                        "replacement_chain_usage_counts"
-                    ].items():
-                        replacement_chain_usage_counts[chain_count] = (
-                            replacement_chain_usage_counts.get(chain_count, 0)
-                            + int(count)
-                        )
-                    total_proposals = int(
-                        replacement_info.get(
-                            "total_rwalk_proposals",
-                            replacement_info.get("total_proposal_count", 0),
-                        )
-                    )
-                    accepted_moves = int(
-                        replacement_info.get(
-                            "accepted_rwalk_moves",
-                            replacement_info.get("accepted_move_count", 0),
-                        )
-                    )
-                    if total_proposals > 0:
-                        rwalk_accepted_move_history.append(accepted_moves)
-                        rwalk_proposal_history.append(total_proposals)
-                        update_adaptive_scale(accepted_moves / total_proposals)
-                else:
-                    key, new_u, new_theta, new_logl, calls, accepted = draw_result
-                    if kernel == "jax":
-                        batch_ncall = int(walks) * int(replacement_chains)
-                        batches_used = int(math.ceil(int(calls) / batch_ncall))
-                        chains_used = int(replacement_chains) * batches_used
-                        replacement_batches.append(batches_used)
-                        replacement_chains_used.append(chains_used)
-                        chain_count = str(int(replacement_chains))
-                        replacement_chain_usage_counts[chain_count] = (
-                            replacement_chain_usage_counts.get(chain_count, 0)
-                            + batches_used
-                        )
-                        # Adaptive scale updates require true rwalk move-acceptance
-                        # telemetry, which legacy six-item draw results do not provide.
-                    else:
-                        replacement_batches.append(1)
-                        replacement_chains_used.append(1)
-            ncall += calls
-            replacement_ncall.append(int(calls))
-            iteration = i + 1
-            if not accepted:
-                replacement_failures += 1
-                success = False
-                message = (
-                    f"max_attempts={max_attempts} hit during constrained prior draw"
-                )
-                delta_logz = _remaining_delta_logz(logz_dead, logx_new, live_logl)
-                final_delta_logz = delta_logz
-                state = build_state(
-                    iteration=i + 1,
-                    logz=logz_dead,
-                    dlogz=delta_logz,
-                    ncall=ncall,
-                    logl_min=logl_worst,
-                    logl_live_max=float(jnp.max(live_logl)),
-                )
-                if callback is not None and (
-                    i + 1 == 1 or (i + 1) % callback_interval == 0
-                ):
-                    if callback(state) is False:
-                        message = "stopped by callback"
-                        stopped_by_callback = True
-                if progress_printer is not None:
-                    progress_printer.print(_format_progress_line(state), final=True)
-                maybe_checkpoint(final=True)
-                break
-
-            # Insertion rank == number of surviving live points at or below the
-            # replacement. Count the full live array (still holding the worst
-            # point here) and drop the worst, matching the cached block path and
-            # avoiding a per-iteration O(nlive log nlive) sort.
-            insertion_index = int(
-                jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
+        block_size_now = min(int(block_size), maxiter - iteration)
+        logz_dead_before_block = logz_dead
+        frames = None
+        if tracker is not None:
+            host_start = time.perf_counter()
+            frames = tracker.frames(
+                live_u, iteration, dead_u_storage, dead_logwt_storage
             )
-            insertion_indices.append(insertion_index)
-
-            live_u = live_u.at[worst].set(new_u)
-            live_theta = live_theta.at[worst].set(new_theta)
-            live_logl = live_logl.at[worst].set(new_logl)
-            maybe_checkpoint()
-
-            delta_logz = _remaining_delta_logz(logz_dead, logx_new, live_logl)
+            cluster_host_s += time.perf_counter() - host_start
+        block_kernel = _make_static_jax_rwalk_block_kernel(
+            loglike,
+            prior_transform,
+            int(ndim),
+            int(walks),
+            int(replacement_chains),
+            int(block_size_now),
+            frames is not None,
+        )
+        (
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            dead_u_block,
+            dead_theta_block,
+            dead_logl_block,
+            dead_logwt_block,
+            replacement_ncall_block,
+            insertion_indices_block,
+            replacement_batches_block,
+            accepted_block,
+            accepted_move_count_block,
+            total_proposal_count_block,
+            *swap_block,
+            logz_dead,
+            logx_final,
+        ) = block_kernel(
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            jnp.asarray(logz_dead),
+            jnp.asarray(iteration, dtype=jnp.int32),
+            jnp.asarray(nlive, dtype=jnp.int32),
+            jnp.asarray(scale),
+            jnp.asarray(max_batches, dtype=jnp.int32),
+            *([] if frames is None else [frames]),
+            *callable_leaves,
+        )
+        block_start = iteration
+        failed_offsets = np.flatnonzero(~np.asarray(accepted_block))
+        if failed_offsets.size:
+            # The block kernel left the live set and the key as they were
+            # after the last successful replacement; keep the dead points
+            # before the failed one.
+            replacement_failures += 1
+            success = False
+            partial_block_failure_offset = int(failed_offsets[0])
+            message = (
+                "replacement failed at iteration "
+                f"{block_start + partial_block_failure_offset + 1}: no chain "
+                f"ended above the likelihood threshold in {max_batches} "
+                f"batches of {walks} steps x {replacement_chains} chains"
+            )
+            partial_block_failure_message = message
+            block_size_now = partial_block_failure_offset
+            ncall += int(
+                np.asarray(replacement_ncall_block)[partial_block_failure_offset]
+            )
+            logz_dead = float(logz_dead_before_block)
+            for logwt_value in np.asarray(dead_logwt_block[:block_size_now]):
+                logz_dead = float(jnp.logaddexp(logz_dead, float(logwt_value)))
+            logx_final = -(block_start + block_size_now) / int(nlive)
+        block_stop = block_start + block_size_now
+        dead_u_block = dead_u_block[:block_size_now]
+        dead_theta_block = dead_theta_block[:block_size_now]
+        dead_logl_block = dead_logl_block[:block_size_now]
+        dead_logwt_block = dead_logwt_block[:block_size_now]
+        replacement_ncall_block = replacement_ncall_block[:block_size_now]
+        insertion_indices_block = insertion_indices_block[:block_size_now]
+        replacement_batches_block = replacement_batches_block[:block_size_now]
+        accepted_move_count_block = accepted_move_count_block[:block_size_now]
+        total_proposal_count_block = total_proposal_count_block[:block_size_now]
+        if swap_block:
+            # The rwalk telemetry and the scale adaptation count rwalk steps
+            # only; swaps are counted on their own.
+            swaps = np.asarray(swap_block[0])[:block_size_now]
+            accepted_move_count_block = (
+                np.asarray(accepted_move_count_block) - swaps[:, 0]
+            )
+            total_proposal_count_block = (
+                np.asarray(total_proposal_count_block) - swaps[:, 1]
+            )
+            tracker.log["swap"] = [
+                int(a + b)
+                for a, b in zip(tracker.log["swap"], swaps.sum(0), strict=True)
+            ]
+        dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
+        dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
+        dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
+        dead_logwt_storage[block_start:block_stop] = np.asarray(dead_logwt_block)
+        block_ncalls = [int(x) for x in np.asarray(replacement_ncall_block)]
+        replacement_ncall.extend(block_ncalls)
+        insertion_indices.extend(int(x) for x in np.asarray(insertion_indices_block))
+        ncall += int(sum(block_ncalls))
+        replacement_batches.extend(
+            int(x) for x in np.asarray(replacement_batches_block)
+        )
+        rwalk_accepted_move_history.extend(
+            int(x) for x in np.asarray(accepted_move_count_block)
+        )
+        rwalk_proposal_history.extend(
+            int(x) for x in np.asarray(total_proposal_count_block)
+        )
+        total_moves = int(np.sum(np.asarray(accepted_move_count_block)))
+        total_proposals = int(np.sum(np.asarray(total_proposal_count_block)))
+        if total_proposals > 0:
+            update_scale(total_moves / total_proposals)
+        iteration = block_stop
+        maybe_checkpoint()
+        if failed_offsets.size:
+            delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
             final_delta_logz = delta_logz
-            final_iteration = delta_logz < dlogz or i + 1 == maxiter
-            if i + 1 == maxiter and delta_logz >= dlogz:
+            partial_block_failure_delta_logz = float(delta_logz)
+            if iteration > 0 and delta_logz < dlogz:
+                success = True
+                message = "converged after partial block before replacement failure"
+                terminated_after_partial_block_failure = True
+            maybe_checkpoint(final=True)
+            break
+
+        delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+        final_delta_logz = delta_logz
+        final_iteration = delta_logz < dlogz or iteration == maxiter
+        if iteration == maxiter and delta_logz >= dlogz:
+            success = False
+            message = f"maxiter={maxiter} reached"
+        state = build_state(
+            iteration=iteration,
+            logz=logz_dead,
+            dlogz=delta_logz,
+            ncall=ncall,
+            logl_min=float(dead_logl_block[-1]),
+            logl_live_max=float(jnp.max(live_logl)),
+        )
+        if callback is not None and (
+            iteration == 1 or iteration % callback_interval == 0 or final_iteration
+        ):
+            if callback(state) is False:
                 success = False
-                message = f"maxiter={maxiter} reached"
-            state = build_state(
-                iteration=i + 1,
-                logz=logz_dead,
-                dlogz=delta_logz,
-                ncall=ncall,
-                logl_min=logl_worst,
-                logl_live_max=float(jnp.max(live_logl)),
+                message = "stopped by callback"
+                stopped_by_callback = True
+                final_iteration = True
+        if progress_printer is not None and (
+            iteration == 1 or iteration % progress_interval == 0 or final_iteration
+        ):
+            progress_printer.print(
+                _format_progress_line(state), final=final_iteration
             )
-            if callback is not None and (
-                i + 1 == 1 or (i + 1) % callback_interval == 0 or final_iteration
-            ):
-                if callback(state) is False:
-                    success = False
-                    message = "stopped by callback"
-                    stopped_by_callback = True
-                    final_iteration = True
-            if progress_printer is not None and (
-                i + 1 == 1 or (i + 1) % progress_interval == 0 or final_iteration
-            ):
-                progress_printer.print(
-                    _format_progress_line(state), final=final_iteration
-                )
-            if final_iteration:
-                maybe_checkpoint(final=True)
-                break
+        if final_iteration:
+            maybe_checkpoint(final=True)
+            break
 
     wall_time_s = time.perf_counter() - sampling_start
     compile_s = None if first_block is None else first_block[0]
@@ -2007,15 +1055,6 @@ def run_static_nested(
     logzerr, logzerr_diagnostics = _logzerr_diagnostics(
         logwt, logl, logz, nlive, nlive_final
     )
-    replacement_initial_batch_ncall = int(walks) * int(replacement_chains)
-    replacement_max_batch_ncall = replacement_initial_batch_ncall
-    replacement_batch_ncall = replacement_initial_batch_ncall
-    if replacement_chain_schedule is not None:
-        replacement_initial_batch_ncall = int(walks) * int(
-            replacement_chain_schedule[0]
-        )
-        replacement_max_batch_ncall = int(walks) * int(replacement_chain_schedule[-1])
-        replacement_batch_ncall = replacement_max_batch_ncall
     if replacement_ncall:
         mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
         max_replacement_ncall = int(max(replacement_ncall))
@@ -2035,31 +1074,6 @@ def run_static_nested(
         if total_rwalk_proposals > 0
         else None
     )
-    adaptive_metadata = {"rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale)}
-    if rwalk_adaptive_step_scale:
-        adaptive_metadata.update(
-            {
-                "rwalk_target_accept": float(rwalk_target_accept),
-                "rwalk_effective_step_scale_initial": float(step_scale),
-                "rwalk_effective_step_scale_final": float(effective_step_scale),
-                "rwalk_effective_step_scale_min_seen": float(
-                    min(adaptive_scale_history)
-                ),
-                "rwalk_effective_step_scale_max_seen": float(
-                    max(adaptive_scale_history)
-                ),
-                "rwalk_effective_step_scale_mean": float(
-                    sum(adaptive_scale_history) / len(adaptive_scale_history)
-                ),
-                "rwalk_adaptation_updates": int(adaptive_updates),
-                "rwalk_observed_accept_mean": (
-                    float(sum(adaptive_accept_history) / len(adaptive_accept_history))
-                    if adaptive_accept_history
-                    else 0.0
-                ),
-                "rwalk_observed_accept_source": "move_acceptance",
-            }
-        )
 
     cluster_metadata = {"cluster_swap": bool(cluster_swap)}
     if tracker is not None:
@@ -2089,20 +1103,26 @@ def run_static_nested(
         success=success,
         message=message,
         metadata={
-            **adaptive_metadata,
+            "rwalk_scale_initial": _INITIAL_SCALE,
+            "rwalk_scale_final": float(scale),
+            "rwalk_scale_min_seen": float(min(adaptive_scale_history)),
+            "rwalk_scale_max_seen": float(max(adaptive_scale_history)),
+            "rwalk_scale_mean": float(
+                sum(adaptive_scale_history) / len(adaptive_scale_history)
+            ),
+            "rwalk_adaptation_updates": int(adaptive_updates),
+            "rwalk_observed_accept_mean": (
+                float(sum(adaptive_accept_history) / len(adaptive_accept_history))
+                if adaptive_accept_history
+                else 0.0
+            ),
             **cluster_metadata,
-            "sample": sample,
-            "kernel": kernel,
             # Wall time of this call (a resume counts only its own part); the
             # first block includes the compiles, so the per-call cost skips it.
             "wall_time_s": float(wall_time_s),
             "compile_s": compile_s,
             "mean_ms_per_call": mean_ms_per_call,
-            "jax_block_size": int(jax_block_size),
-            "jax_block_mode": bool(jax_block_size > 1),
-            "jax_block_cached": jax_block_cached,
-            "jax_block_kernel": jax_block_kernel,
-            "jax_block_impl": jax_block_impl,
+            "block_size": int(block_size),
             "dlogz": dlogz,
             "maxiter": maxiter,
             "niter": niter,
@@ -2115,33 +1135,13 @@ def run_static_nested(
             "final_logz_dead": float(logz_dead),
             "final_logl_live_max": float(jnp.max(live_logl)),
             "walks": walks,
-            "step_scale": step_scale,
-            "min_accepts": min_accepts,
-            "rwalk_proposal": rwalk_proposal,
             "replacement_chains": replacement_chains,
-            "replacement_chain_schedule": (
-                None
-                if replacement_chain_schedule is None
-                else list(replacement_chain_schedule)
-            ),
-            "adaptive_replacement_chains": replacement_chain_schedule is not None,
-            "replacement_batch_ncall": replacement_batch_ncall,
-            "replacement_initial_batch_ncall": replacement_initial_batch_ncall,
-            "replacement_max_batch_ncall": replacement_max_batch_ncall,
-            "batch_size": batch_size,
+            "replacement_batch_ncall": batch_ncall,
             "replacement_ncall": replacement_ncall,
             "insertion_indices": jnp.asarray(insertion_indices, dtype=int),
             "insertion_index_nslots": nlive,
             "insertion_index_nlive": nlive - 1,
             "replacement_failures": int(replacement_failures),
-            "replacement_rescue_used": bool(replacement_rescue_attempts > 0),
-            "replacement_rescue_attempts": int(replacement_rescue_attempts),
-            "replacement_rescue_successes": int(replacement_rescue_successes),
-            "replacement_rescue_failures": int(replacement_rescue_failures),
-            "replacement_rescue_stage_counts": dict(replacement_rescue_stage_counts),
-            "replacement_rescue_ncall": int(replacement_rescue_ncall),
-            "replacement_rescue_max_stage": replacement_rescue_max_stage,
-            "replacement_rescue_last_message": replacement_rescue_last_message,
             "terminated_after_partial_block_failure": bool(
                 terminated_after_partial_block_failure
             ),
@@ -2156,20 +1156,11 @@ def run_static_nested(
                 else 0.0
             ),
             "max_replacement_batches": int(max(replacement_batches, default=0)),
-            "mean_replacement_chains_used": (
-                float(sum(replacement_chains_used) / len(replacement_chains_used))
-                if replacement_chains_used
-                else 0.0
-            ),
-            "max_replacement_chains_used": int(max(replacement_chains_used, default=0)),
-            "replacement_chain_usage_counts": replacement_chain_usage_counts,
             "replacement_acceptance_proxy": replacement_acceptance_proxy,
             "accepted_rwalk_moves": accepted_rwalk_moves,
             "total_rwalk_proposals": total_rwalk_proposals,
             "rwalk_acceptance": rwalk_acceptance,
             "mean_rwalk_acceptance": rwalk_acceptance,
-            "jax_vectorized": bool(jax_vectorized),
-            "mean_total_replacement_calls": mean_replacement_ncall,
             "progress_interval": progress_interval,
             "callback_interval": callback_interval,
             "stopped_by_callback": bool(stopped_by_callback),

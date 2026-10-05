@@ -21,7 +21,8 @@ def prior_transform(u):
 
 
 def make_sampler(**kwargs):
-    options = {"ndim": 2, "nlive": 20, "sample": "prior"}
+    # block_size=1 checkpoints after every iteration and compiles one kernel.
+    options = {"ndim": 2, "nlive": 20, "walks": 5, "block_size": 1}
     options.update(kwargs)
     return NestedSampler(loglike, prior_transform, **options)
 
@@ -64,14 +65,15 @@ def test_resume_does_not_reinitialize(tmp_path):
     [
         ({"ndim": 3}, "ndim"),
         ({"nlive": 25}, "nlive"),
-        ({"sample": "rwalk"}, "sample"),
-        ({"step_scale": 0.2}, "step_scale"),
-        ({"min_accepts": 2}, "min_accepts"),
+        ({"walks": 6}, "walks"),
+        ({"replacement_chains": 2}, "replacement_chains"),
+        ({"block_size": 2}, "block_size"),
+        ({"cluster_swap": False}, "cluster_swap"),
     ],
 )
 def test_incompatible_checkpoint_config_raises(tmp_path, kwargs, match):
     path = tmp_path / "run.checkpoint.npz"
-    make_sampler(step_scale=0.1).run(4, maxiter=2, checkpoint_path=path)
+    make_sampler().run(4, maxiter=2, checkpoint_path=path)
 
     with pytest.raises(ValueError, match=match):
         make_sampler(**kwargs).resume(path, maxiter=3)
@@ -148,17 +150,7 @@ def test_resume_matches_uninterrupted_run(tmp_path):
 
 def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
     path = tmp_path / "rwalk_telemetry.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=2,
-        replacement_chains=2,
-        max_attempts=16,
-        rwalk_proposal="isotropic",
-        jax_block_size=1,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.4,
-    )
+    sampler = make_sampler(walks=2, replacement_chains=2)
 
     full = sampler.run(100, maxiter=8, dlogz=0.0)
     sampler.run(
@@ -177,14 +169,9 @@ def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
     assert resumed.metadata["replacement_ncall"] == full.metadata[
         "replacement_ncall"
     ]
-    assert resumed.metadata["replacement_chain_usage_counts"] == full.metadata[
-        "replacement_chain_usage_counts"
-    ]
     for key in (
         "mean_replacement_batches",
         "max_replacement_batches",
-        "mean_replacement_chains_used",
-        "max_replacement_chains_used",
         "accepted_rwalk_moves",
         "total_rwalk_proposals",
         "rwalk_adaptation_updates",
@@ -192,9 +179,10 @@ def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
         assert resumed.metadata[key] == full.metadata[key]
     for key in (
         "rwalk_acceptance",
-        "rwalk_effective_step_scale_min_seen",
-        "rwalk_effective_step_scale_max_seen",
-        "rwalk_effective_step_scale_mean",
+        "rwalk_scale_final",
+        "rwalk_scale_min_seen",
+        "rwalk_scale_max_seen",
+        "rwalk_scale_mean",
         "rwalk_observed_accept_mean",
     ):
         assert resumed.metadata[key] == pytest.approx(full.metadata[key])
@@ -219,37 +207,26 @@ def test_resume_without_telemetry_payload_uses_empty_history_defaults(tmp_path):
     assert math.isfinite(result.logz)
 
 
-def test_checkpoint_with_min_accepts_two_resumes_with_matching_config(tmp_path):
-    path = tmp_path / "run.checkpoint.npz"
-    sampler = make_sampler(sample="rwalk", walks=3, min_accepts=2)
-
-    sampler.run(11, maxiter=2, dlogz=0.0, checkpoint_path=path)
-    result = sampler.resume(path, maxiter=4, dlogz=0.0)
-
-    assert math.isfinite(result.logz)
-    assert result.metadata["min_accepts"] == 2
-    assert result.metadata["resumed_from_checkpoint"] is True
-
-
 def test_resume_rejects_checkpoint_after_replacement_failure(tmp_path):
     path = tmp_path / "failed.checkpoint.npz"
 
-    def increasing_loglike(theta):
-        return float(jnp.asarray(theta)[0])
-
+    # No point is admissible above a NaN threshold.
     failed_sampler = NestedSampler(
-        increasing_loglike,
+        lambda theta: jnp.nan,
         prior_transform,
         ndim=1,
-        nlive=1,
-        sample="prior",
-        max_attempts=1,
+        nlive=3,
+        walks=10,
+        cluster_swap=False,
     )
     result = failed_sampler.run(0, maxiter=10, dlogz=0.0, checkpoint_path=path)
 
     assert path.exists()
     assert result.success is False
-    assert "max_attempts" in result.message
+    assert "replacement failed" in result.message
+    state, _ = load_checkpoint_npz(path)
+    assert state.success is False
+    assert state.replacement_failures == 1
     with pytest.raises(ValueError, match="replacement failure"):
         failed_sampler.resume(path, maxiter=10, dlogz=0.0)
 
@@ -287,34 +264,6 @@ def test_resume_rejects_inconsistent_dead_count(tmp_path):
         )
 
 
-def test_checkpoint_kernel_mismatch_raises(tmp_path):
-    path = tmp_path / "jax.checkpoint.npz"
-    make_sampler(sample="rwalk", kernel="jax", walks=3, step_scale=0.05).run(
-        14, maxiter=2, dlogz=0.0, checkpoint_path=path
-    )
-
-    with pytest.raises(ValueError, match="kernel"):
-        make_sampler(sample="rwalk", kernel="python", walks=3, step_scale=0.05).resume(
-            path, maxiter=3
-        )
-
-
-def test_checkpoint_missing_kernel_defaults_to_python(tmp_path):
-    path = tmp_path / "run.checkpoint.npz"
-    old_path = tmp_path / "old.checkpoint.npz"
-    make_sampler(kernel="python").run(15, maxiter=2, checkpoint_path=path)
-    with np.load(path) as data:
-        values = {name: data[name] for name in data.files}
-    config = json.loads(str(values["config_json"].item()))
-    config.pop("kernel", None)
-    values["config_json"] = np.asarray(json.dumps(config, sort_keys=True))
-    np.savez(old_path, **values)
-
-    result = make_sampler(kernel="python").resume(old_path, maxiter=3)
-
-    assert result.metadata["kernel"] == "python"
-
-
 def _rewrite_checkpoint_config(path, update):
     with np.load(path) as data:
         arrays = {name: data[name] for name in data.files}
@@ -327,7 +276,7 @@ def _rewrite_checkpoint_config(path, update):
 
 def test_checkpoint_config_includes_replacement_chains(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
-    make_sampler(sample="rwalk", kernel="jax", walks=3, replacement_chains=2).run(
+    make_sampler(walks=3, replacement_chains=2).run(
         16, maxiter=1, dlogz=0.0, checkpoint_path=path
     )
 
@@ -338,47 +287,44 @@ def test_checkpoint_config_includes_replacement_chains(tmp_path):
 
 def test_resume_rejects_replacement_chains_mismatch(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
-    make_sampler(sample="rwalk", kernel="jax", walks=3, replacement_chains=2).run(
+    make_sampler(walks=3, replacement_chains=2).run(
         17, maxiter=1, dlogz=0.0, checkpoint_path=path
     )
 
     with pytest.raises(ValueError, match="replacement_chains"):
-        make_sampler(sample="rwalk", kernel="jax", walks=3).resume(path, maxiter=2)
+        make_sampler(walks=3).resume(path, maxiter=2)
 
 
-def test_old_checkpoint_missing_replacement_chains_defaults_to_one(tmp_path):
+def test_checkpoint_missing_config_key_is_rejected(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
-    make_sampler(sample="rwalk", walks=3).run(
-        18, maxiter=1, dlogz=0.0, checkpoint_path=path
-    )
+    make_sampler(walks=3).run(18, maxiter=1, dlogz=0.0, checkpoint_path=path)
     _rewrite_checkpoint_config(path, lambda config: config.pop("replacement_chains"))
 
-    result = make_sampler(sample="rwalk", walks=3).resume(path, maxiter=2)
+    with pytest.raises(ValueError, match="checkpoint replacement_chains=None"):
+        make_sampler(walks=3).resume(path, maxiter=2)
 
-    assert result.metadata["replacement_chains"] == 1
 
-
-def test_checkpoint_has_no_removed_option_keys(tmp_path):
+def test_checkpoint_config_and_telemetry_keys(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
-    make_sampler(sample="rwalk", walks=3).run(
-        19, maxiter=40, dlogz=0.0, checkpoint_path=path
-    )
+    make_sampler(walks=3).run(19, maxiter=40, dlogz=0.0, checkpoint_path=path)
 
     state, config = load_checkpoint_npz(path)
-    assert not [name for name in config if "bound" in name]
-    assert not [name for name in state.telemetry if "bound" in name]
-
-
-def test_checkpoint_config_validates_jax_vectorized(tmp_path):
-    path = tmp_path / "run.checkpoint.npz"
-    make_sampler(sample="rwalk", kernel="jax", jax_vectorized=False).run(
-        101, maxiter=1, dlogz=0.0, checkpoint_path=path
-    )
-
-    with pytest.raises(ValueError, match="jax_vectorized"):
-        make_sampler(sample="rwalk", kernel="jax", jax_vectorized=True).resume(
-            path, maxiter=2
-        )
+    assert config == {
+        "ndim": 2,
+        "nlive": 20,
+        "walks": 3,
+        "replacement_chains": 1,
+        "block_size": 1,
+        "cluster_swap": True,
+    }
+    assert set(state.telemetry) == {
+        "replacement_batches",
+        "rwalk_accepted_move_history",
+        "rwalk_proposal_history",
+        "adaptive_scale_history",
+        "adaptive_accept_history",
+        "adaptive_updates",
+    }
 
 
 def _rewrite_checkpoint_array(path, name, value):
@@ -403,13 +349,9 @@ def test_block_mode_writes_intermediate_checkpoints(tmp_path, monkeypatch):
     # Block advances iteration by 8; with interval 10 the new cadence saves at
     # 16, 32, 48, ... The old `iteration % interval == 0` cadence would not save
     # until iteration 40 (block 32 / interval 100 example: not until 800).
-    result = make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.1,
-        jax_block_size=8,
-    ).run(21, maxiter=400, dlogz=0.1, checkpoint_path=path, checkpoint_interval=10)
+    result = make_sampler(block_size=8).run(
+        21, maxiter=400, dlogz=0.1, checkpoint_path=path, checkpoint_interval=10
+    )
 
     final_iteration = result.metadata["final_iteration"]
     assert final_iteration > 16
@@ -420,26 +362,10 @@ def test_block_mode_writes_intermediate_checkpoints(tmp_path, monkeypatch):
     assert result.success is True
 
 
-def test_resume_of_converged_run_reports_success_python(tmp_path):
-    path = tmp_path / "converged_python.checkpoint.npz"
-    sampler = make_sampler(sample="rwalk", kernel="python", walks=5)
-
-    first = sampler.run(30, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
-    assert first.success is True
-    assert "converged" in first.message
-
-    resumed = sampler.resume(path, dlogz=0.5)
-
-    assert resumed.success is True
-    assert "converged" in resumed.message
-    assert resumed.metadata["resumed_from_checkpoint"] is True
-
-
-def test_resume_of_converged_run_reports_success_block(tmp_path):
+@pytest.mark.parametrize("block_size", [1, 8])
+def test_resume_of_converged_run_reports_success(tmp_path, block_size):
     path = tmp_path / "converged_block.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk", kernel="jax", walks=5, step_scale=0.1, jax_block_size=8
-    )
+    sampler = make_sampler(block_size=block_size)
 
     first = sampler.run(31, dlogz=0.5, checkpoint_path=path, checkpoint_interval=8)
     assert first.success is True
@@ -452,107 +378,48 @@ def test_resume_of_converged_run_reports_success_block(tmp_path):
     assert resumed.metadata["resumed_from_checkpoint"] is True
 
 
-def test_adaptive_step_scale_restored_on_resume(tmp_path):
+def test_adapted_scale_restored_on_resume(tmp_path):
     path = tmp_path / "adaptive.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.1,
-        rwalk_proposal="isotropic",
-        jax_block_size=1,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.5,
-    )
+    sampler = make_sampler()
 
     first = sampler.run(40, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
     assert first.success is True
 
     state, _ = load_checkpoint_npz(path)
-    assert state.effective_step_scale is not None
-    # Force a distinctive effective scale, clearly different from base step_scale.
-    _rewrite_checkpoint_array(path, "effective_step_scale", 0.037)
+    assert state.scale == pytest.approx(first.metadata["rwalk_scale_final"])
+    # Force a distinctive scale, clearly different from the initial 0.5.
+    _rewrite_checkpoint_array(path, "scale", 0.037)
 
     resumed = sampler.resume(path, dlogz=0.5)
 
     assert resumed.success is True
     # Already converged on resume, so no further adaptation runs: the reported
-    # final effective scale is the restored checkpoint value, not base 0.1.
-    assert resumed.metadata["rwalk_effective_step_scale_final"] == pytest.approx(0.037)
-    assert resumed.metadata["rwalk_effective_step_scale_initial"] == pytest.approx(0.1)
+    # final scale is the restored checkpoint value.
+    assert resumed.metadata["rwalk_scale_final"] == pytest.approx(0.037)
+    assert resumed.metadata["rwalk_scale_initial"] == 0.5
 
 
-def test_resume_without_effective_step_scale_field_falls_back(tmp_path):
+def test_resume_without_scale_field_falls_back_to_initial_scale(tmp_path):
     path = tmp_path / "adaptive_full.checkpoint.npz"
     stripped = tmp_path / "adaptive_stripped.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.1,
-        rwalk_proposal="isotropic",
-        jax_block_size=1,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.5,
-    )
+    sampler = make_sampler()
 
     sampler.run(41, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
 
     with np.load(path) as data:
-        values = {
-            name: data[name]
-            for name in data.files
-            if name != "effective_step_scale"
-        }
+        values = {name: data[name] for name in data.files if name != "scale"}
     np.savez(stripped, **values)
 
     state, _ = load_checkpoint_npz(stripped)
-    assert state.effective_step_scale is None
+    assert state.scale is None
 
     resumed = sampler.resume(stripped, dlogz=0.5)
 
     assert resumed.success is True
-    # Missing field falls back to the base step_scale.
-    assert resumed.metadata["rwalk_effective_step_scale_final"] == pytest.approx(0.1)
+    assert resumed.metadata["rwalk_scale_final"] == 0.5
 
 
-def test_resume_rejects_rwalk_adaptive_step_scale_mismatch(tmp_path):
-    path = tmp_path / "adaptive_config.checkpoint.npz"
-    make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=3,
-        rwalk_proposal="isotropic",
-        rwalk_adaptive_step_scale=True,
-    ).run(42, maxiter=2, dlogz=0.0, checkpoint_path=path)
-
-    with pytest.raises(ValueError, match="rwalk_adaptive_step_scale"):
-        make_sampler(
-            sample="rwalk", kernel="jax", walks=3, rwalk_proposal="isotropic"
-        ).resume(path, maxiter=3)
-
-
-def test_resume_rejects_rwalk_target_accept_mismatch(tmp_path):
-    path = tmp_path / "target_accept_config.checkpoint.npz"
-    make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=3,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.5,
-    ).run(43, maxiter=2, dlogz=0.0, checkpoint_path=path)
-
-    with pytest.raises(ValueError, match="rwalk_target_accept"):
-        make_sampler(
-            sample="rwalk",
-            kernel="jax",
-            walks=3,
-            rwalk_adaptive_step_scale=True,
-            rwalk_target_accept=0.3,
-        ).resume(path, maxiter=3)
-
-
-def test_resume_at_maxiter_without_convergence_reports_maxiter_python(
+def test_resume_at_maxiter_without_convergence_reports_maxiter_per_iteration(
     tmp_path, monkeypatch
 ):
     captured = []
@@ -592,9 +459,7 @@ def test_resume_at_maxiter_without_convergence_reports_maxiter_python(
 
 def test_resume_at_maxiter_without_convergence_reports_maxiter_block(tmp_path):
     path = tmp_path / "maxiter_block.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk", kernel="jax", walks=5, step_scale=0.1, jax_block_size=4
-    )
+    sampler = make_sampler(block_size=4)
 
     first = sampler.run(51, maxiter=4, dlogz=0.0, checkpoint_path=path)
     assert first.success is False
@@ -609,23 +474,15 @@ def test_resume_at_maxiter_without_convergence_reports_maxiter_block(tmp_path):
 
 def test_live_cov_resume_continues_with_adapted_scale(tmp_path):
     path = tmp_path / "live_cov.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=8,
-        step_scale=0.1,
-        rwalk_proposal="live-cov",
-        jax_block_size=4,
-    )
+    sampler = make_sampler(walks=8, block_size=4)
     partial = sampler.run(43, maxiter=40, dlogz=0.5, checkpoint_path=path)
     state, _ = load_checkpoint_npz(path)
-    assert state.effective_step_scale is not None
-    assert state.effective_step_scale != pytest.approx(0.1)
+    assert state.scale is not None
+    assert state.scale != pytest.approx(0.5)
 
     resumed = sampler.resume(path, dlogz=0.5)
     assert resumed.success is True
     assert len(resumed.logl) > len(partial.logl)
-    assert resumed.metadata["rwalk_proposal"] == "live-cov"
 
 
 def test_default_kwargs_checkpoint_round_trip(tmp_path):
@@ -641,13 +498,14 @@ def test_default_kwargs_checkpoint_round_trip(tmp_path):
     _, config = load_checkpoint_npz(path)
 
     # The resolved defaults are recorded, not the None placeholders.
-    assert config["sample"] == "rwalk"
-    assert config["kernel"] == "jax"
-    assert config["rwalk_proposal"] == "live-cov"
-    assert config["walks"] == 25
-    assert config["step_scale"] == 0.5
-    assert config["jax_block_size"] == 32
-    assert config["rwalk_adaptive_step_scale"] is True
+    assert config == {
+        "ndim": 2,
+        "nlive": 30,
+        "walks": 25,
+        "replacement_chains": 1,
+        "block_size": 32,
+        "cluster_swap": True,
+    }
 
     resumed = default_sampler().resume(path, maxiter=128, dlogz=0.0)
 
@@ -656,21 +514,3 @@ def test_default_kwargs_checkpoint_round_trip(tmp_path):
     assert resumed.ncall == full.ncall
     assert resumed.logz == pytest.approx(full.logz)
 
-
-def test_old_checkpoint_without_rwalk_proposal_is_isotropic(tmp_path):
-    path = tmp_path / "old_isotropic.checkpoint.npz"
-    old_kwargs = dict(
-        sample="rwalk", kernel="jax", walks=5, step_scale=0.1, jax_block_size=1
-    )
-    make_sampler(rwalk_proposal="isotropic", **old_kwargs).run(
-        45, maxiter=2, dlogz=0.0, checkpoint_path=path
-    )
-    _rewrite_checkpoint_config(path, lambda config: config.pop("rwalk_proposal"))
-
-    # A checkpoint without the key predates live-cov, so it was isotropic.
-    with pytest.raises(ValueError, match="rwalk_proposal"):
-        make_sampler(rwalk_proposal="live-cov", **old_kwargs).resume(path, maxiter=4)
-    result = make_sampler(rwalk_proposal="isotropic", **old_kwargs).resume(
-        path, maxiter=4
-    )
-    assert result.metadata["rwalk_proposal"] == "isotropic"

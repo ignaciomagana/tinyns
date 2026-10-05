@@ -1,4 +1,4 @@
-"""Pytree callables and closures: large arrays are jit arguments on the fast path.
+"""Pytree callables and closures: large arrays are jit arguments of the kernels.
 
 Pytree callables pass their array leaves; closures have their large jaxpr
 constants hoisted.
@@ -21,10 +21,10 @@ from tinyns import NestedSampler
 from tinyns.run import run_static_nested
 from tinyns.samplers import (
     _callable_leaves,
+    _callable_specs,
     _combine_callable,
-    _make_rwalk_jax_kernel,
+    _make_rwalk_jax_kernel_cached,
     _partition_callable,
-    draw_constrained_rwalk_jax,
 )
 
 NDIM = 2
@@ -112,8 +112,8 @@ def test_plain_function_and_equivalent_closure_are_bit_identical() -> None:
     assert_same_result(*runs)
 
 
-@pytest.mark.parametrize("jax_block_size", [None, 1])
-def test_partial_loglike_with_large_array_matches_closure(jax_block_size) -> None:
+@pytest.mark.parametrize("block_size", [None, 1])
+def test_partial_loglike_with_large_array_matches_closure(block_size) -> None:
     # The closure's 200k-element constant is hoisted to a jit argument, so the
     # two forms compile the same program and agree bit for bit.
     data = make_data(200_000)
@@ -127,8 +127,8 @@ def test_partial_loglike_with_large_array_matches_closure(jax_block_size) -> Non
         return prior_fn(BOUNDS, u)
 
     kwargs = {"maxiter": 96, "dlogz": 0.0}
-    if jax_block_size is not None:
-        kwargs["jax_block_size"] = jax_block_size
+    if block_size is not None:
+        kwargs["block_size"] = block_size
     partial_result = run_static_nested(
         random.PRNGKey(11), partial_loglike, partial_prior, NDIM, 40, **kwargs
     )
@@ -140,38 +140,37 @@ def test_partial_loglike_with_large_array_matches_closure(jax_block_size) -> Non
     assert_same_result(partial_result, closure_result)
 
 
-def test_draw_constrained_rwalk_jax_accepts_partial_callables() -> None:
+def test_rwalk_kernel_accepts_partial_callables() -> None:
     data = make_data(1000)
     loglike = jax.tree_util.Partial(loglike_fn, data)
     prior = jax.tree_util.Partial(prior_fn, BOUNDS)
     live_u = random.uniform(random.PRNGKey(3), (16, NDIM))
     live_logl = jax.vmap(lambda u: loglike(prior(u)))(live_u)
-    results = [
-        draw_constrained_rwalk_jax(
-            random.PRNGKey(5),
-            fn,
-            pt,
-            float(jnp.median(live_logl)),
-            live_u,
-            live_logl,
-            NDIM,
-            walks=10,
-            proposal="live-cov",
+    results = []
+    for fn, pt in (
+        (loglike, prior),
+        (lambda t: loglike_fn(data, t), lambda u: prior_fn(BOUNDS, u)),
+    ):
+        specs = _callable_specs(fn, pt, NDIM)
+        kernel = _make_rwalk_jax_kernel_cached(*specs, NDIM, 10, 1)
+        results.append(
+            kernel(
+                random.PRNGKey(5),
+                jnp.median(live_logl),
+                live_u,
+                live_logl,
+                jnp.asarray(0.5),
+                jnp.asarray(10, dtype=jnp.int32),
+                *_callable_leaves(fn, pt, NDIM),
+            )
         )
-        for fn, pt in (
-            (loglike, prior),
-            (lambda t: loglike_fn(data, t), lambda u: prior_fn(BOUNDS, u)),
-        )
-    ]
-    np.testing.assert_array_equal(results[0][1], results[1][1])
-    assert results[0][3:] == results[1][3:]
-    assert results[0][5] is True
+    for a, b in zip(*results, strict=True):
+        np.testing.assert_array_equal(a, b)
+    assert bool(results[0][5])
 
 
 def _lower_block_kernel_text(loglike, prior):
-    kernel = run_mod._make_static_jax_rwalk_block_kernel(
-        loglike, prior, NDIM, 5, 4, 8, "live-cov"
-    )
+    kernel = run_mod._make_static_jax_rwalk_block_kernel(loglike, prior, NDIM, 5, 4, 8)
     live_u = jnp.full((20, NDIM), 0.5)
     lowered = kernel.lower(
         random.PRNGKey(0),
@@ -182,7 +181,6 @@ def _lower_block_kernel_text(loglike, prior):
         jnp.asarray(0, dtype=jnp.int32),
         jnp.asarray(20, dtype=jnp.int32),
         jnp.asarray(0.5),
-        jnp.asarray(1),
         jnp.asarray(10, dtype=jnp.int32),
         *_callable_leaves(loglike, prior, NDIM),
     )
@@ -191,7 +189,7 @@ def _lower_block_kernel_text(loglike, prior):
 
 def test_block_kernel_hlo_does_not_embed_partial_arrays() -> None:
     run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-    _make_rwalk_jax_kernel.cache_clear()
+    _make_rwalk_jax_kernel_cached.cache_clear()
     try:
         prior = jax.tree_util.Partial(prior_fn, BOUNDS)
         texts = {
@@ -204,7 +202,7 @@ def test_block_kernel_hlo_does_not_embed_partial_arrays() -> None:
         assert abs(len(texts[200_000]) - len(texts[1_000])) < 2_000
     finally:
         run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-        _make_rwalk_jax_kernel.cache_clear()
+        _make_rwalk_jax_kernel_cached.cache_clear()
 
 
 def test_block_kernel_is_cached_per_partial_instance() -> None:
@@ -212,10 +210,10 @@ def test_block_kernel_is_cached_per_partial_instance() -> None:
     try:
         loglike = jax.tree_util.Partial(loglike_fn, make_data(100))
         first = run_mod._make_static_jax_rwalk_block_kernel(
-            loglike, plain_prior, NDIM, 5, 4, 8, "live-cov"
+            loglike, plain_prior, NDIM, 5, 4, 8
         )
         second = run_mod._make_static_jax_rwalk_block_kernel(
-            loglike, plain_prior, NDIM, 5, 4, 8, "live-cov"
+            loglike, plain_prior, NDIM, 5, 4, 8
         )
         assert first is second
     finally:
@@ -236,29 +234,12 @@ def test_partial_loglike_checkpoint_resume_matches_uninterrupted(tmp_path) -> No
     assert_same_result(resumed, full)
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"kernel": "python"},
-        {"sample": "prior"},
-        {"replacement_chain_schedule": (1, 2)},
-    ],
-)
-def test_partial_callables_run_on_closure_semantics_paths(kwargs) -> None:
-    loglike = jax.tree_util.Partial(loglike_fn, make_data(100))
-    prior = jax.tree_util.Partial(prior_fn, BOUNDS)
-    result = run_static_nested(
-        random.PRNGKey(2), loglike, prior, NDIM, 30, maxiter=20, **kwargs
-    )
-    assert np.isfinite(result.logz)
-
-
 # --- closures: large constants are hoisted ---
 
 
 def clear_caches():
     run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-    _make_rwalk_jax_kernel.cache_clear()
+    _make_rwalk_jax_kernel_cached.cache_clear()
     run_mod._make_live_points_kernel.cache_clear()
     samplers_mod._split_callables.cache_clear()
 
@@ -388,21 +369,6 @@ def test_hoisted_one_dimensional_closure_and_prior() -> None:
 
 
 @pytest.mark.usefixtures("fresh_caches")
-def test_jax_vectorized_closure_falls_back_to_closure_call() -> None:
-    data = make_data(10_000)
-
-    def vectorized(theta):
-        center = jnp.min(data)
-        precision = jnp.max(data)
-        return -0.5 * jnp.sum(((theta - center) * precision) ** 2, axis=-1)
-
-    result = run(
-        vectorized, lambda u: -1.0 + 2.0 * u, maxiter=20, jax_vectorized=True
-    )
-    assert np.isfinite(result.logz)
-
-
-@pytest.mark.usefixtures("fresh_caches")
 def test_make_jaxpr_failure_falls_back_to_closure_semantics(
     monkeypatch, caplog
 ) -> None:
@@ -526,13 +492,6 @@ V022_FINGERPRINTS = {
         "b3ec3331262f69b9",
         "b6ff6462d6dc00fa",
     ),
-    "per_iteration": (
-        "-0x1.fc245c0000000p+1",
-        6332,
-        "fee5bedf1b27260b",
-        "a670633426560bdb",
-        "b880a8923f7d8971",
-    ),
     "small_closure": (
         "-0x1.122a400000000p+2",
         7405,
@@ -568,15 +527,14 @@ def fingerprint(result):
 @pytest.mark.parametrize("case", sorted(V022_FINGERPRINTS))
 def test_plain_functions_match_v022_bit_for_bit(case) -> None:
     loglike = small_closure_loglike if case == "small_closure" else plain_loglike
-    kwargs = {"jax_block_size": 1} if case == "per_iteration" else {}
     result = run_static_nested(
-        random.PRNGKey(7), loglike, plain_prior, NDIM, 50, maxiter=300, **kwargs
+        random.PRNGKey(7), loglike, plain_prior, NDIM, 50, maxiter=300
     )
     assert fingerprint(result) == V022_FINGERPRINTS[case]
 
 
-@pytest.mark.parametrize("jax_block_size", [1, 32])
-def test_wall_time_telemetry(jax_block_size, capsys) -> None:
+@pytest.mark.parametrize("block_size", [1, 32])
+def test_wall_time_telemetry(block_size, capsys) -> None:
     result = run_static_nested(
         random.PRNGKey(3),
         plain_loglike,
@@ -585,7 +543,7 @@ def test_wall_time_telemetry(jax_block_size, capsys) -> None:
         30,
         maxiter=96,
         dlogz=0.0,
-        jax_block_size=jax_block_size,
+        block_size=block_size,
         progress=True,
     )
     metadata = result.metadata

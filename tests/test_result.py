@@ -162,7 +162,6 @@ def _small_gaussian_run():
         nlive=50,
         dlogz=0.3,
         maxiter=200000,
-        sample="prior",
     )
 
 
@@ -300,8 +299,6 @@ def test_diagnostics_propagates_logzerr_status_and_finite_counts() -> None:
 def test_diagnostics_reports_replacement_batches_for_batched_jax_payload() -> None:
     result = make_result()
     result.metadata = {
-        "sample": "rwalk",
-        "kernel": "jax",
         "walks": 25,
         "replacement_chains": 16,
         "mean_replacement_ncall": 400.0,

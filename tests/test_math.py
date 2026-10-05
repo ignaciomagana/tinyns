@@ -12,7 +12,6 @@ from tinyns.math import (
     logdiffexp,
     logsumexp,
     normalize_log_weights,
-    reflect_unit_cube,
     systematic_resample,
 )
 
@@ -108,9 +107,3 @@ def test_systematic_resample_uses_only_positive_infinite_weights() -> None:
 
     assert jnp.all((indices == 0) | (indices == 2))
 
-
-def test_reflect_unit_cube_maps_values_into_unit_interval() -> None:
-    reflected = reflect_unit_cube(jnp.array([-1.25, -0.25, 0.25, 1.25, 2.25]))
-
-    assert jnp.all(reflected >= 0.0)
-    assert jnp.all(reflected <= 1.0)

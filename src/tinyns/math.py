@@ -96,9 +96,3 @@ def systematic_resample(key, logw: ArrayLike, n: int):
     positions = start + jnp.arange(n) / n
     return jnp.searchsorted(cdf, positions, side="left")
 
-
-def reflect_unit_cube(u: ArrayLike):
-    """Reflect arbitrary coordinates into ``[0, 1]`` with mirror boundaries."""
-
-    period_position = jnp.mod(u, 2.0)
-    return jnp.where(period_position <= 1.0, period_position, 2.0 - period_position)
