@@ -57,6 +57,9 @@ class NestedRunState:
     stopped_by_callback: bool = False
     effective_step_scale: float | None = None
     telemetry: dict[str, Any] = field(default_factory=dict)
+    # Cluster tracker state (``cluster_swap``): {"log": dict, "arrays": dict
+    # with "labels" and "u", or None}.
+    clusters: dict[str, Any] | None = None
 
 
 def _npz_scalar(value):
@@ -109,8 +112,20 @@ def save_checkpoint_npz(path, state: NestedRunState, config: dict) -> None:
             ),
             telemetry_json=np.asarray(json.dumps(state.telemetry, sort_keys=True)),
             config_json=np.asarray(json.dumps(config, sort_keys=True)),
+            **_cluster_fields(state.clusters),
         )
     os.replace(tmp_path, path)
+
+
+def _cluster_fields(clusters) -> dict:
+    """Optional checkpoint fields for the cluster tracker (no version bump)."""
+    if clusters is None:
+        return {}
+    fields = {"clusters_json": np.asarray(json.dumps(clusters["log"]))}
+    if clusters["arrays"] is not None:
+        fields["cluster_labels"] = np.asarray(clusters["arrays"]["labels"])
+        fields["cluster_u"] = np.asarray(clusters["arrays"]["u"])
+    return fields
 
 
 def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
@@ -137,6 +152,18 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
         telemetry = {}
         if "telemetry_json" in data.files:
             telemetry = json.loads(str(_npz_scalar(data["telemetry_json"])))
+        clusters = None
+        if "clusters_json" in data.files:
+            arrays = None
+            if "cluster_labels" in data.files:
+                arrays = {
+                    "labels": np.asarray(data["cluster_labels"]),
+                    "u": np.asarray(data["cluster_u"]),
+                }
+            clusters = {
+                "log": json.loads(str(_npz_scalar(data["clusters_json"]))),
+                "arrays": arrays,
+            }
         dead_u = [jnp.asarray(point) for point in np.asarray(data["dead_u"])]
         dead_theta = [jnp.asarray(point) for point in np.asarray(data["dead_theta"])]
         state = NestedRunState(
@@ -160,5 +187,6 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
             stopped_by_callback=bool(_npz_scalar(data["stopped_by_callback"])),
             effective_step_scale=effective_step_scale,
             telemetry=telemetry,
+            clusters=clusters,
         )
         return state, config

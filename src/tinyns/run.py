@@ -18,6 +18,7 @@ from tinyns.bounds import (
     build_multi_ellipsoid_bound,
     build_single_ellipsoid_bound,
 )
+from tinyns.clusters import ClusterTracker
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
 from tinyns.samplers import (
@@ -52,7 +53,10 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     explicit ``"live-cov"`` is not overridden, so an unsupported combination
     still raises. ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for
     ``ndim=1``) and the initial ``step_scale`` to 0.5 for live-cov, 0.1 for
-    isotropic. Explicit values pass through unchanged.
+    isotropic. Explicit values pass through unchanged. ``cluster_swap``
+    defaults to True where the swap move is supported (live-cov block mode
+    with one replacement chain) and to False elsewhere; an explicit True
+    where it is unsupported raises.
     """
 
     kernel = options["kernel"]
@@ -78,12 +82,29 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     jax_block_size = options["jax_block_size"]
     if jax_block_size is None:
         jax_block_size = 32 if fast_path and not options["jax_vectorized"] else 1
+    swap_supported = (
+        fast_path
+        and proposal == "live-cov"
+        and options["replacement_chains"] == 1
+        and isinstance(jax_block_size, int)
+        and jax_block_size > 1
+    )
+    cluster_swap = options["cluster_swap"]
+    if cluster_swap is None:
+        cluster_swap = swap_supported
+    elif cluster_swap and not swap_supported:
+        raise NotImplementedError(
+            "cluster_swap=True is supported only for sample='rwalk', "
+            "kernel='jax', bound='none', rwalk_proposal='live-cov', "
+            "replacement_chains=1 and jax_block_size > 1"
+        )
     return {
         "kernel": kernel,
         "walks": walks,
         "step_scale": step_scale,
         "rwalk_proposal": proposal,
         "jax_block_size": jax_block_size,
+        "cluster_swap": bool(cluster_swap),
     }
 
 
@@ -273,6 +294,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
     replacement_chains: int,
     block_size: int,
     proposal: str = "isotropic",
+    cluster_swap: bool = False,
 ):
     """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel.
 
@@ -284,6 +306,12 @@ def _make_static_jax_rwalk_block_kernel_cached(
     ndim)``) as trailing arguments and threads them to the rwalk kernel, so
     they are jit arguments rather than compiled-in constants. Callables with
     neither take no trailing arguments.
+
+    With ``cluster_swap=True`` the chains also propose affine swaps between
+    clusters (see :mod:`tinyns.clusters`): ``block_kernel`` takes the cluster
+    frames before the callable leaves and returns one more output, the
+    per-iteration ``[accepted swaps, proposed swaps]``. A replaced live point
+    leaves its cluster's statistics (its label becomes -1).
     """
 
     ndim = int(ndim)
@@ -299,6 +327,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
         replacement_chains,
         False,
         proposal,
+        cluster_swap,
     )
 
     def block_kernel(
@@ -314,11 +343,17 @@ def _make_static_jax_rwalk_block_kernel_cached(
         max_batches,
         *callable_leaves,
     ):
+        if cluster_swap:
+            clusters, *callable_leaves = callable_leaves
+            labels = [clusters["labels"]]
+        else:
+            labels = []
+
         def one_iteration(carry, offset):
-            key, live_u, live_theta, live_logl, logz_dead, active = carry
+            key, live_u, live_theta, live_logl, logz_dead, active, *labels = carry
 
             def run_iteration(state):
-                key, live_u, live_theta, live_logl, logz_dead = state
+                key, live_u, live_theta, live_logl, logz_dead, *labels = state
                 worst = jnp.argmin(live_logl)
                 dead_u = live_u[worst]
                 dead_theta = live_theta[worst]
@@ -341,6 +376,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     accepted,
                     accepted_move_count,
                     total_proposal_count,
+                    *swap_counts,
                 ) = rwalk_kernel(
                     key,
                     logl_worst,
@@ -349,8 +385,11 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     jnp.asarray(step_scale),
                     jnp.asarray(min_accepts),
                     jnp.asarray(max_batches, dtype=jnp.int32),
+                    *([{**clusters, "labels": labels[0]}] if cluster_swap else []),
                     *callable_leaves,
                 )
+                if cluster_swap:
+                    labels = [labels[0].at[worst].set(-1)]
                 replacement_batches_used = (
                     total_proposal_count
                     + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
@@ -375,6 +414,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     live_logl,
                     logz_dead,
                     accepted,
+                    *labels,
                 ), (
                     dead_u,
                     dead_theta,
@@ -390,10 +430,11 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     new_u,
                     new_theta,
                     new_logl,
+                    *swap_counts,
                 )
 
             def skip_iteration(state):
-                key, live_u, live_theta, live_logl, logz_dead = state
+                key, live_u, live_theta, live_logl, logz_dead, *labels = state
                 worst = jnp.argmin(live_logl)
                 dead_u = live_u[worst]
                 dead_theta = live_theta[worst]
@@ -406,6 +447,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     live_logl,
                     logz_dead,
                     jnp.asarray(False),
+                    *labels,
                 ), (
                     dead_u,
                     dead_theta,
@@ -421,13 +463,14 @@ def _make_static_jax_rwalk_block_kernel_cached(
                     dead_u,
                     dead_theta,
                     logl_worst,
+                    *([jnp.zeros(2, dtype=jnp.int32)] if cluster_swap else []),
                 )
 
             return lax.cond(
                 active,
                 run_iteration,
                 skip_iteration,
-                (key, live_u, live_theta, live_logl, logz_dead),
+                (key, live_u, live_theta, live_logl, logz_dead, *labels),
             )
 
         (
@@ -437,7 +480,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                 new_live_theta,
                 new_live_logl,
                 logz_dead_new,
-                _,
+                *_,
             ),
             block,
         ) = lax.scan(
@@ -449,6 +492,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
                 live_logl,
                 jnp.asarray(logz_dead),
                 jnp.asarray(True),
+                *labels,
             ),
             jnp.arange(block_size, dtype=jnp.int32),
         )
@@ -467,6 +511,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
             new_u_block,
             new_theta_block,
             new_logl_block,
+            *swap_block,
         ) = block
         logx_final_new = -(
             jnp.asarray(start_iteration, dtype=jnp.float32)
@@ -493,6 +538,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
             new_logl_block,
             logz_dead_new,
             logx_final_new,
+            *swap_block,
         )
 
     return jax.jit(block_kernel)
@@ -506,6 +552,7 @@ def _make_static_jax_rwalk_block_kernel(
     replacement_chains: int,
     block_size: int,
     proposal: str = "isotropic",
+    cluster_swap: bool = False,
 ):
     """Return the cached block kernel for these callables' specs."""
     return _make_static_jax_rwalk_block_kernel_cached(
@@ -515,6 +562,7 @@ def _make_static_jax_rwalk_block_kernel(
         replacement_chains,
         block_size,
         proposal,
+        cluster_swap,
     )
 
 
@@ -911,6 +959,7 @@ def run_static_nested(
     jax_block_size: int | None = None,
     rwalk_adaptive_step_scale: bool = False,
     rwalk_target_accept: float = 0.25,
+    cluster_swap: bool | None = None,
     initial_state: NestedRunState | None = None,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
@@ -921,6 +970,11 @@ def run_static_nested(
     ``"prior"``. ``None`` options (``kernel``, ``walks``, ``step_scale``,
     ``rwalk_proposal``, ``jax_block_size``) resolve to the fast path where it
     is supported; see :func:`_resolve_defaults`.
+
+    ``cluster_swap`` (default: on where supported) tracks clusters of the live
+    points between blocks and, once two clusters are large enough, lets the
+    chains swap between them so that mode weights do not drift with the seed
+    (see :mod:`tinyns.clusters`). Pass ``cluster_swap=False`` to opt out.
     """
     if ndim <= 0:
         raise ValueError("ndim must be a positive integer")
@@ -938,6 +992,8 @@ def run_static_nested(
             "step_scale": step_scale,
             "rwalk_proposal": rwalk_proposal,
             "jax_block_size": jax_block_size,
+            "replacement_chains": replacement_chains,
+            "cluster_swap": cluster_swap,
         },
     )
     kernel = resolved["kernel"]
@@ -945,6 +1001,7 @@ def run_static_nested(
     step_scale = resolved["step_scale"]
     rwalk_proposal = resolved["rwalk_proposal"]
     jax_block_size = resolved["jax_block_size"]
+    cluster_swap = resolved["cluster_swap"]
     if sample not in {"prior", "rwalk"}:
         raise ValueError("sample must be one of {'prior', 'rwalk'}")
     if kernel not in {"python", "jax"}:
@@ -1205,6 +1262,7 @@ def run_static_nested(
         "jax_block_impl": jax_block_impl,
         "rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale),
         "rwalk_target_accept": float(rwalk_target_accept),
+        "cluster_swap": bool(cluster_swap),
     }
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
@@ -1442,6 +1500,14 @@ def run_static_nested(
         for value in restored_telemetry.get("adaptive_accept_history", [])
     ]
     adaptive_updates = int(restored_telemetry.get("adaptive_updates", 0))
+    # Clusters are tracked on the host between blocks; the tracker never
+    # touches the PRNG stream, and the swap kernel only runs (and is only
+    # compiled) once two clusters can swap.
+    tracker = None
+    cluster_host_s = 0.0
+    if cluster_swap:
+        stored = getattr(initial_state, "clusters", None) or {}
+        tracker = ClusterTracker(nlive, stored.get("arrays"), stored.get("log"))
     if rwalk_proposal == "live-cov":
         # The live-cov step already follows the contracting live set, so the
         # scale is a dimensionless O(1) factor that the update can chase fast.
@@ -1492,6 +1558,11 @@ def run_static_nested(
             message=message,
             stopped_by_callback=stopped_by_callback,
             effective_step_scale=effective_step_scale,
+            clusters=(
+                None
+                if tracker is None
+                else {"log": tracker.log, "arrays": tracker.arrays()}
+            ),
             telemetry={
                 "replacement_batches": list(replacement_batches),
                 "replacement_chains_used": list(replacement_chains_used),
@@ -1682,6 +1753,7 @@ def run_static_nested(
             block_extra = None
             accepted_move_count_block = None
             total_proposal_count_block = None
+            swap_block = ()
             if bound in {"single", "multi"}:
                 maybe_rebuild_bound(iteration)
                 seed_limit = bound_max_draws or max_attempts
@@ -1731,6 +1803,13 @@ def run_static_nested(
             else:
                 batch_ncall = int(walks) * int(replacement_chains)
                 max_batches = int(max_attempts) // batch_ncall
+                frames = None
+                if tracker is not None:
+                    host_start = time.perf_counter()
+                    frames = tracker.frames(
+                        live_u, iteration, dead_u_storage, dead_logwt_storage
+                    )
+                    cluster_host_s += time.perf_counter() - host_start
                 block_kernel = _make_static_jax_rwalk_block_kernel(
                     loglike,
                     prior_transform,
@@ -1739,6 +1818,7 @@ def run_static_nested(
                     int(replacement_chains),
                     int(block_size_now),
                     rwalk_proposal,
+                    frames is not None,
                 )
                 result = block_kernel(
                     key,
@@ -1755,6 +1835,7 @@ def run_static_nested(
                     ),
                     jnp.asarray(min_accepts),
                     jnp.asarray(max_batches, dtype=jnp.int32),
+                    *([] if frames is None else [frames]),
                     *callable_leaves,
                 )
                 (
@@ -1778,6 +1859,7 @@ def run_static_nested(
                     new_logl_block,
                     logz_dead,
                     logx_final,
+                    *swap_block,
                 ) = result
             block_start = iteration
             block_accepted = [bool(x) for x in np.asarray(accepted_block)]
@@ -1853,6 +1935,20 @@ def run_static_nested(
             if accepted_move_count_block is not None:
                 accepted_move_count_block = accepted_move_count_block[:block_size_now]
                 total_proposal_count_block = total_proposal_count_block[:block_size_now]
+            if swap_block:
+                # The rwalk telemetry and the step-scale adaptation count
+                # rwalk steps only; swaps are counted on their own.
+                swaps = np.asarray(swap_block[0])[:block_size_now]
+                accepted_move_count_block = (
+                    np.asarray(accepted_move_count_block) - swaps[:, 0]
+                )
+                total_proposal_count_block = (
+                    np.asarray(total_proposal_count_block) - swaps[:, 1]
+                )
+                tracker.log["swap"] = [
+                    int(a + b)
+                    for a, b in zip(tracker.log["swap"], swaps.sum(0), strict=True)
+                ]
             dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
             dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
             dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
@@ -2774,6 +2870,21 @@ def run_static_nested(
             }
         )
 
+    cluster_metadata = {"cluster_swap": bool(cluster_swap)}
+    if tracker is not None:
+        host_start = time.perf_counter()
+        cluster_metadata.update(
+            tracker.summary(
+                dead_u_storage[:iteration],
+                dead_logwt_storage[:iteration],
+                np.asarray(live_u),
+                np.asarray(live_logwt),
+            )
+        )
+        cluster_metadata["cluster_host_s"] = (
+            cluster_host_s + time.perf_counter() - host_start
+        )
+
     return NestedSamplingResult(
         samples_u=samples_u,
         samples=samples,
@@ -2788,6 +2899,7 @@ def run_static_nested(
         message=message,
         metadata={
             **adaptive_metadata,
+            **cluster_metadata,
             "sample": sample,
             "kernel": kernel,
             # Wall time of this call (a resume counts only its own part); the

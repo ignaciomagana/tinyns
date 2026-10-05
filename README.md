@@ -395,6 +395,52 @@ under-samples them. On two-mode targets with a true 6% minor mode, the old
 default `min_accepts=1` gave 2.9% at 4-D (logZ bias +0.13 nats) and 1.7% at
 10-D; the new default gives 6.3% and 6.7%.
 
+## Multimodal posteriors
+
+Replacement chains start from live points and cannot cross between separated
+modes. Each mode's live-point count then does a random walk, so the mode
+weights scatter from seed to seed: on a real 18-D posterior with a 16% minor
+mode, two runs gave 7% and 32%. Neither `logzerr` nor the insertion ranks show
+this.
+
+On the fast path, tinyns tracks clusters of the live points between blocks.
+Once two clusters each hold enough of the live volume, a tenth of the chain
+steps become affine swaps `u' = mu_b + L_b L_a^-1 (u - mu_a)`: the point moves
+from its cluster `a` to the same relative place in another cluster `b`. The
+swap is accepted with the Metropolis factor `det L_b / det L_a`. This is exact
+for any cluster frames. It pulls the populations toward the modes' true
+volumes, while the rwalk keeps the global live covariance.
+`cluster_swap=False` turns it off.
+
+On two-mode Gaussian targets with a 6% minor mode (nlive 500, 20 seeds per
+cell), the seed scatter of the minor mode's mass in logit units went from
+0.46 to 0.15 at 4-D, 0.83 to 0.16 at 10-D and 1.28 to 0.58 at 18-D. The mean
+stayed on the truth (0.060, 0.057 and 0.070 +/- 0.009), and logZ did not
+change. Runs made 2% to 5% fewer likelihood calls. The host-side clustering
+costs about 12 ms per update at 13-D, one update every 128 iterations.
+
+Limits:
+
+- A minor mode needs its volume share to predict at least about 2 x `ndim`
+  live points (`nlive * V_minor / V_total >= 2 * ndim`); below that the swap
+  stays off and the weights drift as before. Raise `nlive`: the mode is
+  reliably resolved once it holds about 3 x `ndim` live points when it is
+  first detected.
+- The frames are ellipsoids. Curved or truncated modes lower the swap
+  acceptance, and the result moves back toward the drift, but stays valid.
+- A unimodal run that the clustering does not split is bit-identical to
+  v0.2.4. Real posteriors are sometimes split (3 of 10 seeds on a 13-D
+  spectral-siren mock); the swap is exact either way and those runs agree with
+  v0.2.4 within `logzerr`.
+
+If the weight of a small or non-ellipsoidal mode matters, split the prior into
+one region per mode and run each, or run several seeds and compare.
+`result.metadata["cluster_modes"]` lists each detected mode's mass, its
+smallest live count between detection and its posterior median, and
+`urn_logit_sd`, the seed scatter of `logit(mass)` that the drift would cause
+without the swap; `cluster_swap_accepts` and `cluster_swap_proposals` count
+the swaps.
+
 ## Design philosophy
 
 - **Tiny:** keep dependencies and abstractions minimal.
@@ -431,6 +477,8 @@ probabilistic programming language.
   was about 1.3x `logzerr` at 13-D with the default walks (1.1x with twice the
   walks). At high dimension, treat `logzerr` as up to about 25% optimistic, or
   raise `walks`.
+- Mode weights of separated modes are reliable only when each mode holds at
+  least about 3 x `ndim` live points (see Multimodal posteriors).
 - Multiellipsoid bounding is experimental.
 - No full vectorized `rwalk` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
