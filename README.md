@@ -428,8 +428,10 @@ Limits:
   first detected.
 - The frames are ellipsoids. Curved or truncated modes lower the swap
   acceptance, and the result moves back toward the drift, but stays valid.
-- A unimodal run does not switch the swap on (the clustering made no false
-  split in our tests) and is then bit-identical to v0.2.4.
+- A unimodal run that the clustering does not split is bit-identical to
+  v0.2.4. Real posteriors are sometimes split (3 of 10 seeds on a 13-D
+  spectral-siren mock); the swap is exact either way and those runs agree with
+  v0.2.4 within `logzerr`.
 
 If the weight of a small or non-ellipsoidal mode matters, split the prior into
 one region per mode and run each, or run several seeds and compare.
