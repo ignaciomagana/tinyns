@@ -9,10 +9,10 @@ import numpy as np
 import pytest
 from jax import random
 
-import tinyns.run as run_mod
-from tinyns import NestedSampler, clusters
+from tinyns import NestedSampler, clusters, core
+from tinyns.callables import _callable_specs
+from tinyns.core import _chain_kernel
 from tinyns.run import run_static_nested
-from tinyns.samplers import _callable_specs, _make_rwalk_jax_kernel_cached
 from tinyns.state import load_checkpoint_npz
 
 # --- the swap kernel leaves the constrained prior invariant ---
@@ -86,7 +86,7 @@ def test_swap_kernel_relaxes_to_the_volume_share() -> None:
     nwalkers, nsteps = 2000, 12
     reference = np.vstack([_uniform_in(0, 150, rng), _uniform_in(1, 50, rng)])
     nlive = len(reference) + 1
-    kernel = _make_rwalk_jax_kernel_cached(
+    kernel = _chain_kernel(
         *_callable_specs(_region_logl, _identity, 2),
         2,
         10,
@@ -234,13 +234,13 @@ def fingerprint(result):
 def test_unimodal_runs_match_v024_bit_for_bit(case, monkeypatch) -> None:
     (loglike, ndim, nlive, kwargs), expected = V024_FINGERPRINTS[case]
     swap_flags = []
-    make_block_kernel = run_mod._make_static_jax_rwalk_block_kernel
+    step = core.step
 
-    def spy(*args):
-        swap_flags.append(args[-1])
-        return make_block_kernel(*args)
+    def spy(*args, extras=None):
+        swap_flags.append(extras is not None)
+        return step(*args, extras=extras)
 
-    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", spy)
+    monkeypatch.setattr(core, "step", spy)
     result = run_static_nested(
         random.PRNGKey(11), loglike, lambda u: u, ndim, nlive, **kwargs
     )

@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 from jax import random
 
-import tinyns.run as run_mod
+from tinyns import core
+from tinyns.callables import _callable_specs, _clear_caches
 from tinyns.run import run_static_nested
 
 
@@ -241,26 +242,30 @@ def _scripted_rwalk_kernel(new_logl, accepted=None):
 
 
 def _run_block_kernel(live_logl, block_size):
+    """Run one ``core.step`` from a scripted live set; return ``(state, dead)``."""
     live_logl = jnp.asarray(live_logl, dtype=float)
     live_u = jnp.tile(live_logl[:, None] / 100.0, (1, 2))
-    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-    kernel = run_mod._make_static_jax_rwalk_block_kernel(
-        lambda theta: theta[0], lambda u: u, 2, 1, 1, block_size
+    state = core.State(
+        key=jnp.asarray(0, dtype=jnp.int32),
+        u=live_u,
+        theta=live_u,
+        logl=live_logl,
+        birth=jnp.full_like(live_logl, -jnp.inf),
+        logz=jnp.asarray(-jnp.inf),
+        logx=jnp.asarray(0.0, dtype=jnp.float32),
+        it=jnp.asarray(0, dtype=jnp.int32),
+        scale=jnp.asarray(0.1),
+        ncall=jnp.asarray(0, dtype=jnp.int32),
+        failed=jnp.asarray(False),
     )
+    cfg = core.Config(
+        2, live_logl.size, walks=1, block_size=block_size, cluster_swap=False
+    )
+    _clear_caches()  # the step kernel looks up the fake chain kernel when traced
     try:
-        return kernel(
-            jnp.asarray(0, dtype=jnp.int32),
-            live_u,
-            live_u,
-            live_logl,
-            jnp.asarray(-jnp.inf),
-            jnp.asarray(0, dtype=jnp.int32),
-            jnp.asarray(live_logl.size, dtype=jnp.int32),
-            jnp.asarray(0.1),
-            jnp.asarray(1, dtype=jnp.int32),
-        )
+        return core.step(state, lambda theta: theta[0], lambda u: u, cfg)
     finally:
-        run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+        _clear_caches()
 
 
 def test_block_insertion_ranks_match_bruteforce_reference(monkeypatch) -> None:
@@ -270,9 +275,9 @@ def test_block_insertion_ranks_match_bruteforce_reference(monkeypatch) -> None:
     # Each scripted likelihood is above the worst it replaces.
     scripted_new_logl = [0.5, 6.5, 1.5, 4.5, 100.0, 3.5]
     fake = _scripted_rwalk_kernel(scripted_new_logl)
-    monkeypatch.setattr(run_mod, "_make_rwalk_jax_kernel_cached", fake)
-    result = _run_block_kernel(initial_live_logl, len(scripted_new_logl))
-    got = [int(x) for x in np.asarray(result[9])]
+    monkeypatch.setattr(core, "_chain_kernel", fake)
+    _, dead = _run_block_kernel(initial_live_logl, len(scripted_new_logl))
+    got = [int(x) for x in np.asarray(dead.insertion)]
 
     live = list(initial_live_logl)
     expected = []
@@ -288,88 +293,76 @@ def test_block_insertion_ranks_match_bruteforce_reference(monkeypatch) -> None:
 
 def test_block_stops_scanning_after_first_failed_replacement(monkeypatch) -> None:
     monkeypatch.setattr(
-        run_mod,
-        "_make_rwalk_jax_kernel_cached",
+        core,
+        "_chain_kernel",
         _scripted_rwalk_kernel([1.0, 2.0, 3.0, 4.0], [True, False, True, True]),
     )
-    result = _run_block_kernel([0.0, 1.0], 4)
+    state, dead = _run_block_kernel([0.0, 1.0], 4)
 
-    assert int(result[0]) == 2  # the skipped iterations do not advance the key
-    assert jnp.asarray(result[11]).tolist() == [True, False, False, False]
-    assert jnp.asarray(result[8]).tolist() == [1, 1, 0, 0]  # ncall
-    assert jnp.asarray(result[13]).tolist() == [1, 1, 0, 0]  # proposals
+    assert int(state.key) == 2  # the skipped iterations do not advance the key
+    assert jnp.asarray(dead.valid).tolist() == [True, False, False, False]
+    assert jnp.asarray(dead.ncall).tolist() == [1, 1, 0, 0]
+    assert jnp.asarray(dead.proposals).tolist() == [1, 1, 0, 0]
     # The live set holds the first replacement only.
     assert jnp.allclose(
-        jnp.sort(jnp.asarray(result[1]), axis=0),
+        jnp.sort(jnp.asarray(state.u), axis=0),
         jnp.asarray(((0.01, 0.01), (0.3, 0.3))),
     )
-    assert jnp.asarray(result[3]).tolist() == [1.0, 1.0]
+    assert jnp.asarray(state.logl).tolist() == [1.0, 1.0]
+    # The first replacement was born above the contour it replaced.
+    assert jnp.asarray(state.birth).tolist() == [0.0, -jnp.inf]
+    assert jnp.asarray(dead.birth).tolist() == [-jnp.inf, 0.0, 0.0, 0.0]
+    assert bool(state.failed) and int(state.it) == 1 and int(state.ncall) == 2
 
 
-def _fake_block_kernel(*, accepted_prefix: int, replacement_ncall, moves=None):
-    """Factory for a fake block kernel with the real output layout."""
+def _fake_step(*, accepted_prefix: int, replacement_ncall, moves=None):
+    """Factory for a fake ``core.step`` with the real output layout."""
     replacement_ncall = tuple(int(x) for x in replacement_ncall)
     block_size = len(replacement_ncall)
     moves = replacement_ncall if moves is None else tuple(moves)
     calls = []
 
-    def make_kernel(*args, **_kwargs):
-        def kernel(
-            key,
-            live_u,
-            live_theta,
-            live_logl,
-            logz_dead,
-            start_iteration,
-            nlive,
-            scale,
-            *_rest,
-        ):
-            calls.append(float(scale))
-            worst = int(jnp.argmin(live_logl))
-            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
-            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
-            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
-            offsets = jnp.arange(block_size)
-            iterations = start_iteration + offsets
-            logx_prev = -iterations / nlive
-            logx_new = -(iterations + 1) / nlive
-            dead_logwt = (
-                logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + live_logl[worst]
-            )
-            ncall_block = jnp.asarray(replacement_ncall, dtype=jnp.int32)
-            return (
-                key,
-                live_u,
-                live_theta,
-                live_logl,
-                dead_u,
-                dead_theta,
-                dead_logl,
-                dead_logwt,
-                ncall_block,
-                jnp.zeros((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                offsets < accepted_prefix,
-                jnp.asarray(moves, dtype=jnp.int32),
-                ncall_block,
-                logz_dead,
-                -(start_iteration + block_size) / nlive,
-            )
+    def step(state, loglike, prior_transform, cfg, extras=None):
+        calls.append(float(state.scale))
+        worst = int(jnp.argmin(state.logl))
+        offsets = jnp.arange(block_size)
+        iterations = state.it + offsets
+        logx_prev = -iterations / cfg.nlive
+        logx_new = -(iterations + 1) / cfg.nlive
+        logl_worst = state.logl[worst]
+        valid = offsets < accepted_prefix
+        ncall_block = jnp.asarray(replacement_ncall, dtype=jnp.int32)
+        dead = core.Dead(
+            u=jnp.repeat(state.u[worst][None, :], block_size, axis=0),
+            theta=jnp.repeat(state.theta[worst][None, :], block_size, axis=0),
+            logl=jnp.repeat(logl_worst[None], block_size, axis=0),
+            logwt=logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + logl_worst,
+            ncall=ncall_block,
+            insertion=jnp.zeros((block_size,), dtype=jnp.int32),
+            batches=jnp.ones((block_size,), dtype=jnp.int32),
+            valid=valid,
+            moves=jnp.asarray(moves, dtype=jnp.int32),
+            proposals=ncall_block,
+            birth=jnp.full((block_size,), -jnp.inf),
+        )
+        new_state = state._replace(
+            logx=-(state.it + block_size) / cfg.nlive,
+            it=state.it + jnp.sum(valid, dtype=jnp.int32),
+            failed=~jnp.all(valid),
+        )
+        return new_state, dead
 
-        return kernel
-
-    make_kernel.scales = calls
-    return make_kernel
+    step.scales = calls
+    return step
 
 
 def test_block_partial_failure_after_convergence_reports_success(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        run_mod,
-        "_make_static_jax_rwalk_block_kernel",
-        _fake_block_kernel(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
+        core,
+        "step",
+        _fake_step(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
     )
 
     result = run_static_nested(
@@ -398,9 +391,9 @@ def test_block_partial_failure_before_convergence_remains_failure(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        run_mod,
-        "_make_static_jax_rwalk_block_kernel",
-        _fake_block_kernel(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
+        core,
+        "step",
+        _fake_step(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
     )
 
     result = run_static_nested(
@@ -431,9 +424,9 @@ def test_block_partial_failure_before_convergence_remains_failure(
 def test_block_ncall_counts_failed_offset(monkeypatch) -> None:
     # Prefix offsets 0, 1 succeed (3 + 3 calls); offset 2 fails (9 calls).
     monkeypatch.setattr(
-        run_mod,
-        "_make_static_jax_rwalk_block_kernel",
-        _fake_block_kernel(accepted_prefix=2, replacement_ncall=(3, 3, 9, 3)),
+        core,
+        "step",
+        _fake_step(accepted_prefix=2, replacement_ncall=(3, 3, 9, 3)),
     )
 
     result = run_static_nested(
@@ -738,7 +731,7 @@ def test_block_ring2d_no_failures() -> None:
 
 
 def test_live_cov_cholesky_handles_degenerate_live_set() -> None:
-    from tinyns.samplers import live_cov_cholesky
+    from tinyns.core import live_cov_cholesky
 
     live_u = jnp.tile(jnp.asarray([[0.3, 0.7, 0.5]]), (8, 1))
     chol = live_cov_cholesky(live_u)
@@ -876,29 +869,26 @@ def test_static_jax_block_kernel_cache_is_bounded() -> None:
     def prior_transform(u):
         return u
 
-    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-    run_mod._make_rwalk_jax_kernel_cached.cache_clear()
+    _clear_caches()
     try:
         for offset in range(40):
             def loglike(theta, offset=offset):
                 return -jnp.sum(theta**2) + offset
 
-            run_mod._make_static_jax_rwalk_block_kernel(
-                loglike,
-                prior_transform,
+            core._step_kernel(
+                *_callable_specs(loglike, prior_transform, 2),
                 2,
                 1,
                 1,
                 2,
             )
 
-        cache_info = run_mod._make_static_jax_rwalk_block_kernel.cache_info()
+        cache_info = core._step_kernel.cache_info()
         assert cache_info.maxsize == 32
         assert cache_info.currsize == 32
         assert cache_info.misses == 40
     finally:
-        run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-        run_mod._make_rwalk_jax_kernel_cached.cache_clear()
+        _clear_caches()
 
 
 def test_update_scale_direction_and_clamps() -> None:
@@ -915,10 +905,10 @@ def test_update_scale_direction_and_clamps() -> None:
 
 @pytest.mark.parametrize("moves, grows", [(1, False), (15, True)])
 def test_scale_adapts_to_block_move_acceptance(monkeypatch, moves, grows) -> None:
-    fake = _fake_block_kernel(
+    fake = _fake_step(
         accepted_prefix=4, replacement_ncall=(20, 20, 20, 20), moves=(moves,) * 4
     )
-    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", fake)
+    monkeypatch.setattr(core, "step", fake)
     result = run_static_nested(
         random.PRNGKey(123),
         _standard_gaussian_2d_loglike,
