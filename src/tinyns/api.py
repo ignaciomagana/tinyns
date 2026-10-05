@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
 import inspect
-import warnings
 from typing import Any
 
 from tinyns.result import NestedSamplingResult
@@ -15,9 +15,8 @@ from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 # Sampler options forwarded from ``**kwargs`` to :func:`run_static_nested`, with
 # their defaults taken from its signature so the two entry points cannot drift.
 # ``None`` defaults (``kernel``, ``walks``, ``step_scale``, ``rwalk_proposal``,
-# ``jax_block_size``) are resolved per sampler by ``_resolve_defaults``. Unknown
-# keys are still stored (dynesty drop-in compatibility) but trigger a warning so
-# typos and unsupported options are not silently ignored.
+# ``jax_block_size``) are resolved per sampler by ``_resolve_defaults``. Any
+# other keyword raises ``TypeError``.
 _OPTION_NAMES = (
     "kernel",
     "walks",
@@ -93,7 +92,8 @@ class NestedSampler:
         ``jax_block_size=1``. ``sample="prior"`` defaults to ``kernel="python"``.
         ``jax_vectorized=True`` declares that JAX replacement kernels should call
         ``prior_transform`` and ``loglike`` on explicit batches instead of using
-        ``jax.vmap`` around scalar callables.
+        ``jax.vmap`` around scalar callables. Any other keyword raises
+        ``TypeError``.
     """
 
     def __init__(
@@ -108,16 +108,19 @@ class NestedSampler:
         max_attempts: int | None = 10_000,
         **kwargs: Any,
     ):
+        for name in sorted(set(kwargs) - _KNOWN_KWARGS):
+            close = difflib.get_close_matches(name, _KNOWN_KWARGS, n=1)
+            hint = f"; did you mean {close[0]!r}?" if close else ""
+            raise TypeError(
+                f"NestedSampler got an unexpected keyword argument {name!r}{hint}"
+            )
         if ndim <= 0:
             raise ValueError("ndim must be a positive integer")
         if nlive <= 0:
             raise ValueError("nlive must be a positive integer")
         if sample not in {"prior", "rwalk"}:
             raise ValueError("sample must be one of {'prior', 'rwalk'}")
-        options = {
-            **_OPTION_DEFAULTS,
-            **{name: value for name, value in kwargs.items() if name in _KNOWN_KWARGS},
-        }
+        options = {**_OPTION_DEFAULTS, **kwargs}
         options.update(_resolve_defaults(ndim, sample, options))
         kernel = options["kernel"]
         if kernel not in {"python", "jax"}:
@@ -198,13 +201,6 @@ class NestedSampler:
                     "jax_block_size > 1; use jax_block_size=1 for adaptive "
                     "replacement-chain schedules"
                 )
-        unknown = sorted(set(kwargs) - _KNOWN_KWARGS)
-        if unknown:
-            warnings.warn(
-                "NestedSampler received unknown keyword arguments (ignored): "
-                + ", ".join(unknown),
-                stacklevel=2,
-            )
         self.kwargs = dict(kwargs)
         # Resolved options, forwarded to run_static_nested and checkpointed.
         self._options = options
