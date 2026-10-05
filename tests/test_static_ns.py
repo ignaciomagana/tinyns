@@ -952,3 +952,21 @@ def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
     assert len(calls) == result.ncall
     assert result.ncall < 100 + metadata["total_rwalk_proposals"]
 
+
+@pytest.mark.parametrize(
+    "loglike",
+    [
+        lambda theta: 0.0,  # a plain Python float: weakly typed
+        lambda theta: (-jnp.sum(theta**2)).astype(jnp.float32),
+    ],
+    ids=["python_float", "float32"],
+)
+def test_likelihood_dtype_does_not_break_x64(loglike) -> None:
+    """The kernels cast the likelihood to the default float dtype."""
+    from jax.experimental import enable_x64
+
+    with enable_x64():
+        result = run_ns(0, loglike, lambda u: u, 2, 20, maxiter=64, dlogz=0.0)
+        assert result.logl.dtype == jnp.float64
+    assert result.metadata["niter"] == 64
+    assert math.isfinite(result.logz)

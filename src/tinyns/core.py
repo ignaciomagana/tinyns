@@ -157,7 +157,12 @@ def _evaluate_jax_batch(loglike, prior_transform, u_batch, ndim):
         raise ValueError(f"u_batch must have shape (batch, {ndim})")
     nbatch = int(u_batch.shape[0])
     theta_batch = _evaluate_jax_prior_batch(prior_transform, u_batch, ndim)
-    logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
+    # The live logl dtype is the default float dtype, never weakly typed: a
+    # plain-Python-float (weak) or float32 likelihood under x64 would otherwise
+    # give the lax.cond branches of the kernels different output types.
+    logl_batch = jnp.asarray(
+        jax.vmap(loglike)(theta_batch), dtype=jnp.result_type(float)
+    )
     if logl_batch.shape != (nbatch,):
         raise ValueError("loglike must return a scalar")
     return theta_batch, logl_batch

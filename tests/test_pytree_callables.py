@@ -482,23 +482,43 @@ def test_finished_runs_do_not_keep_datasets_alive(form) -> None:
     assert not callables_mod._IDENTITY_SPLITS
 
 
-# Fixed-seed fingerprints of tinyns v0.2.2 (ae330f2) on CPU with jax 0.4.34:
-# (logz.hex(), ncall, sha256[:16] of samples, samples_u and logl).
+# Fixed-seed fingerprints on CPU with jax 0.4.34, keyed by JAX_ENABLE_X64:
+# (logz.hex(), ncall, sha256[:16] of samples, samples_u and logl). x64 off: tinyns
+# v0.2.2 (ae330f2); x64 on: recorded on the v0.3 loop branch, which
+# tools/ab_bitwise.py shows bit-identical to main on the same machine.
 V022_FINGERPRINTS = {
-    "block": (
-        "-0x1.122a400000000p+2",
-        7405,
-        "ea9e454c31e2785c",
-        "b3ec3331262f69b9",
-        "b6ff6462d6dc00fa",
-    ),
-    "small_closure": (
-        "-0x1.122a400000000p+2",
-        7405,
-        "ea9e454c31e2785c",
-        "b3ec3331262f69b9",
-        "47b56e8a8af6eb32",
-    ),
+    "block": {
+        False: (
+            "-0x1.122a400000000p+2",
+            7405,
+            "ea9e454c31e2785c",
+            "b3ec3331262f69b9",
+            "b6ff6462d6dc00fa",
+        ),
+        True: (
+            "-0x1.0a0814caa64b4p+2",
+            7399,
+            "a5474aa0f59ac9cc",
+            "d81d0818ffe68725",
+            "2a684b9e6e3c53e8",
+        ),
+    },
+    "small_closure": {
+        False: (
+            "-0x1.122a400000000p+2",
+            7405,
+            "ea9e454c31e2785c",
+            "b3ec3331262f69b9",
+            "47b56e8a8af6eb32",
+        ),
+        True: (
+            "-0x1.0a0814caa64b5p+2",
+            7399,
+            "a5474aa0f59ac9cc",
+            "d81d0818ffe68725",
+            "035c407de852aa65",
+        ),
+    },
 }
 SMALL = jnp.linspace(0.1, 0.3, 50)
 
@@ -530,7 +550,8 @@ def test_plain_functions_match_v022_bit_for_bit(case) -> None:
     result = run_ns(
         random.PRNGKey(7), loglike, plain_prior, NDIM, 50, maxiter=300
     )
-    assert fingerprint(result) == V022_FINGERPRINTS[case]
+    expected = V022_FINGERPRINTS[case][bool(jax.config.jax_enable_x64)]
+    assert fingerprint(result) == expected
 
 
 @pytest.mark.parametrize("block_size", [1, 32])
