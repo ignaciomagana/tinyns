@@ -7,12 +7,8 @@ import jax.numpy as jnp
 import pytest
 from jax import random
 
-from tinyns.samplers import (
-    _callable_leaves,
-    _callable_specs,
-    _evaluate_jax_batch,
-    _make_rwalk_jax_kernel_cached,
-)
+from tinyns.callables import _callable_leaves, _callable_specs
+from tinyns.core import _chain_kernel, _evaluate_jax_batch
 
 
 def gaussian_loglike(theta):
@@ -37,8 +33,8 @@ def draw(
     scale=0.5,
     max_batches=1,
 ):
-    """Run the cached rwalk kernel once and return its outputs as Python values."""
-    kernel = _make_rwalk_jax_kernel_cached(
+    """Run the cached chain kernel once and return its outputs as Python values."""
+    kernel = _chain_kernel(
         *_callable_specs(loglike, prior_transform, ndim),
         ndim,
         walks,
@@ -149,9 +145,9 @@ def test_rwalk_kernel_caches_unhashable_callable_instances() -> None:
 
     prior = UnhashablePrior()
     loglike = UnhashableLogLike()
-    _make_rwalk_jax_kernel_cached.cache_clear()
-    first = _make_rwalk_jax_kernel_cached(*_callable_specs(loglike, prior, 2), 2, 2, 1)
-    second = _make_rwalk_jax_kernel_cached(*_callable_specs(loglike, prior, 2), 2, 2, 1)
+    _chain_kernel.cache_clear()
+    first = _chain_kernel(*_callable_specs(loglike, prior, 2), 2, 2, 1)
+    second = _chain_kernel(*_callable_specs(loglike, prior, 2), 2, 2, 1)
 
     assert first is second
     live_u = jnp.asarray(((0.2, 0.3), (0.4, 0.7), (0.8, 0.6), (0.5, 0.5)))
@@ -242,7 +238,7 @@ def test_rwalk_kernel_keeps_unmoved_chain_as_seed_copy() -> None:
 def test_rwalk_kernel_rejects_cluster_swap_with_several_chains() -> None:
     specs = _callable_specs(gaussian_loglike, identity_prior_transform, 2)
     with pytest.raises(ValueError, match="cluster_swap"):
-        _make_rwalk_jax_kernel_cached(*specs, 2, 5, 2, True)
+        _chain_kernel(*specs, 2, 5, 2, True)
 
 
 def test_evaluate_jax_batch_scalar_functions_use_vmap() -> None:

@@ -5,8 +5,9 @@ from __future__ import annotations
 import difflib
 from typing import Any
 
+from tinyns.core import Config
 from tinyns.result import NestedSamplingResult
-from tinyns.run import _resolve_options, run_static_nested
+from tinyns.run import run_static_nested
 from tinyns.state import load_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -79,13 +80,18 @@ class NestedSampler:
         self.ndim = ndim
         self.nlive = nlive
         # Resolved options, forwarded to run_static_nested and checkpointed.
-        self._options = _resolve_options(
+        config = Config(
             ndim,
+            nlive,
             walks=walks,
             replacement_chains=replacement_chains,
             block_size=block_size,
             cluster_swap=cluster_swap,
         )
+        self._options = {
+            name: getattr(config, name)
+            for name in ("walks", "replacement_chains", "block_size", "cluster_swap")
+        }
 
     def run(
         self,

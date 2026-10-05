@@ -1,8 +1,14 @@
-"""Static nested-sampling implementation for :mod:`tinyns`."""
+"""The host loop of static nested sampling for :mod:`tinyns`.
+
+:func:`run_static_nested` drives :func:`tinyns.core.step` block by block and
+owns everything between blocks: termination, the step-scale adaptation,
+telemetry, progress, callbacks, checkpoints, the cluster tracker of the swap
+move and the handling of a failed replacement.
+"""
 
 from __future__ import annotations
 
-import functools
+import dataclasses
 import math
 import os
 import time
@@ -10,18 +16,12 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import lax, random
 from jax.scipy.special import logsumexp
 
+from tinyns import core
+from tinyns.callables import _device_leaves
 from tinyns.clusters import ClusterTracker
 from tinyns.result import NestedSamplingResult
-from tinyns.samplers import (
-    _callable_leaves,
-    _callable_specs,
-    _evaluate_jax_batch,
-    _make_rwalk_jax_kernel_cached,
-    _split_callables,
-)
 from tinyns.state import NestedRunState, save_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
@@ -29,115 +29,10 @@ from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 # every block, moves in log space toward 25% move acceptance. It is a
 # dimensionless O(1) factor (the step already follows the contracting live
 # set), so the update can chase it fast.
-_INITIAL_SCALE = 0.5
 _TARGET_ACCEPT = 0.25
 _SCALE_RATE = 0.5
 _MIN_SCALE = 1e-3
 _MAX_SCALE = 10.0
-# Likelihood-call budget of one replacement: a batch of ``walks`` steps on
-# each of ``replacement_chains`` chains is retried until one chain ends above
-# the threshold, at most ``max(1, 10_000 // (walks * replacement_chains))``
-# times. Chains start strictly above the threshold, so only a likelihood
-# plateau exhausts it.
-_MAX_REPLACEMENT_CALLS = 10_000
-
-
-def _positive_int(name: str, value) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _resolve_options(
-    ndim: int,
-    *,
-    walks: int | None,
-    replacement_chains: int,
-    block_size: int,
-    cluster_swap: bool | None,
-) -> dict:
-    """Validate the sampler options and resolve their ``None`` defaults.
-
-    ``walks`` defaults to ``max(25, 6 * ndim)`` (12 for ``ndim=1``).
-    ``cluster_swap`` defaults to True with one replacement chain, the only
-    configuration that supports it, and to False otherwise; an explicit True
-    with more chains raises.
-    """
-
-    if walks is None:
-        # 1-D needs far fewer walks for unbiased logZ (validated to 10);
-        # from 2-D on, max(25, 6 * ndim) (see CHANGELOG, v0.2.0 / v0.2.1).
-        walks = 12 if int(ndim) == 1 else max(25, 6 * int(ndim))
-    _positive_int("walks", walks)
-    _positive_int("replacement_chains", replacement_chains)
-    _positive_int("block_size", block_size)
-    if cluster_swap is None:
-        cluster_swap = replacement_chains == 1
-    elif cluster_swap and replacement_chains != 1:
-        raise NotImplementedError("cluster_swap=True needs replacement_chains=1")
-    return {
-        "walks": walks,
-        "replacement_chains": replacement_chains,
-        "block_size": block_size,
-        "cluster_swap": bool(cluster_swap),
-    }
-
-
-def _evaluate_live_points_jax(
-    loglike, prior_transform, live_u, ndim, *, chunk_size, callable_leaves=None
-):
-    """Evaluate the initial live set in one compiled pass.
-
-    Points go through ``lax.map`` ``chunk_size`` at a time (vmapped within a
-    chunk), so device memory is bounded by the same batch the rwalk kernel uses.
-    Array leaves of pytree callables and large closure constants are jit
-    arguments, not constants; ``callable_leaves`` (default: taken from the
-    callables) lets the caller pass leaves it has already placed on the device.
-    """
-    nlive = int(live_u.shape[0])
-    chunk_size = max(1, min(int(chunk_size), nlive))
-    nchunks = -(-nlive // chunk_size)
-    pad = nchunks * chunk_size - nlive
-    padded = jnp.concatenate(
-        [live_u, jnp.broadcast_to(live_u[:1], (pad, ndim))], axis=0
-    ).reshape((nchunks, chunk_size, ndim))
-
-    (loglike_dynamic, loglike_spec), (prior_dynamic, prior_spec) = (
-        _split_callables(loglike, prior_transform, ndim)
-    )
-    if callable_leaves is None:
-        callable_leaves = tuple(loglike_dynamic) + tuple(prior_dynamic)
-    evaluate = _make_live_points_kernel(loglike_spec, prior_spec, int(ndim))
-    theta, logl = evaluate(padded, *callable_leaves)
-    theta = theta.reshape((nchunks * chunk_size,) + theta.shape[2:])[:nlive]
-    return theta, logl.reshape((-1,))[:nlive]
-
-
-@functools.lru_cache(maxsize=32)
-def _make_live_points_kernel(loglike_spec, prior_spec, ndim: int):
-    """Return the cached jitted pass of :func:`_evaluate_live_points_jax`."""
-    nloglike_leaves = loglike_spec.nleaves
-
-    def evaluate(u, *leaves):
-        loglike_fn = loglike_spec.rebuild(leaves[:nloglike_leaves])
-        prior_fn = prior_spec.rebuild(leaves[nloglike_leaves:])
-
-        def evaluate_chunk(u_chunk):
-            return _evaluate_jax_batch(loglike_fn, prior_fn, u_chunk, ndim)
-
-        return lax.map(evaluate_chunk, u)
-
-    return jax.jit(evaluate)
-
-
-def _remaining_delta_logz(logz_dead, logx_final, live_logl):
-    """Return the live-evidence remainder in log-evidence units."""
-
-    if math.isinf(float(logz_dead)) and float(logz_dead) < 0.0:
-        return math.inf
-    logz_remain = float(logx_final) + float(jnp.max(live_logl))
-    return float(jnp.logaddexp(logz_dead, logz_remain) - logz_dead)
-
 
 
 def _logzerr_diagnostics(
@@ -210,249 +105,6 @@ def _update_scale(current_scale: float, observed_accept: float) -> float:
     delta = _SCALE_RATE * float(np.clip(observed_accept - _TARGET_ACCEPT, -0.5, 0.5))
     new_scale = math.exp(log_scale + delta)
     return float(np.clip(new_scale, _MIN_SCALE, _MAX_SCALE))
-
-
-@functools.lru_cache(maxsize=32)
-def _make_static_jax_rwalk_block_kernel_cached(
-    loglike_spec,
-    prior_spec,
-    ndim: int,
-    walks: int,
-    replacement_chains: int,
-    block_size: int,
-    cluster_swap: bool = False,
-):
-    """Return a cached jitted block kernel: ``block_size`` NS iterations.
-
-    The cache is keyed on the callables' specs (see
-    :class:`tinyns.samplers._CallableSpec`), so pytree callables that differ
-    only in their array leaves share one compiled kernel. The returned
-    ``block_kernel`` takes the array leaves of pytree callables and the large
-    constants of closures (``*_callable_leaves(loglike, prior_transform,
-    ndim)``) as trailing arguments and threads them to the rwalk kernel, so
-    they are jit arguments rather than compiled-in constants. Callables with
-    neither take no trailing arguments.
-
-    After a failed replacement the remaining iterations of the block are
-    skipped: they neither touch the live set nor advance the key.
-
-    With ``cluster_swap=True`` the chains also propose affine swaps between
-    clusters (see :mod:`tinyns.clusters`): ``block_kernel`` takes the cluster
-    frames before the callable leaves and returns one more output, the
-    per-iteration ``[accepted swaps, proposed swaps]``. A replaced live point
-    leaves its cluster's statistics (its label becomes -1).
-    """
-
-    ndim = int(ndim)
-    walks = int(walks)
-    replacement_chains = int(replacement_chains)
-    block_size = int(block_size)
-    batch_ncall = walks * replacement_chains
-    rwalk_kernel = _make_rwalk_jax_kernel_cached(
-        loglike_spec,
-        prior_spec,
-        ndim,
-        walks,
-        replacement_chains,
-        cluster_swap,
-    )
-
-    def block_kernel(
-        key,
-        live_u,
-        live_theta,
-        live_logl,
-        logz_dead,
-        start_iteration,
-        nlive,
-        scale,
-        max_batches,
-        *callable_leaves,
-    ):
-        if cluster_swap:
-            clusters, *callable_leaves = callable_leaves
-            labels = [clusters["labels"]]
-        else:
-            labels = []
-
-        def one_iteration(carry, offset):
-            key, live_u, live_theta, live_logl, logz_dead, active, *labels = carry
-
-            def run_iteration(state):
-                key, live_u, live_theta, live_logl, logz_dead, *labels = state
-                worst = jnp.argmin(live_logl)
-                dead_u = live_u[worst]
-                dead_theta = live_theta[worst]
-                logl_worst = live_logl[worst]
-                iteration = jnp.asarray(start_iteration, dtype=jnp.int32) + offset
-                logx_prev = -iteration / nlive
-                logx_new = -(iteration + 1) / nlive
-                logwidth = logx_prev + jnp.log1p(
-                    -jnp.exp(logx_new - logx_prev)
-                )
-                logwt = logwidth + logl_worst
-                logz_dead = jnp.logaddexp(logz_dead, logwt)
-
-                (
-                    key,
-                    new_u,
-                    new_theta,
-                    new_logl,
-                    replacement_ncall,
-                    accepted,
-                    accepted_move_count,
-                    total_proposal_count,
-                    *swap_counts,
-                ) = rwalk_kernel(
-                    key,
-                    logl_worst,
-                    live_u,
-                    live_logl,
-                    jnp.asarray(scale),
-                    jnp.asarray(max_batches, dtype=jnp.int32),
-                    *([{**clusters, "labels": labels[0]}] if cluster_swap else []),
-                    *callable_leaves,
-                )
-                if cluster_swap:
-                    labels = [labels[0].at[worst].set(-1)]
-                replacement_batches_used = (
-                    total_proposal_count
-                    + jnp.asarray(batch_ncall - 1, dtype=jnp.int32)
-                ) // jnp.asarray(batch_ncall, dtype=jnp.int32)
-                insertion_index = (
-                    jnp.sum(live_logl <= new_logl) - (logl_worst <= new_logl)
-                ).astype(jnp.int32)
-                live_u = jnp.where(accepted, live_u.at[worst].set(new_u), live_u)
-                live_theta = jnp.where(
-                    accepted, live_theta.at[worst].set(new_theta), live_theta
-                )
-                live_logl = jnp.where(
-                    accepted, live_logl.at[worst].set(new_logl), live_logl
-                )
-                return (
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    logz_dead,
-                    accepted,
-                    *labels,
-                ), (
-                    dead_u,
-                    dead_theta,
-                    logl_worst,
-                    logwt,
-                    replacement_ncall,
-                    insertion_index,
-                    replacement_batches_used,
-                    accepted,
-                    accepted_move_count,
-                    total_proposal_count,
-                    *swap_counts,
-                )
-
-            def skip_iteration(state):
-                key, live_u, live_theta, live_logl, logz_dead, *labels = state
-                worst = jnp.argmin(live_logl)
-                dead_u = live_u[worst]
-                dead_theta = live_theta[worst]
-                logl_worst = live_logl[worst]
-                zero = jnp.asarray(0, dtype=jnp.int32)
-                return (
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    logz_dead,
-                    jnp.asarray(False),
-                    *labels,
-                ), (
-                    dead_u,
-                    dead_theta,
-                    logl_worst,
-                    jnp.asarray(-jnp.inf, dtype=live_logl.dtype),
-                    zero,
-                    zero,
-                    zero,
-                    jnp.asarray(False),
-                    zero,
-                    zero,
-                    *([jnp.zeros(2, dtype=jnp.int32)] if cluster_swap else []),
-                )
-
-            return lax.cond(
-                active,
-                run_iteration,
-                skip_iteration,
-                (key, live_u, live_theta, live_logl, logz_dead, *labels),
-            )
-
-        (
-            (
-                new_key,
-                new_live_u,
-                new_live_theta,
-                new_live_logl,
-                logz_dead_new,
-                *_,
-            ),
-            block,
-        ) = lax.scan(
-            one_iteration,
-            (
-                key,
-                live_u,
-                live_theta,
-                live_logl,
-                jnp.asarray(logz_dead),
-                jnp.asarray(True),
-                *labels,
-            ),
-            jnp.arange(block_size, dtype=jnp.int32),
-        )
-        logx_final_new = -(
-            jnp.asarray(start_iteration, dtype=jnp.float32)
-            + jnp.asarray(block_size, dtype=jnp.float32)
-        ) / jnp.asarray(nlive, dtype=jnp.float32)
-        return (
-            new_key,
-            new_live_u,
-            new_live_theta,
-            new_live_logl,
-            *block,
-            logz_dead_new,
-            logx_final_new,
-        )
-
-    return jax.jit(block_kernel)
-
-
-def _make_static_jax_rwalk_block_kernel(
-    loglike,
-    prior_transform,
-    ndim: int,
-    walks: int,
-    replacement_chains: int,
-    block_size: int,
-    cluster_swap: bool = False,
-):
-    """Return the cached block kernel for these callables' specs."""
-    return _make_static_jax_rwalk_block_kernel_cached(
-        *_callable_specs(loglike, prior_transform, ndim),
-        ndim,
-        walks,
-        replacement_chains,
-        block_size,
-        cluster_swap,
-    )
-
-
-_make_static_jax_rwalk_block_kernel.cache_clear = (
-    _make_static_jax_rwalk_block_kernel_cached.cache_clear
-)
-_make_static_jax_rwalk_block_kernel.cache_info = (
-    _make_static_jax_rwalk_block_kernel_cached.cache_info
-)
 
 
 def _make_run_state(
@@ -575,19 +227,16 @@ def run_static_nested(
     drift with the seed (see :mod:`tinyns.clusters`). Pass
     ``cluster_swap=False`` to opt out.
     """
-    if ndim <= 0:
-        raise ValueError("ndim must be a positive integer")
-    if nlive <= 0:
-        raise ValueError("nlive must be a positive integer")
-    options = _resolve_options(
+    cfg = core.Config(
         ndim,
+        nlive,
         walks=walks,
         replacement_chains=replacement_chains,
         block_size=block_size,
         cluster_swap=cluster_swap,
     )
-    walks = options["walks"]
-    cluster_swap = options["cluster_swap"]
+    walks = cfg.walks
+    cluster_swap = cfg.cluster_swap
     if progress_interval <= 0:
         raise ValueError("progress_interval must be a positive integer")
     if callback_interval <= 0:
@@ -605,9 +254,8 @@ def run_static_nested(
     if maxiter is None:
         maxiter = 10_000 * ndim
 
-    config = {"ndim": int(ndim), "nlive": int(nlive), **options}
+    config = dataclasses.asdict(cfg)
     batch_ncall = int(walks) * int(replacement_chains)
-    max_batches = max(1, _MAX_REPLACEMENT_CALLS // batch_ncall)
     checkpoint_path_str = (
         None if checkpoint_path is None else os.fspath(checkpoint_path)
     )
@@ -623,38 +271,20 @@ def run_static_nested(
     sampling_start = time.perf_counter()
     first_block = None  # (seconds since sampling_start, ncall) after block 1
 
-    # Array leaves of pytree callables and large closure constants, placed on
-    # the device once per run and passed to the compiled kernels as arguments
-    # (empty for callables with neither).
-    callable_leaves = tuple(
-        jnp.asarray(leaf) for leaf in _callable_leaves(loglike, prior_transform, ndim)
-    )
+    # Array leaves of pytree callables are jit arguments of the compiled
+    # kernels; numpy leaves are placed on the device once per run.
+    loglike = _device_leaves(loglike)
+    prior_transform = _device_leaves(prior_transform)
 
     if initial_state is None:
-        key = random.PRNGKey(int(key)) if isinstance(key, int) else key
-        key, init_key = random.split(key)
-        live_u = random.uniform(init_key, shape=(nlive, ndim))
-        live_theta, live_logl = _evaluate_live_points_jax(
-            loglike,
-            prior_transform,
-            live_u,
-            ndim,
-            chunk_size=replacement_chains,
-            callable_leaves=callable_leaves,
-        )
+        state = core.init(key, loglike, prior_transform, cfg)
         ncall = nlive
-        logz_dead = -math.inf
         replacement_ncall = []
         insertion_indices = []
         replacement_failures = 0
         replacement_batches = []
-        logx_final = 0.0
         iteration = 0
     else:
-        key = initial_state.key
-        live_u = initial_state.live_u
-        live_theta = initial_state.live_theta
-        live_logl = initial_state.live_logl
         checkpoint_dead_count = len(initial_state.dead_logl)
         if not (
             len(initial_state.dead_u)
@@ -663,8 +293,6 @@ def run_static_nested(
             == len(initial_state.dead_logwt)
         ):
             raise ValueError("checkpoint dead point arrays have inconsistent lengths")
-        logz_dead = float(initial_state.logz_dead)
-        logx_final = float(initial_state.logx_final)
         ncall = int(initial_state.ncall)
         replacement_ncall = list(initial_state.replacement_ncall)
         insertion_indices = list(initial_state.insertion_indices)
@@ -683,14 +311,29 @@ def run_static_nested(
                 "checkpoint dead point count must match checkpoint iteration; "
                 f"got {checkpoint_dead_count} dead points and iteration={iteration}"
             )
+        state = core.State(
+            key=initial_state.key,
+            u=initial_state.live_u,
+            theta=initial_state.live_theta,
+            logl=initial_state.live_logl,
+            # Births are not checkpointed yet (checkpoint v2): unknown.
+            birth=jnp.full_like(initial_state.live_logl, jnp.nan),
+            # Host floats, as checkpointed; see core.State.
+            logz=float(initial_state.logz_dead),
+            logx=float(initial_state.logx_final),
+            it=jnp.asarray(iteration, dtype=jnp.int32),
+            scale=None,  # the host scale, set below
+            ncall=jnp.asarray(ncall, dtype=jnp.int32),
+            failed=jnp.asarray(False),
+        )
     success = True
     message = "converged"
     stopped_by_callback = False
 
-    dead_u_storage = np.empty((maxiter, ndim), dtype=np.asarray(live_u).dtype)
-    dead_theta_storage = np.empty((maxiter, ndim), dtype=np.asarray(live_theta).dtype)
-    dead_logl_storage = np.empty((maxiter,), dtype=np.asarray(live_logl).dtype)
-    dead_logwt_storage = np.empty((maxiter,), dtype=np.asarray(live_logl).dtype)
+    dead_u_storage = np.empty((maxiter, ndim), dtype=np.asarray(state.u).dtype)
+    dead_theta_storage = np.empty((maxiter, ndim), dtype=np.asarray(state.theta).dtype)
+    dead_logl_storage = np.empty((maxiter,), dtype=np.asarray(state.logl).dtype)
+    dead_logwt_storage = np.empty((maxiter,), dtype=np.asarray(state.logl).dtype)
     if initial_state is not None and iteration:
         dead_u_storage[:iteration] = np.asarray(jnp.stack(initial_state.dead_u))
         dead_theta_storage[:iteration] = np.asarray(jnp.stack(initial_state.dead_theta))
@@ -712,7 +355,7 @@ def run_static_nested(
         int(value)
         for value in restored_telemetry.get("rwalk_proposal_history", [])
     ]
-    scale = _INITIAL_SCALE
+    scale = core._INITIAL_SCALE
     if initial_state is not None:
         restored_scale = getattr(initial_state, "scale", None)
         if restored_scale is not None and math.isfinite(float(restored_scale)):
@@ -748,16 +391,16 @@ def run_static_nested(
 
     def current_state() -> NestedRunState:
         return NestedRunState(
-            key=key,
-            live_u=live_u,
-            live_theta=live_theta,
-            live_logl=live_logl,
+            key=state.key,
+            live_u=state.u,
+            live_theta=state.theta,
+            live_logl=state.logl,
             dead_u=[jnp.asarray(point) for point in dead_u_storage[:iteration]],
             dead_theta=[jnp.asarray(point) for point in dead_theta_storage[:iteration]],
             dead_logl=[float(x) for x in dead_logl_storage[:iteration]],
             dead_logwt=[float(x) for x in dead_logwt_storage[:iteration]],
-            logz_dead=logz_dead,
-            logx_final=logx_final,
+            logz_dead=state.logz,
+            logx_final=state.logx,
             ncall=ncall,
             replacement_ncall=replacement_ncall,
             insertion_indices=insertion_indices,
@@ -837,7 +480,7 @@ def run_static_nested(
     # `success=True, message="converged"` initial values.
     resumed_terminal = False
     if iteration > 0:
-        delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+        delta_logz = core.remaining_dlogz(state)
         final_delta_logz = delta_logz
         if delta_logz < dlogz:
             success = True
@@ -852,7 +495,7 @@ def run_static_nested(
 
     while not resumed_terminal and iteration < maxiter:
         if iteration > 0:
-            delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+            delta_logz = core.remaining_dlogz(state)
             final_delta_logz = delta_logz
             if delta_logz < dlogz:
                 success = True
@@ -860,58 +503,29 @@ def run_static_nested(
                 maybe_checkpoint(final=True)
                 break
         block_size_now = min(int(block_size), maxiter - iteration)
-        logz_dead_before_block = logz_dead
+        logz_dead_before_block = state.logz
         frames = None
         if tracker is not None:
             host_start = time.perf_counter()
             frames = tracker.frames(
-                live_u, iteration, dead_u_storage, dead_logwt_storage
+                state.u, iteration, dead_u_storage, dead_logwt_storage
             )
             cluster_host_s += time.perf_counter() - host_start
-        block_kernel = _make_static_jax_rwalk_block_kernel(
+        block_cfg = cfg
+        if block_size_now != cfg.block_size:  # the maxiter tail
+            block_cfg = dataclasses.replace(cfg, block_size=block_size_now)
+        state, dead = core.step(
+            state._replace(scale=jnp.asarray(scale)),
             loglike,
             prior_transform,
-            int(ndim),
-            int(walks),
-            int(replacement_chains),
-            int(block_size_now),
-            frames is not None,
+            block_cfg,
+            extras=frames,
         )
-        (
-            key,
-            live_u,
-            live_theta,
-            live_logl,
-            dead_u_block,
-            dead_theta_block,
-            dead_logl_block,
-            dead_logwt_block,
-            replacement_ncall_block,
-            insertion_indices_block,
-            replacement_batches_block,
-            accepted_block,
-            accepted_move_count_block,
-            total_proposal_count_block,
-            *swap_block,
-            logz_dead,
-            logx_final,
-        ) = block_kernel(
-            key,
-            live_u,
-            live_theta,
-            live_logl,
-            jnp.asarray(logz_dead),
-            jnp.asarray(iteration, dtype=jnp.int32),
-            jnp.asarray(nlive, dtype=jnp.int32),
-            jnp.asarray(scale),
-            jnp.asarray(max_batches, dtype=jnp.int32),
-            *([] if frames is None else [frames]),
-            *callable_leaves,
-        )
+        rows = jax.device_get(dead)
         block_start = iteration
-        failed_offsets = np.flatnonzero(~np.asarray(accepted_block))
+        failed_offsets = np.flatnonzero(~rows.valid)
         if failed_offsets.size:
-            # The block kernel left the live set and the key as they were
+            # The step left the live set and the key as they were
             # after the last successful replacement; keep the dead points
             # before the failed one.
             replacement_failures += 1
@@ -920,53 +534,41 @@ def run_static_nested(
             message = (
                 "replacement failed at iteration "
                 f"{block_start + partial_block_failure_offset + 1}: no chain "
-                f"ended above the likelihood threshold in {max_batches} "
+                f"ended above the likelihood threshold in {cfg.max_batches} "
                 f"batches of {walks} steps x {replacement_chains} chains"
             )
             partial_block_failure_message = message
             block_size_now = partial_block_failure_offset
-            ncall += int(
-                np.asarray(replacement_ncall_block)[partial_block_failure_offset]
-            )
+            ncall += int(rows.ncall[partial_block_failure_offset])
             logz_dead = float(logz_dead_before_block)
-            for logwt_value in np.asarray(dead_logwt_block[:block_size_now]):
+            for logwt_value in rows.logwt[:block_size_now]:
                 logz_dead = float(jnp.logaddexp(logz_dead, float(logwt_value)))
-            logx_final = -(block_start + block_size_now) / int(nlive)
+            state = state._replace(
+                logz=logz_dead, logx=-(block_start + block_size_now) / int(nlive)
+            )
         block_stop = block_start + block_size_now
-        dead_u_block = dead_u_block[:block_size_now]
-        dead_theta_block = dead_theta_block[:block_size_now]
-        dead_logl_block = dead_logl_block[:block_size_now]
-        dead_logwt_block = dead_logwt_block[:block_size_now]
-        replacement_ncall_block = replacement_ncall_block[:block_size_now]
-        insertion_indices_block = insertion_indices_block[:block_size_now]
-        replacement_batches_block = replacement_batches_block[:block_size_now]
-        accepted_move_count_block = accepted_move_count_block[:block_size_now]
-        total_proposal_count_block = total_proposal_count_block[:block_size_now]
-        if swap_block:
+        rows = jax.tree_util.tree_map(lambda x, n=block_size_now: x[:n], rows)
+        accepted_move_count_block = rows.moves
+        total_proposal_count_block = rows.proposals
+        if rows.swaps is not None:
             # The rwalk telemetry and the scale adaptation count rwalk steps
             # only; swaps are counted on their own.
-            swaps = np.asarray(swap_block[0])[:block_size_now]
-            accepted_move_count_block = (
-                np.asarray(accepted_move_count_block) - swaps[:, 0]
-            )
-            total_proposal_count_block = (
-                np.asarray(total_proposal_count_block) - swaps[:, 1]
-            )
+            swaps = rows.swaps
+            accepted_move_count_block = accepted_move_count_block - swaps[:, 0]
+            total_proposal_count_block = total_proposal_count_block - swaps[:, 1]
             tracker.log["swap"] = [
                 int(a + b)
                 for a, b in zip(tracker.log["swap"], swaps.sum(0), strict=True)
             ]
-        dead_u_storage[block_start:block_stop] = np.asarray(dead_u_block)
-        dead_theta_storage[block_start:block_stop] = np.asarray(dead_theta_block)
-        dead_logl_storage[block_start:block_stop] = np.asarray(dead_logl_block)
-        dead_logwt_storage[block_start:block_stop] = np.asarray(dead_logwt_block)
-        block_ncalls = [int(x) for x in np.asarray(replacement_ncall_block)]
+        dead_u_storage[block_start:block_stop] = rows.u
+        dead_theta_storage[block_start:block_stop] = rows.theta
+        dead_logl_storage[block_start:block_stop] = rows.logl
+        dead_logwt_storage[block_start:block_stop] = rows.logwt
+        block_ncalls = [int(x) for x in rows.ncall]
         replacement_ncall.extend(block_ncalls)
-        insertion_indices.extend(int(x) for x in np.asarray(insertion_indices_block))
+        insertion_indices.extend(int(x) for x in rows.insertion)
         ncall += int(sum(block_ncalls))
-        replacement_batches.extend(
-            int(x) for x in np.asarray(replacement_batches_block)
-        )
+        replacement_batches.extend(int(x) for x in rows.batches)
         rwalk_accepted_move_history.extend(
             int(x) for x in np.asarray(accepted_move_count_block)
         )
@@ -980,7 +582,7 @@ def run_static_nested(
         iteration = block_stop
         maybe_checkpoint()
         if failed_offsets.size:
-            delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+            delta_logz = core.remaining_dlogz(state)
             final_delta_logz = delta_logz
             partial_block_failure_delta_logz = float(delta_logz)
             if iteration > 0 and delta_logz < dlogz:
@@ -990,24 +592,24 @@ def run_static_nested(
             maybe_checkpoint(final=True)
             break
 
-        delta_logz = _remaining_delta_logz(logz_dead, logx_final, live_logl)
+        delta_logz = core.remaining_dlogz(state)
         final_delta_logz = delta_logz
         final_iteration = delta_logz < dlogz or iteration == maxiter
         if iteration == maxiter and delta_logz >= dlogz:
             success = False
             message = f"maxiter={maxiter} reached"
-        state = build_state(
+        run_state = build_state(
             iteration=iteration,
-            logz=logz_dead,
+            logz=state.logz,
             dlogz=delta_logz,
             ncall=ncall,
-            logl_min=float(dead_logl_block[-1]),
-            logl_live_max=float(jnp.max(live_logl)),
+            logl_min=float(rows.logl[-1]),
+            logl_live_max=float(jnp.max(state.logl)),
         )
         if callback is not None and (
             iteration == 1 or iteration % callback_interval == 0 or final_iteration
         ):
-            if callback(state) is False:
+            if callback(run_state) is False:
                 success = False
                 message = "stopped by callback"
                 stopped_by_callback = True
@@ -1016,7 +618,7 @@ def run_static_nested(
             iteration == 1 or iteration % progress_interval == 0 or final_iteration
         ):
             progress_printer.print(
-                _format_progress_line(state), final=final_iteration
+                _format_progress_line(run_state), final=final_iteration
             )
         if final_iteration:
             maybe_checkpoint(final=True)
@@ -1031,7 +633,8 @@ def run_static_nested(
         else None
     )
 
-    live_logwt = logx_final - math.log(nlive) + live_logl
+    live_u, live_theta, live_logl = state.u, state.theta, state.logl
+    live_logwt = state.logx - math.log(nlive) + live_logl
 
     dead_u_arr = jnp.asarray(dead_u_storage[:iteration])
     dead_theta_arr = jnp.asarray(dead_theta_storage[:iteration])
@@ -1103,7 +706,7 @@ def run_static_nested(
         success=success,
         message=message,
         metadata={
-            "rwalk_scale_initial": _INITIAL_SCALE,
+            "rwalk_scale_initial": core._INITIAL_SCALE,
             "rwalk_scale_final": float(scale),
             "rwalk_scale_min_seen": float(min(adaptive_scale_history)),
             "rwalk_scale_max_seen": float(max(adaptive_scale_history)),
@@ -1131,8 +734,8 @@ def run_static_nested(
             "nposterior": nposterior,
             **logzerr_diagnostics,
             "final_delta_logz": float(final_delta_logz),
-            "final_logx": float(logx_final),
-            "final_logz_dead": float(logz_dead),
+            "final_logx": float(state.logx),
+            "final_logz_dead": float(state.logz),
             "final_logl_live_max": float(jnp.max(live_logl)),
             "walks": walks,
             "replacement_chains": replacement_chains,
