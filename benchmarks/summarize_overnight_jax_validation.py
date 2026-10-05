@@ -11,6 +11,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+BASELINE_CONFIG = "live_cov_B1"
+
 
 def _mean(values: list[float]) -> float | None:
     return None if not values else sum(values) / len(values)
@@ -132,12 +134,11 @@ def summarize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def fastest_passing_by_target(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Speedups are relative to the single-iteration blocks (block size 1).
     baselines = {
         row["target"]: row
         for row in summaries
-        if row["run_label"] == "no_block"
-        and row["config_name"] == "unbounded_isotropic_rwalk"
-        and row["median_seconds"] is not None
+        if row["config_name"] == BASELINE_CONFIG and row["median_seconds"] is not None
     }
     by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in summaries:

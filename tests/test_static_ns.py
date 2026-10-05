@@ -11,6 +11,10 @@ import tinyns.run as run_mod
 from tinyns.run import run_static_nested
 
 
+def _sum_squares(theta):
+    return -jnp.sum(theta**2)
+
+
 def test_constant_likelihood_unit_cube_logz_close_to_zero() -> None:
     result = run_static_nested(
         random.PRNGKey(0),
@@ -29,7 +33,7 @@ def test_constant_likelihood_unit_cube_logz_close_to_zero() -> None:
 
 def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None:
     def loglike(theta):
-        return float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi))
+        return -0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi)
 
     def prior_transform(u):
         return 20.0 * u - 10.0
@@ -40,7 +44,6 @@ def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None
         prior_transform,
         ndim=1,
         nlive=100,
-        sample="prior",
         dlogz=0.05,
         maxiter=2_000,
     )
@@ -52,11 +55,10 @@ def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None
 def test_result_shapes_finite_logz_and_equal_resampling() -> None:
     result = run_static_nested(
         random.PRNGKey(2),
-        lambda theta: float(-jnp.sum(theta**2)),
+        _sum_squares,
         lambda u: 2.0 * u - 1.0,
         ndim=3,
         nlive=40,
-        sample="prior",
         dlogz=0.1,
         maxiter=500,
     )
@@ -72,11 +74,10 @@ def test_result_shapes_finite_logz_and_equal_resampling() -> None:
 def test_static_nested_result_counts_match_metadata() -> None:
     result = run_static_nested(
         random.PRNGKey(23),
-        lambda theta: float(-jnp.sum(theta**2)),
+        _sum_squares,
         lambda u: u,
         ndim=2,
         nlive=12,
-        sample="prior",
         dlogz=0.0,
         maxiter=5,
     )
@@ -91,7 +92,7 @@ def test_static_nested_maxiter_zero_raises() -> None:
     with pytest.raises(ValueError, match="maxiter must be a positive integer"):
         run_static_nested(
             random.PRNGKey(24),
-            lambda theta: float(-jnp.sum(theta**2)),
+            _sum_squares,
             lambda u: u,
             ndim=2,
             nlive=7,
@@ -99,35 +100,43 @@ def test_static_nested_maxiter_zero_raises() -> None:
         )
 
 
-def test_failure_to_replace_returns_result_with_live_contribution() -> None:
+def test_replacement_failure_stops_the_run_with_a_message() -> None:
+    # No point is admissible above a NaN threshold: the first replacement
+    # exhausts its batches and the run stops.
+    walks = 10
     result = run_static_nested(
-        random.PRNGKey(4),
-        lambda theta: float(theta[0]),
+        random.PRNGKey(8),
+        lambda theta: jnp.nan,
         lambda u: u,
         ndim=1,
         nlive=3,
-        sample="prior",
+        walks=walks,
         dlogz=0.0,
         maxiter=10,
-        max_attempts=1,
+        block_size=4,
+        cluster_swap=False,
     )
 
     assert result.success is False
-    assert "max_attempts=1" in result.message
-    assert result.ncall > result.nlive
-    assert result.samples.shape[1:] == (1,)
-    assert result.logwt.shape == (result.samples.shape[0],)
-    assert jnp.isfinite(result.logz)
+    assert result.message.startswith("replacement failed at iteration 1")
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["partial_block_failure_offset"] == 0
+    assert result.metadata["niter"] == 0
+    max_batches = 10_000 // walks
+    assert result.metadata["replacement_batch_ncall"] == walks
+    # the failed replacement's calls are counted
+    assert result.nlive < result.ncall <= result.nlive + max_batches * walks
+    assert result.samples.shape == (3, 1)
+    assert result.logwt.shape == (3,)
 
 
 def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
     result = run_static_nested(
         random.PRNGKey(5),
-        lambda theta: float(-(theta[0] ** 2)),
+        lambda theta: -(theta[0] ** 2),
         lambda u: u[0],
         ndim=1,
         nlive=5,
-        sample="prior",
         maxiter=2,
     )
 
@@ -140,41 +149,13 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
     assert result.metadata["nposterior"] == result.metadata["niter"] + result.nlive
 
 
-def test_static_nested_rwalk_gaussian_returns_finite_logz() -> None:
-    def loglike(theta):
-        return float(-0.5 * theta[0] ** 2 - 0.5 * math.log(2.0 * math.pi))
-
-    def prior_transform(u):
-        return 20.0 * u - 10.0
-
-    result = run_static_nested(
-        random.PRNGKey(6),
-        loglike,
-        prior_transform,
-        ndim=1,
-        nlive=40,
-        kernel="python",
-        dlogz=0.1,
-        maxiter=300,
-        sample="rwalk",
-        walks=5,
-        step_scale=0.2,
-    )
-
-    assert jnp.isfinite(result.logz)
-    assert result.metadata["sample"] == "rwalk"
-    assert result.metadata["walks"] == 5
-    assert result.metadata["step_scale"] == 0.2
-
-
 def test_replacement_stats_metadata_after_normal_run() -> None:
     result = run_static_nested(
         random.PRNGKey(7),
-        lambda theta: float(-jnp.sum(theta**2)),
+        _sum_squares,
         lambda u: u,
         ndim=2,
         nlive=10,
-        sample="prior",
         dlogz=0.1,
         maxiter=20,
     )
@@ -210,11 +191,10 @@ def test_replacement_stats_metadata_after_normal_run() -> None:
 def test_insertion_indices_metadata_after_normal_run() -> None:
     result = run_static_nested(
         random.PRNGKey(70),
-        lambda theta: float(-jnp.sum(theta**2)),
+        _sum_squares,
         lambda u: u,
         ndim=2,
         nlive=10,
-        sample="prior",
         dlogz=0.1,
         maxiter=20,
     )
@@ -230,164 +210,250 @@ def test_insertion_indices_metadata_after_normal_run() -> None:
     assert bool(jnp.all(insertion_indices <= metadata["insertion_index_nlive"]))
 
 
-def test_static_insertion_ranks_match_bruteforce_reference(monkeypatch) -> None:
-    """Non-block insertion ranks equal the count of surviving live points at or
-    below each replacement.
+def _scripted_rwalk_kernel(new_logl, accepted=None):
+    """Fake rwalk kernel factory: replacement ``key`` gets ``new_logl[key]``.
 
-    Guards the sort-free rank computation in the Python-loop path: a controlled
-    initial live set and scripted replacements produce a known, varied rank
-    sequence that is checked against an independent brute-force count.
+    The key is an int32 counter, advanced by one per replacement.
     """
-    initial_live_logl = jnp.asarray(
-        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], dtype=float
-    )
-    nlive = int(initial_live_logl.size)
+    new_logl = jnp.asarray(new_logl, dtype=float)
+    if accepted is None:
+        accepted = [True] * int(new_logl.size)
+    accepted = jnp.asarray(accepted)
 
-    monkeypatch.setattr(
-        run_mod,
-        "_evaluate_live_points",
-        lambda *_args, **_kwargs: initial_live_logl,
-    )
+    def make_rwalk_kernel(*_args, **_kwargs):
+        def kernel(key, logl_min, live_u, _live_logl, _scale, _max_batches):
+            new_u = jnp.full(live_u.shape[1:], (key + 3).astype(live_u.dtype) / 10)
+            ok = accepted[key]
+            return (
+                key + 1,
+                new_u,
+                new_u,
+                new_logl[key],
+                jnp.asarray(1, dtype=jnp.int32),
+                ok,
+                ok.astype(jnp.int32),
+                jnp.asarray(1, dtype=jnp.int32),
+            )
 
-    # Each scripted likelihood is strictly above the worst it replaces (so the
-    # draw is accepted) and chosen to land at a varied insertion rank.
+        return kernel
+
+    return make_rwalk_kernel
+
+
+def _run_block_kernel(live_logl, block_size):
+    live_logl = jnp.asarray(live_logl, dtype=float)
+    live_u = jnp.tile(live_logl[:, None] / 100.0, (1, 2))
+    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+    kernel = run_mod._make_static_jax_rwalk_block_kernel(
+        lambda theta: theta[0], lambda u: u, 2, 1, 1, block_size
+    )
+    try:
+        return kernel(
+            jnp.asarray(0, dtype=jnp.int32),
+            live_u,
+            live_u,
+            live_logl,
+            jnp.asarray(-jnp.inf),
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(live_logl.size, dtype=jnp.int32),
+            jnp.asarray(0.1),
+            jnp.asarray(1, dtype=jnp.int32),
+        )
+    finally:
+        run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
+
+
+def test_block_insertion_ranks_match_bruteforce_reference(monkeypatch) -> None:
+    """Insertion ranks equal the count of surviving live points at or below
+    each replacement, for a scripted, varied rank sequence."""
+    initial_live_logl = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    # Each scripted likelihood is above the worst it replaces.
     scripted_new_logl = [0.5, 6.5, 1.5, 4.5, 100.0, 3.5]
-    calls = {"i": 0}
+    fake = _scripted_rwalk_kernel(scripted_new_logl)
+    monkeypatch.setattr(run_mod, "_make_rwalk_jax_kernel_cached", fake)
+    result = _run_block_kernel(initial_live_logl, len(scripted_new_logl))
+    got = [int(x) for x in np.asarray(result[9])]
 
-    def fake_draw(key, loglike, prior_transform, logl_min, ndim, **_kwargs):
-        new_logl = scripted_new_logl[calls["i"]]
-        calls["i"] += 1
-        new_u = jnp.full((ndim,), 0.5)
-        return key, new_u, new_u, jnp.asarray(new_logl, dtype=float), 1, True
-
-    monkeypatch.setattr(run_mod, "draw_constrained_prior", fake_draw)
-
-    result = run_static_nested(
-        random.PRNGKey(0),
-        lambda theta: 0.0,
-        lambda u: u,
-        ndim=1,
-        nlive=nlive,
-        sample="prior",
-        maxiter=len(scripted_new_logl),
-    )
-
-    got = [int(x) for x in result.metadata["insertion_indices"]]
-
-    live = [float(x) for x in initial_live_logl]
+    live = list(initial_live_logl)
     expected = []
-    for new_logl in scripted_new_logl[: len(got)]:
+    for new_logl in scripted_new_logl:
         worst = min(range(len(live)), key=lambda j: live[j])
         others = live[:worst] + live[worst + 1 :]
         expected.append(sum(1 for value in others if value <= new_logl))
         live[worst] = new_logl
 
-    assert len(got) >= 4  # exercise the varied, non-zero middle ranks
     assert got == expected
+    assert len(set(got)) >= 4  # varied, non-zero middle ranks
 
 
-def test_failure_to_replace_increments_replacement_failures() -> None:
+def test_block_stops_scanning_after_first_failed_replacement(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run_mod,
+        "_make_rwalk_jax_kernel_cached",
+        _scripted_rwalk_kernel([1.0, 2.0, 3.0, 4.0], [True, False, True, True]),
+    )
+    result = _run_block_kernel([0.0, 1.0], 4)
+
+    assert int(result[0]) == 2  # the skipped iterations do not advance the key
+    assert jnp.asarray(result[11]).tolist() == [True, False, False, False]
+    assert jnp.asarray(result[8]).tolist() == [1, 1, 0, 0]  # ncall
+    assert jnp.asarray(result[13]).tolist() == [1, 1, 0, 0]  # proposals
+    # The live set holds the first replacement only.
+    assert jnp.allclose(
+        jnp.sort(jnp.asarray(result[1]), axis=0),
+        jnp.asarray(((0.01, 0.01), (0.3, 0.3))),
+    )
+    assert jnp.asarray(result[3]).tolist() == [1.0, 1.0]
+
+
+def _fake_block_kernel(*, accepted_prefix: int, replacement_ncall, moves=None):
+    """Factory for a fake block kernel with the real output layout."""
+    replacement_ncall = tuple(int(x) for x in replacement_ncall)
+    block_size = len(replacement_ncall)
+    moves = replacement_ncall if moves is None else tuple(moves)
+    calls = []
+
+    def make_kernel(*args, **_kwargs):
+        def kernel(
+            key,
+            live_u,
+            live_theta,
+            live_logl,
+            logz_dead,
+            start_iteration,
+            nlive,
+            scale,
+            *_rest,
+        ):
+            calls.append(float(scale))
+            worst = int(jnp.argmin(live_logl))
+            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
+            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
+            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
+            offsets = jnp.arange(block_size)
+            iterations = start_iteration + offsets
+            logx_prev = -iterations / nlive
+            logx_new = -(iterations + 1) / nlive
+            dead_logwt = (
+                logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + live_logl[worst]
+            )
+            ncall_block = jnp.asarray(replacement_ncall, dtype=jnp.int32)
+            return (
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                dead_u,
+                dead_theta,
+                dead_logl,
+                dead_logwt,
+                ncall_block,
+                jnp.zeros((block_size,), dtype=jnp.int32),
+                jnp.ones((block_size,), dtype=jnp.int32),
+                offsets < accepted_prefix,
+                jnp.asarray(moves, dtype=jnp.int32),
+                ncall_block,
+                logz_dead,
+                -(start_iteration + block_size) / nlive,
+            )
+
+        return kernel
+
+    make_kernel.scales = calls
+    return make_kernel
+
+
+def test_block_partial_failure_after_convergence_reports_success(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        run_mod,
+        "_make_static_jax_rwalk_block_kernel",
+        _fake_block_kernel(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
+    )
+
     result = run_static_nested(
-        random.PRNGKey(8),
-        lambda theta: float(theta[0]),
+        random.PRNGKey(1236),
+        lambda theta: 0.0,
         lambda u: u,
-        ndim=1,
-        nlive=3,
-        sample="prior",
+        2,
+        12,
+        maxiter=4,
+        dlogz=10.0,
+        block_size=4,
+    )
+
+    assert result.success is True
+    assert "converged" in result.message
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["terminated_after_partial_block_failure"] is True
+    assert result.metadata["partial_block_failure_offset"] == 1
+    assert (
+        result.metadata["partial_block_failure_delta_logz"] < result.metadata["dlogz"]
+    )
+    assert result.metadata["final_delta_logz"] < result.metadata["dlogz"]
+
+
+def test_block_partial_failure_before_convergence_remains_failure(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        run_mod,
+        "_make_static_jax_rwalk_block_kernel",
+        _fake_block_kernel(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
+    )
+
+    result = run_static_nested(
+        random.PRNGKey(1237),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        walks=1,
+        maxiter=4,
         dlogz=0.0,
-        maxiter=10,
-        max_attempts=1,
+        block_size=4,
+    )
+
+    assert result.success is False
+    assert result.message.startswith("replacement failed at iteration 2")
+    assert result.metadata["partial_block_failure_message"] == result.message
+    assert result.metadata["replacement_failures"] == 1
+    assert result.metadata["terminated_after_partial_block_failure"] is False
+    assert result.metadata["partial_block_failure_offset"] == 1
+    assert result.metadata["niter"] == 1
+    assert (
+        result.metadata["partial_block_failure_delta_logz"] >= result.metadata["dlogz"]
+    )
+    assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
+
+
+def test_block_ncall_counts_failed_offset(monkeypatch) -> None:
+    # Prefix offsets 0, 1 succeed (3 + 3 calls); offset 2 fails (9 calls).
+    monkeypatch.setattr(
+        run_mod,
+        "_make_static_jax_rwalk_block_kernel",
+        _fake_block_kernel(accepted_prefix=2, replacement_ncall=(3, 3, 9, 3)),
+    )
+
+    result = run_static_nested(
+        random.PRNGKey(4242),
+        lambda theta: 0.0,
+        lambda u: u,
+        2,
+        12,
+        walks=1,
+        maxiter=8,
+        dlogz=0.0,
+        block_size=4,
     )
 
     assert result.success is False
     assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["replacement_ncall"][-1] == 1
-
-
-def test_vectorized_prior_constant_likelihood_returns_finite_logz() -> None:
-    result = run_static_nested(
-        random.PRNGKey(9),
-        lambda theta_batch: jnp.zeros((theta_batch.shape[0],)),
-        lambda u_batch: u_batch,
-        ndim=2,
-        nlive=20,
-        sample="prior",
-        dlogz=0.1,
-        maxiter=50,
-        vectorized=True,
-        batch_size=8,
-    )
-
-    assert jnp.isfinite(result.logz)
-    assert result.samples.shape[1:] == (2,)
-    assert all(ncall == 8 for ncall in result.metadata["replacement_ncall"])
-
-
-def test_vectorized_prior_1d_gaussian_returns_finite_logz() -> None:
-    def loglike(theta_batch):
-        theta = theta_batch[:, 0]
-        return -0.5 * theta**2 - 0.5 * math.log(2.0 * math.pi)
-
-    result = run_static_nested(
-        random.PRNGKey(10),
-        loglike,
-        lambda u_batch: 20.0 * u_batch - 10.0,
-        ndim=1,
-        nlive=30,
-        sample="prior",
-        dlogz=0.2,
-        maxiter=100,
-        vectorized=True,
-        batch_size=6,
-    )
-
-    assert jnp.isfinite(result.logz)
-    assert result.samples.shape[1:] == (1,)
-    assert result.metadata["batch_size"] == 6
-
-
-def test_vectorized_loglike_correct_initial_shape_passes() -> None:
-    result = run_static_nested(
-        random.PRNGKey(11),
-        lambda theta_batch: -jnp.sum(theta_batch**2, axis=1),
-        lambda u_batch: u_batch,
-        ndim=2,
-        nlive=7,
-        sample="prior",
-        maxiter=2,
-        vectorized=True,
-    )
-
-    assert result.logl.ndim == 1
-    assert math.isfinite(result.logz)
-
-
-def test_vectorized_loglike_scalar_initial_shape_raises() -> None:
-    with pytest.raises(ValueError, match="one value per live point"):
-        run_static_nested(
-            random.PRNGKey(12),
-            lambda theta_batch: 0.0,
-            lambda u_batch: u_batch,
-            ndim=2,
-            nlive=7,
-            sample="prior",
-            maxiter=1,
-            vectorized=True,
-        )
-
-
-def test_vectorized_loglike_wrong_initial_shape_raises() -> None:
-    with pytest.raises(ValueError, match=r"expected shape \(7,\), got \(6,\)"):
-        run_static_nested(
-            random.PRNGKey(13),
-            lambda theta_batch: jnp.zeros((theta_batch.shape[0] - 1,)),
-            lambda u_batch: u_batch,
-            ndim=2,
-            nlive=7,
-            sample="prior",
-            maxiter=1,
-            vectorized=True,
-        )
+    assert result.metadata["partial_block_failure_offset"] == 2
+    assert result.metadata["replacement_ncall"] == [3, 3]
+    # nlive initial evals + successful prefix (3 + 3) + failed offset (9).
+    assert result.ncall == result.nlive + 3 + 3 + 9
 
 
 def test_progress_interval_must_be_positive() -> None:
@@ -445,7 +511,9 @@ def test_callback_is_called_during_short_run() -> None:
 
     assert jnp.isfinite(result.logz)
     assert states
-    assert {"iter", "logz", "dlogz", "ncall", "sample"}.issubset(states[0])
+    assert {"iter", "logz", "dlogz", "ncall", "walks", "calls_per_s"}.issubset(
+        states[0]
+    )
 
 
 def test_callback_can_stop_run_gracefully() -> None:
@@ -461,11 +529,13 @@ def test_callback_can_stop_run_gracefully() -> None:
         maxiter=10,
         callback=callback,
         callback_interval=1,
+        block_size=1,
     )
 
     assert result.success is False
     assert result.message == "stopped by callback"
     assert result.metadata["stopped_by_callback"] is True
+    assert result.metadata["niter"] == 2
     assert jnp.isfinite(result.logz)
     assert result.samples.shape[0] > 0
 
@@ -485,7 +555,7 @@ def test_progress_true_does_not_crash(capsys) -> None:
     captured = capsys.readouterr()
     assert "iter=" in captured.out
     assert "logz=" in captured.out
-    assert "sample=" in captured.out
+    assert "repl_batches=" in captured.out
     assert "\x1b" not in captured.out
     assert "[K" not in captured.out
 
@@ -502,7 +572,6 @@ def test_format_progress_line_contains_core_fields() -> None:
             "logl_min": -1.0,
             "logl_live_max": 2.0,
             "replacement_mean_ncall_so_far": 3.0,
-            "sample": "slice",
         }
     )
 
@@ -510,20 +579,20 @@ def test_format_progress_line_contains_core_fields() -> None:
     assert "iter=" in line
     assert "logz=" in line
     assert "dlogz=" in line
-    assert "repl_batches=" in line
-    assert "repl_chains=" in line
+    assert "repl_ncall=3.0" in line
+    assert "repl_batches=n/a" in line
 
 
 def test_progress_printer_pads_shorter_final_line(capsys) -> None:
     from tinyns.run import _ProgressPrinter
 
     printer = _ProgressPrinter()
-    printer.print("sample=longer-name", final=False)
-    printer.print("sample=x", final=True)
+    printer.print("iter=longer-line", final=False)
+    printer.print("iter=x", final=True)
 
     captured = capsys.readouterr()
-    assert "sample=x" in captured.out
-    padded_short_line = "sample=x" + " " * (len("sample=longer-name") - len("sample=x"))
+    assert "iter=x" in captured.out
+    padded_short_line = "iter=x" + " " * (len("iter=longer-line") - len("iter=x"))
     assert padded_short_line in captured.out
     assert "\x1b" not in captured.out
     assert "[K" not in captured.out
@@ -545,84 +614,35 @@ def _wide_box_prior_transform(u):
     return 10.0 * u - 5.0
 
 
-def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
+def test_nested_sampler_block_size_one_runs() -> None:
     from tinyns import NestedSampler
 
     sampler = NestedSampler(
-        _jax_loglike,
-        _jax_prior_transform,
-        ndim=2,
-        nlive=25,
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.05,
-        rwalk_proposal="isotropic",
-        jax_block_size=1,
+        _jax_loglike, _jax_prior_transform, ndim=2, nlive=25, walks=5, block_size=1
     )
     result = sampler.run(random.PRNGKey(0), dlogz=10.0)
 
     assert result.success is True
     assert math.isfinite(result.logz)
-    assert result.metadata["kernel"] == "jax"
-    assert result.metadata["jax_block_size"] == 1
-    assert result.metadata["jax_block_mode"] is False
-    assert result.metadata["jax_block_impl"] is None
+    assert result.metadata["block_size"] == 1
+    # one scale update per block, so per iteration
+    assert result.metadata["rwalk_adaptation_updates"] == result.metadata["niter"]
 
 
-def test_nested_sampler_rwalk_jax_block_size_one_matches_existing_path() -> None:
-    base_kwargs = dict(
-        sample="rwalk",
-        kernel="jax",
-        walks=3,
-        step_scale=0.05,
-        maxiter=5,
-        max_attempts=60,
-        rwalk_proposal="isotropic",
-    )
-    # jax_block_size=1 was the default before the fast path; pass it explicitly.
-    existing = run_static_nested(
-        random.PRNGKey(10),
-        _jax_loglike,
-        _jax_prior_transform,
-        2,
-        15,
-        jax_block_size=1,
-        **base_kwargs,
-    )
-    block_one = run_static_nested(
-        random.PRNGKey(10),
-        _jax_loglike,
-        _jax_prior_transform,
-        2,
-        15,
-        jax_block_size=1,
-        **base_kwargs,
-    )
-
-    assert jnp.allclose(block_one.samples_u, existing.samples_u)
-    assert jnp.allclose(block_one.logl, existing.logl)
-    assert jnp.allclose(block_one.logwt, existing.logwt)
-    assert block_one.metadata["jax_block_mode"] is False
-
-
-def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
+def test_block_size_five_runs_and_shapes() -> None:
     result = run_static_nested(
         random.PRNGKey(11),
         _jax_loglike,
         _jax_prior_transform,
         2,
         20,
-        sample="rwalk",
-        kernel="jax",
         walks=3,
-        step_scale=0.05,
         maxiter=10,
-        max_attempts=60,
-        jax_block_size=5,
+        block_size=5,
     )
 
     assert result.success is False
+    assert result.message == "maxiter=10 reached"
     assert math.isfinite(result.logz)
     assert result.samples_u.shape == (result.metadata["nposterior"], 2)
     assert result.samples.shape == (result.metadata["nposterior"], 2)
@@ -630,12 +650,10 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert result.logwt.shape == (result.metadata["nposterior"],)
     assert len(result.metadata["replacement_ncall"]) == result.metadata["niter"]
     assert result.metadata["insertion_indices"].shape == (result.metadata["niter"],)
-    assert result.metadata["jax_block_size"] == 5
-    assert result.metadata["jax_block_mode"] is True
-    assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
-    assert result.metadata["jax_block_cached"] is True
-    assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
-    assert result.metadata["total_rwalk_proposals"] == sum(
+    assert result.metadata["block_size"] == 5
+    assert result.metadata["rwalk_adaptation_updates"] == 2
+    # A single chain skips the likelihood for out-of-cube proposals.
+    assert result.metadata["total_rwalk_proposals"] >= sum(
         result.metadata["replacement_ncall"]
     )
     assert (
@@ -646,78 +664,59 @@ def test_nested_sampler_rwalk_jax_block_size_five_runs_and_shapes() -> None:
     assert 0.0 <= result.metadata["rwalk_acceptance"] <= 1.0
 
 
-def test_recommended_rwalk_jax_isotropic_cached_block_b32_records_metadata() -> None:
+def test_default_block_run_records_metadata() -> None:
     from tinyns import NestedSampler
 
     sampler = NestedSampler(
-        _standard_gaussian_2d_loglike,
-        _wide_box_prior_transform,
-        ndim=2,
-        nlive=50,
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        replacement_chains=1,
-        rwalk_proposal="isotropic",
-        jax_block_size=32,
+        _standard_gaussian_2d_loglike, _wide_box_prior_transform, ndim=2, nlive=50
     )
     result = sampler.run(random.PRNGKey(112), dlogz=0.5, maxiter=300)
 
+    metadata = result.metadata
     assert result.success is True
-    assert result.metadata["sample"] == "rwalk"
-    assert result.metadata["kernel"] == "jax"
-    assert result.metadata["rwalk_proposal"] == "isotropic"
-    assert result.metadata["jax_block_mode"] is True
-    assert result.metadata["jax_block_cached"] is True
-    assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
-    assert result.metadata["jax_block_size"] == 32
-    assert result.metadata["replacement_failures"] == 0
+    assert metadata["block_size"] == 32
+    assert metadata["walks"] == 25
+    assert metadata["replacement_chains"] == 1
+    assert metadata["replacement_batch_ncall"] == 25
+    assert metadata["replacement_failures"] == 0
     assert math.isfinite(result.logz)
     assert result.ncall > 0
-    assert result.metadata["niter"] > 0
-    assert result.metadata.get("rwalk_adaptive_step_scale") is False
-    assert "rwalk_adaptation_updates" not in result.metadata
+    assert metadata["niter"] > 0
+    assert metadata["rwalk_scale_initial"] == 0.5
+    assert metadata["rwalk_adaptation_updates"] == -(-metadata["niter"] // 32)
+    for name in ("final", "min_seen", "max_seen", "mean"):
+        assert math.isfinite(metadata[f"rwalk_scale_{name}"])
+    assert math.isfinite(metadata["rwalk_observed_accept_mean"])
+    assert metadata["wall_time_s"] > 0.0
+    assert metadata["compile_s"] is not None
 
 
-def test_nested_sampler_rwalk_jax_cached_b32_block_close_to_non_block() -> None:
-    base_kwargs = dict(
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        replacement_chains=1,
-        nlive=50,
-        dlogz=0.5,
-        maxiter=300,
-        rwalk_proposal="isotropic",
-    )
-    non_block = run_static_nested(
+def test_block_size_one_and_32_agree_within_errors() -> None:
+    kwargs = dict(walks=5, nlive=50, dlogz=0.5, maxiter=300)
+    one = run_static_nested(
         random.PRNGKey(113),
         _standard_gaussian_2d_loglike,
         _wide_box_prior_transform,
         ndim=2,
-        jax_block_size=1,
-        **base_kwargs,
+        block_size=1,
+        **kwargs,
     )
     block = run_static_nested(
         random.PRNGKey(113),
         _standard_gaussian_2d_loglike,
         _wide_box_prior_transform,
         ndim=2,
-        jax_block_size=32,
-        **base_kwargs,
+        block_size=32,
+        **kwargs,
     )
 
-    assert math.isfinite(non_block.logz)
-    assert math.isfinite(block.logz)
-    assert non_block.metadata["replacement_failures"] == 0
+    assert one.metadata["replacement_failures"] == 0
     assert block.metadata["replacement_failures"] == 0
-    tolerance = max(0.5, 3.0 * max(float(block.logzerr), float(non_block.logzerr)))
-    assert abs(float(block.logz) - float(non_block.logz)) < tolerance
-    assert block.metadata["jax_block_cached"] is True
-    assert block.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
+    tolerance = max(0.5, 3.0 * max(float(block.logzerr), float(one.logzerr)))
+    assert abs(float(block.logz) - float(one.logz)) < tolerance
 
 
-def test_nested_sampler_rwalk_jax_cached_block_ring2d_no_failures() -> None:
+def test_block_ring2d_no_failures() -> None:
     from validation.targets import get_target
 
     target = get_target("ring2d")
@@ -727,89 +726,15 @@ def test_nested_sampler_rwalk_jax_cached_block_ring2d_no_failures() -> None:
         target.prior_transform,
         target.ndim,
         30,
-        sample="rwalk",
-        kernel="jax",
         walks=5,
-        replacement_chains=1,
-        rwalk_proposal="isotropic",
         dlogz=2.0,
         maxiter=96,
-        max_attempts=200,
-        jax_block_size=16,
+        block_size=16,
     )
 
     assert math.isfinite(result.logz)
     assert result.metadata["replacement_failures"] == 0
     assert result.ncall > 0
-    assert result.metadata["jax_block_cached"] is True
-    assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
-
-
-def test_schedule_with_block_size_gt_one_raises() -> None:
-    from tinyns import NestedSampler
-
-    with pytest.raises(
-        ValueError, match="replacement_chain_schedule is not supported"
-    ):
-        NestedSampler(
-            _jax_loglike,
-            _jax_prior_transform,
-            ndim=2,
-            nlive=20,
-            sample="rwalk",
-            kernel="jax",
-            walks=3,
-            replacement_chain_schedule=(1, 2, 4),
-            jax_block_size=4,
-        )
-
-    with pytest.raises(
-        ValueError, match="replacement_chain_schedule is not supported"
-    ):
-        run_static_nested(
-            random.PRNGKey(14),
-            _jax_loglike,
-            _jax_prior_transform,
-            2,
-            20,
-            sample="rwalk",
-            kernel="jax",
-            walks=3,
-            max_attempts=24,
-            replacement_chain_schedule=(1, 2, 4),
-            jax_block_size=4,
-        )
-
-
-def test_unknown_rwalk_proposal_rejected() -> None:
-    from tinyns import NestedSampler
-
-    with pytest.raises(ValueError, match="rwalk_proposal"):
-        NestedSampler(
-            _jax_loglike,
-            _jax_prior_transform,
-            ndim=2,
-            nlive=20,
-            sample="rwalk",
-            kernel="jax",
-            rwalk_proposal="bogus",
-        )
-
-
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"kernel": "python"},
-        {"replacement_chain_schedule": (1, 2)},
-    ],
-)
-def test_live_cov_proposal_requires_fixed_chain_jax_rwalk(extra) -> None:
-    kwargs = {"sample": "rwalk", "kernel": "jax", "rwalk_proposal": "live-cov"}
-    kwargs.update(extra)
-    with pytest.raises(NotImplementedError, match="live-cov"):
-        run_static_nested(
-            random.PRNGKey(15), _jax_loglike, _jax_prior_transform, 2, 20, **kwargs
-        )
 
 
 def test_live_cov_cholesky_handles_degenerate_live_set() -> None:
@@ -828,8 +753,8 @@ def test_live_cov_cholesky_handles_degenerate_live_set() -> None:
     np.testing.assert_allclose(chol @ chol.T, np.cov(points.T), rtol=1e-4, atol=1e-6)
 
 
-@pytest.mark.parametrize("jax_block_size", [1, 8])
-def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(jax_block_size) -> None:
+@pytest.mark.parametrize("block_size", [1, 8])
+def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(block_size) -> None:
     """A narrow, strongly correlated 2D Gaussian under a wide box prior."""
     width = 20.0
     cov = np.array([[1.0, 0.95 * 0.05], [0.95 * 0.05, 0.05**2]])
@@ -848,17 +773,31 @@ def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(jax_block_size) ->
         prior_transform,
         2,
         200,
-        sample="rwalk",
-        kernel="jax",
-        rwalk_proposal="live-cov",
         walks=25,
-        jax_block_size=jax_block_size,
+        block_size=block_size,
     )
     assert result.success
     assert abs(result.logz - (-2 * math.log(width))) < 5 * result.logzerr
-    metadata = result.metadata
-    assert metadata["rwalk_adaptive_step_scale"] is True
-    assert 0.1 < metadata["rwalk_acceptance"] < 0.5
+    assert 0.1 < result.metadata["rwalk_acceptance"] < 0.5
+
+
+@pytest.mark.parametrize("cluster_swap", [False, True])
+def test_block_size_one_supports_cluster_swap_setting(cluster_swap) -> None:
+    result = run_static_nested(
+        random.PRNGKey(31),
+        _jax_loglike,
+        _jax_prior_transform,
+        2,
+        40,
+        block_size=1,
+        cluster_swap=cluster_swap,
+        maxiter=50,
+        dlogz=0.0,
+    )
+
+    assert result.metadata["cluster_swap"] is cluster_swap
+    assert result.metadata["niter"] == 50
+    assert result.metadata["replacement_failures"] == 0
 
 
 def test_static_nested_metadata_has_no_removed_option_keys() -> None:
@@ -869,57 +808,41 @@ def test_static_nested_metadata_has_no_removed_option_keys() -> None:
         lambda u: 2.0 * u - 1.0,
         ndim=2,
         nlive=20,
-        sample="rwalk",
-        kernel="jax",
         maxiter=2,
         dlogz=0.0,
         callback=states.append,
     )
 
+    removed = {
+        "sample",
+        "kernel",
+        "rwalk_proposal",
+        "min_accepts",
+        "max_attempts",
+        "batch_size",
+        "jax_vectorized",
+        "rwalk_target_accept",
+        "mean_total_replacement_calls",
+    }
+    removed_parts = (
+        "bound",
+        "step_scale",
+        "schedule",
+        "rescue",
+        "chains_used",
+        "chain_usage",
+        "jax_block",
+    )
     assert result.metadata["niter"] == 2
-    assert not [name for name in result.metadata if "bound" in name]
     assert states
-    assert not [name for name in states[-1] if "bound" in name]
+    for names in (result.metadata, states[-1]):
+        stale = [
+            n for n in names if n in removed or any(r in n for r in removed_parts)
+        ]
+        assert not stale
 
 
-def test_jax_vectorized_metadata_default_false() -> None:
-    result = run_static_nested(
-        random.PRNGKey(4400),
-        lambda theta: 0.0,
-        lambda u: u,
-        ndim=2,
-        nlive=12,
-        dlogz=10.0,
-        maxiter=1,
-    )
-
-    assert result.metadata["jax_vectorized"] is False
-
-
-def test_jax_block_rwalk_failure_propagates_replacement_failure() -> None:
-    result = run_static_nested(
-        random.PRNGKey(1234),
-        _jax_loglike,
-        _jax_prior_transform,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        walks=1,
-        min_accepts=2,
-        replacement_chains=1,
-        max_attempts=1,
-        maxiter=4,
-        dlogz=0.0,
-        jax_block_size=4,
-    )
-
-    assert result.success is False
-    assert result.metadata["replacement_failures"] == 1
-    assert "max_attempts=1" in result.message
-
-
-def test_jax_block_rwalk_supports_unhashable_callable_instances() -> None:
+def test_block_rwalk_supports_unhashable_callable_instances() -> None:
     class UnhashablePrior:
         __hash__ = None
 
@@ -938,18 +861,14 @@ def test_jax_block_rwalk_supports_unhashable_callable_instances() -> None:
         UnhashablePrior(),
         2,
         12,
-        sample="rwalk",
-        kernel="jax",
         walks=1,
-        max_attempts=4,
         maxiter=2,
         dlogz=10.0,
-        jax_block_size=2,
+        block_size=2,
     )
 
     assert result.success is True
     assert result.metadata["niter"] == 2
-    assert result.metadata["jax_block_impl"] == "lax-scan-unbounded"
     assert jnp.isfinite(result.logz)
 
 
@@ -982,616 +901,43 @@ def test_static_jax_block_kernel_cache_is_bounded() -> None:
         run_mod._make_rwalk_jax_kernel_cached.cache_clear()
 
 
-def test_jax_block_partial_failure_after_convergence_reports_success(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        run_mod,
-        "_make_static_jax_rwalk_block_kernel",
-        _partial_failure_block_kernel_20tuple(
-            accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)
-        ),
-    )
+def test_update_scale_direction_and_clamps() -> None:
+    from tinyns.run import _update_scale
 
+    assert _update_scale(0.5, 0.05) < 0.5
+    assert _update_scale(0.5, 0.75) > 0.5
+    assert _update_scale(0.5, 0.25) == pytest.approx(0.5)
+    # log-space step of rate * clip(accept - 0.25, -0.5, 0.5)
+    assert _update_scale(0.5, 1.0) == pytest.approx(0.5 * math.exp(0.25))
+    assert _update_scale(1e-3, 0.0) == pytest.approx(1e-3)
+    assert _update_scale(10.0, 1.0) == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("moves, grows", [(1, False), (15, True)])
+def test_scale_adapts_to_block_move_acceptance(monkeypatch, moves, grows) -> None:
+    fake = _fake_block_kernel(
+        accepted_prefix=4, replacement_ncall=(20, 20, 20, 20), moves=(moves,) * 4
+    )
+    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", fake)
     result = run_static_nested(
-        random.PRNGKey(1236),
-        lambda theta: 0.0,
-        lambda u: u,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        maxiter=4,
-        dlogz=10.0,
-        jax_block_size=4,
-    )
-
-    assert result.success is True
-    assert "converged" in result.message
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["terminated_after_partial_block_failure"] is True
-    assert result.metadata["partial_block_failure_offset"] == 1
-    assert (
-        result.metadata["partial_block_failure_delta_logz"] < result.metadata["dlogz"]
-    )
-    assert result.metadata["final_delta_logz"] < result.metadata["dlogz"]
-
-
-def test_jax_block_partial_failure_before_convergence_remains_failure(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        run_mod,
-        "_make_static_jax_rwalk_block_kernel",
-        _partial_failure_block_kernel_20tuple(
-            accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)
-        ),
-    )
-
-    result = run_static_nested(
-        random.PRNGKey(1237),
-        lambda theta: 0.0,
-        lambda u: u,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        walks=1,
-        replacement_chains=1,
-        # max_attempts == walks * replacement_chains disables the rescue ladder,
-        # preserving the partial-failure-remains-failure behavior.
-        max_attempts=1,
-        maxiter=4,
+        random.PRNGKey(123),
+        _standard_gaussian_2d_loglike,
+        _wide_box_prior_transform,
+        ndim=2,
+        nlive=16,
+        walks=5,
         dlogz=0.0,
-        jax_block_size=4,
-    )
-
-    assert result.success is False
-    assert "max_attempts" in result.message
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["terminated_after_partial_block_failure"] is False
-    assert result.metadata["partial_block_failure_offset"] == 1
-    assert (
-        result.metadata["partial_block_failure_delta_logz"] >= result.metadata["dlogz"]
-    )
-    assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
-
-
-def test_jax_block_rwalk_rescue_succeeds_after_normal_failure(monkeypatch) -> None:
-    def make_kernel(*_args, **_kwargs):
-        def kernel(
-            key,
-            live_u,
-            live_theta,
-            live_logl,
-            logz_dead,
-            start_iteration,
-            nlive,
-            *_rest,
-        ):
-            block_size = 2
-            worst = int(jnp.argmin(live_logl))
-            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
-            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
-            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
-            offsets = jnp.arange(block_size)
-            iterations = start_iteration + offsets
-            logx_prev = -iterations / nlive
-            logx_new = -(iterations + 1) / nlive
-            dead_logwt = (
-                logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + live_logl[worst]
-            )
-            return (
-                key,
-                live_u,
-                live_theta,
-                live_logl,
-                dead_u,
-                dead_theta,
-                dead_logl,
-                dead_logwt,
-                jnp.full((block_size,), 2, dtype=jnp.int32),
-                jnp.zeros((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                jnp.zeros((block_size,), dtype=bool),
-                jnp.zeros((block_size,), dtype=jnp.int32),
-                jnp.full((block_size,), 2, dtype=jnp.int32),
-                dead_u,
-                dead_theta,
-                dead_logl,
-                logz_dead,
-                -(start_iteration + block_size) / nlive,
-            )
-
-        return kernel
-
-    rescue_calls = {"count": 0}
-
-    def rescue_draw(
-        key, _loglike, _prior_transform, logl_min, live_u, _live_logl, ndim, **_kwargs
-    ):
-        rescue_calls["count"] += 1
-        new_u = jnp.clip(live_u[0] + 0.01, 0.0, 1.0)
-        if rescue_calls["count"] == 1:
-            return (
-                key,
-                new_u,
-                new_u,
-                jnp.asarray(logl_min),
-                3,
-                False,
-                {
-                    "replacement_batches": 1,
-                    "replacement_chains_used": 1,
-                    "replacement_chain_usage_counts": {"1": 1},
-                    "accepted_rwalk_moves": 1,
-                    "total_rwalk_proposals": 3,
-                },
-            )
-        return (
-            key,
-            new_u,
-            new_u,
-            jnp.asarray(logl_min + 1.0),
-            5,
-            True,
-            {
-                "replacement_batches": 1,
-                "replacement_chains_used": 2,
-                "replacement_chain_usage_counts": {"2": 1},
-                "accepted_rwalk_moves": 2,
-                "total_rwalk_proposals": 5,
-            },
-        )
-
-    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", make_kernel)
-    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", rescue_draw)
-
-    result = run_static_nested(
-        random.PRNGKey(2001),
-        lambda theta: 0.0,
-        lambda u: u,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        walks=1,
-        replacement_chains=1,
-        max_attempts=2,
-        maxiter=5,
-        dlogz=10.0,
-        jax_block_size=2,
-    )
-
-    assert result.success is True
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["replacement_rescue_used"] is True
-    assert result.metadata["replacement_rescue_attempts"] == 2
-    assert result.metadata["replacement_rescue_successes"] == 1
-    assert result.metadata["replacement_rescue_failures"] == 0
-    assert result.metadata["replacement_rescue_ncall"] == 8
-    assert result.metadata["replacement_rescue_stage_counts"] == {
-        "1": 1,
-        "2": 1,
-        "3": 0,
-        "4": 0,
-    }
-    assert result.metadata["replacement_ncall"] == [10]
-    assert result.metadata["replacement_chain_usage_counts"]["1"] == 1
-    assert result.metadata["replacement_chain_usage_counts"]["2"] == 1
-    assert result.metadata["accepted_rwalk_moves"] == 3
-    assert result.metadata["total_rwalk_proposals"] == 10
-    assert result.metadata["rwalk_acceptance"] == pytest.approx(0.3)
-    # ncall accounts for both the failed offset's calls (2) and the full rescue
-    # ladder's calls (stage 1: 3 + stage 2: 5 = 8): nlive + 2 + 8 == nlive + 10.
-    failed_offset_calls = 2
-    rescue_calls_total = 3 + 5
-    assert result.ncall == result.nlive + failed_offset_calls + rescue_calls_total
-
-
-def test_jax_block_rwalk_rescue_fails_before_convergence(monkeypatch) -> None:
-    def rescue_draw(
-        key, _loglike, _prior_transform, logl_min, live_u, _live_logl, ndim, **_kwargs
-    ):
-        return key, live_u[0], live_u[0], jnp.asarray(logl_min), 4, False
-
-    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", rescue_draw)
-
-    result = run_static_nested(
-        random.PRNGKey(2002),
-        _jax_loglike,
-        _jax_prior_transform,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        walks=1,
-        min_accepts=3,
-        replacement_chains=1,
-        max_attempts=2,
-        maxiter=4,
-        dlogz=0.0,
-        jax_block_size=4,
-    )
-
-    assert result.success is False
-    assert "max_attempts" in result.message
-    assert result.metadata["replacement_rescue_used"] is True
-    assert result.metadata["replacement_rescue_failures"] == 1
-    assert result.metadata["replacement_rescue_attempts"] == 4
-    assert result.metadata["replacement_rescue_ncall"] == 16
-    assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
-
-
-def _partial_failure_block_kernel_20tuple(
-    *, accepted_prefix: int, replacement_ncall
-):
-    replacement_ncall = tuple(int(x) for x in replacement_ncall)
-    block_size = len(replacement_ncall)
-
-    def make_kernel(*_args, **_kwargs):
-        def kernel(
-            key,
-            live_u,
-            live_theta,
-            live_logl,
-            logz_dead,
-            start_iteration,
-            nlive,
-            *_rest,
-        ):
-            worst = int(jnp.argmin(live_logl))
-            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
-            dead_theta = jnp.repeat(live_theta[worst][None, :], block_size, axis=0)
-            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
-            offsets = jnp.arange(block_size)
-            iterations = start_iteration + offsets
-            logx_prev = -iterations / nlive
-            logx_new = -(iterations + 1) / nlive
-            dead_logwt = (
-                logx_prev + jnp.log1p(-jnp.exp(logx_new - logx_prev)) + live_logl[worst]
-            )
-            ncall_block = jnp.asarray(replacement_ncall, dtype=jnp.int32)
-            accepted = offsets < accepted_prefix
-            return (
-                key,
-                live_u,
-                live_theta,
-                live_logl,
-                dead_u,
-                dead_theta,
-                dead_logl,
-                dead_logwt,
-                ncall_block,
-                jnp.zeros((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                accepted,
-                jnp.ones((block_size,), dtype=jnp.int32),
-                ncall_block,
-                dead_u,
-                dead_theta,
-                dead_logl,
-                logz_dead,
-                -(start_iteration + block_size) / nlive,
-            )
-
-        return kernel
-
-    return make_kernel
-
-
-def test_jax_block_stops_scanning_after_first_failed_replacement(monkeypatch) -> None:
-    def make_rwalk_kernel(*_args, **_kwargs):
-        def kernel(
-            key,
-            logl_min,
-            live_u,
-            _live_logl,
-            _step_scale,
-            _min_accepts,
-            _max_batches,
-        ):
-            accepted = key == 0
-            new_u = jnp.full(
-                live_u.shape[1:], (key + 3).astype(live_u.dtype) / 10
-            )
-            return (
-                key + 1,
-                new_u,
-                new_u,
-                logl_min + 1,
-                jnp.asarray(1, dtype=jnp.int32),
-                accepted,
-                accepted.astype(jnp.int32),
-                jnp.asarray(1, dtype=jnp.int32),
-            )
-
-        return kernel
-
-    monkeypatch.setattr(run_mod, "_make_rwalk_jax_kernel_cached", make_rwalk_kernel)
-    run_mod._make_static_jax_rwalk_block_kernel.cache_clear()
-    kernel = run_mod._make_static_jax_rwalk_block_kernel(
-        lambda theta: theta[0],
-        lambda u: u,
-        2,
-        1,
-        1,
-        4,
-    )
-    result = kernel(
-        jnp.asarray(0, dtype=jnp.int32),
-        jnp.asarray(((0.1, 0.1), (0.2, 0.2))),
-        jnp.asarray(((0.1, 0.1), (0.2, 0.2))),
-        jnp.asarray((0.0, 1.0)),
-        jnp.asarray(-jnp.inf),
-        jnp.asarray(0, dtype=jnp.int32),
-        jnp.asarray(2, dtype=jnp.int32),
-        jnp.asarray(0.1),
-        jnp.asarray(1, dtype=jnp.int32),
-        jnp.asarray(1, dtype=jnp.int32),
-    )
-
-    assert int(result[0]) == 2
-    assert jnp.asarray(result[12]).tolist() == [True, False, False, False]
-    assert jnp.asarray(result[8]).tolist() == [1, 1, 0, 0]
-    assert jnp.asarray(result[14]).tolist() == [1, 1, 0, 0]
-    assert jnp.allclose(
-        jnp.sort(jnp.asarray(result[1]), axis=0),
-        jnp.asarray(((0.2, 0.2), (0.3, 0.3))),
-    )
-
-
-def test_jax_block_partial_failure_restores_successful_live_prefix(
-    monkeypatch,
-) -> None:
-    def make_kernel(*_args, **_kwargs):
-        def kernel(
-            key,
-            live_u,
-            live_theta,
-            live_logl,
-            logz_dead,
-            start_iteration,
-            nlive,
-            *_rest,
-        ):
-            block_size = 4
-            worst = int(jnp.argmin(live_logl))
-            dead_u = jnp.repeat(live_u[worst][None, :], block_size, axis=0)
-            dead_theta = jnp.repeat(
-                live_theta[worst][None, :], block_size, axis=0
-            )
-            dead_logl = jnp.repeat(live_logl[worst][None], block_size, axis=0)
-            offsets = jnp.arange(block_size)
-            iterations = start_iteration + offsets
-            logx_prev = -iterations / nlive
-            logx_new = -(iterations + 1) / nlive
-            dead_logwt = (
-                logx_prev
-                + jnp.log1p(-jnp.exp(logx_new - logx_prev))
-                + dead_logl
-            )
-            new_u = jnp.asarray(
-                ((0.25, 0.25), (0.99, 0.99), (0.99, 0.99), (0.99, 0.99))
-            )
-            new_logl = jnp.asarray((1.0, 2.0, 3.0, 4.0))
-            corrupted_live = jnp.full_like(live_u, 0.99)
-            return (
-                key,
-                corrupted_live,
-                jnp.full_like(live_theta, 0.99),
-                jnp.full_like(live_logl, 99.0),
-                dead_u,
-                dead_theta,
-                dead_logl,
-                dead_logwt,
-                jnp.asarray((1, 2, 7, 11), dtype=jnp.int32),
-                jnp.zeros((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                jnp.asarray((True, False, False, False)),
-                jnp.ones((block_size,), dtype=jnp.int32),
-                jnp.asarray((1, 2, 7, 11), dtype=jnp.int32),
-                new_u,
-                new_u,
-                new_logl,
-                logz_dead,
-                -(start_iteration + block_size) / nlive,
-            )
-
-        return kernel
-
-    monkeypatch.setattr(run_mod, "_make_static_jax_rwalk_block_kernel", make_kernel)
-    result = run_static_nested(
-        random.PRNGKey(4241),
-        lambda theta: 0.0,
-        lambda u: u,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        maxiter=4,
-        dlogz=10.0,
-        jax_block_size=4,
-    )
-
-    final_live_u = jnp.asarray(result.samples_u[-result.nlive :])
-    final_live_logl = jnp.asarray(result.logl[-result.nlive :])
-    assert jnp.any(jnp.all(jnp.isclose(final_live_u, 0.25), axis=1))
-    assert not jnp.any(jnp.all(jnp.isclose(final_live_u, 0.99), axis=1))
-    assert 1.0 in final_live_logl
-    assert 99.0 not in final_live_logl
-    assert result.ncall == result.nlive + 1 + 2
-
-
-def test_jax_block_ncall_counts_failed_offset_when_rescue_skipped(monkeypatch) -> None:
-    # Prefix offsets 0, 1 succeed (3 + 3 calls); offset 2 fails (9 calls).
-    monkeypatch.setattr(
-        run_mod,
-        "_make_static_jax_rwalk_block_kernel",
-        _partial_failure_block_kernel_20tuple(
-            accepted_prefix=2, replacement_ncall=(3, 3, 9, 3)
-        ),
-    )
-
-    result = run_static_nested(
-        random.PRNGKey(4242),
-        lambda theta: 0.0,
-        lambda u: u,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        walks=1,
-        replacement_chains=1,
-        # max_attempts == walks * replacement_chains disables the rescue ladder.
-        max_attempts=1,
         maxiter=8,
-        dlogz=0.0,
-        jax_block_size=4,
+        block_size=4,
     )
 
-    assert result.success is False
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["partial_block_failure_offset"] == 2
-    assert result.metadata["replacement_rescue_used"] is False
-    # nlive initial evals + successful prefix (3 + 3) + failed offset (9).
-    successful_prefix_calls = 3 + 3
-    failed_offset_calls = 9
-    assert result.ncall == result.nlive + successful_prefix_calls + failed_offset_calls
-
-
-def test_update_adaptive_step_scale_direction_and_clamps() -> None:
-    from tinyns.run import _update_adaptive_step_scale
-
-    assert _update_adaptive_step_scale(0.1, 0.05, 0.25, 0.1, 1e-4, 0.5) < 0.1
-    assert _update_adaptive_step_scale(0.1, 0.75, 0.25, 0.1, 1e-4, 0.5) > 0.1
-    assert _update_adaptive_step_scale(
-        0.1, 0.25, 0.25, 0.1, 1e-4, 0.5
-    ) == pytest.approx(0.1)
-    assert _update_adaptive_step_scale(
-        1e-4, 0.0, 1.0, 10.0, 1e-4, 0.5
-    ) == pytest.approx(1e-4)
-    assert _update_adaptive_step_scale(0.5, 1.0, 0.0, 10.0, 1e-4, 0.5) == pytest.approx(
-        0.5
-    )
-
-
-def test_rwalk_adaptive_step_scale_uses_low_move_acceptance_to_shrink(
-    monkeypatch,
-) -> None:
-    import tinyns.run as run_mod
-    from tinyns import NestedSampler
-
-    def fake_draw(
-        key, loglike, prior_transform, logl_min, live_u, live_logl, ndim, **kwargs
-    ):
-        new_u = live_u[0]
-        new_theta = prior_transform(new_u)
-        info = {
-            "replacement_batches": 1,
-            "replacement_chains_used": 1,
-            "replacement_chain_usage_counts": {"1": 1},
-            "accepted_move_count": 1,
-            "total_proposal_count": 20,
-            "observed_rwalk_acceptance": 0.05,
-        }
-        return key, new_u, new_theta, float(loglike(new_theta)), 20, True, info
-
-    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", fake_draw)
-    sampler = NestedSampler(
-        _standard_gaussian_2d_loglike,
-        _wide_box_prior_transform,
-        ndim=2,
-        nlive=16,
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.1,
-        rwalk_proposal="isotropic",
-        jax_block_size=1,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.25,
-    )
-    result = sampler.run(random.PRNGKey(123), dlogz=10.0, maxiter=3)
-
-    assert result.metadata["rwalk_effective_step_scale_final"] < 0.1
-    assert result.metadata["rwalk_observed_accept_mean"] == pytest.approx(0.05)
-
-
-def test_rwalk_adaptive_step_scale_uses_high_move_acceptance_to_grow(
-    monkeypatch,
-) -> None:
-    import tinyns.run as run_mod
-    from tinyns import NestedSampler
-
-    def fake_draw(
-        key, loglike, prior_transform, logl_min, live_u, live_logl, ndim, **kwargs
-    ):
-        new_u = live_u[0]
-        new_theta = prior_transform(new_u)
-        info = {
-            "replacement_batches": 1,
-            "replacement_chains_used": 1,
-            "replacement_chain_usage_counts": {"1": 1},
-            "accepted_move_count": 15,
-            "total_proposal_count": 20,
-            "observed_rwalk_acceptance": 0.75,
-        }
-        return key, new_u, new_theta, float(loglike(new_theta)), 20, True, info
-
-    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", fake_draw)
-    sampler = NestedSampler(
-        _standard_gaussian_2d_loglike,
-        _wide_box_prior_transform,
-        ndim=2,
-        nlive=16,
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.1,
-        rwalk_proposal="isotropic",
-        jax_block_size=1,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.25,
-    )
-    result = sampler.run(random.PRNGKey(124), dlogz=10.0, maxiter=3)
-
-    assert result.metadata["rwalk_effective_step_scale_final"] > 0.1
-    assert result.metadata["rwalk_observed_accept_mean"] == pytest.approx(0.75)
-
-
-def test_nested_sampler_rwalk_jax_adaptive_step_scale_records_metadata() -> None:
-    from tinyns import NestedSampler
-
-    sampler = NestedSampler(
-        _standard_gaussian_2d_loglike,
-        _wide_box_prior_transform,
-        ndim=2,
-        nlive=32,
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        step_scale=0.05,
-        rwalk_proposal="isotropic",
-        jax_block_size=4,
-        rwalk_adaptive_step_scale=True,
-        rwalk_target_accept=0.25,
-    )
-    result = sampler.run(random.PRNGKey(314), dlogz=2.0, maxiter=120)
-
-    assert result.success is True
-    assert result.metadata["rwalk_adaptive_step_scale"] is True
-    assert result.metadata["rwalk_target_accept"] == pytest.approx(0.25)
-    assert math.isfinite(result.metadata["rwalk_effective_step_scale_final"])
-    assert math.isfinite(result.metadata["rwalk_effective_step_scale_min_seen"])
-    assert math.isfinite(result.metadata["rwalk_effective_step_scale_max_seen"])
-    assert math.isfinite(result.metadata["rwalk_effective_step_scale_mean"])
-    assert result.metadata["rwalk_adaptation_updates"] > 0
-    assert math.isfinite(result.metadata["rwalk_observed_accept_mean"])
-    assert result.metadata["rwalk_observed_accept_source"] == "move_acceptance"
+    metadata = result.metadata
+    assert fake.scales[0] == 0.5  # the initial scale
+    assert len(fake.scales) == 2
+    assert (fake.scales[1] > 0.5) is grows
+    assert (metadata["rwalk_scale_final"] > 0.5) is grows
+    assert metadata["rwalk_adaptation_updates"] == 2
+    assert metadata["rwalk_observed_accept_mean"] == pytest.approx(moves / 20)
 
 
 def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
@@ -1613,6 +959,5 @@ def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
     )
     jax.effects_barrier()
     metadata = result.metadata
-    assert metadata["rwalk_proposal"] == "live-cov"
     assert len(calls) == result.ncall
     assert result.ncall < 100 + metadata["total_rwalk_proposals"]

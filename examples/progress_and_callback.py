@@ -19,7 +19,7 @@ def prior_transform(u):
 def loglike(theta):
     """Standard 2D Gaussian log likelihood."""
 
-    return float(-0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi))
+    return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
 
 
 def main() -> None:
@@ -29,10 +29,7 @@ def main() -> None:
         prior_transform,
         ndim=2,
         nlive=40,
-        sample="rwalk",
-        kernel="python",
-        walks=5,
-        step_scale=0.2,
+        block_size=8,
     )
 
     callback_states = []

@@ -55,7 +55,7 @@ class NestedRunState:
     success: bool
     message: str
     stopped_by_callback: bool = False
-    effective_step_scale: float | None = None
+    scale: float | None = None
     telemetry: dict[str, Any] = field(default_factory=dict)
     # Cluster tracker state (``cluster_swap``): {"log": dict, "arrays": dict
     # with "labels" and "u", or None}.
@@ -105,10 +105,8 @@ def save_checkpoint_npz(path, state: NestedRunState, config: dict) -> None:
             success=np.asarray(bool(state.success)),
             message=np.asarray(str(state.message)),
             stopped_by_callback=np.asarray(bool(state.stopped_by_callback)),
-            effective_step_scale=np.asarray(
-                float(state.effective_step_scale)
-                if state.effective_step_scale is not None
-                else float("nan")
+            scale=np.asarray(
+                float(state.scale) if state.scale is not None else float("nan")
             ),
             telemetry_json=np.asarray(json.dumps(state.telemetry, sort_keys=True)),
             config_json=np.asarray(json.dumps(config, sort_keys=True)),
@@ -144,11 +142,11 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
                 f"{format_version!r}; expected {_CHECKPOINT_NPZ_FORMAT_VERSION!r}"
             )
         config = json.loads(str(_npz_scalar(data["config_json"])))
-        effective_step_scale = None
-        if "effective_step_scale" in data.files:
-            raw_step_scale = float(_npz_scalar(data["effective_step_scale"]))
-            if np.isfinite(raw_step_scale):
-                effective_step_scale = raw_step_scale
+        scale = None
+        if "scale" in data.files:
+            raw_scale = float(_npz_scalar(data["scale"]))
+            if np.isfinite(raw_scale):
+                scale = raw_scale
         telemetry = {}
         if "telemetry_json" in data.files:
             telemetry = json.loads(str(_npz_scalar(data["telemetry_json"])))
@@ -185,7 +183,7 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
             success=bool(_npz_scalar(data["success"])),
             message=str(_npz_scalar(data["message"])),
             stopped_by_callback=bool(_npz_scalar(data["stopped_by_callback"])),
-            effective_step_scale=effective_step_scale,
+            scale=scale,
             telemetry=telemetry,
             clusters=clusters,
         )

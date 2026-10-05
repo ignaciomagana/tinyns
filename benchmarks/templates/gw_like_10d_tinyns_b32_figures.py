@@ -161,17 +161,9 @@ def _make_sampler(args: argparse.Namespace) -> NestedSampler:
         prior_transform,
         ndim=len(PARAMETER_NAMES),
         nlive=args.nlive,
-        sample="rwalk",
-        kernel="jax",
         walks=args.walks,
         replacement_chains=args.replacement_chains,
-        rwalk_proposal="isotropic",
-        step_scale=args.step_scale,
-        min_accepts=args.min_accepts,
-        max_attempts=args.max_attempts,
-        jax_block_size=args.jax_block_size,
-        rwalk_adaptive_step_scale=args.rwalk_adaptive_step_scale,
-        rwalk_target_accept=args.rwalk_target_accept,
+        block_size=args.block_size,
     )
 
 
@@ -358,14 +350,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--nlive", type=int, default=1000)
     parser.add_argument("--dlogz", type=float, default=0.5)
     parser.add_argument("--maxiter", type=int, default=80000)
-    parser.add_argument("--walks", type=int, default=20)
-    parser.add_argument("--replacement-chains", type=int, default=8)
-    parser.add_argument("--step-scale", type=float, default=0.03)
-    parser.add_argument("--min-accepts", type=int, default=3)
-    parser.add_argument("--max-attempts", type=int, default=20000)
-    parser.add_argument("--jax-block-size", type=int, default=32)
-    parser.add_argument("--rwalk-adaptive-step-scale", action="store_true")
-    parser.add_argument("--rwalk-target-accept", type=float, default=0.25)
+    parser.add_argument(
+        "--walks", type=int, default=None, help="Default: max(25, 6 * ndim)."
+    )
+    parser.add_argument("--replacement-chains", type=int, default=1)
+    parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--output-dir", type=Path, default=Path("gw_like_10d_results"))
     parser.add_argument("--n-plot-samples", type=int, default=3000)
     parser.add_argument("--max-plot-points", type=int, default=3000)
@@ -387,12 +376,6 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.max_attempts < args.walks * args.replacement_chains:
-        raise ValueError(
-            "--max-attempts must be at least --walks * --replacement-chains "
-            "for one complete batched rwalk replacement attempt"
-        )
-
     rows = [_run_seed(seed, args) for seed in args.seeds]
     payload = {
         "config": {
@@ -402,12 +385,7 @@ def main(argv: list[str] | None = None) -> None:
             "maxiter": args.maxiter,
             "walks": args.walks,
             "replacement_chains": args.replacement_chains,
-            "step_scale": args.step_scale,
-            "min_accepts": args.min_accepts,
-            "max_attempts": args.max_attempts,
-            "jax_block_size": args.jax_block_size,
-            "rwalk_adaptive_step_scale": args.rwalk_adaptive_step_scale,
-            "rwalk_target_accept": args.rwalk_target_accept,
+            "block_size": args.block_size,
         },
         "truth": dict(TRUTH),
         "parameter_names": PARAMETER_NAMES,

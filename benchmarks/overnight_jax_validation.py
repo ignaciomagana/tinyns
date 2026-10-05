@@ -1,8 +1,9 @@
-"""Opt-in overnight validation/benchmark harness for fast JAX rwalk configs.
+"""Opt-in overnight validation/benchmark harness for the default sampler.
 
-Defaults are intentionally tiny so an accidental invocation is safe.  Use larger
-``--nlive``, stricter ``--dlogz``, more ``--seeds``, and ``--include-block`` for
-overnight diagnostics.
+Runs one configuration per ``--block-sizes`` entry (default 32). Defaults are
+intentionally tiny so an accidental invocation is safe. Use larger
+``--nlive``, stricter ``--dlogz`` and more ``--seeds`` for overnight
+diagnostics.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ EXPECTED_KEYS = [
     "final_delta_logz",
     "replacement_failures",
     "mean_replacement_ncall",
-    "mean_replacement_chains_used",
+    "mean_replacement_batches",
 ]
 
 
@@ -56,7 +57,6 @@ EXPECTED_KEYS = [
 class Config:
     name: str
     kwargs: dict[str, Any]
-    needs_block: bool = False
 
 
 def _jsonable(value: Any) -> Any:
@@ -84,36 +84,11 @@ def overnight_targets() -> list[str]:
 
 
 def build_configs(args: argparse.Namespace) -> list[Config]:
-    common = {
-        "sample": "rwalk",
-        "kernel": "jax",
-        "walks": args.walks,
-        "max_attempts": args.max_attempts,
-        "step_scale": args.step_scale,
-        "min_accepts": args.min_accepts,
-        "replacement_chains": args.replacement_chains,
-        "rwalk_proposal": "isotropic",
-        "jax_block_size": 1,
-    }
-    configs = [
-        Config("unbounded_isotropic_rwalk", common),
-        Config(
-            "adaptive_rwalk",
-            {
-                **common,
-                "replacement_chain_schedule": args.replacement_chain_schedule,
-            },
-        ),
+    common = {"walks": args.walks, "replacement_chains": args.replacement_chains}
+    return [
+        Config(f"live_cov_B{block_size}", {**common, "block_size": block_size})
+        for block_size in args.block_sizes
     ]
-    if args.include_block:
-        configs.append(
-            Config(
-                "block_jax_rwalk_unbounded",
-                {**common, "jax_block_size": args.jax_block_size},
-                needs_block=True,
-            )
-        )
-    return configs
 
 
 def run_one(
@@ -159,7 +134,7 @@ def run_one(
         "mean_replacement_ncall": metadata.get(
             "mean_replacement_ncall", diagnostics.get("replacement_mean_ncall")
         ),
-        "mean_replacement_chains_used": metadata.get("mean_replacement_chains_used"),
+        "mean_replacement_batches": metadata.get("mean_replacement_batches"),
         "success": bool(result.success),
         "message": str(result.message),
         "ndim": target.ndim,
@@ -181,19 +156,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dlogz", type=float, default=10.0)
     parser.add_argument("--maxiter", type=int, default=10)
     parser.add_argument("--output", type=str, default="overnight_jax_validation.json")
-    parser.add_argument("--include-block", action="store_true")
+    parser.add_argument(
+        "--block-sizes",
+        nargs="+",
+        type=int,
+        default=[32],
+        help="One run configuration per block size.",
+    )
     parser.add_argument(
         "--quick", action="store_true", help="Use explicit tiny smoke settings."
     )
-    parser.add_argument("--walks", type=int, default=5)
-    parser.add_argument("--step-scale", type=float, default=0.1)
-    parser.add_argument("--min-accepts", type=int, default=1)
-    parser.add_argument("--replacement-chains", type=int, default=1)
     parser.add_argument(
-        "--replacement-chain-schedule", nargs="+", type=int, default=[1, 2, 4]
+        "--walks", type=int, default=None, help="Default: the sampler default."
     )
-    parser.add_argument("--max-attempts", type=int, default=1000)
-    parser.add_argument("--jax-block-size", type=int, default=4)
+    parser.add_argument("--replacement-chains", type=int, default=1)
     parser.add_argument("--progress", action="store_true")
     return parser.parse_args(argv)
 

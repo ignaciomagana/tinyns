@@ -26,8 +26,8 @@ def loglike(theta):
 def main():
     key = jax.random.PRNGKey(0)
 
-    # The defaults are the fast path: sample="rwalk", kernel="jax",
-    # rwalk_proposal="live-cov", jax_block_size=32 and walks=max(25, 6 * ndim).
+    # The defaults: live-cov rwalk in jitted blocks of block_size=32
+    # iterations, walks=max(25, 6 * ndim) and the cluster swap.
     sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=200)
 
     result = sampler.run(key, dlogz=0.1)

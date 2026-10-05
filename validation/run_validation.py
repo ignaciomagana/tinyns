@@ -89,28 +89,16 @@ def _posterior_moments(
     return sample_mean, sample_cov, sample_std
 
 
-def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, Any]:
+def run_one(target_name: str, seed: int, args) -> dict[str, Any]:
     target = get_target(target_name)
-    kwargs = {
-        "sample": sampler_name,
-        "nlive": args.nlive,
-        "max_attempts": args.max_attempts,
-        "step_scale": args.step_scale,
-        "min_accepts": args.min_accepts,
-        "kernel": args.kernel,
-        "replacement_chains": args.replacement_chains,
-        # Pin the isotropic per-iteration path this harness was calibrated on.
-        "rwalk_proposal": "isotropic",
-        "jax_block_size": 1,
-    }
-    if sampler_name == "rwalk":
-        kwargs["walks"] = args.walks
-
     sampler = NestedSampler(
         target.loglike,
         target.prior_transform,
         ndim=target.ndim,
-        **kwargs,
+        nlive=args.nlive,
+        walks=args.walks,
+        replacement_chains=args.replacement_chains,
+        block_size=args.block_size,
     )
     result = sampler.run(
         jax.random.PRNGKey(seed),
@@ -154,17 +142,15 @@ def run_one(target_name: str, sampler_name: str, seed: int, args) -> dict[str, A
 
     return {
         "target": target_name,
-        "sampler": sampler_name,
+        # Summaries and comparisons key rows on (target, sampler), so runs
+        # with different settings stay comparable across files.
+        "sampler": "rwalk",
         "nlive": args.nlive,
         "dlogz": args.dlogz,
         "maxiter": args.maxiter,
-        "sample": sampler_name,
-        "kernel": args.kernel,
-        "walks": args.walks,
-        "step_scale": args.step_scale,
-        "min_accepts": args.min_accepts,
+        "walks": metadata.get("walks"),
         "replacement_chains": args.replacement_chains,
-        "max_attempts": args.max_attempts,
+        "block_size": args.block_size,
         "seed": seed,
         "ndim": target.ndim,
         "logz": float(result.logz),
@@ -210,19 +196,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=["gaussian1d", "gaussian2d", "correlated_gaussian2d"],
     )
-    parser.add_argument(
-        "--samplers", nargs="+", choices=["prior", "rwalk"], default=["prior", "rwalk"]
-    )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--dlogz", type=float, default=0.1)
     parser.add_argument("--maxiter", type=int, default=None)
-    parser.add_argument("--walks", type=int, default=25)
-    parser.add_argument("--step-scale", type=float, default=0.1)
-    parser.add_argument("--max-attempts", type=int, default=10000)
-    parser.add_argument("--min-accepts", type=int, default=1)
+    parser.add_argument(
+        "--walks", type=int, default=None, help="Default: the sampler default."
+    )
     parser.add_argument("--replacement-chains", type=int, default=1)
-    parser.add_argument("--kernel", choices=["python", "jax"], default="python")
+    parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument(
         "--progress",
         action="store_true",
@@ -242,18 +224,16 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     results = []
     for target_name in args.targets:
-        for sampler_name in args.samplers:
-            for seed in args.seeds:
-                run = run_one(target_name, sampler_name, seed, args)
-                results.append(run)
-                print(
-                    f"target={target_name} sampler={sampler_name} "
-                    f"kernel={args.kernel} seed={seed} "
-                    f"logz={run['logz']:.3g} err={run['logz_error']} "
-                    f"logzerr={run['logzerr']:.3g} z={run['z_score']} "
-                    f"ncall={run['ncall']} ess={run['posterior_ess']:.0f} "
-                    f"success={run['success']} warnings={len(run['warnings'])}"
-                )
+        for seed in args.seeds:
+            run = run_one(target_name, seed, args)
+            results.append(run)
+            print(
+                f"target={target_name} sampler={run['sampler']} seed={seed} "
+                f"logz={run['logz']:.3g} err={run['logz_error']} "
+                f"logzerr={run['logzerr']:.3g} z={run['z_score']} "
+                f"ncall={run['ncall']} ess={run['posterior_ess']:.0f} "
+                f"success={run['success']} warnings={len(run['warnings'])}"
+            )
 
     if args.output is not None:
         payload = {"config": vars(args), "results": results}

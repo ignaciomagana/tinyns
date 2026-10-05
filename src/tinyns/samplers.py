@@ -1,10 +1,9 @@
-"""Replacement samplers for :mod:`tinyns`."""
+"""The live-cov rwalk replacement kernel and callable splitting for :mod:`tinyns`."""
 
 from __future__ import annotations
 
 import functools
 import logging
-import math
 import weakref
 from functools import lru_cache
 
@@ -14,8 +13,6 @@ import numpy as np
 from jax import lax, random
 
 from tinyns.clusters import loo_frames, swap_step
-from tinyns.math import reflect_unit_cube
-from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 try:  # jaxpr evaluation moved between JAX versions; hoisting is optional.
     from jax.extend.core import eval_jaxpr as _eval_jaxpr
@@ -32,14 +29,14 @@ except ImportError:
 _logger = logging.getLogger(__name__)
 
 # Closure constants with at least this many elements become jit arguments on
-# the fast path (see _hoist_closure_consts); smaller ones stay embedded.
+# the compiled kernels (see _hoist_closure_consts); smaller ones stay embedded.
 _HOIST_MIN_SIZE = 4096
 
 
 class _CallableSpec:
-    """Hashable, data-free stand-in for a fast-path callable.
+    """Hashable, data-free stand-in for a callable of the compiled kernels.
 
-    The compiled fast-path kernels are cached on specs, not on callables. A
+    The compiled kernels are cached on specs, not on callables. A
     kernel takes the callable's ``nleaves`` dynamic leaves as jit arguments and
     ``rebuild(leaves)`` returns the callable inside the trace. The spec of a
     pytree callable is keyed on its structure, the static part from
@@ -81,22 +78,18 @@ def _partition_callable(fn):
 
     ``dynamic`` is the tuple of array leaves (``jax.Array`` / ``np.ndarray``) of
     ``jax.tree_util.tree_flatten(fn)``; ``static`` holds the treedef and every
-    other leaf. The compiled fast-path kernels take ``dynamic`` as explicit jit
+    other leaf. The compiled kernels take ``dynamic`` as explicit jit
     arguments and rebuild ``fn`` inside the trace with
     :func:`_combine_callable`, so large data are not embedded as constants.
 
     A plain function or closure flattens to ``[fn]``: ``dynamic`` is empty and
-    :func:`_combine_callable` returns ``fn`` itself (closure semantics). On the
-    fast path such callables have their large constants hoisted instead
+    :func:`_combine_callable` returns ``fn`` itself (closure semantics). Such
+    callables have their large constants hoisted instead
     (:func:`_split_callable`).
 
-    Only the fast-path jit boundaries use this split: the rwalk kernel
-    (:func:`_make_rwalk_jax_kernel_cached`, hence
-    :func:`draw_constrained_rwalk_jax`), the block kernel and the initial
-    live-point pass in :mod:`tinyns.run`. The ``replacement_chain_schedule``
-    adaptive kernels, the python kernel and prior sampling keep closure
-    semantics: pytree callables work there, but their arrays are embedded in
-    the compiled programs as constants.
+    The jit boundaries that use this split are the rwalk kernel
+    (:func:`_make_rwalk_jax_kernel_cached`), the block kernel and the initial
+    live-point pass in :mod:`tinyns.run`.
     """
     leaves, treedef = jax.tree_util.tree_flatten(fn)
     mask = tuple(_is_dynamic_leaf(leaf) for leaf in leaves)
@@ -237,7 +230,7 @@ def _split_callable(fn, key, example):
 
 
 def _split_callables(loglike, prior_transform, ndim: int):
-    """Return ``((dynamic, spec), (dynamic, spec))`` for the fast path.
+    """Return ``((dynamic, spec), (dynamic, spec))`` for the compiled kernels.
 
     ``loglike`` is traced on a theta of shape ``(ndim,)`` with the dtype
     ``prior_transform`` produces, ``prior_transform`` on a u of shape
@@ -279,203 +272,31 @@ def _callable_specs(loglike, prior_transform, ndim: int):
     return loglike_spec, prior_spec
 
 
-def _validate_theta_shape(theta, ndim: int):
-    theta = jnp.asarray(theta)
-    if ndim == 1 and theta.shape == ():
-        theta = theta.reshape((1,))
-    if theta.shape != (ndim,):
-        raise ValueError(f"prior_transform must return shape ({ndim},)")
-    return theta
-
-
-def _evaluate_jax_prior_batch(
-    prior_transform,
-    u_batch,
-    ndim: int,
-    *,
-    jax_vectorized: bool,
-):
-    """Evaluate a JAX prior transform and normalize its batch shape."""
+def _evaluate_jax_prior_batch(prior_transform, u_batch, ndim: int):
+    """Evaluate a scalar JAX prior transform on a batch (``jax.vmap``)."""
     u_batch = jnp.asarray(u_batch)
     if u_batch.ndim != 2 or u_batch.shape[1] != ndim:
         raise ValueError(f"u_batch must have shape (batch, {ndim})")
-    batch_size = int(u_batch.shape[0])
-
-    if jax_vectorized:
-        theta_batch = jnp.asarray(prior_transform(u_batch))
-        if theta_batch.shape != (batch_size, ndim):
-            raise ValueError(
-                "jax_vectorized prior_transform must return shape "
-                f"({batch_size}, {ndim}); got {theta_batch.shape}"
-            )
-        return theta_batch
-
+    nbatch = int(u_batch.shape[0])
     theta_batch = jnp.asarray(jax.vmap(prior_transform)(u_batch))
-    if ndim == 1 and theta_batch.shape == (batch_size,):
-        theta_batch = theta_batch.reshape((batch_size, 1))
-    if theta_batch.shape != (batch_size, ndim):
+    if ndim == 1 and theta_batch.shape == (nbatch,):
+        theta_batch = theta_batch.reshape((nbatch, 1))
+    if theta_batch.shape != (nbatch, ndim):
         raise ValueError(f"prior_transform must return shape ({ndim},)")
     return theta_batch
 
 
-def _evaluate_jax_batch(
-    loglike,
-    prior_transform,
-    u_batch,
-    ndim,
-    *,
-    jax_vectorized: bool,
-):
-    """Evaluate JAX prior/likelihood functions on a unit-cube batch."""
+def _evaluate_jax_batch(loglike, prior_transform, u_batch, ndim):
+    """Evaluate scalar JAX prior/likelihood functions on a unit-cube batch."""
     u_batch = jnp.asarray(u_batch)
     if u_batch.ndim != 2 or u_batch.shape[1] != ndim:
         raise ValueError(f"u_batch must have shape (batch, {ndim})")
-    batch_size = int(u_batch.shape[0])
-    theta_batch = _evaluate_jax_prior_batch(
-        prior_transform,
-        u_batch,
-        ndim,
-        jax_vectorized=jax_vectorized,
-    )
-
-    if jax_vectorized:
-        logl_batch = jnp.asarray(loglike(theta_batch))
-        if logl_batch.shape != (batch_size,):
-            raise ValueError(
-                "jax_vectorized loglike must return shape "
-                f"({batch_size},); got {logl_batch.shape}"
-            )
-        return theta_batch, logl_batch
-
+    nbatch = int(u_batch.shape[0])
+    theta_batch = _evaluate_jax_prior_batch(prior_transform, u_batch, ndim)
     logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
-    if logl_batch.shape != (batch_size,):
+    if logl_batch.shape != (nbatch,):
         raise ValueError("loglike must return a scalar")
     return theta_batch, logl_batch
-
-
-def _validate_min_accepts(min_accepts: int) -> None:
-    if (
-        not isinstance(min_accepts, int)
-        or isinstance(min_accepts, bool)
-        or min_accepts < 0
-    ):
-        raise ValueError("min_accepts must be a non-negative integer")
-
-
-def draw_constrained_prior(
-    key: PRNGKeyLike,
-    loglike: LogLikelihood,
-    prior_transform: PriorTransform,
-    logl_min: float,
-    ndim: int,
-    *,
-    max_attempts: int = 10_000,
-):
-    """Draw a point from the prior subject to a likelihood constraint.
-
-    Points are drawn uniformly from the unit cube, transformed through
-    ``prior_transform``, and accepted once ``loglike(theta) >= logl_min``. If no
-    attempted point satisfies the constraint, the best attempted point is
-    returned with ``accepted`` set to ``False``.
-    """
-    if ndim <= 0:
-        raise ValueError("ndim must be a positive integer")
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be a positive integer")
-
-    best_u = None
-    best_theta = None
-    best_logl = -math.inf
-
-    new_key = key
-    for ncall in range(1, max_attempts + 1):
-        new_key, draw_key = random.split(new_key)
-        u = random.uniform(draw_key, shape=(ndim,))
-        theta = _validate_theta_shape(prior_transform(u), ndim)
-        logl = float(loglike(theta))
-
-        if best_u is None or logl > best_logl:
-            best_u = u
-            best_theta = theta
-            best_logl = logl
-
-        if logl >= logl_min:
-            return new_key, u, theta, logl, ncall, True
-
-    return new_key, best_u, best_theta, best_logl, max_attempts, False
-
-
-def draw_constrained_prior_vectorized(
-    key: PRNGKeyLike,
-    loglike: LogLikelihood,
-    prior_transform: PriorTransform,
-    logl_min: float,
-    ndim: int,
-    *,
-    batch_size: int = 128,
-    max_attempts: int = 10_000,
-):
-    """Draw a constrained prior replacement using batched proposals.
-
-    Proposals are drawn from the unit cube in batches. The first point in a
-    batch with ``loglike(theta) >= logl_min`` is accepted. If no proposal is
-    accepted after at least ``max_attempts`` likelihood evaluations, the best
-    attempted point is returned with ``accepted`` set to ``False``.
-    """
-    if ndim <= 0:
-        raise ValueError("ndim must be a positive integer")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be a positive integer")
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be a positive integer")
-
-    best_u = None
-    best_theta = None
-    best_logl = -math.inf
-    ncall = 0
-    new_key = key
-
-    while ncall < max_attempts:
-        new_key, draw_key = random.split(new_key)
-        u_batch = random.uniform(draw_key, shape=(batch_size, ndim))
-        theta_batch = jnp.asarray(prior_transform(u_batch))
-        if theta_batch.shape != (batch_size, ndim):
-            raise ValueError(
-                f"vectorized prior_transform must return shape ({batch_size}, {ndim})"
-            )
-        logl_batch = jnp.asarray(loglike(theta_batch), dtype=float)
-        try:
-            logl_batch = logl_batch.reshape((batch_size,))
-        except TypeError as exc:
-            raise ValueError(
-                f"vectorized loglike must return {batch_size} values"
-            ) from exc
-
-        ncall += batch_size
-
-        batch_best_idx = int(jnp.argmax(logl_batch))
-        batch_best_logl = float(logl_batch[batch_best_idx])
-        if best_u is None or batch_best_logl > best_logl:
-            best_u = u_batch[batch_best_idx]
-            best_theta = theta_batch[batch_best_idx]
-            best_logl = batch_best_logl
-
-        accepted_mask = logl_batch >= logl_min
-        if bool(jnp.any(accepted_mask)):
-            accept_idx = int(jnp.argmax(accepted_mask))
-            return (
-                new_key,
-                u_batch[accept_idx],
-                theta_batch[accept_idx],
-                float(logl_batch[accept_idx]),
-                ncall,
-                True,
-            )
-
-    return new_key, best_u, best_theta, best_logl, ncall, False
-
-
-RWALK_PROPOSALS = ("isotropic", "live-cov")
 
 
 def live_cov_cholesky(live_u):
@@ -503,65 +324,59 @@ def _make_rwalk_jax_kernel_cached(
     ndim: int,
     walks: int,
     replacement_chains: int,
-    jax_vectorized: bool,
-    proposal: str = "isotropic",
     cluster_swap: bool = False,
 ):
-    """Return a cached compiled retrying constrained rwalk kernel.
+    """Return a cached compiled live-cov rwalk replacement kernel.
 
-    This is the single internal rwalk kernel factory. It is imported directly
-    by :mod:`tinyns.run` (for the per-iteration and block paths) and wrapped by
-    :func:`draw_constrained_rwalk_jax`. The returned jitted ``kernel`` always
-    produces an eight-element tuple, in this order:
+    The block kernel of :mod:`tinyns.run` calls it once per iteration. The
+    returned jitted ``kernel`` always produces an eight-element tuple, in this
+    order:
 
     1. ``key`` -- the advanced PRNG key.
     2. ``new_u`` -- the accepted replacement point in unit-cube coordinates.
     3. ``new_theta`` -- the prior-transformed replacement point.
     4. ``new_logl`` -- the log-likelihood of ``new_theta``.
     5. ``ncall`` -- likelihood evaluations actually made. This is batches x
-       walks x ``replacement_chains``, except that a single unbatched live-cov
-       chain skips (and does not count) proposals that leave the unit cube.
-    6. ``accepted`` -- whether an in-constraint move was found before the batch
-       budget was exhausted.
+       walks x ``replacement_chains``, except that a single chain skips (and
+       does not count) proposals that leave the unit cube.
+    6. ``accepted`` -- whether a chain ended inside the constraint before the
+       ``max_batches`` budget was exhausted.
     7. ``accepted_move_count`` -- accepted proposals summed over all chains and
        batches (rwalk-acceptance numerator).
     8. ``total_proposal_count`` -- total proposals attempted (batches x walks x
        ``replacement_chains``), the rwalk-acceptance denominator.
 
-    ``proposal="isotropic"`` steps by ``step_scale * N(0, I)`` in the unit cube
-    and reflects at the cube faces. ``proposal="live-cov"`` steps by
-    ``step_scale * L N(0, I)`` with ``L`` the Cholesky factor of the live-point
-    covariance, so the step follows the contracting, correlated live set; moves
-    that leave the cube are rejected (reflection is not symmetric for
-    correlated steps). Its chains start from live points strictly above
-    ``logl_min`` whenever any exist.
+    Each step is ``scale * L N(0, I)`` with ``L`` the Cholesky factor of the
+    live-point covariance, so the step follows the contracting, correlated
+    live set. Moves that leave the cube are rejected. Chains start from live
+    points strictly above ``logl_min`` whenever any exist. A batch runs
+    ``replacement_chains`` chains of ``walks`` steps and keeps one chain that
+    ends inside the constraint; an unmoved chain is kept as a copy of its seed
+    (its seed is strictly above ``logl_min``). Only if no chain qualifies does
+    the kernel run another batch, up to ``max_batches``.
 
     The callables arrive as :class:`_CallableSpec` objects (``loglike_spec``,
-    ``prior_spec``; see :func:`_make_rwalk_jax_kernel`), so the cache holds
-    no data. Their array leaves (pytree callables) or large constants
-    (closures, see :func:`_split_callable`) are trailing arguments of
-    ``kernel``: call it as ``kernel(key, ..., max_batches,
-    *_callable_leaves(loglike, prior_transform, ndim))`` and the callables are
-    rebuilt inside the trace, so the arrays are jit arguments rather than
-    baked-in constants. Callables with neither take no trailing arguments and
-    are traced exactly as before.
+    ``prior_spec``), so the cache holds no data. Their array leaves (pytree
+    callables) or large constants (closures, see :func:`_split_callable`) are
+    trailing arguments of ``kernel``: call it as ``kernel(key, ...,
+    max_batches, *_callable_leaves(loglike, prior_transform, ndim))`` and the
+    callables are rebuilt inside the trace, so the arrays are jit arguments
+    rather than baked-in constants. Callables with neither take no trailing
+    arguments.
 
-    ``cluster_swap=True`` (single unbatched live-cov chain only) makes a
-    fraction of the chain steps affine swaps between cluster frames (see
-    :mod:`tinyns.clusters`). The kernel then takes the cluster frames as an
-    extra argument before the callable leaves and returns a ninth output,
-    ``[accepted swaps, proposed swaps]``; the swap steps are included in
-    ``accepted_move_count`` and ``total_proposal_count``.
+    ``cluster_swap=True`` (single chain only) makes a fraction of the chain
+    steps affine swaps between cluster frames (see :mod:`tinyns.clusters`).
+    The kernel then takes the cluster frames as an extra argument before the
+    callable leaves and returns a ninth output, ``[accepted swaps, proposed
+    swaps]``; the swap steps are included in ``accepted_move_count`` and
+    ``total_proposal_count``.
     """
 
-    if proposal not in RWALK_PROPOSALS:
-        raise ValueError(f"proposal must be one of {RWALK_PROPOSALS}")
-    live_cov = proposal == "live-cov"
-    # With one unbatched chain, out-of-cube live-cov proposals skip the
-    # likelihood (lax.cond); under vmap a cond would evaluate both branches.
-    skip_out_of_cube = live_cov and replacement_chains == 1 and not jax_vectorized
+    # With one chain, out-of-cube proposals skip the likelihood (lax.cond);
+    # under vmap a cond would evaluate both branches.
+    skip_out_of_cube = replacement_chains == 1
     if cluster_swap and not skip_out_of_cube:
-        raise ValueError("cluster_swap needs a single unbatched live-cov chain")
+        raise ValueError("cluster_swap needs a single replacement chain")
     nloglike_leaves = loglike_spec.nleaves
     nleaves = loglike_spec.nleaves + prior_spec.nleaves
 
@@ -571,8 +386,7 @@ def _make_rwalk_jax_kernel_cached(
         logl_min,
         live_u,
         live_logl,
-        step_scale,
-        min_accepts,
+        scale,
         max_batches,
         *callable_leaves,
     ):
@@ -585,20 +399,13 @@ def _make_rwalk_jax_kernel_cached(
             )
         loglike = loglike_spec.rebuild(callable_leaves[:nloglike_leaves])
         prior_transform = prior_spec.rebuild(callable_leaves[nloglike_leaves:])
-        nlive = live_u.shape[0]
-        chol = live_cov_cholesky(live_u) if live_cov else None
-        if live_cov:
-            # Never restart a chain from the point being replaced when others exist.
-            above = live_logl > logl_min
-            seed_logits = jnp.where(
-                jnp.any(above), jnp.where(above, 0.0, -jnp.inf), 0.0
-            )
+        chol = live_cov_cholesky(live_u)
+        # Never restart a chain from the point being replaced when others exist.
+        above = live_logl > logl_min
+        seed_logits = jnp.where(jnp.any(above), jnp.where(above, 0.0, -jnp.inf), 0.0)
         template_u = live_u[0]
         template_theta = _evaluate_jax_prior_batch(
-            prior_transform,
-            template_u[None, :],
-            ndim,
-            jax_vectorized=jax_vectorized,
+            prior_transform, template_u[None, :], ndim
         )[0]
         initial_best_logl = jnp.asarray(-jnp.inf, dtype=live_logl.dtype)
         initial_ncall = jnp.asarray(0, dtype=jnp.int32)
@@ -629,21 +436,11 @@ def _make_rwalk_jax_kernel_cached(
             ) = state
 
             key, seed_key = random.split(key)
-            if live_cov:
-                seed_idx = random.categorical(
-                    seed_key, seed_logits, shape=(replacement_chains,)
-                )
-            else:
-                seed_idx = random.randint(
-                    seed_key, shape=(replacement_chains,), minval=0, maxval=nlive
-                )
-            current_u = live_u[seed_idx]
-            current_theta = _evaluate_jax_prior_batch(
-                prior_transform,
-                current_u,
-                ndim,
-                jax_vectorized=jax_vectorized,
+            seed_idx = random.categorical(
+                seed_key, seed_logits, shape=(replacement_chains,)
             )
+            current_u = live_u[seed_idx]
+            current_theta = _evaluate_jax_prior_batch(prior_transform, current_u, ndim)
             current_logl = live_logl[seed_idx]
             if cluster_swap:
                 frames = loo_frames(clusters, seed_idx[0], current_u[0])
@@ -669,26 +466,23 @@ def _make_rwalk_jax_kernel_cached(
                 ) = carry
                 key, proposal_key = random.split(key)
                 z = random.normal(proposal_key, shape=(replacement_chains, ndim))
-                if live_cov:
-                    u_raw = current_u + step_scale * (z @ chol.T)
-                    if cluster_swap:
-                        swap_u, swap_ok, is_swap = swap_step(
-                            random.fold_in(proposal_key, 1), current_u[0], frames
-                        )
-                        u_raw = jnp.where(is_swap, swap_u[None, :], u_raw)
-                    in_cube = jnp.all((u_raw >= 0.0) & (u_raw <= 1.0), axis=1)
-                    if cluster_swap:
-                        # A swap that fails its likelihood-free tests is
-                        # rejected without a call, like an out-of-cube step.
-                        in_cube = in_cube & (swap_ok | ~is_swap)
-                    u_prop = jnp.clip(u_raw, 0.0, 1.0)
-                else:
-                    u_prop = reflect_unit_cube(current_u + step_scale * z)
+                u_raw = current_u + scale * (z @ chol.T)
+                if cluster_swap:
+                    swap_u, swap_ok, is_swap = swap_step(
+                        random.fold_in(proposal_key, 1), current_u[0], frames
+                    )
+                    u_raw = jnp.where(is_swap, swap_u[None, :], u_raw)
+                in_cube = jnp.all((u_raw >= 0.0) & (u_raw <= 1.0), axis=1)
+                if cluster_swap:
+                    # A swap that fails its likelihood-free tests is rejected
+                    # without a call, like an out-of-cube step.
+                    in_cube = in_cube & (swap_ok | ~is_swap)
+                u_prop = jnp.clip(u_raw, 0.0, 1.0)
                 if skip_out_of_cube:
 
                     def evaluate(u):
                         theta, logl = _evaluate_jax_batch(
-                            loglike, prior_transform, u, ndim, jax_vectorized=False
+                            loglike, prior_transform, u, ndim
                         )
                         return (
                             theta.astype(current_theta.dtype),
@@ -703,19 +497,14 @@ def _make_rwalk_jax_kernel_cached(
                     batch_evals = batch_evals + in_cube[0].astype(jnp.int32)
                 else:
                     theta_prop, logl_prop = _evaluate_jax_batch(
-                        loglike,
-                        prior_transform,
-                        u_prop,
-                        ndim,
-                        jax_vectorized=jax_vectorized,
+                        loglike, prior_transform, u_prop, ndim
                     )
                     batch_evals = batch_evals + jnp.asarray(
                         replacement_chains, dtype=jnp.int32
                     )
 
-                if live_cov:
-                    # Out-of-cube moves never count as the fallback best point.
-                    logl_prop = jnp.where(in_cube, logl_prop, -jnp.inf)
+                # Out-of-cube moves never count as the fallback best point.
+                logl_prop = jnp.where(in_cube, logl_prop, -jnp.inf)
                 is_best = logl_prop > attempt_best_logl
                 attempt_best_u = jnp.where(is_best[:, None], u_prop, attempt_best_u)
                 attempt_best_theta = jnp.where(
@@ -723,10 +512,8 @@ def _make_rwalk_jax_kernel_cached(
                 )
                 attempt_best_logl = jnp.where(is_best, logl_prop, attempt_best_logl)
 
-                accept = logl_prop >= logl_min
-                if live_cov:
-                    # Out-of-cube moves are rejected even when logl_min is -inf.
-                    accept = accept & in_cube
+                # Out-of-cube moves are rejected even when logl_min is -inf.
+                accept = (logl_prop >= logl_min) & in_cube
                 current_u = jnp.where(accept[:, None], u_prop, current_u)
                 current_theta = jnp.where(accept[:, None], theta_prop, current_theta)
                 current_logl = jnp.where(accept, logl_prop, current_logl)
@@ -782,11 +569,11 @@ def _make_rwalk_jax_kernel_cached(
             )
             best_logl = jnp.where(is_global_best, batch_best_logl, best_logl)
 
-            # A chain succeeds once it made min_accepts moves and ends inside the
-            # constraint. With min_accepts=0 (default) an unmoved chain is kept as
-            # a copy of its seed, provided the seed is strictly above logl_min;
-            # discarding unmoved chains would under-sample hard-to-move regions.
-            success_mask = (accepted_moves >= min_accepts) & jnp.where(
+            # A chain succeeds if it ends inside the constraint. An unmoved
+            # chain is kept as a copy of its seed, provided the seed is
+            # strictly above logl_min; discarding unmoved chains would
+            # under-sample hard-to-move regions.
+            success_mask = jnp.where(
                 accepted_moves > 0, current_logl >= logl_min, current_logl > logl_min
             )
             any_success = jnp.any(success_mask)
@@ -880,394 +667,3 @@ def _make_rwalk_jax_kernel_cached(
         )
 
     return kernel
-
-
-def _make_rwalk_jax_kernel(
-    loglike,
-    prior_transform,
-    ndim: int,
-    walks: int,
-    replacement_chains: int,
-    jax_vectorized: bool,
-    proposal: str = "isotropic",
-):
-    """Return the cached rwalk kernel for these callables' specs.
-
-    Pytree callables with the same structure share one kernel; any other
-    callable is keyed by identity (see :class:`_CallableSpec`).
-    """
-    return _make_rwalk_jax_kernel_cached(
-        *_callable_specs(loglike, prior_transform, ndim),
-        ndim,
-        walks,
-        replacement_chains,
-        jax_vectorized,
-        proposal,
-    )
-
-
-_make_rwalk_jax_kernel.cache_clear = _make_rwalk_jax_kernel_cached.cache_clear
-_make_rwalk_jax_kernel.cache_info = _make_rwalk_jax_kernel_cached.cache_info
-
-
-def _validate_replacement_chain_schedule(
-    replacement_chain_schedule, walks: int, max_attempts: int
-) -> tuple[int, ...]:
-    """Validate and normalize an adaptive replacement-chain schedule."""
-    if replacement_chain_schedule is None:
-        raise ValueError("replacement_chain_schedule must not be None here")
-    try:
-        schedule = tuple(replacement_chain_schedule)
-    except TypeError as exc:
-        raise ValueError(
-            "replacement_chain_schedule must be a non-empty sequence "
-            "of positive integers"
-        ) from exc
-    if not schedule:
-        raise ValueError(
-            "replacement_chain_schedule must be a non-empty sequence "
-            "of positive integers"
-        )
-    if any(
-        not isinstance(value, int) or isinstance(value, bool) or value <= 0
-        for value in schedule
-    ):
-        raise ValueError(
-            "replacement_chain_schedule must be a non-empty sequence "
-            "of positive integers"
-        )
-    if max(schedule) * int(walks) > int(max_attempts):
-        raise ValueError(
-            "max_attempts must be at least max(replacement_chain_schedule) * walks"
-        )
-    return schedule
-
-
-def draw_constrained_rwalk_jax(
-    key: PRNGKeyLike,
-    loglike: LogLikelihood,
-    prior_transform: PriorTransform,
-    logl_min: float,
-    live_u,
-    live_logl,
-    ndim: int,
-    *,
-    walks: int = 25,
-    step_scale: float = 0.1,
-    max_attempts: int = 10_000,
-    min_accepts: int = 0,
-    replacement_chains: int = 1,
-    jax_vectorized: bool = False,
-    return_info: bool = False,
-    proposal: str = "isotropic",
-):
-    """Draw a constrained replacement with a compiled JAX rwalk kernel.
-
-    Array leaves of pytree ``loglike`` / ``prior_transform`` callables, and the
-    large constants of closures (see :func:`_split_callable`), are passed to
-    the compiled kernel as arguments. ``np.ndarray`` pytree leaves are copied
-    to the device on every call; use ``jax.Array`` leaves to avoid that.
-    """
-    if ndim <= 0:
-        raise ValueError("ndim must be a positive integer")
-    if walks <= 0:
-        raise ValueError("walks must be a positive integer")
-    if step_scale <= 0:
-        raise ValueError("step_scale must be positive")
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be a positive integer")
-    _validate_min_accepts(min_accepts)
-    if (
-        not isinstance(replacement_chains, int)
-        or isinstance(replacement_chains, bool)
-        or replacement_chains <= 0
-    ):
-        raise ValueError("replacement_chains must be a positive integer")
-    batch_ncall = int(walks) * int(replacement_chains)
-    if batch_ncall > max_attempts:
-        raise ValueError("max_attempts must be at least walks * replacement_chains")
-
-    live_u = jnp.asarray(live_u)
-    live_logl = jnp.asarray(live_logl)
-    if live_u.ndim != 2 or live_u.shape[1] != ndim:
-        raise ValueError(f"live_u must have shape (nlive, {ndim})")
-    nlive = live_u.shape[0]
-    if nlive <= 0:
-        raise ValueError("live_u must contain at least one live point")
-    if live_logl.shape != (nlive,):
-        raise ValueError(f"live_logl must have shape ({nlive},)")
-
-    kernel = _make_rwalk_jax_kernel(
-        loglike,
-        prior_transform,
-        int(ndim),
-        int(walks),
-        int(replacement_chains),
-        bool(jax_vectorized),
-        str(proposal),
-    )
-    max_batches = max_attempts // batch_ncall
-    (
-        new_key,
-        new_u,
-        new_theta,
-        new_logl,
-        ncall,
-        accepted,
-        accepted_move_count,
-        total_proposal_count,
-    ) = kernel(
-        key,
-        jnp.asarray(logl_min),
-        live_u,
-        live_logl,
-        jnp.asarray(step_scale),
-        jnp.asarray(min_accepts),
-        jnp.asarray(max_batches, dtype=jnp.int32),
-        *_callable_leaves(loglike, prior_transform, ndim),
-    )
-    if return_info:
-        batches = int(math.ceil(int(total_proposal_count) / batch_ncall))
-        observed_acceptance = (
-            float(accepted_move_count) / float(total_proposal_count)
-            if int(total_proposal_count) > 0
-            else 0.0
-        )
-        info = {
-            "replacement_batches": batches,
-            "replacement_chains_used": int(replacement_chains) * batches,
-            "replacement_chain_usage_counts": {str(int(replacement_chains)): batches},
-            "accepted_move_count": int(accepted_move_count),
-            "total_proposal_count": int(total_proposal_count),
-            "observed_rwalk_acceptance": observed_acceptance,
-            "accepted_rwalk_moves": int(accepted_move_count),
-            "total_rwalk_proposals": int(total_proposal_count),
-            "rwalk_acceptance": observed_acceptance,
-        }
-        return (
-            new_key,
-            new_u,
-            new_theta,
-            float(new_logl),
-            int(ncall),
-            bool(accepted),
-            info,
-        )
-    return new_key, new_u, new_theta, float(new_logl), int(ncall), bool(accepted)
-
-
-def draw_constrained_rwalk_jax_adaptive(
-    key: PRNGKeyLike,
-    loglike: LogLikelihood,
-    prior_transform: PriorTransform,
-    logl_min: float,
-    live_u,
-    live_logl,
-    ndim: int,
-    *,
-    walks: int = 25,
-    step_scale: float = 0.1,
-    max_attempts: int = 10_000,
-    min_accepts: int = 0,
-    replacement_chain_schedule=(1, 4, 16, 64),
-    jax_vectorized: bool = False,
-):
-    """Draw a constrained JAX rwalk replacement with adaptive batch retries."""
-    schedule = _validate_replacement_chain_schedule(
-        replacement_chain_schedule, walks, max_attempts
-    )
-    total_ncall = 0
-    accepted_move_count = 0
-    total_proposal_count = 0
-    best_u = None
-    best_theta = None
-    best_logl = -float("inf")
-    batches = 0
-    chains_used = 0
-    usage_counts = {int(c): 0 for c in schedule}
-
-    def try_batch(key, c):
-        return draw_constrained_rwalk_jax(
-            key,
-            loglike,
-            prior_transform,
-            logl_min,
-            live_u,
-            live_logl,
-            ndim,
-            walks=walks,
-            step_scale=step_scale,
-            max_attempts=int(walks) * int(c),
-            min_accepts=min_accepts,
-            replacement_chains=int(c),
-            jax_vectorized=jax_vectorized,
-            return_info=True,
-        )
-
-    c = schedule[-1]
-    stage_index = 0
-    while True:
-        if stage_index < len(schedule):
-            c = schedule[stage_index]
-            stage_index += 1
-        batch_budget = int(walks) * int(c)
-        if total_ncall + batch_budget > int(max_attempts):
-            break
-        (
-            key,
-            candidate_u,
-            candidate_theta,
-            candidate_logl,
-            ncall,
-            accepted,
-            batch_info,
-        ) = try_batch(key, c)
-        total_ncall += int(ncall)
-        accepted_move_count += int(batch_info["accepted_move_count"])
-        total_proposal_count += int(batch_info["total_proposal_count"])
-        batches += 1
-        chains_used += int(c)
-        usage_counts[int(c)] = usage_counts.get(int(c), 0) + 1
-        if float(candidate_logl) > best_logl or best_u is None:
-            best_u = candidate_u
-            best_theta = candidate_theta
-            best_logl = float(candidate_logl)
-        observed_acceptance = (
-            float(accepted_move_count) / float(total_proposal_count)
-            if total_proposal_count > 0
-            else 0.0
-        )
-        info = {
-            "replacement_batches": batches,
-            "replacement_chains_used": chains_used,
-            "replacement_last_chain_count": int(c),
-            "replacement_chain_usage_counts": {
-                str(k): v for k, v in usage_counts.items()
-            },
-            "accepted_move_count": int(accepted_move_count),
-            "total_proposal_count": int(total_proposal_count),
-            "observed_rwalk_acceptance": observed_acceptance,
-            "accepted_rwalk_moves": int(accepted_move_count),
-            "total_rwalk_proposals": int(total_proposal_count),
-            "rwalk_acceptance": observed_acceptance,
-        }
-        if accepted:
-            return (
-                key,
-                candidate_u,
-                candidate_theta,
-                candidate_logl,
-                total_ncall,
-                True,
-                info,
-            )
-
-    if best_u is None:
-        raise RuntimeError("adaptive replacement schedule made no attempts")
-    observed_acceptance = (
-        float(accepted_move_count) / float(total_proposal_count)
-        if total_proposal_count > 0
-        else 0.0
-    )
-    info = {
-        "replacement_batches": batches,
-        "replacement_chains_used": chains_used,
-        "replacement_last_chain_count": int(c),
-        "replacement_chain_usage_counts": {str(k): v for k, v in usage_counts.items()},
-        "accepted_move_count": int(accepted_move_count),
-        "total_proposal_count": int(total_proposal_count),
-        "observed_rwalk_acceptance": observed_acceptance,
-        "accepted_rwalk_moves": int(accepted_move_count),
-        "total_rwalk_proposals": int(total_proposal_count),
-        "rwalk_acceptance": observed_acceptance,
-    }
-    return key, best_u, best_theta, best_logl, total_ncall, False, info
-
-
-def draw_constrained_rwalk(
-    key: PRNGKeyLike,
-    loglike: LogLikelihood,
-    prior_transform: PriorTransform,
-    logl_min: float,
-    live_u,
-    live_logl,
-    ndim: int,
-    *,
-    walks: int = 25,
-    step_scale: float = 0.1,
-    max_attempts: int = 10_000,
-    min_accepts: int = 0,
-):
-    """Draw a constrained replacement with a reflected random walk.
-
-    A live point is chosen as the seed, then ``walks`` reflected Gaussian
-    transition proposals are attempted per replacement attempt. The copied live
-    seed does not count toward ``min_accepts``. With the default
-    ``min_accepts=0`` a chain that never moves returns its seed (when the seed
-    is strictly above ``logl_min``); ``min_accepts >= 1`` instead retries until
-    a chain makes that many moves, which under-samples hard-to-move regions.
-    """
-    if ndim <= 0:
-        raise ValueError("ndim must be a positive integer")
-    if walks <= 0:
-        raise ValueError("walks must be a positive integer")
-    if step_scale <= 0:
-        raise ValueError("step_scale must be positive")
-    if max_attempts <= 0:
-        raise ValueError("max_attempts must be a positive integer")
-    _validate_min_accepts(min_accepts)
-
-    live_u = jnp.asarray(live_u)
-    live_logl = jnp.asarray(live_logl)
-    if live_u.ndim != 2 or live_u.shape[1] != ndim:
-        raise ValueError(f"live_u must have shape (nlive, {ndim})")
-    nlive = live_u.shape[0]
-    if nlive <= 0:
-        raise ValueError("live_u must contain at least one live point")
-    if live_logl.shape != (nlive,):
-        raise ValueError(f"live_logl must have shape ({nlive},)")
-
-    best_u = None
-    best_theta = None
-    best_logl = -math.inf
-    ncall = 0
-    new_key = key
-
-    while ncall < max_attempts:
-        new_key, seed_key = random.split(new_key)
-        seed_idx = int(random.randint(seed_key, shape=(), minval=0, maxval=nlive))
-        current_u = live_u[seed_idx]
-        current_theta = _validate_theta_shape(prior_transform(current_u), ndim)
-        current_logl = float(live_logl[seed_idx])
-        accepted_moves = 0
-
-        for _ in range(walks):
-            if ncall >= max_attempts:
-                break
-            new_key, proposal_key = random.split(new_key)
-            step = step_scale * random.normal(proposal_key, shape=(ndim,))
-            u_prop = reflect_unit_cube(current_u + step)
-            theta_prop = _validate_theta_shape(prior_transform(u_prop), ndim)
-            logl_prop = float(loglike(theta_prop))
-            ncall += 1
-
-            if best_u is None or logl_prop > best_logl:
-                best_u = u_prop
-                best_theta = theta_prop
-                best_logl = logl_prop
-
-            if logl_prop >= logl_min:
-                current_u = u_prop
-                current_theta = theta_prop
-                current_logl = logl_prop
-                accepted_moves += 1
-
-        # Same rule as the JAX kernel: an unmoved chain is kept only if its
-        # seed is strictly above logl_min.
-        inside = (
-            current_logl >= logl_min if accepted_moves > 0 else current_logl > logl_min
-        )
-        if accepted_moves >= min_accepts and inside:
-            return new_key, current_u, current_theta, current_logl, ncall, True
-
-    return new_key, best_u, best_theta, best_logl, ncall, False

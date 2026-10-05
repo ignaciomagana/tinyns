@@ -91,8 +91,6 @@ def test_swap_kernel_relaxes_to_the_volume_share() -> None:
         2,
         10,
         1,
-        False,
-        "live-cov",
         True,
     )
     frames = jax.tree_util.tree_map(jnp.asarray, _frames(nlive))
@@ -100,9 +98,7 @@ def test_swap_kernel_relaxes_to_the_volume_share() -> None:
 
     def move(key, walker, reference, frames):
         live_u = jnp.concatenate([walker[None, :], reference])
-        out = kernel(
-            key, -0.5, live_u, live_logl, 0.5, 0, jnp.int32(1), frames
-        )
+        out = kernel(key, -0.5, live_u, live_logl, 0.5, jnp.int32(1), frames)
         return out[1], out[8]
 
     move = jax.jit(jax.vmap(move, in_axes=(0, 0, None, None)))
@@ -205,7 +201,7 @@ V024_FINGERPRINTS = {
         ),
     ),
     "plain2_b8": (
-        (plain2, 2, 40, {"jax_block_size": 8}),
+        (plain2, 2, 40, {"block_size": 8}),
         (
             "-0x1.7c3fac0000000p+1",
             4372,
@@ -310,26 +306,19 @@ def test_two_mode_resume_with_swap_matches_uninterrupted(tmp_path) -> None:
 # --- API ---
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"kernel": "python"},
-        {"jax_block_size": 1},
-        {"replacement_chains": 2},
-        {"rwalk_proposal": "isotropic"},
-    ],
-)
-def test_cluster_swap_off_the_fast_path(kwargs) -> None:
+def test_cluster_swap_needs_a_single_replacement_chain() -> None:
     with pytest.raises(NotImplementedError, match="cluster_swap"):
-        NestedSampler(plain2, lambda u: u, 2, nlive=20, cluster_swap=True, **kwargs)
+        NestedSampler(
+            plain2, lambda u: u, 2, nlive=20, cluster_swap=True, replacement_chains=2
+        )
     result = run_static_nested(
-        0, plain2, lambda u: u, 2, 20, maxiter=40, **kwargs
+        0, plain2, lambda u: u, 2, 20, maxiter=40, replacement_chains=2
     )
     assert result.metadata["cluster_swap"] is False
     assert "cluster_modes" not in result.metadata
 
 
-def test_old_checkpoint_without_cluster_swap_reads_as_off(tmp_path) -> None:
+def test_checkpoint_without_cluster_swap_is_rejected(tmp_path) -> None:
     import json
 
     path = tmp_path / "old.checkpoint.npz"
@@ -343,9 +332,8 @@ def test_old_checkpoint_without_cluster_swap_reads_as_off(tmp_path) -> None:
     fields["config_json"] = np.asarray(json.dumps(config))
     np.savez(path, **fields)
 
-    with pytest.raises(ValueError, match="cluster_swap"):
-        NestedSampler(plain2, lambda u: u, 2, nlive=20).resume(path, maxiter=96)
-    result = NestedSampler(plain2, lambda u: u, 2, nlive=20, cluster_swap=False).resume(
-        path, maxiter=96
-    )
-    assert result.metadata["cluster_swap"] is False
+    for cluster_swap in (None, False):
+        with pytest.raises(ValueError, match="cluster_swap"):
+            NestedSampler(
+                plain2, lambda u: u, 2, nlive=20, cluster_swap=cluster_swap
+            ).resume(path, maxiter=96)

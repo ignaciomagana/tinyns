@@ -1,4 +1,9 @@
-"""Lightweight static nested-sampling benchmarks for tinyns."""
+"""Lightweight static nested-sampling benchmarks for tinyns.
+
+Runs the default sampler on validation targets, optionally over a grid of
+``replacement_chains``, and reports wall time, call rates and replacement
+statistics.
+"""
 
 from __future__ import annotations
 
@@ -56,25 +61,23 @@ def _mean(values: list[float | int | None]) -> float | None:
 def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return grouped benchmark summaries, excluding warmup rows."""
 
-    grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in results:
         if row.get("warmup", False):
             continue
         key = (
             row["target"],
-            row["sampler"],
-            row.get("kernel", "python"),
+            int(row.get("block_size", 32)),
             int(row.get("replacement_chains", 1)),
         )
         grouped[key].append(row)
 
     summaries = []
-    for (target, sampler, kernel, replacement_chains), rows in sorted(grouped.items()):
+    for (target, block_size, replacement_chains), rows in sorted(grouped.items()):
         summaries.append(
             {
                 "target": target,
-                "sampler": sampler,
-                "kernel": kernel,
+                "block_size": block_size,
                 "replacement_chains": replacement_chains,
                 "nruns": len(rows),
                 "mean_seconds": _mean([row.get("seconds") for row in rows]),
@@ -113,12 +116,12 @@ def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     baselines = {
-        (row["target"], row["sampler"], row["kernel"]): row
+        (row["target"], row["block_size"]): row
         for row in summaries
         if row["replacement_chains"] == 1
     }
     for row in summaries:
-        baseline = baselines.get((row["target"], row["sampler"], row["kernel"]))
+        baseline = baselines.get((row["target"], row["block_size"]))
         row["relative_speedup_vs_chains1"] = None
         row["relative_iter_s_vs_chains1"] = None
         if baseline is not None:
@@ -141,27 +144,8 @@ def build_payload(
     return {"results": results, "summaries": summaries}
 
 
-def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, Any]:
-    kwargs = {
-        "sample": sampler_name,
-        "nlive": args.nlive,
-        "max_attempts": args.max_attempts,
-        "step_scale": args.step_scale,
-        "min_accepts": args.min_accepts,
-        "kernel": args.kernel,
-        "replacement_chains": args.replacement_chains,
-        "replacement_chain_schedule": args.replacement_chain_schedule,
-        "rwalk_proposal": args.rwalk_proposal,
-        "jax_block_size": 1,
-    }
-    if sampler_name == "rwalk":
-        kwargs["walks"] = args.walks
-    return kwargs
-
-
 def run_one(
     target_name: str,
-    sampler_name: str,
     seed: int,
     args: argparse.Namespace,
     *,
@@ -174,7 +158,10 @@ def run_one(
         target.loglike,
         target.prior_transform,
         ndim=target.ndim,
-        **_sampler_kwargs(sampler_name, args),
+        nlive=args.nlive,
+        walks=args.walks,
+        replacement_chains=args.replacement_chains,
+        block_size=args.block_size,
     )
 
     start = time.perf_counter()
@@ -193,11 +180,7 @@ def run_one(
         niter = int(niter)
     iter_per_s, ncall_per_s = compute_rates(niter, int(result.ncall), seconds)
     warnings = diagnostics.get("warnings", [])
-    replacement_batch_ncall = int(
-        diagnostics.get("replacement_batch_ncall")
-        or metadata.get("replacement_batch_ncall")
-        or (args.walks * args.replacement_chains)
-    )
+    replacement_batch_ncall = int(metadata["replacement_batch_ncall"])
     mean_replacement_ncall = float(metadata.get("mean_replacement_ncall", 0.0))
     max_replacement_ncall = int(metadata.get("max_replacement_ncall", 0))
     repl_batches = metadata.get("mean_replacement_batches")
@@ -217,31 +200,22 @@ def run_one(
 
     return {
         "target": target_name,
-        "sampler": sampler_name,
-        "kernel": args.kernel,
         "seed": seed,
         "nlive": args.nlive,
         "ndim": target.ndim,
         "dlogz": args.dlogz,
         "maxiter": args.maxiter,
-        "walks": args.walks,
-        "step_scale": args.step_scale,
-        "min_accepts": args.min_accepts,
+        "walks": metadata.get("walks"),
         "replacement_chains": args.replacement_chains,
-        "adaptive_replacement_chains": bool(
-            args.replacement_chain_schedule is not None
-        ),
-        "replacement_chain_schedule": args.replacement_chain_schedule,
+        "block_size": args.block_size,
         "replacement_batch_ncall": replacement_batch_ncall,
-        "replacement_initial_batch_ncall": metadata.get(
-            "replacement_initial_batch_ncall"
-        ),
-        "replacement_max_batch_ncall": metadata.get("replacement_max_batch_ncall"),
         "repl_batches": repl_batches,
         "max_repl_batches": max_repl_batches,
         "mean_replacement_batches": repl_batches,
         "max_replacement_batches": max_repl_batches,
         "seconds": seconds,
+        "compile_s": metadata.get("compile_s"),
+        "mean_ms_per_call": metadata.get("mean_ms_per_call"),
         "ncall": int(result.ncall),
         "niter": niter,
         "ndead": diagnostics.get("ndead"),
@@ -249,11 +223,6 @@ def run_one(
         "likelihood_calls_per_second": ncall_per_s,
         "mean_replacement_ncall": mean_replacement_ncall,
         "max_replacement_ncall": max_replacement_ncall,
-        "mean_replacement_chains_used": metadata.get("mean_replacement_chains_used"),
-        "max_replacement_chains_used": metadata.get("max_replacement_chains_used"),
-        "replacement_chain_usage_counts": metadata.get(
-            "replacement_chain_usage_counts"
-        ),
         "replacement_failures": int(metadata.get("replacement_failures", 0)),
         "logz": float(result.logz),
         "logzerr": float(result.logzerr),
@@ -275,26 +244,20 @@ def _fmt(value: Any, precision: int = 3) -> str:
 
 def print_results(results: list[dict[str, Any]]) -> None:
     print(
-        "target sampler kernel replacement_chains seed seconds niter ncall iter/s "
-        "ncall/s repl_ncall repl_batches max_repl_batches mean_repl_chains "
-        "max_repl_chains usage adaptive initial_batch max_batch logz logzerr "
+        "target block_size replacement_chains seed seconds compile_s niter ncall "
+        "iter/s ncall/s repl_ncall repl_batches max_repl_batches logz logzerr "
         "success warnings"
     )
     for row in results:
         print(
-            f"{row['target']} {row['sampler']} {row['kernel']} "
+            f"{row['target']} {row['block_size']} "
             f"{row['replacement_chains']} {row['seed']} "
-            f"{_fmt(row['seconds'])} {_fmt(row['niter'])} {row['ncall']} "
+            f"{_fmt(row['seconds'])} {_fmt(row.get('compile_s'))} "
+            f"{_fmt(row['niter'])} {row['ncall']} "
             f"{_fmt(row['iterations_per_second'])} "
             f"{_fmt(row['likelihood_calls_per_second'])} "
             f"{_fmt(row['mean_replacement_ncall'])} {_fmt(row['repl_batches'])} "
             f"{_fmt(row['max_repl_batches'])} "
-            f"{_fmt(row.get('mean_replacement_chains_used'))} "
-            f"{_fmt(row.get('max_replacement_chains_used'))} "
-            f"{row.get('replacement_chain_usage_counts')} "
-            f"{row.get('adaptive_replacement_chains')} "
-            f"{_fmt(row.get('replacement_initial_batch_ncall'))} "
-            f"{_fmt(row.get('replacement_max_batch_ncall'))} "
             f"{_fmt(row['logz'])} {_fmt(row['logzerr'])} "
             f"{row['success']} {row['warning_count']}"
         )
@@ -303,14 +266,14 @@ def print_results(results: list[dict[str, Any]]) -> None:
 def print_summaries(summaries: list[dict[str, Any]]) -> None:
     print()
     print(
-        "target sampler kernel replacement_chains nruns mean_seconds mean_iter_per_s "
+        "target block_size replacement_chains nruns mean_seconds mean_iter_per_s "
         "mean_ncall_per_s mean_ncall mean_repl_ncall mean_repl_batches "
         "max_repl_batches success_fraction relative_speedup_vs_chains1 "
         "relative_iter_s_vs_chains1"
     )
     for row in summaries:
         print(
-            f"{row['target']} {row['sampler']} {row['kernel']} "
+            f"{row['target']} {row['block_size']} "
             f"{row['replacement_chains']} {row['nruns']} "
             f"{_fmt(row['mean_seconds'])} {_fmt(row['mean_iter_per_s'])} "
             f"{_fmt(row['mean_ncall_per_s'])} {_fmt(row['mean_ncall'])} "
@@ -326,69 +289,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--targets", nargs="+", default=["gaussian2d", "correlated_gaussian2d"]
     )
-    parser.add_argument(
-        "--samplers", nargs="+", choices=["prior", "rwalk"], default=["prior", "rwalk"]
-    )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--nlive", type=int, default=200)
     parser.add_argument("--dlogz", type=float, default=0.1)
     parser.add_argument("--maxiter", type=int, default=None)
-    parser.add_argument("--walks", type=int, default=25)
-    parser.add_argument("--step-scale", type=float, default=0.1)
-    parser.add_argument("--min-accepts", type=int, default=1)
+    parser.add_argument(
+        "--walks", type=int, default=None, help="Default: the sampler default."
+    )
     parser.add_argument("--replacement-chains", type=int, default=1)
-    parser.add_argument(
-        "--rwalk-proposal", choices=["isotropic"], default="isotropic"
-    )
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
-    parser.add_argument(
-        "--replacement-chain-schedule", nargs="+", type=int, default=None
-    )
+    parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--discard-warmup", action="store_true")
-    parser.add_argument("--max-attempts", type=int, default=10000)
-    parser.add_argument(
-        "--auto-max-attempts",
-        action="store_true",
-        help=(
-            "Benchmark convenience for JAX rwalk chain sweeps: raise "
-            "--max-attempts to at least four replacement batches when needed."
-        ),
-    )
-    parser.add_argument("--kernel", choices=["python", "jax"], default="python")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--progress", action="store_true")
     return parser.parse_args(argv)
-
-
-def validate_benchmark_args(args: argparse.Namespace) -> None:
-    """Validate benchmark-only argument combinations before running cases."""
-
-    replacement_chains_values = (
-        [args.replacement_chains]
-        if args.replacement_chain_schedule is not None
-        else args.replacement_chains_grid
-        if args.replacement_chains_grid is not None
-        else [args.replacement_chains]
-    )
-    max_replacement_chains = max(
-        args.replacement_chain_schedule
-        if args.replacement_chain_schedule is not None
-        else replacement_chains_values
-    )
-    required_max_attempts = args.walks * max_replacement_chains
-
-    if args.kernel == "jax" and "rwalk" in args.samplers:
-        if args.auto_max_attempts:
-            args.max_attempts = max(args.max_attempts, 4 * required_max_attempts)
-        elif args.max_attempts < required_max_attempts:
-            raise ValueError(
-                "--max-attempts must be at least walks * max(replacement_chains). "
-                f"Got max_attempts={args.max_attempts}, walks={args.walks}, "
-                f"max replacement_chains={max_replacement_chains}, "
-                f"required={required_max_attempts}. "
-                f"Try --max-attempts {required_max_attempts} or larger."
-            )
 
 
 def _args_for_replacement_chains(
@@ -401,39 +316,29 @@ def _args_for_replacement_chains(
 
 def _run_benchmark_grid(args: argparse.Namespace) -> list[dict[str, Any]]:
     replacement_chains_values = (
-        [args.replacement_chains]
-        if args.replacement_chain_schedule is not None
-        else args.replacement_chains_grid
+        args.replacement_chains_grid
         if args.replacement_chains_grid is not None
         else [args.replacement_chains]
     )
     results: list[dict[str, Any]] = []
     for target_name in args.targets:
-        for sampler_name in args.samplers:
-            for replacement_chains in replacement_chains_values:
-                case_args = _args_for_replacement_chains(args, replacement_chains)
-                warmup_rows = [
-                    run_one(
-                        target_name,
-                        sampler_name,
-                        -(warmup_index + 1),
-                        case_args,
-                        warmup=True,
-                    )
-                    for warmup_index in range(args.warmup_runs)
-                ]
-                if not args.discard_warmup:
-                    results.extend(warmup_rows)
-                results.extend(
-                    run_one(target_name, sampler_name, seed, case_args, warmup=False)
-                    for seed in args.seeds
-                )
+        for replacement_chains in replacement_chains_values:
+            case_args = _args_for_replacement_chains(args, replacement_chains)
+            warmup_rows = [
+                run_one(target_name, -(warmup_index + 1), case_args, warmup=True)
+                for warmup_index in range(args.warmup_runs)
+            ]
+            if not args.discard_warmup:
+                results.extend(warmup_rows)
+            results.extend(
+                run_one(target_name, seed, case_args, warmup=False)
+                for seed in args.seeds
+            )
     return results
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    validate_benchmark_args(args)
     results = _run_benchmark_grid(args)
     summaries = summarize_results(results)
     print_results(results)
