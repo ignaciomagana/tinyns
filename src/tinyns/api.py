@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import dataclasses
 import difflib
 from typing import Any
 
-from tinyns import loop
+from tinyns import checkpoint, loop
 from tinyns.core import Config
 from tinyns.result import NestedSamplingResult
-from tinyns.state import load_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
 
 _KNOWN_KWARGS = frozenset(("walks", "replacement_chains", "block_size", "cluster_swap"))
@@ -120,18 +118,6 @@ class NestedSampler:
             checkpoint_interval=checkpoint_interval,
         )
 
-    def _checkpoint_config(self) -> dict[str, object]:
-        return dataclasses.asdict(self._config)
-
-    def _validate_checkpoint_config(self, checkpoint_config: dict) -> None:
-        for name, current_value in self._checkpoint_config().items():
-            checkpoint_value = checkpoint_config.get(name)
-            if checkpoint_value != current_value:
-                raise ValueError(
-                    f"checkpoint {name}={checkpoint_value!r} is not "
-                    f"compatible with sampler {name}={current_value!r}"
-                )
-
     def resume(
         self,
         checkpoint_path,
@@ -145,15 +131,18 @@ class NestedSampler:
         checkpoint_path_out=None,
         checkpoint_interval: int = 100,
     ) -> NestedSamplingResult:
-        """Resume nested sampling from an active checkpoint ``.npz`` file."""
+        """Resume nested sampling from a ``tinyns-ckpt-2`` checkpoint file.
 
-        state, checkpoint_config = load_checkpoint_npz(checkpoint_path)
-        self._validate_checkpoint_config(checkpoint_config)
-        if not state.success and state.replacement_failures:
-            raise ValueError(
-                "cannot resume checkpoint saved after replacement failure: "
-                f"{state.message}"
-            )
+        The checkpoint's ``ndim``, ``nlive``, ``walks``, ``replacement_chains``,
+        ``block_size`` and ``cluster_swap`` must match this sampler's, or a
+        ``ValueError`` names the key that differs. The callables are not saved
+        and cannot be checked: pass the ``loglike`` and ``prior_transform`` the
+        run started with. A checkpoint saved after a replacement failure cannot
+        be resumed, and files written before tinyns v0.3 are not read.
+        """
+
+        ckpt = checkpoint.load(checkpoint_path)
+        checkpoint.check_config(ckpt.config, self._config)
         output_path = (
             checkpoint_path if checkpoint_path_out is None else checkpoint_path_out
         )
@@ -170,5 +159,5 @@ class NestedSampler:
             callback_interval=callback_interval,
             checkpoint_path=output_path,
             checkpoint_interval=checkpoint_interval,
-            resume_state=state,
+            resume=ckpt,
         )

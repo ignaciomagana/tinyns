@@ -10,10 +10,9 @@ import pytest
 from jax import random
 from tests.helpers import run_ns
 
-from tinyns import NestedSampler, clusters, core
+from tinyns import NestedSampler, checkpoint, clusters, core
 from tinyns.callables import _callable_specs
 from tinyns.core import _chain_kernel
-from tinyns.state import load_checkpoint_npz
 
 # --- the swap kernel leaves the constrained prior invariant ---
 
@@ -318,9 +317,9 @@ def test_two_mode_resume_with_swap_matches_uninterrupted(tmp_path) -> None:
     sampler = NestedSampler(two_modes, lambda u: u, 3, nlive=200)
     full = sampler.run(5, maxiter=1600, dlogz=0.0)
     sampler.run(5, maxiter=1024, dlogz=0.0, checkpoint_path=path)
-    state, config = load_checkpoint_npz(path)
-    assert config["cluster_swap"] is True
-    assert len(state.clusters["log"]["ids"]) == 2  # resumed with the swap on
+    ckpt = checkpoint.load(path)
+    assert ckpt.config["cluster_swap"] is True
+    assert len(ckpt.ext["clusters"]["log"]["ids"]) == 2  # resumed with the swap on
     resumed = sampler.resume(path, maxiter=1600, dlogz=0.0)
 
     assert resumed.metadata["cluster_swap_accepts"] > 0

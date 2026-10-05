@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import jax.numpy as jnp
@@ -46,7 +47,7 @@ def test_nested_sampler_stores_configuration() -> None:
     assert sampler.prior_transform is prior_transform
     assert sampler.ndim == 3
     assert sampler.nlive == 500
-    assert sampler._checkpoint_config() == {
+    assert dataclasses.asdict(sampler._config) == {
         "ndim": 3,
         "nlive": 500,
         "walks": 12,
@@ -180,7 +181,7 @@ def test_loop_run_defaults_match_nested_sampler() -> None:
 def test_default_walks_is_max_25_or_six_ndim(ndim: int, walks: int) -> None:
     sampler = NestedSampler(_jax_gaussian_loglike, _jax_box_prior, ndim=ndim)
 
-    assert sampler._checkpoint_config()["walks"] == walks
+    assert dataclasses.asdict(sampler._config)["walks"] == walks
 
 
 def test_default_walks_reaches_run_metadata() -> None:
