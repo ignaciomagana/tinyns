@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import json
 
-import pytest
 from benchmarks.bench_static import (
     build_payload,
     compute_rates,
     main,
     parse_args,
     summarize_results,
-    validate_benchmark_args,
 )
 
 
@@ -24,7 +22,6 @@ def test_summarize_results_groups_means_and_success_fraction() -> None:
     rows = [
         {
             "target": "gaussian2d",
-            "sampler": "rwalk",
             "seconds": 2.0,
             "iterations_per_second": 5.0,
             "likelihood_calls_per_second": 50.0,
@@ -37,7 +34,6 @@ def test_summarize_results_groups_means_and_success_fraction() -> None:
         },
         {
             "target": "gaussian2d",
-            "sampler": "rwalk",
             "seconds": 2.0,
             "iterations_per_second": 5.0,
             "likelihood_calls_per_second": 50.0,
@@ -49,7 +45,6 @@ def test_summarize_results_groups_means_and_success_fraction() -> None:
         },
         {
             "target": "gaussian2d",
-            "sampler": "rwalk",
             "seconds": 4.0,
             "iterations_per_second": 10.0,
             "likelihood_calls_per_second": 100.0,
@@ -84,44 +79,13 @@ def test_build_payload() -> None:
     }
 
 
-def test_cli_smoke_tiny_settings_writes_json(tmp_path) -> None:
+def test_cli_smoke_writes_json(tmp_path) -> None:
     output = tmp_path / "bench.json"
 
     main(
         [
             "--targets",
             "gaussian2d",
-            "--samplers",
-            "prior",
-            "--seeds",
-            "0",
-            "--nlive",
-            "20",
-            "--maxiter",
-            "5",
-            "--output",
-            str(output),
-        ]
-    )
-
-    assert output.exists()
-    payload = json.loads(output.read_text())
-    assert "results" in payload
-    assert len(payload["results"]) == 1
-    assert payload["results"][0]["warmup"] is False
-
-
-def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
-    output = tmp_path / "bench_jax.json"
-
-    main(
-        [
-            "--targets",
-            "gaussian2d",
-            "--samplers",
-            "rwalk",
-            "--kernel",
-            "jax",
             "--seeds",
             "0",
             "--nlive",
@@ -130,6 +94,8 @@ def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
             "10",
             "--walks",
             "5",
+            "--block-size",
+            "8",
             "--output",
             str(output),
         ]
@@ -138,14 +104,22 @@ def test_cli_smoke_jax_rwalk_success_writes_json(tmp_path) -> None:
     payload = json.loads(output.read_text())
     assert len(payload["results"]) == 1
     row = payload["results"][0]
-    assert row["kernel"] == "jax"
+    assert row["warmup"] is False
     assert row["success"] is True
-    assert "replacement_chains" in row
-    assert "replacement_batch_ncall" in row
-    assert "repl_batches" in row
-    assert "max_repl_batches" in row
-    assert "mean_replacement_batches" in row
-    assert "max_replacement_batches" in row
+    assert row["block_size"] == 8
+    assert row["walks"] == 5
+    assert row["replacement_chains"] == 1
+    assert row["replacement_batch_ncall"] == 5
+    for key in (
+        "repl_batches",
+        "max_repl_batches",
+        "mean_replacement_batches",
+        "max_replacement_batches",
+        "compile_s",
+        "mean_ms_per_call",
+    ):
+        assert key in row
+    assert payload["summaries"][0]["block_size"] == 8
 
 
 def test_benchmark_parser_accepts_replacement_chains() -> None:
@@ -167,82 +141,10 @@ def test_benchmark_parser_accepts_replacement_chains_grid() -> None:
     assert args.replacement_chains_grid == [1, 4, 16]
 
 
-def test_validate_benchmark_args_accepts_safe_replacement_chains_grid() -> None:
-    args = parse_args(
-        [
-            "--samplers",
-            "rwalk",
-            "--kernel",
-            "jax",
-            "--replacement-chains-grid",
-            "1",
-            "4",
-            "16",
-            "--walks",
-            "25",
-            "--max-attempts",
-            "10000",
-        ]
-    )
-
-    validate_benchmark_args(args)
-
-    assert args.max_attempts == 10000
-
-
-def test_validate_benchmark_args_rejects_unsafe_replacement_chains_grid() -> None:
-    args = parse_args(
-        [
-            "--samplers",
-            "rwalk",
-            "--kernel",
-            "jax",
-            "--replacement-chains-grid",
-            "1024",
-            "--walks",
-            "25",
-            "--max-attempts",
-            "10000",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="25600") as exc_info:
-        validate_benchmark_args(args)
-
-    message = str(exc_info.value)
-    assert "--max-attempts must be at least walks * max(replacement_chains)" in message
-    assert "required=25600" in message
-    assert "Try --max-attempts 25600 or larger" in message
-
-
-def test_validate_benchmark_args_auto_max_attempts_uses_four_batches() -> None:
-    args = parse_args(
-        [
-            "--samplers",
-            "rwalk",
-            "--kernel",
-            "jax",
-            "--replacement-chains-grid",
-            "1024",
-            "--walks",
-            "25",
-            "--max-attempts",
-            "10000",
-            "--auto-max-attempts",
-        ]
-    )
-
-    validate_benchmark_args(args)
-
-    assert args.max_attempts == 102400
-
-
 def test_summarize_results_groups_replacement_chains_separately() -> None:
     rows = [
         {
             "target": "gaussian2d",
-            "sampler": "rwalk",
-            "kernel": "jax",
             "replacement_chains": 1,
             "seconds": 4.0,
             "iterations_per_second": 5.0,
@@ -256,8 +158,6 @@ def test_summarize_results_groups_replacement_chains_separately() -> None:
         },
         {
             "target": "gaussian2d",
-            "sampler": "rwalk",
-            "kernel": "jax",
             "replacement_chains": 4,
             "seconds": 2.0,
             "iterations_per_second": 20.0,
@@ -281,13 +181,14 @@ def test_summarize_results_groups_replacement_chains_separately() -> None:
 
 
 def test_overnight_jax_validation_parser_defaults_are_safe() -> None:
-    from benchmarks.overnight_jax_validation import parse_args
+    from benchmarks.overnight_jax_validation import build_configs, parse_args
 
     args = parse_args([])
 
     assert args.nlive <= 25
     assert args.maxiter <= 10
-    assert args.include_block is False
+    assert args.block_sizes == [32]
+    assert [config.name for config in build_configs(args)] == ["live_cov_B32"]
 
 
 def test_overnight_jax_validation_quick_writes_expected_keys(tmp_path) -> None:
@@ -306,6 +207,9 @@ def test_overnight_jax_validation_quick_writes_expected_keys(tmp_path) -> None:
             "20",
             "--maxiter",
             "5",
+            "--block-sizes",
+            "1",
+            "4",
             "--output",
             str(output),
         ]
@@ -313,7 +217,7 @@ def test_overnight_jax_validation_quick_writes_expected_keys(tmp_path) -> None:
 
     assert output.exists()
     rows = json.loads(output.read_text())
-    assert rows
+    assert [row["config_name"] for row in rows] == ["live_cov_B1", "live_cov_B4"]
     for key in EXPECTED_KEYS:
         assert key in rows[0]
 
@@ -323,15 +227,15 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
 ) -> None:
     from benchmarks.summarize_overnight_jax_validation import main
 
-    no_block = tmp_path / "overnight_jax_validation_no_block.json"
-    block = tmp_path / "overnight_jax_validation_block_B16.json"
+    no_block = tmp_path / "overnight_jax_validation_B1.json"
+    block = tmp_path / "overnight_jax_validation_B16.json"
     csv_path = tmp_path / "summary.csv"
     no_block.write_text(
         json.dumps(
             [
                 {
                     "target": "gaussian2d",
-                    "config_name": "unbounded_isotropic_rwalk",
+                    "config_name": "live_cov_B1",
                     "seconds": 4.0,
                     "ncall": 40,
                     "niter": 10,
@@ -345,7 +249,7 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
                 },
                 {
                     "target": "gaussian2d",
-                    "config_name": "unbounded_isotropic_rwalk",
+                    "config_name": "live_cov_B1",
                     "seconds": 2.0,
                     "ncall": 20,
                     "niter": 8,
@@ -359,7 +263,7 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
                 },
                 {
                     "target": "ring2d",
-                    "config_name": "unbounded_isotropic_rwalk",
+                    "config_name": "live_cov_B1",
                     "seconds": 1.0,
                     "ncall": 10,
                     "niter": 4,
@@ -378,7 +282,7 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
                 "results": [
                     {
                         "target": "gaussian2d",
-                        "config_name": "block_jax_rwalk_unbounded",
+                        "config_name": "live_cov_B16",
                         "seconds": 1.0,
                         "ncall": 10,
                         "niter": 6,
@@ -401,8 +305,8 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
     assert "Overall by file/target/config" in captured.out
     assert "Accuracy on analytic targets" in captured.out
     assert "Per-target fastest passing config" in captured.out
-    assert "no_block" in captured.out
-    assert "block_B16" in captured.out
+    assert "B1" in captured.out
+    assert "B16" in captured.out
     assert "success_rate" in captured.out
     assert "0.5" in captured.out
     assert "replacement_failures_total=1" in captured.out
@@ -410,4 +314,4 @@ def test_summarize_overnight_jax_validation_prints_tables_and_csv(
     assert "ring2d" in captured.out
     csv_text = csv_path.read_text()
     assert "run_label,target,config_name" in csv_text
-    assert "no_block,gaussian2d,unbounded_isotropic_rwalk" in csv_text
+    assert "B1,gaussian2d,live_cov_B1" in csv_text

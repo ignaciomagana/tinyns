@@ -19,36 +19,34 @@ python validation/run_validation.py --output validation_results.json
 python validation/summarize_validation.py validation_results.json
 ```
 
-Recommended smoke-to-medium validation command for JAX-native users:
+Every run uses the default sampler (live-cov rwalk in jitted blocks). The
+harness exposes the sampler's own knobs: `--walks` (default: the sampler
+default, `max(25, 6 * ndim)`), `--replacement-chains` and `--block-size`.
+
+Recommended smoke-to-medium validation command:
 
 ```bash
 python validation/run_validation.py \
   --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
-  --samplers rwalk \
-  --kernel jax \
   --seeds 0 1 2 3 4 5 6 7 8 9 \
   --nlive 200 \
   --dlogz 0.1 \
-  --output validation_rwalk_jax_fulltargets_nlive200_dlogz01.json
+  --output validation_fulltargets_nlive200_dlogz01.json
 
 python validation/summarize_validation.py \
-  validation_rwalk_jax_fulltargets_nlive200_dlogz01.json
+  validation_fulltargets_nlive200_dlogz01.json
 ```
 
-This is the recommended smoke-to-medium validation command for JAX-native users.
-
-Batched JAX replacement-chain validation example:
+Batched replacement-chain validation example:
 
 ```bash
 python validation/run_validation.py \
   --targets gaussian2d correlated_gaussian2d \
-  --samplers rwalk \
-  --kernel jax \
   --replacement-chains 16 \
   --seeds 0 1 2 3 4 \
   --nlive 200 \
   --dlogz 0.1 \
-  --output validation_rwalk_jax_chains16.json
+  --output validation_chains16.json
 ```
 
 
@@ -70,12 +68,6 @@ Useful warning signs:
 The recommendation column is heuristic and should be treated as a debugging aid,
 not a formal statistical test.
 
-Repeated-seed validation currently separates the recommended path from baselines and reference-only samplers:
-
-- `sample="rwalk", kernel="jax"`: JAX rwalk; this harness runs it with isotropic proposals and `jax_block_size=1` (the sampler default is live-cov with `jax_block_size=32`)
-- `sample="rwalk", kernel="python"`: simple CPU/Python correctness/debug baseline
-- `sample="prior"`: conceptual brute-force constrained-prior baseline
-
 `ring2d` is a qualitative annulus target. It is useful for checking whether constrained-replacement samplers can move around curved shell-like likelihood regions. If no analytic evidence is provided, use posterior diagnostics, insertion-rank behavior, and repeated-run stability rather than z-scores.
 
 
@@ -92,19 +84,19 @@ Qualitative targets such as `ring2d` may not have analytic evidence references. 
 ## Comparing sampler settings
 
 Use `validation/compare_validation.py` to compare settings such as
-`min_accepts=1` and `min_accepts=3`.
+`walks=25` and `walks=50`.
 
 A setting is not better merely because it performs more accepted local moves.
 Prefer settings that improve coverage, reduce large evidence z-scores, and keep
 likelihood-call cost reasonable.
 
-To compare two validation runs, for example `min_accepts=1` versus
-`min_accepts=3`:
+To compare two validation runs, for example `--walks 25` versus
+`--walks 50`:
 
 ```bash
 python validation/compare_validation.py \
-  validation_min_accepts1.json validation_min_accepts3.json \
-  --labels min1 min3
+  validation_walks25.json validation_walks50.json \
+  --labels w25 w50
 ```
 
 The comparison table reports changes in coverage, absolute evidence error,

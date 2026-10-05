@@ -20,7 +20,7 @@ def prior_transform(u):
 
 def loglike(theta):
     # Replace this placeholder with your expensive JAX likelihood.
-    # Keep it JAX-compatible if using kernel="jax".
+    # It must be JAX-traceable: tinyns vmaps and jits it.
     return -0.5 * jnp.sum(theta**2) - 0.5 * theta.shape[0] * jnp.log(2.0 * jnp.pi)
 
 
@@ -28,18 +28,7 @@ def main():
     ndim = 2
     key = jax.random.PRNGKey(0)
 
-    sampler = NestedSampler(
-        loglike,
-        prior_transform,
-        ndim,
-        nlive=500,
-        sample="rwalk",
-        kernel="jax",
-        walks=5,
-        replacement_chains=1,
-        rwalk_proposal="isotropic",
-        jax_block_size=32,
-    )
+    sampler = NestedSampler(loglike, prior_transform, ndim, nlive=500)
 
     start = time.perf_counter()
     result = sampler.run(key, dlogz=0.1)

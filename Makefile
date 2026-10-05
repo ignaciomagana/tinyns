@@ -5,7 +5,7 @@ test:
 	pytest
 
 quick-validation:
-	python benchmarks/overnight_jax_validation.py --quick --include-block --output quick_validation.json
+	python benchmarks/overnight_jax_validation.py --quick --output quick_validation.json
 
 overnight-b32:
 	python benchmarks/overnight_jax_validation.py \
@@ -14,9 +14,8 @@ overnight-b32:
 	  --nlive 500 \
 	  --dlogz 0.1 \
 	  --maxiter 10000 \
-	  --include-block \
-	  --jax-block-size 32 \
-	  --output overnight_jax_validation_block_B32.json
+	  --block-sizes 32 \
+	  --output overnight_jax_validation_B32.json
 
 overnight-b16:
 	python benchmarks/overnight_jax_validation.py \
@@ -25,9 +24,8 @@ overnight-b16:
 	  --nlive 500 \
 	  --dlogz 0.1 \
 	  --maxiter 10000 \
-	  --include-block \
-	  --jax-block-size 16 \
-	  --output overnight_jax_validation_block_B16.json
+	  --block-sizes 16 \
+	  --output overnight_jax_validation_B16.json
 
 overnight-comparison:
 	python benchmarks/overnight_jax_validation.py \
@@ -36,10 +34,11 @@ overnight-comparison:
 	  --nlive 500 \
 	  --dlogz 0.1 \
 	  --maxiter 10000 \
-	  --output overnight_jax_validation_no_block.json
+	  --block-sizes 1 \
+	  --output overnight_jax_validation_B1.json
 
 summarize-overnight:
 	python benchmarks/summarize_overnight_jax_validation.py \
-	  overnight_jax_validation_no_block.json \
-	  overnight_jax_validation_block_B16.json \
-	  overnight_jax_validation_block_B32.json
+	  overnight_jax_validation_B1.json \
+	  overnight_jax_validation_B16.json \
+	  overnight_jax_validation_B32.json

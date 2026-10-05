@@ -64,10 +64,8 @@ def test_validation_cli_smoke_writes_replacement_batch_fields(tmp_path) -> None:
     main([
         "--targets",
         "gaussian2d",
-        "--samplers",
-        "rwalk",
-        "--kernel",
-        "jax",
+        "--block-size",
+        "4",
         "--replacement-chains",
         "2",
         "--seeds",
@@ -85,5 +83,7 @@ def test_validation_cli_smoke_writes_replacement_batch_fields(tmp_path) -> None:
     payload = __import__("json").loads(output.read_text())
     rows = payload["results"]
     assert len(rows) == 1
-    assert "replacement_batch_ncall" in rows[0]
+    assert rows[0]["block_size"] == 4
+    assert rows[0]["walks"] == 5
+    assert rows[0]["replacement_batch_ncall"] == 10
     assert "replacement_mean_batches" in rows[0]
