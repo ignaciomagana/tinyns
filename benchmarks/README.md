@@ -102,7 +102,7 @@ By default, the wrapper writes timestamped JSON results under `benchmarks/result
 
 ### Cached JAX block rwalk validation recipes
 
-These recipes are documentation-only validation workflows for the unbounded JAX `rwalk` path with isotropic proposals. They should be run manually, not in CI. Optional Makefile shortcuts are available for the common workflows: `make quick-validation`, `make overnight-b32`, `make overnight-b16`, `make overnight-comparison`, and `make summarize-overnight`. The explicit commands remain below for transparency and copy-paste use. The isotropic cached-block path they validate on the included benchmark targets is:
+These recipes are documentation-only validation workflows for the JAX `rwalk` path with isotropic proposals. They should be run manually, not in CI. Optional Makefile shortcuts are available for the common workflows: `make quick-validation`, `make overnight-b32`, `make overnight-b16`, `make overnight-comparison`, and `make summarize-overnight`. The explicit commands remain below for transparency and copy-paste use. The isotropic cached-block path they validate on the included benchmark targets is:
 
 ```text
 sample="rwalk"
@@ -115,12 +115,12 @@ jax_block_size=32
 
 This was the recommended fast path before live-cov became the default (see the top-level README). Its fixed unit-cube step does not follow the contracting live set, so at d >= 4 its acceptance collapses and its cost per iteration grows geometrically. The results below come from the 2D targets.
 
-Recent validation found `jax_block_size=32` fastest overall among the validated unbounded cached JAX block runs, with `jax_block_size=16` slightly more conservative. Ordinary no-block isotropic `rwalk` was much slower in that validation. The Live-cov row below used an earlier live-cov proposal that reflected moves at the unit-cube faces; it has been removed and does not describe the current default, which rejects such moves. Bounded/fused bounded paths remain experimental and should not be promoted from these results.
+Recent validation found `jax_block_size=32` fastest overall among the validated cached JAX block runs, with `jax_block_size=16` slightly more conservative. Ordinary no-block isotropic `rwalk` was much slower in that validation. The Live-cov row below used an earlier live-cov proposal that reflected moves at the unit-cube faces; it has been removed and does not describe the current default, which rejects such moves.
 
 
 #### Post-cleanup overnight validation
 
-After removing slice/rslice and the legacy `sample="bound"` mode, the then-recommended unbounded isotropic cached-block JAX rwalk path was rerun on the included validation targets. The B32 path remained fully successful across 50 runs, with zero replacement failures and evidence diagnostics consistent with the no-block isotropic baseline. Timing means exclude first-run compile/warmup outliers. Success and replacement-failure counts include all runs.
+After removing slice/rslice and the legacy `sample="bound"` mode, the then-recommended isotropic cached-block JAX rwalk path was rerun on the included validation targets. The B32 path remained fully successful across 50 runs, with zero replacement failures and evidence diagnostics consistent with the no-block isotropic baseline. Timing means exclude first-run compile/warmup outliers. Success and replacement-failure counts include all runs.
 
 | Config | Success | Replacement failures | Mean sec | Mean ncall | Analytic RMS pull | Max abs pull | Status |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -129,9 +129,6 @@ After removing slice/rslice and the legacy `sample="bound"` mode, the then-recom
 | No-block isotropic | 50/50 | 0 | ~20.66 | ~34,636 | ~1.23 | ~2.56 | Clean but slower |
 | Live-cov (reflected, removed) | 50/50 | 0 | ~19.82 | ~15,582 | ~3.27 | ~7.97 | Removed; do not promote |
 | Adaptive rwalk | 50/50 | 0 | ~24.28 | ~40,187 | ~1.35 | ~2.24 | Experimental |
-| Single bound | 50/50 | 0 | ~72.33 | ~392,211 | ~1.36 | ~2.90 | Experimental; slow |
-| Multi bound | 50/50 | 0 | ~83.62 | ~392,554 | ~1.37 | ~2.97 | Experimental; slow |
-| Fused bounded | 49/50 | 1 | ~95.72 | ~392,229 | ~1.37 | ~2.97 | Experimental; one known failure |
 
 B32 was about 5x faster than the no-block isotropic JAX rwalk baseline while preserving the same analytic evidence behavior. B32 was also about 6–7% faster than B16, at the cost of only about 1.4% more scalar likelihood calls.
 
@@ -143,15 +140,15 @@ B32 was about 5x faster than the no-block isotropic JAX rwalk baseline while pre
 | banana2d | ~5.05x |
 | eggbox2d | ~3.82x |
 
-These results support keeping `jax_block_size=32` as the recommended fast path for unbounded JAX rwalk on the included benchmark targets. `jax_block_size=16` remains a conservative fallback. `jax_block_size=1` disables block mode.
+These results support keeping `jax_block_size=32` as the recommended fast path for JAX rwalk on the included benchmark targets. `jax_block_size=16` remains a conservative fallback. `jax_block_size=1` disables block mode.
 
-These results do not promote bounds, fused bounds, or bounded block mode. The reflected live-cov proposal had concerning analytic pull behavior and was removed, and fused bounded still had one eggbox replacement failure. Experimental settings still require target-specific validation.
+The reflected live-cov proposal had concerning analytic pull behavior and was removed. Experimental settings still require target-specific validation.
 
-On rare constrained-replacement failures, the unbounded JAX `rwalk` block path may retry the same contour with an internal smaller-step/longer-walk rescue schedule before declaring failure. Rescue usage is recorded in result metadata. This is a robustness mechanism, not a substitute for target-specific mixing validation.
+On rare constrained-replacement failures, the JAX `rwalk` block path may retry the same contour with an internal smaller-step/longer-walk rescue schedule before declaring failure. Rescue usage is recorded in result metadata. This is a robustness mechanism, not a substitute for target-specific mixing validation.
 
 #### Extended block-size smoke: B64 and B128
 
-An extended unbounded JAX rwalk block-size smoke run also tested `jax_block_size=64` and `jax_block_size=128` on the included validation targets. B16, B32, B64, and B128 all completed with 50/50 success and zero replacement failures. B64 and B128 were faster on these cheap toy targets, with B128 giving the fastest wall time, but larger block sizes increased ncall/niter overshoot. B32 remains the recommended default because it captures most of the speedup with a smaller overshoot cost.
+An extended JAX rwalk block-size smoke run also tested `jax_block_size=64` and `jax_block_size=128` on the included validation targets. B16, B32, B64, and B128 all completed with 50/50 success and zero replacement failures. B64 and B128 were faster on these cheap toy targets, with B128 giving the fastest wall time, but larger block sizes increased ncall/niter overshoot. B32 remains the recommended default because it captures most of the speedup with a smaller overshoot cost.
 
 `jax_block_size=32` remains the recommended validated fast path. `jax_block_size=16` is the conservative fallback. `jax_block_size=64` and `jax_block_size=128` are experimental performance knobs for cheap likelihoods or target-specific benchmarking, not new defaults.
 
@@ -168,7 +165,7 @@ Relative to B32, B64 was about 3.5% faster while using about 2.6% more scalar li
 
 #### Recommended fast-path validation
 
-To reproduce the isotropic unbounded JAX `rwalk` validation with the recommended block size, run:
+To reproduce the isotropic JAX `rwalk` validation with the recommended block size, run:
 
 ```bash
 python benchmarks/overnight_jax_validation.py \
@@ -182,7 +179,7 @@ python benchmarks/overnight_jax_validation.py \
   --output overnight_jax_validation_block_B32.json
 ```
 
-`jax_block_size=32` is the currently recommended validated fast setting for unbounded JAX `rwalk` on the included benchmark targets, not a universal optimum. `jax_block_size=16` is a conservative alternative. `jax_block_size=1` disables block mode.
+`jax_block_size=32` is the currently recommended validated fast setting for JAX `rwalk` on the included benchmark targets, not a universal optimum. `jax_block_size=16` is a conservative alternative. `jax_block_size=1` disables block mode.
 
 #### Block-size sweep
 
@@ -214,9 +211,9 @@ python benchmarks/summarize_overnight_jax_validation.py \
 
 This validates the success/failure rate, replacement failures, wall time, `ncall`/`niter` growth from block overshoot, logZ accuracy on analytic targets, and `final_delta_logz` overshoot as block size increases. Larger block sizes can reduce wall time, but they may increase `ncall`/`niter` because convergence is checked between blocks.
 
-#### No-block and bounded comparison / experimental candidates
+#### No-block comparison
 
-Use this comparison command when comparing the recommended B32 block mode against no-block and bounded configurations. This is not the primary validation command:
+Use this comparison command when comparing the recommended B32 block mode against no-block configurations. This is not the primary validation command:
 
 ```bash
 python benchmarks/overnight_jax_validation.py \
@@ -225,11 +222,10 @@ python benchmarks/overnight_jax_validation.py \
   --nlive 500 \
   --dlogz 0.1 \
   --maxiter 10000 \
-  --include-bounds \
   --output overnight_jax_validation_no_block.json
 ```
 
-This gives comparison against ordinary unbounded isotropic `rwalk`, adaptive `rwalk`, and bounded single/multi/fused paths. Treat no-block as a comparison baseline, and treat bounded/fused bounded results as experimental unless they are separately validated for the intended workload.
+This gives comparison against ordinary isotropic `rwalk` and adaptive `rwalk`. Treat no-block as a comparison baseline.
 
 #### How to read the results
 
@@ -286,11 +282,10 @@ When benchmarking the optimized path, keep the sampling problem fixed across run
 - compare evidence calibration and replacement failures before treating wall-time speedups as meaningful;
 - do not compare only scalar `ncall` for JAX batched workloads; use wall time plus replacement metadata such as replacement batches, per-replacement calls, chain usage, and success/failure counts.
 
-Starting configurations for external expensive JAX likelihoods should distinguish the recommended unbounded path from experimental candidates:
+Starting configurations for external expensive JAX likelihoods should start from the recommended path:
 
 - Start with the default fast path, `NestedSampler(loglike, prior_transform, ndim)`: live-cov proposals, `walks=max(25, 6 * ndim)` and `jax_block_size=32`.
 - The bench scripts accept only `--rwalk-proposal isotropic`; the isotropic cached block baseline is below.
-- Treat bounds, fused bounds, or bounded block mode as experimental candidates only after an unbounded baseline is calibrated.
 
 Isotropic cached block baseline:
 
@@ -303,36 +298,11 @@ Isotropic cached block baseline:
 --jax-block-size 32
 ```
 
-Experimental bounded 10D candidate for separate validation:
-
-```bash
---sample rwalk \
---kernel jax \
---bound multi \
---rwalk-seed bound \
---rwalk-proposal isotropic \
---walks 5 \
---replacement-chains 16 \
---bound-update-interval 25
-```
-
-Experimental bounded/fused candidate for separate validation (do not treat this as production-ready from the overnight block results alone):
-
-```bash
---sample rwalk \
---kernel jax \
---bound multi \
---rwalk-seed bound \
---rwalk-proposal isotropic \
---fused-bound-rwalk \
---jax-block-size 10
-```
-
 Do not compare wall time between runs that print progress every iteration; progress output can dominate timings for otherwise fast runs. When comparing against dynesty, use the same likelihood, the same seed family, the same `nlive`, and the same stopping threshold. For tiny or cheap likelihoods, Python dispatch and JAX launch overhead can dominate, so fewer scalar likelihood calls do not necessarily imply faster wall time. For expensive JAX likelihoods, prefer batched or vectorized candidate evaluation when it is available, and judge performance primarily with wall time together with replacement metadata rather than scalar `ncall` alone.
 
 ### 10D GW-like stress-target findings
 
-`benchmarks/templates/gw_like_10d_tinyns_b32_figures.py` is a self-contained synthetic 10D GW-like stress target for the unbounded isotropic B32 JAX `rwalk` path. It includes mass-ratio/chirp-mass curvature, hard bounded `q` and `chi_p` priors, distance/inclination amplitude degeneracy, a sky banana plus mirror mode, wrapped phase/polarization structure, and spin/mass-ratio coupling.
+`benchmarks/templates/gw_like_10d_tinyns_b32_figures.py` is a self-contained synthetic 10D GW-like stress target for the isotropic B32 JAX `rwalk` path. It includes mass-ratio/chirp-mass curvature, hard bounded `q` and `chi_p` priors, distance/inclination amplitude degeneracy, a sky banana plus mirror mode, wrapped phase/polarization structure, and spin/mass-ratio coupling.
 
 The 10D GW-like template is intentionally harder than the included low-dimensional validation targets. It should be treated as a constrained-replacement mixing stress test, not as a new default configuration. It is not a production gravitational-wave parameter-estimation likelihood, and mechanically clean behavior on this target should not be presented as evidence that TinyNS is production-ready for arbitrary GW parameter estimation.
 

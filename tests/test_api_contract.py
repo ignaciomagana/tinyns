@@ -33,19 +33,17 @@ def test_public_exports() -> None:
 
 
 def test_nested_sampler_stores_configuration() -> None:
-    with pytest.warns(UserWarning, match="bootstrap"):
-        sampler = NestedSampler(
-            loglike,
-            prior_transform,
-            ndim=3,
-            nlive=500,
-            vectorized=True,
-            sample="rwalk",
-            max_attempts=123,
-            walks=12,
-            step_scale=0.2,
-            bootstrap=10,
-        )
+    sampler = NestedSampler(
+        loglike,
+        prior_transform,
+        ndim=3,
+        nlive=500,
+        vectorized=True,
+        sample="rwalk",
+        max_attempts=123,
+        walks=12,
+        step_scale=0.2,
+    )
 
     assert sampler.loglike is loglike
     assert sampler.prior_transform is prior_transform
@@ -54,11 +52,10 @@ def test_nested_sampler_stores_configuration() -> None:
     assert sampler.vectorized is True
     assert sampler.sample == "rwalk"
     assert sampler.max_attempts == 123
-    # Unknown kwargs still stored for dynesty drop-in compatibility.
-    assert sampler.kwargs == {"walks": 12, "step_scale": 0.2, "bootstrap": 10}
+    assert sampler.kwargs == {"walks": 12, "step_scale": 0.2}
 
 
-def test_nested_sampler_no_warning_for_known_kwargs(recwarn) -> None:
+def test_nested_sampler_accepts_known_kwargs() -> None:
     sampler = NestedSampler(
         loglike,
         prior_transform,
@@ -73,14 +70,19 @@ def test_nested_sampler_no_warning_for_known_kwargs(recwarn) -> None:
         rwalk_target_accept=0.3,
     )
 
-    unknown = [
-        w
-        for w in recwarn.list
-        if issubclass(w.category, UserWarning)
-        and "unknown keyword" in str(w.message)
-    ]
-    assert unknown == []
     assert sampler.kwargs["walks"] == 10
+
+
+def test_nested_sampler_rejects_unknown_kwargs() -> None:
+    with pytest.raises(TypeError, match=r"'walk'; did you mean 'walks'\?"):
+        NestedSampler(loglike, prior_transform, ndim=2, walk=10)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'bootstrap'$"):
+        NestedSampler(loglike, prior_transform, ndim=2, bootstrap=10)
+
+    # Removed options are not accepted either.
+    with pytest.raises(TypeError, match="unexpected keyword argument 'bound'"):
+        NestedSampler(loglike, prior_transform, ndim=2, bound="single")
 
 
 def test_nested_sampler_validates_configuration() -> None:
@@ -103,7 +105,7 @@ def test_nested_sampler_rejects_removed_samplers(sample: str) -> None:
         NestedSampler(loglike, prior_transform, ndim=3, sample=sample)
 
 
-def test_run_static_nested_rejects_bound_sampler_mode() -> None:
+def test_run_static_nested_rejects_removed_sampler_mode() -> None:
     with pytest.raises(ValueError, match=r"sample must be one of"):
         run_static_nested(
             0,
@@ -288,7 +290,6 @@ def test_default_walks_reaches_run_metadata() -> None:
     "extra",
     [
         {"kernel": "python"},
-        {"bound": "single", "rwalk_seed": "bound"},
         {"replacement_chain_schedule": (1, 2)},
     ],
 )
@@ -334,7 +335,6 @@ def test_prior_sampler_defaults_to_python_kernel() -> None:
     "extra",
     [
         {"kernel": "python"},
-        {"bound": "single", "rwalk_seed": "bound"},
         {"replacement_chain_schedule": (1, 2)},
     ],
 )

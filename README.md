@@ -69,11 +69,9 @@ pass `kernel="python"`.
 | `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
 
 `NestedSampler` accepts many optional keyword arguments (`sample`, `kernel`,
-`bound`, `walks`, `rwalk_proposal`, and others documented below). An unknown
-keyword argument is not an error: it is still stored, preserving dynesty
-drop-in compatibility, but `NestedSampler` emits a `UserWarning` naming the
-unrecognized keyword(s) so typos or unsupported options are not silently
-ignored.
+`walks`, `rwalk_proposal`, and others documented below). An unknown keyword
+argument raises `TypeError`, with the closest known name suggested when there
+is one.
 
 ## Saving and loading results
 
@@ -129,7 +127,6 @@ target geometries.
 | Isotropic block path | `rwalk_proposal="isotropic"`, `walks=5`, `jax_block_size=32` | Validated on the included 2D benchmark targets; cost per iteration grows geometrically at d >= 4 |
 | Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
 | Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
-| Experimental | bounds / fused bounds / bounded block | Useful research direction; not production-ready |
 | Experimental | adaptive replacement-chain schedules | Useful tuning knob; not the main recommended path |
 
 Removed: slice/random-slice samplers were removed to keep TinyNS small (use dynesty for slice-based external comparisons). An earlier live-cov proposal that reflected moves at the unit-cube faces, and its `rwalk_cov_jitter` option, were also removed; the current `rwalk_proposal="live-cov"` rejects such moves instead.
@@ -164,8 +161,8 @@ default `walks=max(25, 6 * ndim)`. In 1-D, 10 walks were already unbiased
 (20 seeds, bias 0.2 x `logzerr`), so 1-D defaults to 12; from 2-D on, 15 walks
 still biased logZ on Gaussian and banana targets.
 
-Live-cov is supported only for unbounded JAX rwalk with a fixed
-`replacement_chains`. If you choose `kernel="python"`, a bound, or a
+Live-cov is supported only for JAX rwalk with a fixed
+`replacement_chains`. If you choose `kernel="python"` or a
 `replacement_chain_schedule` and leave `rwalk_proposal` unset, the proposal
 falls back to `"isotropic"` with `step_scale=0.1` and `jax_block_size=1`.
 Passing `rwalk_proposal="live-cov"` explicitly in those combinations raises
@@ -189,10 +186,9 @@ A pytree callable is the explicit form, for example
 equinox-style module or registered dataclass with `__call__`: its `jax.Array` /
 `np.ndarray` leaves become kernel arguments and everything else stays static.
 Use `jax.Array` leaves so the data move to the device once. Both forms apply to
-the fast path (unbounded JAX rwalk, block and per-iteration modes, the rescue
-ladder and the initial live-point pass, without `jax_vectorized`); the bounded,
-fused-bounded and `replacement_chain_schedule` kernels still close over the
-callables.
+the fast path (JAX rwalk, block and per-iteration modes, the rescue ladder and
+the initial live-point pass, without `jax_vectorized`); the
+`replacement_chain_schedule` kernels still close over the callables.
 
 For a campaign over mock datasets in one process, pass
 `jax.tree_util.Partial(loglike_fn, data_i)`: pytree callables with the same
@@ -214,20 +210,12 @@ likelihood cost dominates dispatch overhead. Convergence is checked between
 blocks, not after every individual nested iteration, so a run may overshoot the
 requested `dlogz` threshold by up to roughly `jax_block_size - 1` iterations.
 
-`jax_block_size=32` (the default for unbounded JAX rwalk) is the fastest
+`jax_block_size=32` (the default for JAX rwalk) is the fastest
 validated block size. Use `jax_block_size=16` if you want a more conservative
 block size with slightly less convergence overshoot. Use `jax_block_size=1` for
 the most conservative behavior, which disables block mode. This recommendation
 is based on current validation on the included benchmark targets; it is not a
 proof for all likelihoods.
-
-
-### Bound update interval
-
-For `bound="multi"`, rebuilding every iteration can be expensive. Use
-`bound_update_interval` to reuse a bound for multiple nested-sampling
-iterations. Larger intervals reduce Python/bound-building overhead but can make
-bounds stale. Validate evidence before relying on results.
 
 
 ### Batched JAX replacement chains
@@ -302,72 +290,11 @@ The sampler does not return merely after the first accepted local move; it runs 
 Vectorized `rwalk` replacement sampling is not implemented yet, so
 `vectorized=True` needs an explicit `sample="prior"`.
 
-### Bounding
-
-`tinyns` supports `bound="none"` by default. Bounds are experimental modifiers for rwalk, not a separate public sampler mode. Use `sample="rwalk"` with `bound="single"` or `bound="multi"` and `rwalk_seed="bound"`. Bounds are built in unit-cube coordinates from the live points and enlarged by `bound_enlargement`.
-
-The only currently recommended fast path is unbounded JAX rwalk with live-cov proposals and cached block mode. Bounded rwalk uses isotropic proposals. Bounded/fused-bounded paths remain experimental and require target-specific validation.
-
-Bounding is experimental. Validate evidence and insertion-rank diagnostics on representative targets before relying on it for scientific results.
-
-
 ### Experimental adaptive rwalk step scale
 
 Live-cov always adapts its step scale. For isotropic proposals, `rwalk_adaptive_step_scale=True` is an explicitly experimental JAX-only rwalk option that adapts the isotropic proposal scale from constrained-replacement acceptance telemetry. It defaults to off, with a fixed `step_scale=0.1`.
 
 This is intended for hard-target diagnostics where a fixed rwalk scale is a poor compromise. It is not a dynesty replacement, does not add slice/rslice or `sample="bound"`, and is not a substitute for checking insertion-rank diagnostics, replacement diagnostics, and seed/config stability on the target.
-
-### Bounded rwalk
-
-For experimental dynesty-style bounded rwalk, use both a bound and bound seeding:
-
-```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-    kernel="jax",
-    bound="multi",
-    rwalk_seed="bound",
-    rwalk_proposal="isotropic",
-    walks=5,
-    replacement_chains=16,
-)
-```
-
-Setting `bound="multi"` alone does not define a bounded rwalk transition unless `rwalk_seed="bound"` is also enabled. `tinyns` raises a clear error for `bound != "none"` with live-seeded rwalk unless `allow_unused_bound=True`. Use `allow_unused_bound=True` only when you intentionally want to build bounds for diagnostics or overhead measurements while keeping ordinary live-seeded rwalk.
-
-`fused_bound_rwalk=True` currently means the bounded seed draw and rwalk transition are exposed as one replacement path and share accounting. It is not yet a single compiled seed+rwalk kernel. A future implementation may replace this wrapper fusion with a true single-dispatch JAX kernel.
-
-For `bound="none"`, `jax_block_size=32` uses a cached JAX `lax.scan` over several nested-sampling iterations and is the recommended fast path described above. For bounded rwalk, block mode remains experimental: the current mode reuses a fixed bound across a Python-level block and is mainly a stepping stone toward a fully compiled bounded block kernel.
-
-### Multiellipsoid bounding
-
-`bound="multi"` is an experimental dynesty-style union-of-ellipsoids bound. It recursively splits the live points using a dependency-free PCA/median split and samples from the volume-weighted union of ellipsoids with overlap correction.
-
-An experimental bounded/fused candidate configuration for separate validation is:
-
-```python
-NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-    kernel="jax",
-    bound="multi",
-    rwalk_seed="bound",
-    rwalk_proposal="isotropic",
-    walks=5,
-    replacement_chains=16,
-)
-```
-
-This mode is experimental and is not the recommended fast path. Check evidence calibration, insertion-rank diagnostics, and seed stability before using it for science.
-
-### JAX bound representation
-
-`tinyns` keeps Python-friendly bound objects for readability, but also provides an internal padded `JaxEllipsoidBound` representation. The padded representation is used as a bridge toward fast JAX replacement kernels and should not change public sampling behavior.
 
 ## Current validation status
 
@@ -379,7 +306,7 @@ The live-cov default was checked on anisotropic correlated Gaussians, d = 2..18 
 - `banana2d`
 - `eggbox2d`
 
-The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Bounds are tracked separately as experimental. Users should still validate on their own target geometry before relying on evidence values.
+The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Users should still validate on their own target geometry before relying on evidence values.
 
 ### `min_accepts`
 
@@ -462,9 +389,8 @@ probabilistic programming language.
 - No dynamic nested sampling.
 - The default `kernel="jax"` needs JAX-traceable `loglike` and
   `prior_transform`; use `kernel="python"` otherwise.
-- Live-cov proposals need unbounded JAX rwalk with a fixed
-  `replacement_chains`; bounds, `kernel="python"` and replacement-chain
-  schedules use isotropic proposals.
+- Live-cov proposals need JAX rwalk with a fixed `replacement_chains`;
+  `kernel="python"` and replacement-chain schedules use isotropic proposals.
 - Unbiased evidence needs `walks` of about 5-6 x `ndim`, so likelihood calls
   per iteration grow linearly with dimension.
 - Strongly curved posteriors need more walks than that default. On a 10-D
@@ -479,7 +405,6 @@ probabilistic programming language.
   raise `walks`.
 - Mode weights of separated modes are reliable only when each mode holds at
   least about 3 x `ndim` live points (see Multimodal posteriors).
-- Multiellipsoid bounding is experimental.
 - No full vectorized `rwalk` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
 - Replacement attempts are capped by `max_attempts`; hitting the cap returns

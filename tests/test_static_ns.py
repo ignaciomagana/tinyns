@@ -568,7 +568,6 @@ def test_nested_sampler_rwalk_jax_runs_and_records_kernel() -> None:
     assert result.metadata["jax_block_size"] == 1
     assert result.metadata["jax_block_mode"] is False
     assert result.metadata["jax_block_impl"] is None
-    assert result.metadata["fused_bound_rwalk_impl"] is None
 
 
 def test_nested_sampler_rwalk_jax_block_size_one_matches_existing_path() -> None:
@@ -672,7 +671,6 @@ def test_recommended_rwalk_jax_isotropic_cached_block_b32_records_metadata() -> 
     assert result.metadata["jax_block_cached"] is True
     assert result.metadata["jax_block_kernel"] == "fixed-rwalk-cached"
     assert result.metadata["jax_block_size"] == 32
-    assert result.metadata["jax_block_bound_fixed"] is False
     assert result.metadata["replacement_failures"] == 0
     assert math.isfinite(result.logz)
     assert result.ncall > 0
@@ -794,7 +792,7 @@ def test_unknown_rwalk_proposal_rejected() -> None:
             nlive=20,
             sample="rwalk",
             kernel="jax",
-            rwalk_proposal="ellipsoid",
+            rwalk_proposal="bogus",
         )
 
 
@@ -802,11 +800,10 @@ def test_unknown_rwalk_proposal_rejected() -> None:
     "extra",
     [
         {"kernel": "python"},
-        {"bound": "single", "rwalk_seed": "bound"},
         {"replacement_chain_schedule": (1, 2)},
     ],
 )
-def test_live_cov_proposal_requires_unbounded_jax_rwalk(extra) -> None:
+def test_live_cov_proposal_requires_fixed_chain_jax_rwalk(extra) -> None:
     kwargs = {"sample": "rwalk", "kernel": "jax", "rwalk_proposal": "live-cov"}
     kwargs.update(extra)
     with pytest.raises(NotImplementedError, match="live-cov"):
@@ -864,148 +861,8 @@ def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(jax_block_size) ->
     assert 0.1 < metadata["rwalk_acceptance"] < 0.5
 
 
-def test_static_nested_multi_bound_fused_rwalk_chain_telemetry_regression() -> None:
-    result = run_static_nested(
-        random.PRNGKey(2102),
-        lambda theta: -0.5 * jnp.sum(theta**2),
-        lambda u: 2.0 * u - 1.0,
-        ndim=2,
-        nlive=20,
-        sample="rwalk",
-        kernel="jax",
-        bound="multi",
-        rwalk_seed="bound",
-        bound_seed_kernel="jax",
-        fused_bound_rwalk=True,
-        walks=5,
-        replacement_chains=1,
-        batch_size=128,
-        multi_bound_max_ellipsoids=4,
-        multi_bound_min_points=8,
-        maxiter=5,
-        dlogz=10.0,
-    )
-
-    metadata = result.metadata
-    assert metadata["mean_replacement_chains_used"] == pytest.approx(1.0)
-    assert metadata["mean_bound_seed_calls"] == pytest.approx(128.0)
-    assert metadata["mean_rwalk_kernel_calls"] == pytest.approx(5.0)
-    assert metadata["total_rwalk_proposals"] == pytest.approx(
-        metadata["mean_rwalk_kernel_calls"] * metadata["niter"]
-    )
-    assert metadata["total_rwalk_proposals"] < sum(metadata["replacement_ncall"])
-    assert 0 <= metadata["accepted_rwalk_moves"] <= metadata["total_rwalk_proposals"]
-
-
-def test_static_nested_bound_seed_kernel_jax_invalid_combinations_raise() -> None:
-    with pytest.raises(NotImplementedError, match="bound_seed_kernel='jax'"):
-        run_static_nested(
-            random.PRNGKey(111),
-            lambda theta: -0.5 * jnp.sum(theta**2),
-            lambda u: u,
-            ndim=2,
-            nlive=10,
-            sample="prior",
-            bound_seed_kernel="jax",
-        )
-
-    with pytest.raises(ValueError, match="bound_seed_kernel"):
-        run_static_nested(
-            random.PRNGKey(112),
-            lambda theta: -0.5 * jnp.sum(theta**2),
-            lambda u: u,
-            ndim=2,
-            nlive=10,
-            bound_seed_kernel="bad",
-        )
-
-
-def test_failed_bound_seed_calls_are_counted_when_rwalk_fallback_succeeds(
-    monkeypatch,
-) -> None:
-    def failed_seed(
-        key,
-        _loglike,
-        _prior_transform,
-        logl_min,
-        _bound,
-        ndim,
-        **_kwargs,
-    ):
-        seed_u = jnp.full((ndim,), 0.5)
-        return (
-            key,
-            seed_u,
-            seed_u,
-            logl_min - 1.0,
-            7,
-            False,
-            {
-                "bound_draws": 9,
-                "bound_loglike_evals": 7,
-                "bound_unit_cube_acceptance": 7 / 9,
-                "bound_overlap_rejections": 0,
-            },
-        )
-
-    def successful_fallback(
-        key,
-        _loglike,
-        _prior_transform,
-        logl_min,
-        _live_u,
-        _live_logl,
-        ndim,
-        **_kwargs,
-    ):
-        new_u = jnp.full((ndim,), 0.75)
-        return (
-            key,
-            new_u,
-            new_u,
-            logl_min + 1.0,
-            3,
-            True,
-            {
-                "replacement_batches": 1,
-                "replacement_chains_used": 1,
-                "replacement_chain_usage_counts": {"1": 1},
-                "accepted_rwalk_moves": 2,
-                "total_rwalk_proposals": 3,
-            },
-        )
-
-    monkeypatch.setattr(run_mod, "draw_constrained_single_bound", failed_seed)
-    monkeypatch.setattr(run_mod, "draw_constrained_rwalk_jax", successful_fallback)
-    result = run_static_nested(
-        random.PRNGKey(2103),
-        lambda theta: -jnp.sum(theta**2),
-        lambda u: u,
-        ndim=2,
-        nlive=8,
-        sample="rwalk",
-        kernel="jax",
-        bound="single",
-        rwalk_seed="bound",
-        rwalk_seed_fallback=True,
-        bound_max_draws=7,
-        walks=3,
-        max_attempts=3,
-        maxiter=1,
-        dlogz=10.0,
-    )
-
-    assert result.success is True
-    assert result.ncall == result.nlive + 7 + 3
-    assert result.metadata["replacement_ncall"] == [10]
-    assert result.metadata["mean_bound_seed_calls"] == pytest.approx(7.0)
-    assert result.metadata["mean_rwalk_kernel_calls"] == pytest.approx(3.0)
-    assert result.metadata["mean_bound_loglike_evals"] == pytest.approx(7.0)
-    assert result.metadata["accepted_rwalk_moves"] == 2
-    assert result.metadata["total_rwalk_proposals"] == 3
-
-
-def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
+def test_static_nested_metadata_has_no_removed_option_keys() -> None:
+    states = []
     result = run_static_nested(
         random.PRNGKey(107),
         lambda theta: -0.5 * jnp.sum(theta**2),
@@ -1014,39 +871,15 @@ def test_static_nested_unbounded_rwalk_metadata_unchanged_shape() -> None:
         nlive=20,
         sample="rwalk",
         kernel="jax",
-        bound="none",
         maxiter=2,
         dlogz=0.0,
+        callback=states.append,
     )
 
-    assert result.metadata["bound"] == "none"
-    assert result.metadata["bounded_rwalk"] is False
-    assert result.metadata["bound_build_count"] == 0
-    assert result.metadata["bound_build_time_total"] == 0.0
-    assert result.metadata["bound_build_time_mean"] == 0.0
-    assert result.metadata["bound_build_time_max"] == 0.0
-    assert result.metadata["bound_log_volume_final"] is None
-    assert result.metadata["bound_log_volume_mean"] is None
-    assert result.metadata["bound_log_volume_min"] is None
-    assert result.metadata["bound_log_volume_max"] is None
-    assert result.metadata["bound_nellipsoids_mean"] is None
-    assert result.metadata["bound_nellipsoids_max"] is None
-    assert result.metadata["bound_nellipsoids_final"] is None
-    assert result.metadata["mean_bound_seed_calls"] is None
-
-
-def test_static_nested_invalid_multi_bound_options_raise() -> None:
-    with pytest.raises(ValueError, match="multi_bound_max_ellipsoids"):
-        run_static_nested(
-            random.PRNGKey(32),
-            lambda theta: 0.0,
-            lambda u: u,
-            ndim=2,
-            nlive=10,
-            sample="prior",
-            bound="multi",
-            multi_bound_max_ellipsoids=0,
-        )
+    assert result.metadata["niter"] == 2
+    assert not [name for name in result.metadata if "bound" in name]
+    assert states
+    assert not [name for name in states[-1] if "bound" in name]
 
 
 def test_jax_vectorized_metadata_default_false() -> None:
@@ -1061,37 +894,6 @@ def test_jax_vectorized_metadata_default_false() -> None:
     )
 
     assert result.metadata["jax_vectorized"] is False
-
-
-def test_jax_bounded_seed_draw_supports_vectorized_functions() -> None:
-    def prior_batch(u):
-        return 2.0 * u - 1.0
-
-    def loglike_batch(theta):
-        return -jnp.sum(theta**2, axis=1)
-
-    result = run_static_nested(
-        random.PRNGKey(4401),
-        loglike_batch,
-        prior_batch,
-        ndim=2,
-        nlive=24,
-        dlogz=10.0,
-        maxiter=2,
-        sample="rwalk",
-        kernel="jax",
-        bound="single",
-        rwalk_seed="bound",
-        bound_seed_kernel="jax",
-        walks=2,
-        batch_size=8,
-        max_attempts=32,
-        jax_vectorized=True,
-    )
-
-    assert result.metadata["jax_vectorized"] is True
-    assert result.metadata["bound_seed_kernel"] == "jax"
-    assert jnp.isfinite(result.logz)
 
 
 def test_jax_block_rwalk_failure_propagates_replacement_failure() -> None:
@@ -1659,36 +1461,6 @@ def test_jax_block_ncall_counts_failed_offset_when_rescue_skipped(monkeypatch) -
     successful_prefix_calls = 3 + 3
     failed_offset_calls = 9
     assert result.ncall == result.nlive + successful_prefix_calls + failed_offset_calls
-
-
-def test_jax_bounded_block_rwalk_failure_returns_failed_result() -> None:
-    result = run_static_nested(
-        random.PRNGKey(1235),
-        _jax_loglike,
-        _jax_prior_transform,
-        2,
-        12,
-        sample="rwalk",
-        kernel="jax",
-        bound="single",
-        rwalk_seed="bound",
-        bound_seed_kernel="jax",
-        fused_bound_rwalk=True,
-        walks=1,
-        min_accepts=2,
-        replacement_chains=1,
-        max_attempts=1,
-        maxiter=4,
-        dlogz=0.0,
-        jax_block_size=4,
-        batch_size=2,
-    )
-
-    assert result.success is False
-    assert result.metadata["replacement_failures"] > 0
-    assert "bounded JAX rwalk" in result.message
-    assert "max_attempts=1" in result.message
-    assert result.metadata["jax_block_impl"] == "python-loop-fixed-bound"
 
 
 def test_update_adaptive_step_scale_direction_and_clamps() -> None:

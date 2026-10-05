@@ -33,7 +33,7 @@ def test_readme_support_tiers_keep_key_paths() -> None:
     assert "walks=max(25, 6 * ndim)" in text
     assert "has also been removed" not in lowered
     assert 'rwalk_proposal="isotropic"' in text
-    assert 'bound="multi"' in text
+    assert 'bound="' not in text
 
 
 def test_release_checklist_matches_public_surface_cleanup() -> None:
@@ -42,8 +42,6 @@ def test_release_checklist_matches_public_surface_cleanup() -> None:
     lowered = text.lower()
 
     assert "gaussian_2d_rwalk_jax_block.py" in text
-    assert "no ellipsoidal bounding" not in lowered
-    assert "ellipsoidal" in lowered
     assert "experimental" in lowered
     assert "make overnight-b32" in text
     assert "B32 overnight remains the release gate" in text

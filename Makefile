@@ -36,7 +36,6 @@ overnight-comparison:
 	  --nlive 500 \
 	  --dlogz 0.1 \
 	  --maxiter 10000 \
-	  --include-bounds \
 	  --output overnight_jax_validation_no_block.json
 
 summarize-overnight:

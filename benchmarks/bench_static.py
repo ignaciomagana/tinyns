@@ -153,17 +153,6 @@ def _sampler_kwargs(sampler_name: str, args: argparse.Namespace) -> dict[str, An
         "replacement_chain_schedule": args.replacement_chain_schedule,
         "rwalk_proposal": args.rwalk_proposal,
         "jax_block_size": 1,
-        "bound": args.bound,
-        "bound_enlargement": args.bound_enlargement,
-        "bound_update_interval": args.bound_update_interval,
-        "bound_jitter": args.bound_jitter,
-        "multi_bound_max_ellipsoids": args.multi_bound_max_ellipsoids,
-        "multi_bound_min_points": args.multi_bound_min_points,
-        "multi_bound_split_threshold": args.multi_bound_split_threshold,
-        "multi_bound_overlap_correction": args.multi_bound_overlap_correction,
-        "rwalk_seed": args.rwalk_seed,
-        "bound_seed_kernel": args.bound_seed_kernel,
-        "allow_unused_bound": args.allow_unused_bound,
     }
     if sampler_name == "rwalk":
         kwargs["walks"] = args.walks
@@ -230,24 +219,6 @@ def run_one(
         "target": target_name,
         "sampler": sampler_name,
         "kernel": args.kernel,
-        "bound": args.bound,
-        "rwalk_seed": args.rwalk_seed,
-        "bound_seed_kernel": args.bound_seed_kernel,
-        "allow_unused_bound": args.allow_unused_bound,
-        "bound_update_interval": metadata.get(
-            "bound_update_interval", args.bound_update_interval
-        ),
-        "bound_build_time_total": metadata.get("bound_build_time_total"),
-        "bound_build_time_mean": metadata.get("bound_build_time_mean"),
-        "bound_build_time_max": metadata.get("bound_build_time_max"),
-        "bound_build_count": metadata.get("bound_build_count"),
-        "bound_log_volume_final": metadata.get("bound_log_volume_final"),
-        "bound_log_volume_mean": metadata.get("bound_log_volume_mean"),
-        "bound_log_volume_min": metadata.get("bound_log_volume_min"),
-        "bound_log_volume_max": metadata.get("bound_log_volume_max"),
-        "bound_nellipsoids_mean": metadata.get("bound_nellipsoids_mean"),
-        "bound_nellipsoids_max": metadata.get("bound_nellipsoids_max"),
-        "bound_nellipsoids_final": metadata.get("bound_nellipsoids_final"),
         "seed": seed,
         "nlive": args.nlive,
         "ndim": target.ndim,
@@ -369,23 +340,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rwalk-proposal", choices=["isotropic"], default="isotropic"
     )
-    parser.add_argument("--bound", choices=["none", "single", "multi"], default="none")
-    parser.add_argument("--bound-enlargement", type=float, default=1.25)
-    parser.add_argument("--bound-update-interval", type=int, default=1)
-    parser.add_argument("--bound-jitter", type=float, default=1e-6)
-    parser.add_argument("--multi-bound-max-ellipsoids", type=int, default=32)
-    parser.add_argument("--multi-bound-min-points", type=int, default=None)
-    parser.add_argument("--multi-bound-split-threshold", type=float, default=0.9)
-    parser.add_argument(
-        "--multi-bound-overlap-correction",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--rwalk-seed", choices=["live", "bound"], default="live")
-    parser.add_argument(
-        "--bound-seed-kernel", choices=["python", "jax"], default="python"
-    )
-    parser.add_argument("--allow-unused-bound", action="store_true")
     parser.add_argument("--replacement-chains-grid", nargs="+", type=int, default=None)
     parser.add_argument(
         "--replacement-chain-schedule", nargs="+", type=int, default=None
@@ -423,19 +377,6 @@ def validate_benchmark_args(args: argparse.Namespace) -> None:
         else replacement_chains_values
     )
     required_max_attempts = args.walks * max_replacement_chains
-
-    if (
-        args.bound in {"single", "multi"}
-        and "rwalk" in args.samplers
-        and args.rwalk_seed == "live"
-        and not args.allow_unused_bound
-    ):
-        raise ValueError(
-            "--bound single or --bound multi with --samplers rwalk requires "
-            "--rwalk-seed bound. Otherwise the bound is built but not used. "
-            "Use --allow-unused-bound to benchmark live-seeded rwalk with "
-            "bound overhead."
-        )
 
     if args.kernel == "jax" and "rwalk" in args.samplers:
         if args.auto_max_attempts:
