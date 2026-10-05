@@ -2,8 +2,9 @@
 
 Everything between two jitted blocks happens here: termination, the step-scale
 adaptation, the progress line and the callback, the checkpoint cadence, the
-wall-time telemetry, the cluster tracker of the swap move, the handling of a
-failed replacement, and the :class:`~tinyns.result.NestedSamplingResult`.
+wall-time telemetry, the host hook of the cluster swap
+(:class:`~tinyns.clusters.ClusterTracker`), the handling of a failed
+replacement, and the :class:`~tinyns.result.NestedSamplingResult`.
 """
 
 from __future__ import annotations
@@ -272,14 +273,11 @@ def run(
     if not scale_history or scale_history[-1] != scale:
         scale_history.append(scale)
     accept_history = [float(x) for x in restored.get("adaptive_accept_history", [])]
-    # Clusters are tracked on the host between blocks; the tracker never
-    # touches the PRNG stream, and the swap kernel only runs (and is only
-    # compiled) once two clusters can swap.
-    tracker = None
-    cluster_host_s = 0.0
-    if cfg.cluster_swap:
-        stored = (resume_state.clusters if resume_state is not None else None) or {}
-        tracker = ClusterTracker(nlive, stored.get("arrays"), stored.get("log"))
+    # The cluster swap's host hook (tinyns.clusters): its extras switch the
+    # swap move on in core.step once two clusters can swap.
+    hook = ClusterTracker(nlive) if cfg.cluster_swap else None
+    if hook is not None and resume_state is not None:
+        hook.load_state_dict(resume_state.clusters)
 
     def checkpoint_state() -> NestedRunState:
         return NestedRunState(
@@ -304,11 +302,7 @@ def run(
             message=message,
             stopped_by_callback=stopped_by_callback,
             scale=scale,
-            clusters=(
-                None
-                if tracker is None
-                else {"log": tracker.log, "arrays": tracker.arrays()}
-            ),
+            clusters=None if hook is None else hook.state_dict(),
             telemetry={
                 "replacement_batches": rows["batches"].tolist(),
                 "rwalk_moves": rwalk_moves,
@@ -376,17 +370,13 @@ def run(
         # same program with fewer active iterations.
         n_active = min(block_size, maxiter - iteration)
         logz_before = state.logz
-        frames = None
-        if tracker is not None:
-            host_start = time.perf_counter()
-            frames = tracker.frames(state.u, iteration, rows["u"], rows["logwt"])
-            cluster_host_s += time.perf_counter() - host_start
+        extras = None if hook is None else hook.before_block(state, rows)
         state, dead = core.step(
             state._replace(scale=jnp.asarray(scale)),
             loglike,
             prior_transform,
             cfg,
-            extras=frames,
+            extras=extras,
             n_active=n_active,
         )
         block = jax.tree_util.tree_map(
@@ -415,16 +405,8 @@ def run(
                 logz=logz_dead, logx=-(iteration + offset) / int(nlive)
             )
             block = jax.tree_util.tree_map(lambda x, n=offset: x[:n], block)
-        moves, proposals = block.moves, block.proposals
-        if block.swaps is not None:
-            # The rwalk telemetry and the scale adaptation count rwalk steps
-            # only; swaps are counted on their own.
-            moves = moves - block.swaps[:, 0]
-            proposals = proposals - block.swaps[:, 1]
-            tracker.log["swap"] = [
-                int(a + b)
-                for a, b in zip(tracker.log["swap"], block.swaps.sum(0), strict=True)
-            ]
+        if hook is not None:  # takes the swap steps out of moves and proposals
+            block = hook.after_block(state, block)
         rows.extend(
             u=block.u,
             theta=block.theta,
@@ -436,7 +418,8 @@ def run(
             batches=block.batches,
         )
         ncall += int(sum(int(x) for x in block.ncall))
-        block_moves, block_proposals = int(np.sum(moves)), int(np.sum(proposals))
+        block_moves = int(np.sum(block.moves))
+        block_proposals = int(np.sum(block.proposals))
         rwalk_moves += block_moves
         rwalk_proposals += block_proposals
         if block_proposals > 0:
@@ -516,16 +499,8 @@ def run(
     rwalk_acceptance = rwalk_moves / rwalk_proposals if rwalk_proposals > 0 else None
 
     cluster_metadata = {"cluster_swap": bool(cfg.cluster_swap)}
-    if tracker is not None:
-        host_start = time.perf_counter()
-        cluster_metadata.update(
-            tracker.summary(
-                rows["u"], rows["logwt"], np.asarray(live_u), np.asarray(live_logwt)
-            )
-        )
-        cluster_metadata["cluster_host_s"] = (
-            cluster_host_s + time.perf_counter() - host_start
-        )
+    if hook is not None:
+        cluster_metadata.update(hook.summary(rows, live_u, live_logwt))
 
     return NestedSamplingResult(
         samples_u=samples_u,
