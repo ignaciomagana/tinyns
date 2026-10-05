@@ -291,19 +291,20 @@ class ClusterTracker:
         }
 
     def state_dict(self):
-        """Return the checkpoint state: the JSON-serializable ``log`` and the
-        ``arrays`` (labels and live points of the last update, or None)."""
-        arrays = None if self.labels is None else {"labels": self.labels, "u": self.u}
-        return {"log": self.log, "arrays": arrays}
+        """Return the checkpoint state: the JSON-serializable ``log`` and, once
+        clustered, the ``labels`` and live points ``u`` of the last update."""
+        if self.labels is None:
+            return {"log": self.log}
+        return {"log": self.log, "labels": self.labels, "u": self.u}
 
     def load_state_dict(self, state):
         """Restore the tracker from :meth:`state_dict` (``None`` or ``{}``: fresh)."""
         state = state or {}
         if state.get("log"):
             self.log = state["log"]
-        if state.get("arrays") is not None:
-            self.labels = np.asarray(state["arrays"]["labels"])
-            self.u = np.asarray(state["arrays"]["u"])
+        if "labels" in state:
+            self.labels = np.asarray(state["labels"])
+            self.u = np.asarray(state["u"])
             self._refit()
 
     def before_block(self, state, dead):

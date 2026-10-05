@@ -9,7 +9,6 @@ replacement, and the :class:`~tinyns.result.NestedSamplingResult`.
 
 from __future__ import annotations
 
-import dataclasses
 import math
 import os
 import time
@@ -19,11 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.scipy.special import logsumexp
 
-from tinyns import core
+from tinyns import checkpoint, core
 from tinyns.callables import _device_leaves
 from tinyns.clusters import ClusterTracker
 from tinyns.result import NestedSamplingResult, _logzerr_diagnostics
-from tinyns.state import NestedRunState, save_checkpoint_npz
 
 # The live-cov step is ``scale * L z``. The scale starts at 0.5 and, after
 # every block, moves in log space toward 25% move acceptance. It is a
@@ -105,6 +103,9 @@ class _Rows:
     def __getitem__(self, name):
         return self._columns[name][: self.n]
 
+    def columns(self) -> dict:
+        return {name: self[name] for name in self._columns}
+
 
 def _check_options(
     maxiter,
@@ -128,48 +129,6 @@ def _check_options(
         raise ValueError("maxiter must be a positive integer")
 
 
-def _resumed_state(resume: NestedRunState, maxiter: int) -> core.State:
-    """Rebuild the :class:`core.State` of a checkpoint, after sanity checks."""
-    ndead = len(resume.dead_logl)
-    if (
-        not len(resume.dead_u)
-        == len(resume.dead_theta)
-        == ndead
-        == len(resume.dead_logwt)
-    ):
-        raise ValueError("checkpoint dead point arrays have inconsistent lengths")
-    iteration = int(resume.iteration)
-    if maxiter < iteration:
-        raise ValueError(
-            f"maxiter={maxiter} is smaller than checkpoint iteration={iteration}"
-        )
-    if ndead != iteration:
-        raise ValueError(
-            "checkpoint dead point count must match checkpoint iteration; "
-            f"got {ndead} dead points and iteration={iteration}"
-        )
-    live_logl = resume.live_logl
-    birth = resume.live_birth
-    return core.State(
-        key=resume.key,
-        u=resume.live_u,
-        theta=resume.live_theta,
-        logl=live_logl,
-        birth=(
-            jnp.full_like(live_logl, jnp.nan)
-            if birth is None
-            else jnp.asarray(birth, dtype=live_logl.dtype)
-        ),
-        # Host floats, as checkpointed; see core.State.
-        logz=float(resume.logz_dead),
-        logx=float(resume.logx_final),
-        it=jnp.asarray(iteration, dtype=jnp.int32),
-        scale=None,  # the host scale, set by the loop
-        ncall=jnp.asarray(int(resume.ncall), dtype=jnp.int32),
-        failed=jnp.asarray(False),
-    )
-
-
 def run(
     cfg: core.Config,
     loglike,
@@ -184,13 +143,13 @@ def run(
     callback_interval: int = 100,
     checkpoint_path=None,
     checkpoint_interval: int = 100,
-    resume_state: NestedRunState | None = None,
+    resume: checkpoint.Checkpoint | None = None,
 ) -> NestedSamplingResult:
     """Run static nested sampling block by block; return the result.
 
-    ``key`` (a PRNG key or an int seed) starts a new run; with
-    ``resume_state`` (a loaded checkpoint) the run continues from it instead
-    and ``key`` is ignored. The run stops once the live-evidence remainder
+    ``key`` (a PRNG key or an int seed) starts a new run; with ``resume`` (a
+    loaded :class:`~tinyns.checkpoint.Checkpoint`) the run continues from it
+    instead and ``key`` is ignored. The run stops once the live-evidence remainder
     falls below ``dlogz``, at ``maxiter`` iterations (default
     ``10_000 * ndim``), when ``callback`` returns ``False``, or after a failed
     replacement. Progress and callbacks fire on block boundaries, at
@@ -210,9 +169,7 @@ def run(
     chains, block_size = cfg.replacement_chains, cfg.block_size
     if maxiter is None:
         maxiter = 10_000 * ndim
-    config = dataclasses.asdict(cfg)
     checkpoint_path = None if checkpoint_path is None else os.fspath(checkpoint_path)
-    restored = dict(resume_state.telemetry or {}) if resume_state is not None else {}
 
     # Wall-time telemetry: the first block carries the compiles, so
     # throughput is measured from its end.
@@ -224,14 +181,31 @@ def run(
     loglike = _device_leaves(loglike)
     prior_transform = _device_leaves(prior_transform)
 
-    if resume_state is None:
+    failures = 0
+    if resume is None:
         state = core.init(key, loglike, prior_transform, cfg)
-        ncall, failures, iteration = nlive, 0, 0
+        ncall, iteration, scale = nlive, 0, core._INITIAL_SCALE
+        telemetry = {"rwalk_moves": 0, "rwalk_proposals": 0, "accept_history": []}
+        telemetry["scale_history"] = [scale]
     else:
-        state = _resumed_state(resume_state, maxiter)
-        ncall = int(resume_state.ncall)
-        failures = int(resume_state.replacement_failures)
-        iteration = int(resume_state.iteration)
+        state, telemetry = resume.state, resume.telemetry
+        iteration, scale = int(state.it), float(state.scale)
+        if bool(state.failed):
+            raise ValueError(
+                "cannot resume a checkpoint saved after a replacement failure"
+            )
+        if len(resume.dead["logl"]) != iteration:
+            raise ValueError(
+                "checkpoint dead point count must match checkpoint iteration; got "
+                f"{len(resume.dead['logl'])} dead points and iteration={iteration}"
+            )
+        if maxiter < iteration:
+            raise ValueError(
+                f"maxiter={maxiter} is smaller than checkpoint iteration={iteration}"
+            )
+        # The host count (an int32 State.ncall may wrap): every likelihood
+        # call of a run without a failed replacement is in the dead rows.
+        ncall = nlive + int(resume.dead["ncall"].sum())
     real = np.asarray(state.logl).dtype
     rows = _Rows(
         u=(np.asarray(state.u).dtype, (ndim,)),
@@ -243,19 +217,8 @@ def run(
         insertion=(np.int64, ()),
         batches=(np.int64, ()),
     )
-    if resume_state is not None and iteration:
-        dead_birth = resume_state.dead_birth
-        rows.extend(
-            u=np.asarray(resume_state.dead_u),
-            theta=np.asarray(resume_state.dead_theta),
-            logl=np.asarray(resume_state.dead_logl),
-            logwt=np.asarray(resume_state.dead_logwt),
-            birth=np.full(iteration, np.nan) if dead_birth is None else dead_birth,
-            ncall=np.asarray(resume_state.replacement_ncall, dtype=np.int64),
-            insertion=np.asarray(resume_state.insertion_indices, dtype=np.int64),
-            # Unknown without the telemetry: counted as one batch each.
-            batches=restored.get("replacement_batches", np.ones(iteration, np.int64)),
-        )
+    if resume is not None:
+        rows.extend(**{name: resume.dead[name] for name in rows.columns()})
 
     initial_iteration = iteration
     success, message, stopped_by_callback = True, "converged", False
@@ -263,54 +226,15 @@ def run(
     partial_failure = {"offset": None, "delta_logz": None, "message": None}
     terminated_after_partial_failure = False
     printer = _ProgressPrinter() if progress else None
-    rwalk_moves = int(restored.get("rwalk_moves", 0))
-    rwalk_proposals = int(restored.get("rwalk_proposals", 0))
-    scale = core._INITIAL_SCALE
-    if resume_state is not None and resume_state.scale is not None:
-        if math.isfinite(float(resume_state.scale)):
-            scale = float(resume_state.scale)
-    scale_history = [float(x) for x in restored.get("adaptive_scale_history", [])]
-    if not scale_history or scale_history[-1] != scale:
-        scale_history.append(scale)
-    accept_history = [float(x) for x in restored.get("adaptive_accept_history", [])]
+    rwalk_moves = int(telemetry["rwalk_moves"])
+    rwalk_proposals = int(telemetry["rwalk_proposals"])
+    scale_history = [float(x) for x in telemetry["scale_history"]]
+    accept_history = [float(x) for x in telemetry["accept_history"]]
     # The cluster swap's host hook (tinyns.clusters): its extras switch the
     # swap move on in core.step once two clusters can swap.
     hook = ClusterTracker(nlive) if cfg.cluster_swap else None
-    if hook is not None and resume_state is not None:
-        hook.load_state_dict(resume_state.clusters)
-
-    def checkpoint_state() -> NestedRunState:
-        return NestedRunState(
-            key=state.key,
-            live_u=state.u,
-            live_theta=state.theta,
-            live_logl=state.logl,
-            live_birth=state.birth,
-            dead_u=rows["u"],
-            dead_theta=rows["theta"],
-            dead_logl=rows["logl"],
-            dead_logwt=rows["logwt"],
-            dead_birth=rows["birth"],
-            logz_dead=state.logz,
-            logx_final=state.logx,
-            ncall=ncall,
-            replacement_ncall=rows["ncall"],
-            insertion_indices=rows["insertion"],
-            replacement_failures=failures,
-            iteration=iteration,
-            success=success,
-            message=message,
-            stopped_by_callback=stopped_by_callback,
-            scale=scale,
-            clusters=None if hook is None else hook.state_dict(),
-            telemetry={
-                "replacement_batches": rows["batches"].tolist(),
-                "rwalk_moves": rwalk_moves,
-                "rwalk_proposals": rwalk_proposals,
-                "adaptive_scale_history": list(scale_history),
-                "adaptive_accept_history": list(accept_history),
-            },
-        )
+    if hook is not None and resume is not None:
+        hook.load_state_dict(resume.ext.get("clusters"))
 
     last_checkpoint = initial_iteration
 
@@ -319,7 +243,19 @@ def run(
         if checkpoint_path is None:
             return
         if final or iteration - last_checkpoint >= checkpoint_interval:
-            save_checkpoint_npz(checkpoint_path, checkpoint_state(), config)
+            checkpoint.save(
+                checkpoint_path,
+                state._replace(scale=scale),  # the host scale of the next block
+                rows.columns(),
+                cfg,
+                {
+                    "rwalk_moves": rwalk_moves,
+                    "rwalk_proposals": rwalk_proposals,
+                    "scale_history": scale_history,
+                    "accept_history": accept_history,
+                },
+                ext=None if hook is None else {"clusters": hook.state_dict()},
+            )
             last_checkpoint = iteration
 
     def run_state(delta_logz: float, logl_min: float) -> dict[str, object]:
@@ -577,7 +513,7 @@ def run(
             "checkpoint_interval": (
                 checkpoint_interval if checkpoint_path is not None else None
             ),
-            "resumed_from_checkpoint": resume_state is not None,
+            "resumed_from_checkpoint": resume is not None,
             "initial_iteration": int(initial_iteration),
             "final_iteration": int(iteration),
         },
