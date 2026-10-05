@@ -27,23 +27,6 @@ _OPTION_NAMES = (
     "replacement_chains",
     "replacement_chain_schedule",
     "rwalk_proposal",
-    "bound",
-    "bound_enlargement",
-    "bound_update_interval",
-    "bound_jitter",
-    "bound_max_draws",
-    "multi_bound_max_ellipsoids",
-    "multi_bound_min_points",
-    "multi_bound_split_threshold",
-    "multi_bound_enlargement",
-    "multi_bound_overlap_correction",
-    "rwalk_seed",
-    "rwalk_seed_fallback",
-    "bound_seed_kernel",
-    "allow_unused_bound",
-    "fused_bound_rwalk",
-    "bound_rebuild_on_failure",
-    "bound_failure_rebuild_threshold",
     "jax_vectorized",
     "jax_block_size",
     "rwalk_adaptive_step_scale",
@@ -60,23 +43,6 @@ _OLD_CHECKPOINT_DEFAULTS = {
     "min_accepts": 1,
     "replacement_chains": 1,
     "rwalk_proposal": "isotropic",
-    "bound": "none",
-    "bound_enlargement": 1.25,
-    "bound_update_interval": 1,
-    "bound_jitter": 1e-6,
-    "bound_max_draws": None,
-    "multi_bound_max_ellipsoids": 32,
-    "multi_bound_min_points": None,
-    "multi_bound_split_threshold": 0.9,
-    "multi_bound_enlargement": None,
-    "multi_bound_overlap_correction": True,
-    "rwalk_seed": "live",
-    "rwalk_seed_fallback": True,
-    "bound_seed_kernel": "python",
-    "allow_unused_bound": False,
-    "fused_bound_rwalk": False,
-    "bound_rebuild_on_failure": False,
-    "bound_failure_rebuild_threshold": 1,
     "jax_vectorized": False,
     "jax_block_size": 1,
     "rwalk_adaptive_step_scale": False,
@@ -121,7 +87,7 @@ class NestedSampler:
         chains swap between tracked clusters of the live points, which keeps
         the weights of separated modes from drifting; pass
         ``cluster_swap=False`` to opt out.
-        Where live-cov is unsupported (``kernel="python"``, a bound, or a
+        Where live-cov is unsupported (``kernel="python"`` or a
         ``replacement_chain_schedule``) the defaults fall back to
         ``rwalk_proposal="isotropic"``, ``step_scale=0.1`` and
         ``jax_block_size=1``. ``sample="prior"`` defaults to ``kernel="python"``.
@@ -156,15 +122,6 @@ class NestedSampler:
         kernel = options["kernel"]
         if kernel not in {"python", "jax"}:
             raise ValueError("kernel must be one of {'python', 'jax'}")
-        bound = options["bound"]
-        if bound not in {"none", "single", "multi"}:
-            raise ValueError("bound must be one of {'none', 'single', 'multi'}")
-        rwalk_seed = options["rwalk_seed"]
-        if rwalk_seed not in {"live", "bound"}:
-            raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
-        bound_seed_kernel = options["bound_seed_kernel"]
-        if bound_seed_kernel not in {"python", "jax"}:
-            raise ValueError("bound_seed_kernel must be one of {'python', 'jax'}")
         if not callable(loglike):
             raise TypeError("loglike must be callable")
         if not callable(prior_transform):
@@ -207,14 +164,11 @@ class NestedSampler:
         if rwalk_proposal not in RWALK_PROPOSALS:
             raise ValueError(f"rwalk_proposal must be one of {RWALK_PROPOSALS}")
         if rwalk_proposal == "live-cov" and not (
-            sample == "rwalk"
-            and kernel == "jax"
-            and bound == "none"
-            and replacement_chain_schedule is None
+            sample == "rwalk" and kernel == "jax" and replacement_chain_schedule is None
         ):
             raise NotImplementedError(
                 "rwalk_proposal='live-cov' is supported only for sample='rwalk', "
-                "kernel='jax', bound='none' and a fixed replacement_chains"
+                "kernel='jax' and a fixed replacement_chains"
             )
         if bool(options["rwalk_adaptive_step_scale"]) and not (
             sample == "rwalk" and kernel == "jax"
@@ -225,7 +179,6 @@ class NestedSampler:
             )
         if not (0.0 < float(options["rwalk_target_accept"]) < 1.0):
             raise ValueError("rwalk_target_accept must be between 0 and 1")
-        fused_bound_rwalk = bool(options["fused_bound_rwalk"])
         jax_block_size = options["jax_block_size"]
         if (
             not isinstance(jax_block_size, int)
@@ -234,22 +187,10 @@ class NestedSampler:
         ):
             raise ValueError("jax_block_size must be a positive integer")
         if jax_block_size > 1:
-            unbounded_block = sample == "rwalk" and kernel == "jax" and bound == "none"
-            bounded_block = (
-                sample == "rwalk"
-                and kernel == "jax"
-                and bound in {"single", "multi"}
-                and rwalk_seed == "bound"
-                and bound_seed_kernel == "jax"
-                and fused_bound_rwalk
-            )
-            if not (unbounded_block or bounded_block):
+            if not (sample == "rwalk" and kernel == "jax"):
                 raise NotImplementedError(
-                    "jax_block_size > 1 is experimental and currently supported only "
-                    "for unbounded sample='rwalk', kernel='jax' or fixed-bound "
-                    "block mode with bound in {'single', 'multi'}, "
-                    "rwalk_seed='bound', bound_seed_kernel='jax', and "
-                    "fused_bound_rwalk=True"
+                    "jax_block_size > 1 is supported only for sample='rwalk', "
+                    "kernel='jax'"
                 )
             if replacement_chain_schedule is not None:
                 raise ValueError(
@@ -257,16 +198,6 @@ class NestedSampler:
                     "jax_block_size > 1; use jax_block_size=1 for adaptive "
                     "replacement-chain schedules"
                 )
-        if fused_bound_rwalk and not (
-            sample == "rwalk"
-            and kernel == "jax"
-            and bound in {"single", "multi"}
-            and rwalk_seed == "bound"
-        ):
-            raise NotImplementedError(
-                "fused_bound_rwalk=True is supported only for sample='rwalk', "
-                "kernel='jax', bound in {'single', 'multi'}, and rwalk_seed='bound'"
-            )
         unknown = sorted(set(kwargs) - _KNOWN_KWARGS)
         if unknown:
             warnings.warn(
@@ -330,33 +261,6 @@ class NestedSampler:
             "replacement_chains": int(options["replacement_chains"]),
             "rwalk_proposal": str(options["rwalk_proposal"]),
             "replacement_chain_schedule": None if schedule is None else list(schedule),
-            "bound": str(options["bound"]),
-            "bound_enlargement": float(options["bound_enlargement"]),
-            "bound_update_interval": int(options["bound_update_interval"]),
-            "bound_jitter": float(options["bound_jitter"]),
-            "bound_max_draws": options["bound_max_draws"],
-            "multi_bound_max_ellipsoids": int(options["multi_bound_max_ellipsoids"]),
-            "multi_bound_min_points": options["multi_bound_min_points"],
-            "multi_bound_split_threshold": float(
-                options["multi_bound_split_threshold"]
-            ),
-            "multi_bound_enlargement": options["multi_bound_enlargement"],
-            "multi_bound_overlap_correction": bool(
-                options["multi_bound_overlap_correction"]
-            ),
-            "rwalk_seed": str(options["rwalk_seed"]),
-            "rwalk_seed_fallback": bool(options["rwalk_seed_fallback"]),
-            "bound_seed_kernel": (
-                "jax"
-                if options["fused_bound_rwalk"]
-                else str(options["bound_seed_kernel"])
-            ),
-            "allow_unused_bound": bool(options["allow_unused_bound"]),
-            "fused_bound_rwalk": bool(options["fused_bound_rwalk"]),
-            "bound_rebuild_on_failure": bool(options["bound_rebuild_on_failure"]),
-            "bound_failure_rebuild_threshold": int(
-                options["bound_failure_rebuild_threshold"]
-            ),
             "jax_vectorized": bool(options["jax_vectorized"]),
             "jax_block_size": int(options["jax_block_size"]),
             # live-cov always adapts its step scale (see run_static_nested).

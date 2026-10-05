@@ -317,7 +317,6 @@ def test_two_mode_resume_with_swap_matches_uninterrupted(tmp_path) -> None:
         {"jax_block_size": 1},
         {"replacement_chains": 2},
         {"rwalk_proposal": "isotropic"},
-        {"bound": "single", "rwalk_seed": "bound"},
     ],
 )
 def test_cluster_swap_off_the_fast_path(kwargs) -> None:

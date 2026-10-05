@@ -200,51 +200,6 @@ def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
         assert resumed.metadata[key] == pytest.approx(full.metadata[key])
 
 
-def test_resume_preserves_cumulative_bound_telemetry(tmp_path):
-    path = tmp_path / "bound_telemetry.checkpoint.npz"
-    sampler = make_sampler(
-        sample="rwalk",
-        kernel="jax",
-        walks=1,
-        bound="single",
-        rwalk_seed="bound",
-        bound_seed_kernel="jax",
-        batch_size=8,
-        bound_max_draws=8,
-        max_attempts=8,
-    )
-
-    full = sampler.run(101, maxiter=4, dlogz=0.0)
-    sampler.run(
-        101,
-        maxiter=2,
-        dlogz=0.0,
-        checkpoint_path=path,
-        checkpoint_interval=1,
-    )
-    resumed = sampler.resume(path, maxiter=4, dlogz=0.0)
-
-    for key in (
-        "bound_updates",
-        "bound_build_count",
-        "max_bound_draws",
-        "max_bound_seed_calls",
-        "max_bound_seed_batches",
-    ):
-        assert resumed.metadata[key] == full.metadata[key]
-    for key in (
-        "mean_bound_draws",
-        "mean_bound_loglike_evals",
-        "mean_bound_unit_cube_acceptance",
-        "mean_bound_seed_calls",
-        "mean_bound_seed_batches",
-        "mean_rwalk_kernel_calls",
-        "bound_log_volume_mean",
-        "bound_nellipsoids_mean",
-    ):
-        assert resumed.metadata[key] == pytest.approx(full.metadata[key])
-
-
 def test_resume_without_telemetry_payload_uses_empty_history_defaults(tmp_path):
     path = tmp_path / "telemetry_full.checkpoint.npz"
     stripped = tmp_path / "telemetry_stripped.checkpoint.npz"
@@ -403,46 +358,15 @@ def test_old_checkpoint_missing_replacement_chains_defaults_to_one(tmp_path):
     assert result.metadata["replacement_chains"] == 1
 
 
-def test_checkpoint_config_includes_bound_settings(tmp_path):
+def test_checkpoint_has_no_removed_option_keys(tmp_path):
     path = tmp_path / "run.checkpoint.npz"
-    make_sampler(bound="single", rwalk_seed="live").run(
-        19, maxiter=1, dlogz=0.0, checkpoint_path=path
+    make_sampler(sample="rwalk", walks=3).run(
+        19, maxiter=40, dlogz=0.0, checkpoint_path=path
     )
 
-    _, config = load_checkpoint_npz(path)
-    assert config["bound"] == "single"
-    assert config["bound_enlargement"] == 1.25
-    assert config["bound_update_interval"] == 1
-    assert config["bound_jitter"] == 1e-6
-    assert config["bound_max_draws"] is None
-    assert config["bound_rebuild_on_failure"] is False
-    assert config["bound_failure_rebuild_threshold"] == 1
-    assert config["multi_bound_max_ellipsoids"] == 32
-    assert config["multi_bound_min_points"] is None
-    assert config["multi_bound_split_threshold"] == 0.9
-    assert config["multi_bound_overlap_correction"] is True
-    assert config["rwalk_seed"] == "live"
-
-
-def test_checkpoint_config_includes_multi_bound_settings(tmp_path):
-    path = tmp_path / "run.checkpoint.npz"
-    make_sampler(
-        sample="rwalk",
-        bound="multi",
-        rwalk_seed="bound",
-        walks=3,
-        multi_bound_max_ellipsoids=4,
-        multi_bound_min_points=8,
-        multi_bound_split_threshold=0.95,
-        multi_bound_overlap_correction=True,
-    ).run(20, maxiter=1, dlogz=0.0, checkpoint_path=path)
-
-    _, config = load_checkpoint_npz(path)
-    assert config["bound"] == "multi"
-    assert config["multi_bound_max_ellipsoids"] == 4
-    assert config["multi_bound_min_points"] == 8
-    assert config["multi_bound_split_threshold"] == 0.95
-    assert config["multi_bound_overlap_correction"] is True
+    state, config = load_checkpoint_npz(path)
+    assert not [name for name in config if "bound" in name]
+    assert not [name for name in state.telemetry if "bound" in name]
 
 
 def test_checkpoint_config_validates_jax_vectorized(tmp_path):
@@ -455,29 +379,6 @@ def test_checkpoint_config_validates_jax_vectorized(tmp_path):
         make_sampler(sample="rwalk", kernel="jax", jax_vectorized=True).resume(
             path, maxiter=2
         )
-
-
-def test_checkpoint_config_validates_bound_rebuild_policy(tmp_path):
-    path = tmp_path / "run.checkpoint.npz"
-    make_sampler(
-        bound="single",
-        bound_rebuild_on_failure=True,
-        bound_failure_rebuild_threshold=2,
-    ).run(102, maxiter=1, dlogz=0.0, checkpoint_path=path)
-
-    _, config = load_checkpoint_npz(path)
-    assert config["bound_rebuild_on_failure"] is True
-    assert config["bound_failure_rebuild_threshold"] == 2
-    with pytest.raises(ValueError, match="bound_rebuild_on_failure"):
-        make_sampler(bound="single", bound_rebuild_on_failure=False).resume(
-            path, maxiter=2
-        )
-    with pytest.raises(ValueError, match="bound_failure_rebuild_threshold"):
-        make_sampler(
-            bound="single",
-            bound_rebuild_on_failure=True,
-            bound_failure_rebuild_threshold=1,
-        ).resume(path, maxiter=2)
 
 
 def _rewrite_checkpoint_array(path, name, value):

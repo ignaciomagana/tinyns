@@ -103,7 +103,7 @@ def test_nested_sampler_rejects_removed_samplers(sample: str) -> None:
         NestedSampler(loglike, prior_transform, ndim=3, sample=sample)
 
 
-def test_run_static_nested_rejects_bound_sampler_mode() -> None:
+def test_run_static_nested_rejects_removed_sampler_mode() -> None:
     with pytest.raises(ValueError, match=r"sample must be one of"):
         run_static_nested(
             0,
@@ -288,7 +288,6 @@ def test_default_walks_reaches_run_metadata() -> None:
     "extra",
     [
         {"kernel": "python"},
-        {"bound": "single", "rwalk_seed": "bound"},
         {"replacement_chain_schedule": (1, 2)},
     ],
 )
@@ -334,7 +333,6 @@ def test_prior_sampler_defaults_to_python_kernel() -> None:
     "extra",
     [
         {"kernel": "python"},
-        {"bound": "single", "rwalk_seed": "bound"},
         {"replacement_chain_schedule": (1, 2)},
     ],
 )

@@ -13,11 +13,6 @@ import numpy as np
 from jax import lax, random
 from jax.scipy.special import logsumexp
 
-from tinyns.bounds import (
-    as_jax_ellipsoid_bound,
-    build_multi_ellipsoid_bound,
-    build_single_ellipsoid_bound,
-)
 from tinyns.clusters import ClusterTracker
 from tinyns.math import logdiffexp
 from tinyns.result import NestedSamplingResult
@@ -28,16 +23,11 @@ from tinyns.samplers import (
     _evaluate_jax_batch,
     _make_rwalk_jax_kernel_cached,
     _split_callables,
-    draw_constrained_multi_bound_jax,
-    draw_constrained_multi_bound_rwalk_jax,
     draw_constrained_prior,
     draw_constrained_prior_vectorized,
     draw_constrained_rwalk,
     draw_constrained_rwalk_jax,
     draw_constrained_rwalk_jax_adaptive,
-    draw_constrained_single_bound,
-    draw_constrained_single_bound_jax,
-    draw_constrained_single_bound_rwalk_jax,
 )
 from tinyns.state import NestedRunState, save_checkpoint_npz
 from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
@@ -47,7 +37,7 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     """Resolve the ``None`` (fast-path) defaults of the rwalk options.
 
     ``kernel`` defaults to ``"jax"`` for ``sample="rwalk"``. Where live-cov is
-    supported (unbounded JAX rwalk with a fixed ``replacement_chains``) the
+    supported (JAX rwalk with a fixed ``replacement_chains``) the
     proposal defaults to ``"live-cov"`` and ``jax_block_size`` to 32 (1 with
     ``jax_vectorized``); elsewhere they fall back to ``"isotropic"`` and 1. An
     explicit ``"live-cov"`` is not overridden, so an unsupported combination
@@ -65,7 +55,6 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     fast_path = (
         sample == "rwalk"
         and kernel == "jax"
-        and options["bound"] == "none"
         and options["replacement_chain_schedule"] is None
     )
     proposal = options["rwalk_proposal"]
@@ -95,8 +84,8 @@ def _resolve_defaults(ndim: int, sample: str, options) -> dict:
     elif cluster_swap and not swap_supported:
         raise NotImplementedError(
             "cluster_swap=True is supported only for sample='rwalk', "
-            "kernel='jax', bound='none', rwalk_proposal='live-cov', "
-            "replacement_chains=1 and jax_block_size > 1"
+            "kernel='jax', rwalk_proposal='live-cov', replacement_chains=1 "
+            "and jax_block_size > 1"
         )
     return {
         "kernel": kernel,
@@ -296,7 +285,7 @@ def _make_static_jax_rwalk_block_kernel_cached(
     proposal: str = "isotropic",
     cluster_swap: bool = False,
 ):
-    """Return a cached jitted fixed-chain unbounded JAX rwalk block kernel.
+    """Return a cached jitted fixed-chain JAX rwalk block kernel.
 
     The cache is keyed on the callables' specs (see
     :class:`tinyns.samplers._CallableSpec`), so pytree callables that differ
@@ -574,163 +563,6 @@ _make_static_jax_rwalk_block_kernel.cache_info = (
 )
 
 
-def _run_static_jax_bounded_rwalk_block(
-    key,
-    live_u,
-    live_theta,
-    live_logl,
-    logz_dead,
-    start_iteration,
-    nlive,
-    loglike,
-    prior_transform,
-    ndim,
-    *,
-    jax_bound,
-    bound_kind,
-    block_size,
-    walks,
-    step_scale,
-    replacement_chains,
-    replacement_chain_schedule=None,
-    max_attempts,
-    min_accepts,
-    bound_batch_size,
-    bound_max_batches,
-    overlap_correction,
-    jax_vectorized: bool = False,
-):
-    """Run an experimental bounded rwalk block with one fixed JAX bound.
-
-    The ellipsoid arrays are reused for every replacement in the block.  The
-    Python driver intentionally rebuilds bounds only between blocks according
-    to ``bound_update_interval``, so this experimental path can use a slightly
-    stale bound inside a block.
-    """
-
-    fused_draw = (
-        draw_constrained_multi_bound_rwalk_jax
-        if bound_kind == "multi"
-        else draw_constrained_single_bound_rwalk_jax
-    )
-    carry_key = key
-    dead_u_values = []
-    dead_theta_values = []
-    dead_logl_values = []
-    dead_logwt_values = []
-    replacement_ncall_values = []
-    insertion_index_values = []
-    replacement_batch_values = []
-    replacement_chain_values = []
-    bound_seed_call_values = []
-    bound_seed_batch_values = []
-    rwalk_kernel_call_values = []
-    rwalk_accepted_move_values = []
-    bound_draw_values = []
-    bound_eval_values = []
-    accepted_values = []
-    bound_unit_cube_acceptance_values = []
-    bound_overlap_rejection_values = []
-
-    for offset in range(int(block_size)):
-        worst = int(jnp.argmin(live_logl))
-        dead_u = live_u[worst]
-        dead_theta = live_theta[worst]
-        logl_worst = float(live_logl[worst])
-        iteration = int(start_iteration) + offset
-        logx_prev = -iteration / int(nlive)
-        logx_new = -(iteration + 1) / int(nlive)
-        logwidth = logdiffexp(logx_prev, logx_new)
-        logwt = float(logwidth + logl_worst)
-        logz_dead = float(jnp.logaddexp(logz_dead, logwt))
-
-        result = fused_draw(
-            carry_key,
-            loglike,
-            prior_transform,
-            logl_worst,
-            jax_bound,
-            ndim,
-            walks=walks,
-            step_scale=step_scale,
-            max_attempts=max_attempts,
-            min_accepts=min_accepts,
-            replacement_chains=replacement_chains,
-            replacement_chain_schedule=replacement_chain_schedule,
-            bound_batch_size=bound_batch_size,
-            bound_max_batches=bound_max_batches,
-            jax_vectorized=jax_vectorized,
-            **(
-                {"overlap_correction": overlap_correction}
-                if bound_kind == "multi"
-                else {}
-            ),
-        )
-        carry_key, new_u, new_theta, new_logl, calls, accepted, info = result
-        accepted_bool = bool(accepted)
-        accepted_values.append(accepted_bool)
-        insertion_index = 0
-        if accepted_bool:
-            insertion_index = int(
-                jnp.sum(live_logl <= new_logl) - (live_logl[worst] <= new_logl)
-            )
-            live_u = live_u.at[worst].set(new_u)
-            live_theta = live_theta.at[worst].set(new_theta)
-            live_logl = live_logl.at[worst].set(new_logl)
-
-        dead_u_values.append(dead_u)
-        dead_theta_values.append(dead_theta)
-        dead_logl_values.append(logl_worst)
-        dead_logwt_values.append(logwt)
-        replacement_ncall_values.append(int(calls))
-        insertion_index_values.append(insertion_index)
-        replacement_batch_values.append(int(info["replacement_batches"]))
-        replacement_chain_values.append(int(info["replacement_chains_used"]))
-        bound_seed_call_values.append(int(info.get("bound_seed_loglike_evals", 0)))
-        bound_seed_batch_values.append(int(info.get("bound_seed_batches", 0)))
-        rwalk_kernel_call_values.append(int(info.get("rwalk_kernel_calls", 0)))
-        rwalk_accepted_move_values.append(
-            int(info.get("accepted_rwalk_moves", info.get("accepted_move_count", 0)))
-        )
-        bound_draw_values.append(int(info.get("bound_seed_draws", 0)))
-        bound_eval_values.append(int(info.get("bound_seed_loglike_evals", 0)))
-        bound_unit_cube_acceptance_values.append(
-            float(info.get("bound_seed_unit_cube_acceptance", 0.0))
-        )
-        bound_overlap_rejection_values.append(
-            int(info.get("bound_seed_overlap_rejections", 0))
-        )
-        if not accepted_bool:
-            break
-
-    logx_final_new = -(int(start_iteration) + len(dead_u_values)) / int(nlive)
-    return (
-        carry_key,
-        live_u,
-        live_theta,
-        live_logl,
-        jnp.stack(dead_u_values),
-        jnp.stack(dead_theta_values),
-        jnp.asarray(dead_logl_values),
-        jnp.asarray(dead_logwt_values),
-        jnp.asarray(replacement_ncall_values, dtype=int),
-        jnp.asarray(insertion_index_values, dtype=int),
-        jnp.asarray(replacement_batch_values, dtype=int),
-        jnp.asarray(replacement_chain_values, dtype=int),
-        jnp.asarray(accepted_values, dtype=bool),
-        float(logz_dead),
-        float(logx_final_new),
-        bound_seed_call_values,
-        bound_seed_batch_values,
-        rwalk_kernel_call_values,
-        rwalk_accepted_move_values,
-        bound_draw_values,
-        bound_eval_values,
-        bound_unit_cube_acceptance_values,
-        bound_overlap_rejection_values,
-    )
-
-
 def _make_run_state(
     *,
     iteration: int,
@@ -751,12 +583,6 @@ def _make_run_state(
     replacement_chains: int | None = None,
     kernel: str | None = None,
     walks: int | None = None,
-    bound: str = "none",
-    bound_draws: list[int] | None = None,
-    bound_unit_cube_acceptance: list[float] | None = None,
-    bound_nellipsoids: list[int] | None = None,
-    rwalk_seed: str = "live",
-    bound_seed_kernel: str = "python",
     calls_per_s: float | None = None,
 ) -> dict[str, object]:
     if replacement_ncall:
@@ -782,19 +608,6 @@ def _make_run_state(
         replacement_mean_chains_used_so_far = None
         replacement_max_chains_used_so_far = None
     replacement_chain_usage_counts_so_far = dict(replacement_chain_usage_counts or {})
-    mean_bound_draws_so_far = (
-        float(sum(bound_draws) / len(bound_draws)) if bound_draws else None
-    )
-    mean_bound_unit_cube_acceptance_so_far = (
-        float(sum(bound_unit_cube_acceptance) / len(bound_unit_cube_acceptance))
-        if bound_unit_cube_acceptance
-        else None
-    )
-    mean_bound_nellipsoids_so_far = (
-        float(sum(bound_nellipsoids) / len(bound_nellipsoids))
-        if bound_nellipsoids
-        else None
-    )
     adaptive_replacement_chains = replacement_chain_schedule is not None
     return {
         "iter": int(iteration),
@@ -819,14 +632,6 @@ def _make_run_state(
         "kernel": kernel,
         "walks": walks,
         "replacement_failures": int(replacement_failures),
-        "bound": bound,
-        "rwalk_seed": rwalk_seed,
-        "bound_seed_kernel": bound_seed_kernel,
-        "mean_bound_draws_so_far": mean_bound_draws_so_far,
-        "mean_bound_unit_cube_acceptance_so_far": (
-            mean_bound_unit_cube_acceptance_so_far
-        ),
-        "mean_bound_nellipsoids_so_far": mean_bound_nellipsoids_so_far,
     }
 
 
@@ -854,36 +659,6 @@ def _format_progress_line(state: dict[str, object]) -> str:
         if len(nonzero) > 4:
             usage += ",..."
         usage_text = f" usage={usage}" if usage else ""
-    bound_text = ""
-    if state.get("bound", "none") != "none":
-        bdraw = state.get("mean_bound_draws_so_far")
-        bacc = state.get("mean_bound_unit_cube_acceptance_so_far")
-        bdraw_text = "n/a" if bdraw is None else f"{float(bdraw):.1f}"
-        bacc_text = "n/a" if bacc is None else f"{float(bacc):.3f}"
-        if state.get("bound") == "multi":
-            nell = state.get("mean_bound_nellipsoids_so_far")
-            nell_text = "n/a" if nell is None else f"{float(nell):.1f}"
-            seed_text = state.get("rwalk_seed", "live")
-            seed_kernel_text = (
-                f" seed_kernel={state['bound_seed_kernel']}"
-                if state.get("bound_seed_kernel", "python") != "python"
-                else ""
-            )
-            bound_text = (
-                f" bound=multi seed={seed_text}{seed_kernel_text} "
-                f"nell={nell_text} bacc={bacc_text}"
-            )
-        else:
-            seed_text = state.get("rwalk_seed", "live")
-            seed_kernel_text = (
-                f" seed_kernel={state['bound_seed_kernel']}"
-                if state.get("bound_seed_kernel", "python") != "python"
-                else ""
-            )
-            bound_text = (
-                f" bound={state['bound']} seed={seed_text}{seed_kernel_text} "
-                f"bdraw={bdraw_text} bacc={bacc_text}"
-            )
     return (
         f"iter={int(state['iter']):05d} "
         f"logz={float(state['logz']):.3f} "
@@ -897,7 +672,6 @@ def _format_progress_line(state: dict[str, object]) -> str:
         f"repl_chains={chains_text}"
         f"{usage_text} "
         f"sample={state['sample']}"
-        f"{bound_text}"
     )
 
 
@@ -938,23 +712,6 @@ def run_static_nested(
     replacement_chains: int = 1,
     replacement_chain_schedule=None,
     rwalk_proposal: str | None = None,
-    bound: str = "none",
-    bound_enlargement: float = 1.25,
-    bound_update_interval: int = 1,
-    bound_jitter: float = 1e-6,
-    bound_max_draws: int | None = None,
-    bound_rebuild_on_failure: bool = False,
-    bound_failure_rebuild_threshold: int = 1,
-    multi_bound_max_ellipsoids: int = 32,
-    multi_bound_min_points: int | None = None,
-    multi_bound_split_threshold: float = 0.9,
-    multi_bound_enlargement: float | None = None,
-    multi_bound_overlap_correction: bool = True,
-    rwalk_seed: str = "live",
-    rwalk_seed_fallback: bool = True,
-    bound_seed_kernel: str = "python",
-    allow_unused_bound: bool = False,
-    fused_bound_rwalk: bool = False,
     jax_vectorized: bool = False,
     jax_block_size: int | None = None,
     rwalk_adaptive_step_scale: bool = False,
@@ -985,7 +742,6 @@ def run_static_nested(
         sample,
         {
             "kernel": kernel,
-            "bound": bound,
             "replacement_chain_schedule": replacement_chain_schedule,
             "jax_vectorized": jax_vectorized,
             "walks": walks,
@@ -1006,67 +762,6 @@ def run_static_nested(
         raise ValueError("sample must be one of {'prior', 'rwalk'}")
     if kernel not in {"python", "jax"}:
         raise ValueError("kernel must be one of {'python', 'jax'}")
-    if bound not in {"none", "single", "multi"}:
-        raise ValueError("bound must be one of {'none', 'single', 'multi'}")
-    if bound_update_interval <= 0:
-        raise ValueError("bound_update_interval must be a positive integer")
-    if bound_enlargement <= 0:
-        raise ValueError("bound_enlargement must be positive")
-    if bound_jitter <= 0:
-        raise ValueError("bound_jitter must be positive")
-    if bound_max_draws is not None and bound_max_draws <= 0:
-        raise ValueError("bound_max_draws must be positive or None")
-    if (
-        not isinstance(bound_failure_rebuild_threshold, int)
-        or isinstance(bound_failure_rebuild_threshold, bool)
-        or bound_failure_rebuild_threshold <= 0
-    ):
-        raise ValueError("bound_failure_rebuild_threshold must be a positive integer")
-    if rwalk_seed not in {"live", "bound"}:
-        raise ValueError("rwalk_seed must be one of {'live', 'bound'}")
-    if bound_seed_kernel not in {"python", "jax"}:
-        raise ValueError("bound_seed_kernel must be one of {'python', 'jax'}")
-    if fused_bound_rwalk and not (
-        sample == "rwalk"
-        and kernel == "jax"
-        and bound in {"single", "multi"}
-        and rwalk_seed == "bound"
-    ):
-        raise NotImplementedError(
-            "fused_bound_rwalk=True is supported only for sample='rwalk', "
-            "kernel='jax', bound in {'single', 'multi'}, and rwalk_seed='bound'"
-        )
-    if bound_seed_kernel == "jax" and not (
-        sample == "rwalk"
-        and kernel == "jax"
-        and bound in {"single", "multi"}
-        and rwalk_seed == "bound"
-    ):
-        raise NotImplementedError(
-            "bound_seed_kernel='jax' is supported only for sample='rwalk', "
-            "kernel='jax', bound in {'single', 'multi'}, and "
-            "rwalk_seed='bound'"
-        )
-    if (
-        sample == "rwalk"
-        and bound in {"single", "multi"}
-        and rwalk_seed == "live"
-        and not allow_unused_bound
-    ):
-        raise ValueError(
-            "bound='single' or bound='multi' with sample='rwalk' requires "
-            "rwalk_seed='bound'. Otherwise the bound is built but not used. "
-            "Set rwalk_seed='bound' for bounded rwalk, or bound='none' "
-            "for ordinary live-seeded rwalk."
-        )
-    if multi_bound_max_ellipsoids <= 0:
-        raise ValueError("multi_bound_max_ellipsoids must be positive")
-    if multi_bound_min_points is not None and multi_bound_min_points <= 0:
-        raise ValueError("multi_bound_min_points must be positive or None")
-    if multi_bound_split_threshold <= 0.0:
-        raise ValueError("multi_bound_split_threshold must be positive")
-    if multi_bound_enlargement is not None and multi_bound_enlargement <= 0.0:
-        raise ValueError("multi_bound_enlargement must be positive or None")
     if rwalk_adaptive_step_scale and not (sample == "rwalk" and kernel == "jax"):
         raise ValueError(
             "rwalk_adaptive_step_scale=True is supported only for "
@@ -1081,14 +776,11 @@ def run_static_nested(
         # the multiple is always adapted to the target acceptance.
         rwalk_adaptive_step_scale = True
     if rwalk_proposal == "live-cov" and not (
-        sample == "rwalk"
-        and kernel == "jax"
-        and bound == "none"
-        and replacement_chain_schedule is None
+        sample == "rwalk" and kernel == "jax" and replacement_chain_schedule is None
     ):
         raise NotImplementedError(
             "rwalk_proposal='live-cov' is supported only for sample='rwalk', "
-            "kernel='jax', bound='none' and a fixed replacement_chains"
+            "kernel='jax' and a fixed replacement_chains"
         )
     if kernel == "jax" and sample not in {"rwalk"}:
         raise NotImplementedError(
@@ -1126,21 +818,9 @@ def run_static_nested(
     ):
         raise ValueError("jax_block_size must be a positive integer")
     if jax_block_size > 1:
-        unbounded_block = sample == "rwalk" and kernel == "jax" and bound == "none"
-        bounded_block = (
-            sample == "rwalk"
-            and kernel == "jax"
-            and bound in {"single", "multi"}
-            and rwalk_seed == "bound"
-            and bound_seed_kernel == "jax"
-            and fused_bound_rwalk
-        )
-        if not (unbounded_block or bounded_block):
+        if not (sample == "rwalk" and kernel == "jax"):
             raise NotImplementedError(
-                "jax_block_size > 1 is experimental and currently supported only "
-                "for unbounded sample='rwalk', kernel='jax' or fixed-bound "
-                "block mode with bound in {'single', 'multi'}, rwalk_seed='bound', "
-                "bound_seed_kernel='jax', and fused_bound_rwalk=True"
+                "jax_block_size > 1 is supported only for sample='rwalk', kernel='jax'"
             )
         if jax_vectorized:
             raise NotImplementedError(
@@ -1203,21 +883,9 @@ def run_static_nested(
     if maxiter is None:
         maxiter = 10_000 * ndim
 
-    jax_block_cached = bool(jax_block_size > 1 and bound == "none")
-    jax_block_kernel = (
-        "bounded-python-loop-fixed-bound"
-        if jax_block_size > 1 and bound != "none"
-        else "fixed-rwalk-cached"
-        if jax_block_size > 1
-        else None
-    )
-    jax_block_impl = (
-        "python-loop-fixed-bound"
-        if jax_block_size > 1 and bound != "none"
-        else "lax-scan-unbounded"
-        if jax_block_size > 1
-        else None
-    )
+    jax_block_cached = bool(jax_block_size > 1)
+    jax_block_kernel = "fixed-rwalk-cached" if jax_block_size > 1 else None
+    jax_block_impl = "lax-scan-unbounded" if jax_block_size > 1 else None
 
     config = {
         "ndim": int(ndim),
@@ -1237,24 +905,6 @@ def run_static_nested(
             if replacement_chain_schedule is None
             else list(replacement_chain_schedule)
         ),
-        "bound": str(bound),
-        "bound_enlargement": float(bound_enlargement),
-        "bound_update_interval": int(bound_update_interval),
-        "bound_jitter": float(bound_jitter),
-        "bound_max_draws": bound_max_draws,
-        "bound_rebuild_on_failure": bool(bound_rebuild_on_failure),
-        "bound_failure_rebuild_threshold": int(bound_failure_rebuild_threshold),
-        "multi_bound_max_ellipsoids": int(multi_bound_max_ellipsoids),
-        "multi_bound_min_points": multi_bound_min_points,
-        "multi_bound_split_threshold": float(multi_bound_split_threshold),
-        "multi_bound_enlargement": multi_bound_enlargement,
-        "multi_bound_overlap_correction": bool(multi_bound_overlap_correction),
-        "rwalk_seed": str(rwalk_seed),
-        "rwalk_seed_fallback": bool(rwalk_seed_fallback),
-        "bound_seed_kernel": "jax" if fused_bound_rwalk else str(bound_seed_kernel),
-        "allow_unused_bound": bool(allow_unused_bound),
-        "fused_bound_rwalk": bool(fused_bound_rwalk),
-        "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
         "jax_vectorized": bool(jax_vectorized),
         "jax_block_size": int(jax_block_size),
         "jax_block_cached": jax_block_cached,
@@ -1396,48 +1046,6 @@ def run_static_nested(
     partial_block_failure_offset = None
     partial_block_failure_message = None
     progress_printer = _ProgressPrinter() if progress else None
-    current_bound = None
-    bound_updates = int(restored_telemetry.get("bound_updates", 0))
-    bound_draw_history = [
-        int(value) for value in restored_telemetry.get("bound_draw_history", [])
-    ]
-    bound_eval_history = [
-        int(value) for value in restored_telemetry.get("bound_eval_history", [])
-    ]
-    bound_unit_cube_acceptance_history = [
-        float(value)
-        for value in restored_telemetry.get(
-            "bound_unit_cube_acceptance_history", []
-        )
-    ]
-    bound_build_time_history = [
-        float(value)
-        for value in restored_telemetry.get("bound_build_time_history", [])
-    ]
-    bound_log_volume_history = [
-        float(value)
-        for value in restored_telemetry.get("bound_log_volume_history", [])
-    ]
-    bound_nellipsoid_history = [
-        int(value)
-        for value in restored_telemetry.get("bound_nellipsoid_history", [])
-    ]
-    bound_overlap_rejection_history = [
-        int(value)
-        for value in restored_telemetry.get("bound_overlap_rejection_history", [])
-    ]
-    bound_seed_call_history = [
-        int(value)
-        for value in restored_telemetry.get("bound_seed_call_history", [])
-    ]
-    bound_seed_batch_history = [
-        int(value)
-        for value in restored_telemetry.get("bound_seed_batch_history", [])
-    ]
-    rwalk_kernel_call_history = [
-        int(value)
-        for value in restored_telemetry.get("rwalk_kernel_call_history", [])
-    ]
     rwalk_accepted_move_history = [
         int(value)
         for value in restored_telemetry.get("rwalk_accepted_move_history", [])
@@ -1446,13 +1054,6 @@ def run_static_nested(
         int(value)
         for value in restored_telemetry.get("rwalk_proposal_history", [])
     ]
-    consecutive_bound_failures = int(
-        restored_telemetry.get("consecutive_bound_failures", 0)
-    )
-    force_bound_rebuild = bool(restored_telemetry.get("force_bound_rebuild", False))
-    bound_forced_rebuilds = int(
-        restored_telemetry.get("bound_forced_rebuilds", 0)
-    )
     replacement_rescue_attempts = int(
         restored_telemetry.get("replacement_rescue_attempts", 0)
     )
@@ -1569,28 +1170,10 @@ def run_static_nested(
                 "replacement_chain_usage_counts": dict(
                     replacement_chain_usage_counts
                 ),
-                "bound_updates": int(bound_updates),
-                "bound_draw_history": list(bound_draw_history),
-                "bound_eval_history": list(bound_eval_history),
-                "bound_unit_cube_acceptance_history": list(
-                    bound_unit_cube_acceptance_history
-                ),
-                "bound_build_time_history": list(bound_build_time_history),
-                "bound_log_volume_history": list(bound_log_volume_history),
-                "bound_nellipsoid_history": list(bound_nellipsoid_history),
-                "bound_overlap_rejection_history": list(
-                    bound_overlap_rejection_history
-                ),
-                "bound_seed_call_history": list(bound_seed_call_history),
-                "bound_seed_batch_history": list(bound_seed_batch_history),
-                "rwalk_kernel_call_history": list(rwalk_kernel_call_history),
                 "rwalk_accepted_move_history": list(
                     rwalk_accepted_move_history
                 ),
                 "rwalk_proposal_history": list(rwalk_proposal_history),
-                "consecutive_bound_failures": int(consecutive_bound_failures),
-                "force_bound_rebuild": bool(force_bound_rebuild),
-                "bound_forced_rebuilds": int(bound_forced_rebuilds),
                 "replacement_rescue_attempts": int(replacement_rescue_attempts),
                 "replacement_rescue_successes": int(replacement_rescue_successes),
                 "replacement_rescue_failures": int(replacement_rescue_failures),
@@ -1615,55 +1198,6 @@ def run_static_nested(
         if final or (iteration - last_checkpoint_iteration) >= checkpoint_interval:
             save_checkpoint_npz(checkpoint_path_str, current_state(), config)
             last_checkpoint_iteration = iteration
-
-    def maybe_rebuild_bound(iter_index: int) -> None:
-        """(Re)build the active ellipsoid bound when the interval/force fires.
-
-        ``iter_index`` is the loop counter used for the periodic-rebuild modulo:
-        block mode passes ``iteration`` and per-iteration mode passes ``i`` (the
-        only behavioral difference between the two former inline copies).
-        """
-        nonlocal current_bound, bound_updates, bound_forced_rebuilds
-        nonlocal force_bound_rebuild
-        if bound not in {"single", "multi"}:
-            return
-        if not (
-            current_bound is None
-            or iter_index % bound_update_interval == 0
-            or force_bound_rebuild
-        ):
-            return
-        build_start = time.perf_counter()
-        if bound == "multi":
-            current_bound = build_multi_ellipsoid_bound(
-                live_u,
-                enlargement=multi_bound_enlargement or bound_enlargement,
-                jitter=bound_jitter,
-                max_ellipsoids=multi_bound_max_ellipsoids,
-                min_points=multi_bound_min_points,
-                split_threshold=multi_bound_split_threshold,
-            )
-        else:
-            current_bound = build_single_ellipsoid_bound(
-                live_u,
-                enlargement=bound_enlargement,
-                jitter=bound_jitter,
-            )
-        bound_build_time_history.append(time.perf_counter() - build_start)
-        bound_log_volume_history.append(
-            float(
-                current_bound.log_total_volume
-                if hasattr(current_bound, "log_total_volume")
-                else current_bound.log_volume
-            )
-        )
-        bound_nellipsoid_history.append(
-            int(len(getattr(current_bound, "ellipsoids", (current_bound,))))
-        )
-        bound_updates += 1
-        if force_bound_rebuild:
-            bound_forced_rebuilds += 1
-            force_bound_rebuild = False
 
     def build_state(
         *,
@@ -1704,12 +1238,6 @@ def run_static_nested(
             replacement_chains=replacement_chains,
             kernel=kernel,
             walks=walks,
-            bound=bound,
-            bound_draws=bound_draw_history,
-            bound_unit_cube_acceptance=bound_unit_cube_acceptance_history,
-            bound_nellipsoids=bound_nellipsoid_history,
-            rwalk_seed=rwalk_seed,
-            bound_seed_kernel=bound_seed_kernel,
             calls_per_s=calls / seconds if calls > 0 and seconds > 0 else None,
         )
 
@@ -1750,121 +1278,68 @@ def run_static_nested(
             live_u_before_block = live_u
             live_theta_before_block = live_theta
             live_logl_before_block = live_logl
-            block_extra = None
-            accepted_move_count_block = None
-            total_proposal_count_block = None
             swap_block = ()
-            if bound in {"single", "multi"}:
-                maybe_rebuild_bound(iteration)
-                seed_limit = bound_max_draws or max_attempts
-                result = _run_static_jax_bounded_rwalk_block(
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    logz_dead,
-                    iteration,
-                    nlive,
-                    loglike,
-                    prior_transform,
-                    ndim,
-                    jax_bound=as_jax_ellipsoid_bound(current_bound),
-                    bound_kind=bound,
-                    block_size=block_size_now,
-                    walks=walks,
-                    step_scale=step_scale,
-                    replacement_chains=replacement_chains,
-                    replacement_chain_schedule=replacement_chain_schedule,
-                    max_attempts=max_attempts,
-                    min_accepts=min_accepts,
-                    bound_batch_size=batch_size,
-                    bound_max_batches=int(math.ceil(seed_limit / batch_size)),
-                    overlap_correction=multi_bound_overlap_correction,
-                    jax_vectorized=jax_vectorized,
+            batch_ncall = int(walks) * int(replacement_chains)
+            max_batches = int(max_attempts) // batch_ncall
+            frames = None
+            if tracker is not None:
+                host_start = time.perf_counter()
+                frames = tracker.frames(
+                    live_u, iteration, dead_u_storage, dead_logwt_storage
                 )
-                (
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    dead_u_block,
-                    dead_theta_block,
-                    dead_logl_block,
-                    dead_logwt_block,
-                    replacement_ncall_block,
-                    insertion_indices_block,
-                    replacement_batches_block,
-                    replacement_chains_used_block,
-                    accepted_block,
-                    logz_dead,
-                    logx_final,
-                    *block_extra,
-                ) = result
-            else:
-                batch_ncall = int(walks) * int(replacement_chains)
-                max_batches = int(max_attempts) // batch_ncall
-                frames = None
-                if tracker is not None:
-                    host_start = time.perf_counter()
-                    frames = tracker.frames(
-                        live_u, iteration, dead_u_storage, dead_logwt_storage
-                    )
-                    cluster_host_s += time.perf_counter() - host_start
-                block_kernel = _make_static_jax_rwalk_block_kernel(
-                    loglike,
-                    prior_transform,
-                    int(ndim),
-                    int(walks),
-                    int(replacement_chains),
-                    int(block_size_now),
-                    rwalk_proposal,
-                    frames is not None,
-                )
-                result = block_kernel(
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    jnp.asarray(logz_dead),
-                    jnp.asarray(iteration, dtype=jnp.int32),
-                    jnp.asarray(nlive, dtype=jnp.int32),
-                    jnp.asarray(
-                        effective_step_scale
-                        if rwalk_adaptive_step_scale
-                        else step_scale
-                    ),
-                    jnp.asarray(min_accepts),
-                    jnp.asarray(max_batches, dtype=jnp.int32),
-                    *([] if frames is None else [frames]),
-                    *callable_leaves,
-                )
-                (
-                    key,
-                    live_u,
-                    live_theta,
-                    live_logl,
-                    dead_u_block,
-                    dead_theta_block,
-                    dead_logl_block,
-                    dead_logwt_block,
-                    replacement_ncall_block,
-                    insertion_indices_block,
-                    replacement_batches_block,
-                    replacement_chains_used_block,
-                    accepted_block,
-                    accepted_move_count_block,
-                    total_proposal_count_block,
-                    new_u_block,
-                    new_theta_block,
-                    new_logl_block,
-                    logz_dead,
-                    logx_final,
-                    *swap_block,
-                ) = result
+                cluster_host_s += time.perf_counter() - host_start
+            block_kernel = _make_static_jax_rwalk_block_kernel(
+                loglike,
+                prior_transform,
+                int(ndim),
+                int(walks),
+                int(replacement_chains),
+                int(block_size_now),
+                rwalk_proposal,
+                frames is not None,
+            )
+            result = block_kernel(
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                jnp.asarray(logz_dead),
+                jnp.asarray(iteration, dtype=jnp.int32),
+                jnp.asarray(nlive, dtype=jnp.int32),
+                jnp.asarray(
+                    effective_step_scale if rwalk_adaptive_step_scale else step_scale
+                ),
+                jnp.asarray(min_accepts),
+                jnp.asarray(max_batches, dtype=jnp.int32),
+                *([] if frames is None else [frames]),
+                *callable_leaves,
+            )
+            (
+                key,
+                live_u,
+                live_theta,
+                live_logl,
+                dead_u_block,
+                dead_theta_block,
+                dead_logl_block,
+                dead_logwt_block,
+                replacement_ncall_block,
+                insertion_indices_block,
+                replacement_batches_block,
+                replacement_chains_used_block,
+                accepted_block,
+                accepted_move_count_block,
+                total_proposal_count_block,
+                new_u_block,
+                new_theta_block,
+                new_logl_block,
+                logz_dead,
+                logx_final,
+                *swap_block,
+            ) = result
             block_start = iteration
             block_accepted = [bool(x) for x in np.asarray(accepted_block)]
             failed_offsets = [idx for idx, ok in enumerate(block_accepted) if not ok]
-            rescue_capable_block = bound == "none"
             full_dead_u_block = dead_u_block
             full_dead_theta_block = dead_theta_block
             full_dead_logl_block = dead_logl_block
@@ -1874,24 +1349,12 @@ def run_static_nested(
             full_replacement_chains_used_block = replacement_chains_used_block
             full_accepted_move_count_block = accepted_move_count_block
             full_total_proposal_count_block = total_proposal_count_block
-            full_new_u_block = new_u_block if rescue_capable_block else dead_u_block
-            full_new_theta_block = (
-                new_theta_block if rescue_capable_block else dead_theta_block
-            )
-            full_new_logl_block = (
-                new_logl_block if rescue_capable_block else dead_logl_block
-            )
             if failed_offsets:
                 replacement_failures += 1
                 success = False
-                if bound in {"single", "multi"}:
-                    message = (
-                        f"max_attempts={max_attempts} hit during bounded JAX rwalk draw"
-                    )
-                else:
-                    message = (
-                        f"max_attempts={max_attempts} hit during constrained rwalk draw"
-                    )
+                message = (
+                    f"max_attempts={max_attempts} hit during constrained rwalk draw"
+                )
                 partial_block_failure_offset = int(failed_offsets[0])
                 partial_block_failure_message = message
                 block_size_now = failed_offsets[0]
@@ -1901,21 +1364,18 @@ def run_static_nested(
                     ]
                 )
                 ncall += failed_calls
-                if rescue_capable_block:
-                    live_u = live_u_before_block
-                    live_theta = live_theta_before_block
-                    live_logl = live_logl_before_block
-                    for prior_offset in range(block_size_now):
-                        prior_worst = int(jnp.argmin(live_logl))
-                        live_u = live_u.at[prior_worst].set(
-                            full_new_u_block[prior_offset]
-                        )
-                        live_theta = live_theta.at[prior_worst].set(
-                            full_new_theta_block[prior_offset]
-                        )
-                        live_logl = live_logl.at[prior_worst].set(
-                            full_new_logl_block[prior_offset]
-                        )
+                live_u = live_u_before_block
+                live_theta = live_theta_before_block
+                live_logl = live_logl_before_block
+                for prior_offset in range(block_size_now):
+                    prior_worst = int(jnp.argmin(live_logl))
+                    live_u = live_u.at[prior_worst].set(new_u_block[prior_offset])
+                    live_theta = live_theta.at[prior_worst].set(
+                        new_theta_block[prior_offset]
+                    )
+                    live_logl = live_logl.at[prior_worst].set(
+                        new_logl_block[prior_offset]
+                    )
             block_stop = iteration + block_size_now
             if failed_offsets:
                 logz_dead = float(logz_dead_before_block)
@@ -1932,9 +1392,8 @@ def run_static_nested(
             replacement_chains_used_block = replacement_chains_used_block[
                 :block_size_now
             ]
-            if accepted_move_count_block is not None:
-                accepted_move_count_block = accepted_move_count_block[:block_size_now]
-                total_proposal_count_block = total_proposal_count_block[:block_size_now]
+            accepted_move_count_block = accepted_move_count_block[:block_size_now]
+            total_proposal_count_block = total_proposal_count_block[:block_size_now]
             if swap_block:
                 # The rwalk telemetry and the step-scale adaptation count
                 # rwalk steps only; swaps are counted on their own.
@@ -1965,45 +1424,16 @@ def run_static_nested(
             ]
             replacement_batches.extend(block_batches)
             replacement_chains_used.extend(block_chains_used)
-            if accepted_move_count_block is not None:
-                rwalk_accepted_move_history.extend(
-                    int(x) for x in np.asarray(accepted_move_count_block)
-                )
-                rwalk_proposal_history.extend(
-                    int(x) for x in np.asarray(total_proposal_count_block)
-                )
-            if block_extra is not None:
-                (
-                    block_bound_seed_calls,
-                    block_bound_seed_batches,
-                    block_rwalk_kernel_calls,
-                    block_rwalk_accepted_moves,
-                    block_bound_draws,
-                    block_bound_evals,
-                    block_bound_unit_cube_acceptance,
-                    block_bound_overlap_rejections,
-                ) = block_extra
-                bound_seed_call_history.extend(block_bound_seed_calls)
-                bound_seed_batch_history.extend(block_bound_seed_batches)
-                rwalk_kernel_call_history.extend(block_rwalk_kernel_calls)
-                rwalk_accepted_move_history.extend(block_rwalk_accepted_moves)
-                rwalk_proposal_history.extend(block_rwalk_kernel_calls)
-                bound_draw_history.extend(block_bound_draws)
-                bound_eval_history.extend(block_bound_evals)
-                bound_unit_cube_acceptance_history.extend(
-                    block_bound_unit_cube_acceptance
-                )
-                bound_overlap_rejection_history.extend(block_bound_overlap_rejections)
-            if (
-                sample == "rwalk"
-                and kernel == "jax"
-                and accepted_move_count_block is not None
-                and total_proposal_count_block is not None
-            ):
-                total_moves = int(np.sum(np.asarray(accepted_move_count_block)))
-                total_proposals = int(np.sum(np.asarray(total_proposal_count_block)))
-                if total_proposals > 0:
-                    update_adaptive_scale(total_moves / total_proposals)
+            rwalk_accepted_move_history.extend(
+                int(x) for x in np.asarray(accepted_move_count_block)
+            )
+            rwalk_proposal_history.extend(
+                int(x) for x in np.asarray(total_proposal_count_block)
+            )
+            total_moves = int(np.sum(np.asarray(accepted_move_count_block)))
+            total_proposals = int(np.sum(np.asarray(total_proposal_count_block)))
+            if total_proposals > 0:
+                update_adaptive_scale(total_moves / total_proposals)
             if replacement_chain_schedule is None:
                 chain_count = str(int(replacement_chains))
                 replacement_chain_usage_counts[chain_count] = (
@@ -2037,9 +1467,7 @@ def run_static_nested(
 
                 rescue_success = False
                 if (
-                    bound == "none"
-                    and replacement_chain_schedule is None
-                    and rescue_capable_block
+                    replacement_chain_schedule is None
                     and int(max_attempts) > int(walks) * int(replacement_chains)
                 ):
                     fail_offset = int(failed_offsets[0])
@@ -2333,11 +1761,6 @@ def run_static_nested(
             logz_dead = float(jnp.logaddexp(logz_dead, logwt))
             logx_final = logx_new
 
-            replacement_info = None
-            maybe_rebuild_bound(i)
-
-            bound_failure = False
-            bound_success = False
             if sample == "prior":
                 if vectorized:
                     (
@@ -2382,196 +1805,43 @@ def run_static_nested(
                         else draw_constrained_rwalk
                     )
                 )
-                seed_live_u = live_u
-                seed_live_logl = live_logl
-                if fused_bound_rwalk:
-                    seed_limit = bound_max_draws or max_attempts
-                    fused_draw = (
-                        draw_constrained_multi_bound_rwalk_jax
-                        if bound == "multi"
-                        else draw_constrained_single_bound_rwalk_jax
-                    )
-                    draw_result = fused_draw(
-                        key,
-                        loglike,
-                        prior_transform,
-                        logl_worst,
-                        current_bound,
-                        ndim,
-                        walks=walks,
-                        step_scale=effective_step_scale
-                        if rwalk_adaptive_step_scale
-                        else step_scale,
-                        max_attempts=max_attempts,
-                        min_accepts=min_accepts,
-                        replacement_chains=replacement_chains,
-                        replacement_chain_schedule=replacement_chain_schedule,
-                        bound_batch_size=batch_size,
-                        bound_max_batches=int(math.ceil(seed_limit / batch_size)),
-                        jax_vectorized=jax_vectorized,
-                        **(
-                            {"overlap_correction": multi_bound_overlap_correction}
-                            if bound == "multi"
-                            else {}
-                        ),
-                    )
-                    replacement_info = draw_result[6]
-                    bound_success = bool(draw_result[5])
-                    bound_failure = not bool(draw_result[5])
-                    bound_seed_call_history.append(
-                        int(replacement_info.get("bound_seed_loglike_evals", 0))
-                    )
-                    bound_seed_batch_history.append(
-                        int(replacement_info.get("bound_seed_batches", 0))
-                    )
-                    rwalk_kernel_call_history.append(
-                        int(replacement_info.get("rwalk_kernel_calls", 0))
-                    )
-                elif bound in {"single", "multi"} and rwalk_seed == "bound":
-                    seed_draw = (
-                        draw_constrained_single_bound_jax
-                        if bound_seed_kernel == "jax" and bound == "single"
-                        else (
-                            draw_constrained_multi_bound_jax
-                            if bound_seed_kernel == "jax"
-                            else draw_constrained_single_bound
-                        )
-                    )
-                    seed_limit = bound_max_draws or max_attempts
-                    seed_kwargs = {"batch_size": batch_size}
-                    if bound_seed_kernel == "jax":
-                        seed_kwargs["max_batches"] = int(
-                            math.ceil(seed_limit / batch_size)
-                        )
-                        seed_kwargs["jax_vectorized"] = jax_vectorized
-                        if bound == "multi":
-                            seed_kwargs["overlap_correction"] = (
-                                multi_bound_overlap_correction
-                            )
-                    else:
-                        seed_kwargs["max_attempts"] = seed_limit
-                        seed_kwargs["overlap_correction"] = (
-                            multi_bound_overlap_correction
-                        )
-                    seed_result = seed_draw(
-                        key,
-                        loglike,
-                        prior_transform,
-                        logl_worst,
-                        current_bound,
-                        ndim,
-                        **seed_kwargs,
-                    )
-                    (
-                        key,
-                        seed_u,
-                        _seed_theta,
-                        seed_logl,
-                        seed_calls,
-                        seed_accepted,
-                        seed_info,
-                    ) = seed_result
-                    replacement_info = {
-                        f"bound_seed_{key}": value for key, value in seed_info.items()
-                    }
-                    if seed_accepted:
-                        bound_success = True
-                        seed_live_u = jnp.asarray(seed_u).reshape((1, ndim))
-                        seed_live_logl = jnp.asarray([seed_logl], dtype=live_logl.dtype)
-                    else:
-                        bound_failure = True
-                    if not seed_accepted and not rwalk_seed_fallback:
-                        new_u, new_theta, new_logl, calls, accepted = (
-                            seed_u,
-                            _seed_theta,
-                            seed_logl,
-                            seed_calls,
-                            False,
-                        )
-                        draw_result = None
-                        bound_seed_call_history.append(int(seed_calls))
-                        bound_seed_batch_history.append(
-                            int(seed_info.get("bound_seed_batches", 0))
-                        )
-                else:
-                    seed_calls = 0
-                    seed_accepted = True
-                rwalk_only_calls_for_telemetry = None
-                if not (
-                    fused_bound_rwalk
-                    or (
-                        bound in {"single", "multi"}
-                        and rwalk_seed == "bound"
-                        and not seed_accepted
-                        and not rwalk_seed_fallback
-                    )
-                ):
-                    draw_result = rwalk_draw(
-                        key,
-                        loglike,
-                        prior_transform,
-                        logl_worst,
-                        seed_live_u,
-                        seed_live_logl,
-                        ndim,
-                        walks=walks,
-                        step_scale=effective_step_scale
-                        if rwalk_adaptive_step_scale
-                        else step_scale,
-                        max_attempts=max_attempts,
-                        min_accepts=min_accepts,
-                        **(
-                            {
-                                "jax_vectorized": jax_vectorized,
-                                **(
-                                    {"return_info": True, "proposal": rwalk_proposal}
-                                    if replacement_chain_schedule is None
-                                    else {}
-                                ),
-                            }
-                            if kernel == "jax"
-                            else {}
-                        ),
-                        **(
-                            {"replacement_chain_schedule": replacement_chain_schedule}
-                            if kernel == "jax"
-                            and replacement_chain_schedule is not None
-                            else (
-                                {"replacement_chains": replacement_chains}
-                                if kernel == "jax"
+                draw_result = rwalk_draw(
+                    key,
+                    loglike,
+                    prior_transform,
+                    logl_worst,
+                    live_u,
+                    live_logl,
+                    ndim,
+                    walks=walks,
+                    step_scale=effective_step_scale
+                    if rwalk_adaptive_step_scale
+                    else step_scale,
+                    max_attempts=max_attempts,
+                    min_accepts=min_accepts,
+                    **(
+                        {
+                            "jax_vectorized": jax_vectorized,
+                            **(
+                                {"return_info": True, "proposal": rwalk_proposal}
+                                if replacement_chain_schedule is None
                                 else {}
-                            )
-                        ),
-                    )
-                    if seed_calls:
-                        rwalk_kernel_calls = int(draw_result[4])
-                        rwalk_only_calls_for_telemetry = rwalk_kernel_calls
-                        rwalk_kernel_call_history.append(rwalk_kernel_calls)
-                        bound_seed_call_history.append(int(seed_calls))
-                        bound_seed_batch_history.append(
-                            int(seed_info.get("bound_seed_batches", 0))
+                            ),
+                        }
+                        if kernel == "jax"
+                        else {}
+                    ),
+                    **(
+                        {"replacement_chain_schedule": replacement_chain_schedule}
+                        if kernel == "jax" and replacement_chain_schedule is not None
+                        else (
+                            {"replacement_chains": replacement_chains}
+                            if kernel == "jax"
+                            else {}
                         )
-                        if len(draw_result) == 7:
-                            draw_result = (
-                                *draw_result[:4],
-                                draw_result[4] + seed_calls,
-                                draw_result[5],
-                                {
-                                    **replacement_info,
-                                    **draw_result[6],
-                                    "bound_seed_loglike_evals": int(seed_calls),
-                                    "rwalk_kernel_loglike_evals": rwalk_kernel_calls,
-                                    "total_replacement_loglike_evals": int(seed_calls)
-                                    + rwalk_kernel_calls,
-                                },
-                            )
-                        else:
-                            draw_result = (
-                                *draw_result[:4],
-                                draw_result[4] + seed_calls,
-                                draw_result[5],
-                            )
-                if draw_result is not None and len(draw_result) == 7:
+                    ),
+                )
+                if len(draw_result) == 7:
                     (
                         key,
                         new_u,
@@ -2610,16 +1880,11 @@ def run_static_nested(
                         rwalk_accepted_move_history.append(accepted_moves)
                         rwalk_proposal_history.append(total_proposals)
                         update_adaptive_scale(accepted_moves / total_proposals)
-                elif draw_result is not None:
+                else:
                     key, new_u, new_theta, new_logl, calls, accepted = draw_result
                     if kernel == "jax":
                         batch_ncall = int(walks) * int(replacement_chains)
-                        telemetry_calls = (
-                            int(rwalk_only_calls_for_telemetry)
-                            if rwalk_only_calls_for_telemetry is not None
-                            else int(calls)
-                        )
-                        batches_used = int(math.ceil(telemetry_calls / batch_ncall))
+                        batches_used = int(math.ceil(int(calls) / batch_ncall))
                         chains_used = int(replacement_chains) * batches_used
                         replacement_batches.append(batches_used)
                         replacement_chains_used.append(chains_used)
@@ -2633,64 +1898,6 @@ def run_static_nested(
                     else:
                         replacement_batches.append(1)
                         replacement_chains_used.append(1)
-            if bound_rebuild_on_failure and bound in {"single", "multi"}:
-                if bound_failure:
-                    consecutive_bound_failures += 1
-                    if consecutive_bound_failures >= bound_failure_rebuild_threshold:
-                        force_bound_rebuild = True
-                        consecutive_bound_failures = 0
-                elif bound_success:
-                    consecutive_bound_failures = 0
-
-            if replacement_info is not None:
-                bound_draw_history.append(
-                    int(
-                        replacement_info.get(
-                            "bound_draws",
-                            replacement_info.get(
-                                "bound_seed_bound_draws",
-                                replacement_info.get("bound_seed_draws", 0),
-                            ),
-                        )
-                    )
-                )
-                bound_eval_history.append(
-                    int(
-                        replacement_info.get(
-                            "bound_loglike_evals",
-                            replacement_info.get(
-                                "bound_seed_bound_loglike_evals",
-                                replacement_info.get("bound_seed_loglike_evals", 0),
-                            ),
-                        )
-                    )
-                )
-                bound_unit_cube_acceptance_history.append(
-                    float(
-                        replacement_info.get(
-                            "bound_unit_cube_acceptance",
-                            replacement_info.get(
-                                "bound_seed_bound_unit_cube_acceptance",
-                                replacement_info.get(
-                                    "bound_seed_unit_cube_acceptance", 0.0
-                                ),
-                            ),
-                        )
-                    )
-                )
-                bound_overlap_rejection_history.append(
-                    int(
-                        replacement_info.get(
-                            "bound_overlap_rejections",
-                            replacement_info.get(
-                                "bound_seed_bound_overlap_rejections",
-                                replacement_info.get(
-                                    "bound_seed_overlap_rejections", 0
-                                ),
-                            ),
-                        )
-                    )
-                )
             ncall += calls
             replacement_ncall.append(int(calls))
             iteration = i + 1
@@ -2828,22 +2035,6 @@ def run_static_nested(
         if total_rwalk_proposals > 0
         else None
     )
-    bound_log_volume = None
-    if current_bound is not None:
-        bound_log_volume = float(
-            current_bound.log_total_volume
-            if hasattr(current_bound, "log_total_volume")
-            else current_bound.log_volume
-        )
-    bound_build_count = len(bound_build_time_history)
-    bound_build_time_total = float(sum(bound_build_time_history))
-    bound_log_volume_final = (
-        float(bound_log_volume_history[-1]) if bound_log_volume_history else None
-    )
-    bound_nellipsoids_final = (
-        int(bound_nellipsoid_history[-1]) if bound_nellipsoid_history else None
-    )
-
     adaptive_metadata = {"rwalk_adaptive_step_scale": bool(rwalk_adaptive_step_scale)}
     if rwalk_adaptive_step_scale:
         adaptive_metadata.update(
@@ -2909,7 +2100,6 @@ def run_static_nested(
             "mean_ms_per_call": mean_ms_per_call,
             "jax_block_size": int(jax_block_size),
             "jax_block_mode": bool(jax_block_size > 1),
-            "jax_block_bound_fixed": bool(jax_block_size > 1 and bound != "none"),
             "jax_block_cached": jax_block_cached,
             "jax_block_kernel": jax_block_kernel,
             "jax_block_impl": jax_block_impl,
@@ -2978,123 +2168,7 @@ def run_static_nested(
             "total_rwalk_proposals": total_rwalk_proposals,
             "rwalk_acceptance": rwalk_acceptance,
             "mean_rwalk_acceptance": rwalk_acceptance,
-            "bound": bound,
-            "bound_enlargement": bound_enlargement,
-            "bound_update_interval": bound_update_interval,
-            "bound_jitter": bound_jitter,
-            "bound_max_draws": bound_max_draws,
-            "bound_forced_rebuilds": int(bound_forced_rebuilds),
-            "bound_rebuild_on_failure": bool(bound_rebuild_on_failure),
-            "bound_failure_rebuild_threshold": int(bound_failure_rebuild_threshold),
-            "multi_bound_max_ellipsoids": multi_bound_max_ellipsoids,
-            "multi_bound_min_points": multi_bound_min_points,
-            "multi_bound_split_threshold": multi_bound_split_threshold,
-            "multi_bound_overlap_correction": multi_bound_overlap_correction,
-            "bound_updates": bound_updates,
-            "bound_build_time_total": bound_build_time_total,
-            "bound_build_time_mean": (
-                bound_build_time_total / bound_build_count if bound_build_count else 0.0
-            ),
-            "bound_build_time_max": (
-                float(max(bound_build_time_history))
-                if bound_build_time_history
-                else 0.0
-            ),
-            "bound_build_count": bound_build_count,
-            "bound_log_volume": bound_log_volume,
-            "bound_log_volume_final": bound_log_volume_final,
-            "bound_log_volume_mean": (
-                float(sum(bound_log_volume_history) / len(bound_log_volume_history))
-                if bound_log_volume_history
-                else None
-            ),
-            "bound_log_volume_min": (
-                float(min(bound_log_volume_history))
-                if bound_log_volume_history
-                else None
-            ),
-            "bound_log_volume_max": (
-                float(max(bound_log_volume_history))
-                if bound_log_volume_history
-                else None
-            ),
-            "bound_nellipsoids_mean": (
-                float(sum(bound_nellipsoid_history) / len(bound_nellipsoid_history))
-                if bound_nellipsoid_history
-                else None
-            ),
-            "bound_nellipsoids_max": (
-                int(max(bound_nellipsoid_history, default=0))
-                if bound_nellipsoid_history
-                else None
-            ),
-            "bound_nellipsoids_final": bound_nellipsoids_final,
-            "bound_seed_nellipsoids": (
-                int(max(bound_nellipsoid_history, default=0))
-                if bound_nellipsoid_history
-                else None
-            ),
-            "bound_seed_overlap_rejections": (
-                int(sum(bound_overlap_rejection_history))
-                if bound_overlap_rejection_history
-                else None
-            ),
-            "mean_bound_draws": (
-                float(sum(bound_draw_history) / len(bound_draw_history))
-                if bound_draw_history
-                else None
-            ),
-            "max_bound_draws": (
-                int(max(bound_draw_history, default=0)) if bound_draw_history else None
-            ),
-            "mean_bound_loglike_evals": (
-                float(sum(bound_eval_history) / len(bound_eval_history))
-                if bound_eval_history
-                else None
-            ),
-            "mean_bound_unit_cube_acceptance": (
-                float(
-                    sum(bound_unit_cube_acceptance_history)
-                    / len(bound_unit_cube_acceptance_history)
-                )
-                if bound_unit_cube_acceptance_history
-                else None
-            ),
-            "rwalk_seed": rwalk_seed,
-            "rwalk_seed_fallback": rwalk_seed_fallback,
-            "bound_seed_kernel": "jax" if fused_bound_rwalk else bound_seed_kernel,
-            "allow_unused_bound": bool(allow_unused_bound),
-            "fused_bound_rwalk": bool(fused_bound_rwalk),
-            "fused_bound_rwalk_impl": "wrapper" if fused_bound_rwalk else None,
             "jax_vectorized": bool(jax_vectorized),
-            "bounded_rwalk": bool(
-                sample == "rwalk" and bound != "none" and rwalk_seed == "bound"
-            ),
-            "mean_bound_seed_calls": (
-                float(sum(bound_seed_call_history) / len(bound_seed_call_history))
-                if bound_seed_call_history
-                else None
-            ),
-            "max_bound_seed_calls": (
-                int(max(bound_seed_call_history, default=0))
-                if bound_seed_call_history
-                else None
-            ),
-            "mean_bound_seed_batches": (
-                float(sum(bound_seed_batch_history) / len(bound_seed_batch_history))
-                if bound_seed_batch_history
-                else None
-            ),
-            "max_bound_seed_batches": (
-                int(max(bound_seed_batch_history, default=0))
-                if bound_seed_batch_history
-                else None
-            ),
-            "mean_rwalk_kernel_calls": (
-                float(sum(rwalk_kernel_call_history) / len(rwalk_kernel_call_history))
-                if rwalk_kernel_call_history
-                else None
-            ),
             "mean_total_replacement_calls": mean_replacement_ncall,
             "progress_interval": progress_interval,
             "callback_interval": callback_interval,

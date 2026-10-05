@@ -241,7 +241,6 @@ def test_partial_loglike_checkpoint_resume_matches_uninterrupted(tmp_path) -> No
     [
         {"kernel": "python"},
         {"sample": "prior"},
-        {"bound": "single", "rwalk_seed": "bound"},
         {"replacement_chain_schedule": (1, 2)},
     ],
 )

@@ -1,8 +1,8 @@
 """Opt-in overnight validation/benchmark harness for fast JAX rwalk configs.
 
 Defaults are intentionally tiny so an accidental invocation is safe.  Use larger
-``--nlive``, stricter ``--dlogz``, more ``--seeds``, and ``--include-bounds`` /
-``--include-block`` for overnight diagnostics.
+``--nlive``, stricter ``--dlogz``, more ``--seeds``, and ``--include-block`` for
+overnight diagnostics.
 """
 
 from __future__ import annotations
@@ -49,10 +49,6 @@ EXPECTED_KEYS = [
     "replacement_failures",
     "mean_replacement_ncall",
     "mean_replacement_chains_used",
-    "mean_bound_seed_calls",
-    "mean_rwalk_kernel_calls",
-    "bound_nellipsoids_mean",
-    "bound_build_time_total",
 ]
 
 
@@ -60,7 +56,6 @@ EXPECTED_KEYS = [
 class Config:
     name: str
     kwargs: dict[str, Any]
-    needs_bounds: bool = False
     needs_block: bool = False
 
 
@@ -97,51 +92,24 @@ def build_configs(args: argparse.Namespace) -> list[Config]:
         "step_scale": args.step_scale,
         "min_accepts": args.min_accepts,
         "replacement_chains": args.replacement_chains,
-        "bound_update_interval": args.bound_update_interval,
         "rwalk_proposal": "isotropic",
         "jax_block_size": 1,
     }
     configs = [
-        Config("unbounded_isotropic_rwalk", {**common, "bound": "none"}),
+        Config("unbounded_isotropic_rwalk", common),
         Config(
             "adaptive_rwalk",
             {
                 **common,
-                "bound": "none",
                 "replacement_chain_schedule": args.replacement_chain_schedule,
             },
         ),
     ]
-    if args.include_bounds:
-        bounded = {
-            **common,
-            "rwalk_seed": "bound",
-            "bound_seed_kernel": "jax",
-        }
-        configs.extend(
-            [
-                Config(
-                    "single_bound_bounded_rwalk",
-                    {**bounded, "bound": "single"},
-                    True,
-                ),
-                Config(
-                    "multi_bound_bounded_rwalk",
-                    {**bounded, "bound": "multi"},
-                    True,
-                ),
-                Config(
-                    "fused_bounded_rwalk_wrapper",
-                    {**bounded, "bound": "multi", "fused_bound_rwalk": True},
-                    True,
-                ),
-            ]
-        )
     if args.include_block:
         configs.append(
             Config(
                 "block_jax_rwalk_unbounded",
-                {**common, "bound": "none", "jax_block_size": args.jax_block_size},
+                {**common, "jax_block_size": args.jax_block_size},
                 needs_block=True,
             )
         )
@@ -192,10 +160,6 @@ def run_one(
             "mean_replacement_ncall", diagnostics.get("replacement_mean_ncall")
         ),
         "mean_replacement_chains_used": metadata.get("mean_replacement_chains_used"),
-        "mean_bound_seed_calls": metadata.get("mean_bound_seed_calls"),
-        "mean_rwalk_kernel_calls": metadata.get("mean_rwalk_kernel_calls"),
-        "bound_nellipsoids_mean": metadata.get("bound_nellipsoids_mean"),
-        "bound_build_time_total": metadata.get("bound_build_time_total"),
         "success": bool(result.success),
         "message": str(result.message),
         "ndim": target.ndim,
@@ -217,7 +181,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dlogz", type=float, default=10.0)
     parser.add_argument("--maxiter", type=int, default=10)
     parser.add_argument("--output", type=str, default="overnight_jax_validation.json")
-    parser.add_argument("--include-bounds", action="store_true")
     parser.add_argument("--include-block", action="store_true")
     parser.add_argument(
         "--quick", action="store_true", help="Use explicit tiny smoke settings."
@@ -229,7 +192,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--replacement-chain-schedule", nargs="+", type=int, default=[1, 2, 4]
     )
-    parser.add_argument("--bound-update-interval", type=int, default=5)
     parser.add_argument("--max-attempts", type=int, default=1000)
     parser.add_argument("--jax-block-size", type=int, default=4)
     parser.add_argument("--progress", action="store_true")
