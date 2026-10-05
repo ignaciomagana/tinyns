@@ -4,11 +4,9 @@
 The core public API is deliberately small: provide `loglike`,
 `prior_transform`, and `ndim`, then call `NestedSampler(...).run(key)`.
 
-TinyNS is not many samplers; it is one excellent tiny static nested sampler,
-plus reference baselines. TinyNS deliberately keeps the sampler surface small.
-The main optimized path is static nested sampling with JAX random-walk
-replacement. Other samplers are kept as reference baselines or experimental
-research knobs, not as equally supported production paths.
+TinyNS is not many samplers; it is one tiny static nested sampler: a
+random-walk replacement that follows the live-point covariance, run in jitted
+JAX blocks. The sampler surface is deliberately small.
 
 ## Install
 
@@ -51,16 +49,14 @@ result = sampler.run(key, dlogz=0.1)
 print(result.summary())
 ```
 
-The defaults run the recommended fast path (JAX `rwalk` with live-cov
-proposals and cached blocks of 32 iterations; see below), so `loglike` and
-`prior_transform` must be JAX-traceable. For plain Python or NumPy functions,
-pass `kernel="python"`.
+`loglike` and `prior_transform` must be JAX-traceable functions of one point:
+tinyns `jax.vmap`s and `jax.jit`s them.
 
 ## Minimal API
 
 | API | Purpose |
 | --- | --- |
-| `NestedSampler(loglike, prior_transform, ndim, ...)` | Dynesty-style sampler facade for static nested sampling. |
+| `NestedSampler(loglike, prior_transform, ndim, ...)` | Static nested sampler (see the keyword arguments below). |
 | `NestedSamplingResult` | Result container with samples, weights, evidence estimates, status, and metadata. |
 | `result.summary()` | Human-readable run summary. |
 | `result.diagnostics()` | Plain-dict diagnostics, including ESS, call counts, and warnings. |
@@ -68,10 +64,24 @@ pass `kernel="python"`.
 | `result.to_numpy()` | Plain dictionary with array fields converted to NumPy arrays. |
 | `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
 
-`NestedSampler` accepts many optional keyword arguments (`sample`, `kernel`,
-`walks`, `rwalk_proposal`, and others documented below). An unknown keyword
-argument raises `TypeError`, with the closest known name suggested when there
-is one.
+The full constructor is
+
+```python
+NestedSampler(
+    loglike,
+    prior_transform,
+    ndim,
+    nlive=500,
+    *,
+    walks=None,  # None -> max(25, 6 * ndim); 12 if ndim == 1
+    replacement_chains=1,  # chains run per replacement; one is kept
+    block_size=32,  # nested-sampling iterations per jitted block
+    cluster_swap=None,  # None -> on when replacement_chains == 1
+)
+```
+
+Any other keyword argument raises `TypeError`, with the closest known name
+suggested when there is one.
 
 ## Saving and loading results
 
@@ -114,26 +124,10 @@ result = sampler.run(key, callback=callback, callback_interval=25)
 Returning `False` from the callback stops the run gracefully and returns a
 partial `NestedSamplingResult`.
 
-## Sampler recommendations
+## The sampler
 
-TinyNS is intentionally organized around one recommended fast path, with
-reference baselines and experimental research knobs separated from that primary
-route. The fast path is the default. It should still be revalidated for new
-target geometries.
-
-| Tier | Options | Status |
-| --- | --- | --- |
-| Recommended fast path (default) | `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`, `walks=max(25, 6 * ndim)` (12 in 1-D), `replacement_chains=1`, `jax_block_size=32` | Likelihood calls per iteration stay at `walks` on correlated Gaussians, d = 2..18 |
-| Isotropic block path | `rwalk_proposal="isotropic"`, `walks=5`, `jax_block_size=32` | Validated on the included 2D benchmark targets; cost per iteration grows geometrically at d >= 4 |
-| Reference baseline | `sample="rwalk"`, `kernel="python"` | Simple CPU/Python correctness/debug baseline |
-| Reference baseline | `sample="prior"` | Conceptual brute-force constrained-prior baseline |
-| Experimental | adaptive replacement-chain schedules | Useful tuning knob; not the main recommended path |
-
-Removed: slice/random-slice samplers were removed to keep TinyNS small (use dynesty for slice-based external comparisons). An earlier live-cov proposal that reflected moves at the unit-cube faces, and its `rwalk_cov_jitter` option, were also removed; the current `rwalk_proposal="live-cov"` rejects such moves instead.
-
-### Recommended fast JAX rwalk path
-
-The defaults are the fast path:
+TinyNS has one sampler: static nested sampling with a random-walk replacement
+that runs entirely in JAX.
 
 ```python
 from tinyns import NestedSampler
@@ -142,34 +136,29 @@ sampler = NestedSampler(loglike, prior_transform, ndim)
 result = sampler.run(key, dlogz=0.1)
 ```
 
-This is `sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="live-cov"`,
-`walks=max(25, 6 * ndim)` (12 in 1-D), `step_scale=0.5`, `replacement_chains=1` and
-`jax_block_size=32`. Each live-cov step is `step_scale * L @ z`, where `L` is
-the Cholesky factor of the live-point covariance in the unit cube and `z` is a
-standard normal vector. Moves that leave the unit cube are rejected. The step
-follows the contracting, correlated live set, and `step_scale` is only the
-initial value: live-cov always adapts it toward `rwalk_target_accept` (0.25).
+Each replacement runs `replacement_chains` chains of `walks` steps from live
+points strictly above the likelihood threshold and keeps one chain that ends
+inside the constraint. A chain that never moved is kept as a copy of its seed:
+discarding unmoved chains and retrying would under-sample regions where the
+proposal fits poorly. Each step is `scale * L @ z`, where `L` is the Cholesky
+factor of the live-point covariance in the unit cube and `z` is a standard
+normal vector. Moves that leave the unit cube are rejected; with one chain they
+do not call the likelihood. The step follows the contracting, correlated live
+set. `scale` starts at 0.5 and adapts after every block toward 25% move
+acceptance.
 
-The old default, a fixed isotropic unit-cube step (`step_scale=0.1`), does not
-follow the contracting live set: its acceptance collapsed, and the cost per
-iteration grew geometrically at d >= 4. On anisotropic correlated Gaussians, d = 2..18,
-live-cov keeps the likelihood calls per iteration flat at `walks`. Unbiased
-evidence needs `walks` of about 5-6 x `ndim`: `walks=25` biased logZ high by
-+0.5 nats at 13D and +1.4 nats at 18D, while `walks >= 5 * ndim` was within
-about 0.2 nats, with seed scatter matching the reported `logzerr`. Hence the
-default `walks=max(25, 6 * ndim)`. In 1-D, 10 walks were already unbiased
-(20 seeds, bias 0.2 x `logzerr`), so 1-D defaults to 12; from 2-D on, 15 walks
-still biased logZ on Gaussian and banana targets.
+On anisotropic correlated Gaussians, d = 2..18, the likelihood calls per
+iteration stay flat at about `walks`. Unbiased evidence needs `walks` of about
+5-6 x `ndim`: `walks=25` biased logZ high by +0.5 nats at 13D and +1.4 nats at
+18D, while `walks >= 5 * ndim` was within about 0.2 nats, with seed scatter
+matching the reported `logzerr`. Hence the default `walks=max(25, 6 * ndim)`.
+In 1-D, 10 walks were already unbiased (20 seeds, bias 0.2 x `logzerr`), so
+1-D defaults to 12; from 2-D on, 15 walks still biased logZ on Gaussian and
+banana targets.
 
-Live-cov is supported only for JAX rwalk with a fixed
-`replacement_chains`. If you choose `kernel="python"` or a
-`replacement_chain_schedule` and leave `rwalk_proposal` unset, the proposal
-falls back to `"isotropic"` with `step_scale=0.1` and `jax_block_size=1`.
-Passing `rwalk_proposal="live-cov"` explicitly in those combinations raises
-`NotImplementedError`. `sample="prior"` defaults to `kernel="python"`.
+The initial live points are evaluated in one compiled pass.
 
-With `kernel="jax"`, the initial live points are evaluated in one compiled
-pass.
+### Data in the likelihood
 
 Large arrays used by `loglike` or `prior_transform` are passed to the compiled
 kernels as arguments instead of being embedded as constants (faster compiles,
@@ -185,10 +174,7 @@ A pytree callable is the explicit form, for example
 `jax.tree_util.Partial(loglike_fn, data)` with `loglike_fn(data, theta)`, or an
 equinox-style module or registered dataclass with `__call__`: its `jax.Array` /
 `np.ndarray` leaves become kernel arguments and everything else stays static.
-Use `jax.Array` leaves so the data move to the device once. Both forms apply to
-the fast path (JAX rwalk, block and per-iteration modes, the rescue ladder and
-the initial live-point pass, without `jax_vectorized`); the
-`replacement_chain_schedule` kernels still close over the callables.
+Use `jax.Array` leaves so the data move to the device once.
 
 For a campaign over mock datasets in one process, pass
 `jax.tree_util.Partial(loglike_fn, data_i)`: pytree callables with the same
@@ -202,103 +188,56 @@ JAX's persistent cache: call
 `jax.config.update("jax_compilation_cache_dir", "/path/to/cache")` before the
 first run, with the same path in every process (compiles under 1 s are not stored).
 
-`jax_block_size > 1` batches several nested-sampling replacement iterations
-into one cached, jitted JAX block. This reduces Python/JAX dispatch overhead,
-which usually gives a large speedup for cheap or moderately expensive JAX
-likelihoods. For very expensive likelihoods, the speedup may be smaller because
-likelihood cost dominates dispatch overhead. Convergence is checked between
-blocks, not after every individual nested iteration, so a run may overshoot the
-requested `dlogz` threshold by up to roughly `jax_block_size - 1` iterations.
+### Block size
 
-`jax_block_size=32` (the default for JAX rwalk) is the fastest
-validated block size. Use `jax_block_size=16` if you want a more conservative
-block size with slightly less convergence overshoot. Use `jax_block_size=1` for
-the most conservative behavior, which disables block mode. This recommendation
-is based on current validation on the included benchmark targets; it is not a
-proof for all likelihoods.
+Every `block_size` nested-sampling iterations run as one jitted block, which
+removes the Python/JAX dispatch overhead per iteration. This usually gives a
+large speedup for cheap or moderately expensive likelihoods; for very
+expensive likelihoods the likelihood cost dominates and the speedup is
+smaller. Convergence is checked, and the step scale adapted, between blocks,
+so a run may overshoot the requested `dlogz` threshold by up to
+`block_size - 1` iterations. `block_size=32` (the default) is the fastest
+validated block size; smaller blocks overshoot less, and `block_size=1`
+checks after every iteration.
 
+### Batched replacement chains
 
-### Batched JAX replacement chains
-
-For GPU-native likelihoods, `rwalk+jax` can run several independent replacement chains in parallel:
+For GPU-native likelihoods, several independent replacement chains can run in
+parallel:
 
 ```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-    kernel="jax",
-    walks=25,
-    replacement_chains=16,
-)
+sampler = NestedSampler(loglike, prior_transform, ndim, replacement_chains=16)
 ```
 
-Here `walks` is the length of each chain, while `replacement_chains` is the number of independent chains run in parallel per replacement batch. This can improve wall time on GPU by evaluating many proposals in parallel.
+Here `walks` is the length of each chain, while `replacement_chains` is the
+number of independent chains run in parallel per replacement batch. This can
+improve wall time on GPU by evaluating many proposals in parallel.
 
-The replacement remains valid only if a successful chain is selected without favoring higher-likelihood endpoints. `tinyns` selects randomly among successful chains.
+The replacement remains valid only if a successful chain is selected without
+favoring higher-likelihood endpoints. `tinyns` selects randomly among
+successful chains.
 
-> Warning: Increasing `replacement_chains` increases likelihood evaluations per replacement attempt. It is useful only when the likelihood benefits from batched/device parallelism.
+> Warning: Increasing `replacement_chains` increases likelihood evaluations per replacement. It is useful only when the likelihood benefits from batched/device parallelism.
 
-For batched JAX chains, `ncall` counts scalar likelihood evaluations, not wall-clock-equivalent work. A replacement with `walks=25` and `replacement_chains=16` costs 400 scalar likelihood evaluations, but those chains are evaluated in parallel on device. Use wall time and replacement batch counts when judging batched performance.
+With several chains, `ncall` counts scalar likelihood evaluations, not
+wall-clock-equivalent work, and every proposal is evaluated, in or out of the
+cube. A replacement with `walks=25` and `replacement_chains=16` costs 400
+scalar likelihood evaluations, but those chains are evaluated in parallel on
+device. Use wall time and replacement batch counts when judging batched
+performance. The cluster swap (below) needs a single chain.
 
-For JAX rwalk, `repl_ncall` is scalar likelihood calls per replacement. In fixed chain mode, `repl_chains` reports the effective number of parallel chains used per replacement. In adaptive mode, `usage=...` reports how often each stage in the replacement chain schedule was used. Use these diagnostics to choose the smallest chain count or schedule that avoids retry tails.
-
-
-### Adaptive JAX replacement-chain schedules
-
-Fixed `replacement_chains` runs the same number of independent chains for every replacement. This can waste work when most chains succeed.
-
-For JAX rwalk, `tinyns` can instead start with a small batch and escalate only if needed:
-
-```python
-sampler = NestedSampler(
-    loglike,
-    prior_transform,
-    ndim,
-    sample="rwalk",
-    kernel="jax",
-    walks=25,
-    replacement_chain_schedule=(1, 4, 16, 64, 256),
-)
-```
-
-Use this when replacement difficulty varies across the nested-sampling run. The sampler returns as soon as any stage succeeds and randomly selects among successful chains in that stage. This avoids always paying for large batches.
-
-`replacement_chain_schedule` requires `jax_block_size=1` (the default when a
-schedule is given). It is rejected with a clear error when combined with `jax_block_size > 1`: the
-cached block kernel does not implement schedule-aware early return, so it
-cannot benefit from a schedule and would otherwise silently overstate the
-savings. Use the host-level per-iteration path (`jax_block_size=1`) for
-adaptive replacement-chain schedules.
-
-> Warning: Adaptive schedules do not replace validation. Check evidence calibration and insertion-rank diagnostics on representative targets.
-
-For non-JAX likelihoods, or when debugging sampler behavior, use `kernel="python"` with `sample="rwalk"`.
-
-`kernel="jax"` currently supports `sample="rwalk"` only. The top-level nested-sampling loop remains in Python; only the constrained replacement kernel is compiled.
-
-For local constrained samplers, step-count parameters are decorrelation lengths:
-
-- `walks`: number of random-walk proposals per replacement attempt for `rwalk` (default `max(25, 6 * ndim)`, 12 in 1-D)
-- `min_accepts`: accepted rwalk moves a chain must make before it is kept (default `0`: no retry; see below)
-
-The sampler does not return merely after the first accepted local move; it runs the requested local update length.
-
-`sample="prior"` supports vectorized replacement proposals with
-`vectorized=True`; the full nested-sampling loop remains a small Python loop.
-Vectorized `rwalk` replacement sampling is not implemented yet, so
-`vectorized=True` needs an explicit `sample="prior"`.
-
-### Experimental adaptive rwalk step scale
-
-Live-cov always adapts its step scale. For isotropic proposals, `rwalk_adaptive_step_scale=True` is an explicitly experimental JAX-only rwalk option that adapts the isotropic proposal scale from constrained-replacement acceptance telemetry. It defaults to off, with a fixed `step_scale=0.1`.
-
-This is intended for hard-target diagnostics where a fixed rwalk scale is a poor compromise. It is not a dynesty replacement, does not add slice/rslice or `sample="bound"`, and is not a substitute for checking insertion-rank diagnostics, replacement diagnostics, and seed/config stability on the target.
+If no chain ends inside the constraint, the replacement runs another batch,
+up to `10_000 // (walks * replacement_chains)` batches (at least one). Chains
+start strictly above the threshold, so this happens only on a likelihood
+plateau. When every batch fails, the run stops with `success=False` and a
+message, and returns the dead and live points so far.
 
 ## Current validation status
 
-The live-cov default was checked on anisotropic correlated Gaussians, d = 2..18 (see the fast-path section above). The isotropic block path (`sample="rwalk"`, `kernel="jax"`, `rwalk_proposal="isotropic"`, `walks=5`, `replacement_chains=1`, `jax_block_size=32`) has been checked with repeated-seed validation on the included benchmark targets:
+The default was checked on anisotropic correlated Gaussians, d = 2..18 (see
+above), and against dynesty and analytic evidences on 1-18 dimensional
+targets. The validation harness (`validation/`) runs repeated seeds on the
+included targets:
 
 - `gaussian2d`
 - `correlated_gaussian2d`
@@ -306,21 +245,8 @@ The live-cov default was checked on anisotropic correlated Gaussians, d = 2..18 
 - `banana2d`
 - `eggbox2d`
 
-The analytic Gaussian targets show good evidence calibration in the current validation suite, and qualitative targets show acceptable insertion-rank diagnostics. TinyNS focuses on one optimized static nested-sampling path, JAX rwalk with cached block mode, plus small reference baselines. Users should still validate on their own target geometry before relying on evidence values.
-
-### `min_accepts`
-
-The default is `min_accepts=0`: each replacement runs one chain of `walks`
-proposals and keeps wherever it ends. A chain that never moved returns a copy
-of its seed (a live point strictly above the threshold); that happens in about
-1% of replacements at 25 walks and under 0.1% at 108.
-
-`min_accepts >= 1` restores the old rule: discard chains with fewer accepted
-moves and retry. That rule is biased. Chains fail to move more often in regions
-the proposal fits poorly (a minor mode, a narrow ridge), so retrying
-under-samples them. On two-mode targets with a true 6% minor mode, the old
-default `min_accepts=1` gave 2.9% at 4-D (logZ bias +0.13 nats) and 1.7% at
-10-D; the new default gives 6.3% and 6.7%.
+Users should still validate on their own target geometry before relying on
+evidence values.
 
 ## Multimodal posteriors
 
@@ -330,7 +256,7 @@ weights scatter from seed to seed: on a real 18-D posterior with a 16% minor
 mode, two runs gave 7% and 32%. Neither `logzerr` nor the insertion ranks show
 this.
 
-On the fast path, tinyns tracks clusters of the live points between blocks.
+With one replacement chain (the default), tinyns tracks clusters of the live points between blocks.
 Once two clusters each hold enough of the live volume, a tenth of the chain
 steps become affine swaps `u' = mu_b + L_b L_a^-1 (u - mu_a)`: the point moves
 from its cluster `a` to the same relative place in another cluster `b`. The
@@ -380,17 +306,15 @@ the swaps.
 
 ## Limitations
 
-`tinyns` is an early (v0.2) implementation. It has been validated against
+`tinyns` is an early (v0.3) implementation. It has been validated against
 dynesty and analytic evidences on 1-18 dimensional targets, including
 gravitational-wave population likelihoods. It is intentionally not a
 probabilistic programming language.
 
 - Static nested sampling only.
 - No dynamic nested sampling.
-- The default `kernel="jax"` needs JAX-traceable `loglike` and
-  `prior_transform`; use `kernel="python"` otherwise.
-- Live-cov proposals need JAX rwalk with a fixed `replacement_chains`;
-  `kernel="python"` and replacement-chain schedules use isotropic proposals.
+- `loglike` and `prior_transform` must be JAX-traceable scalar functions of
+  one point.
 - Unbiased evidence needs `walks` of about 5-6 x `ndim`, so likelihood calls
   per iteration grow linearly with dimension.
 - Strongly curved posteriors need more walks than that default. On a 10-D
@@ -405,33 +329,30 @@ probabilistic programming language.
   raise `walks`.
 - Mode weights of separated modes are reliable only when each mode holds at
   least about 3 x `ndim` live points (see Multimodal posteriors).
-- No full vectorized `rwalk` replacement sampler.
 - Not a PPL; users provide functions, not model objects.
-- Replacement attempts are capped by `max_attempts`; hitting the cap returns
-  `success=False` with a partial result rather than raising during the run.
+- A replacement that finds no admissible point (a likelihood plateau) stops
+  the run with `success=False` and a partial result rather than raising.
 
 ## Additional examples
 
 ### Primary
 
-- `examples/gaussian_2d_rwalk_jax_block.py`: recommended fast path with the defaults (JAX `rwalk`, live-cov proposals, cached block mode with `jax_block_size=32`).
+- `examples/gaussian_2d_rwalk_jax_block.py`: the defaults on a 2D Gaussian.
 
 ### Reference
 
-- `examples/gaussian_2d.py`: 2D Gaussian with the default sampler.
-- `examples/gaussian_2d_rwalk.py`: reflected isotropic Python random-walk constrained sampling.
-- `examples/gaussian_2d_rwalk_jax.py`: JAX-native random-walk replacement without block mode (`jax_block_size=1`).
+- `examples/gaussian_1d.py`, `examples/gaussian_2d.py` and `examples/constant.py`: analytic evidences.
 
 ### Utility
 
 - `examples/progress_and_callback.py`: dependency-free progress and callbacks.
-- `examples/vectorized_gaussian_2d.py`: vectorized prior-rejection proposals.
-- `examples/checkpoint_resume.py`: checkpoint and resume with the rwalk baseline.
+- `examples/checkpoint_resume.py`: checkpoint and resume.
+- `examples/save_load_result.py`: save and load a result.
 
-### Experimental
+### Qualitative targets
 
-- `examples/banana_2d.py` and `examples/eggbox_2d.py`: qualitative target demos that can exercise non-primary sampler options for experimentation.
-- `examples/repeated_gaussian_evidence.py` and `examples/save_load_result.py`: workflow/diagnostic demos for coverage or reproducibility checks.
+- `examples/banana_2d.py` and `examples/eggbox_2d.py`: curved and multimodal demos.
+- `examples/repeated_gaussian_evidence.py`: repeated seeds against the analytic evidence.
 
 ## Validation
 
@@ -468,11 +389,11 @@ result = sampler.run(
 
 Checkpoints are written every `checkpoint_interval` nested-sampling
 iterations, counting elapsed iterations since the last checkpoint (or since
-the run/resume start) rather than an iteration-modulo check. This applies in
-both per-iteration mode and block mode (`jax_block_size > 1`): a run with, for
-example, `jax_block_size=32` and the default `checkpoint_interval=100` still
-checkpoints roughly every 100 iterations rather than only after the first
-block boundary that happens to land on a multiple of 100.
+the run/resume start) rather than an iteration-modulo check, at block
+boundaries: a run with `block_size=32` and the default
+`checkpoint_interval=100` checkpoints every 128 iterations rather than only at
+a block boundary that happens to land on a multiple of 100. A run also writes
+a final checkpoint when it ends.
 
 A checkpoint stores the active live points, accumulated dead points, PRNG key,
 iteration counters, and sampler metadata. It does not serialize user functions.
@@ -482,12 +403,13 @@ To resume, reconstruct the same sampler and call:
 result = sampler.resume("run.checkpoint.npz")
 ```
 
-The sampler configuration must match the checkpoint. Checkpoints record the
-resolved `walks`, `step_scale`, `rwalk_proposal` and `jax_block_size`, so a
-sampler built with the same (or default) arguments resumes it. A checkpoint
-written by an earlier version with default arguments records the old defaults
-(`sample="prior"`, `kernel="python"`, `rwalk_proposal="isotropic"`, ...);
-pass those values explicitly to resume it. Checkpoints are distinct
+The sampler configuration must match the checkpoint. Checkpoints record
+`ndim`, `nlive` and the resolved `walks`, `replacement_chains`, `block_size`
+and `cluster_swap`, so a sampler built with the same (or default) arguments
+resumes it, and a mismatch raises `ValueError` naming the key. Checkpoints
+written before v0.3 are not read. A resumed run is bit-identical to an
+uninterrupted one. A checkpoint saved after a replacement failure cannot be
+resumed. Checkpoints are distinct
 from final result files saved with `result.save_npz(...)`. Checkpoints use NumPy
 `.npz` files to avoid extra dependencies. Checkpoint/resume is intended for
 static nested sampling; dynamic nested sampling is not implemented yet.
