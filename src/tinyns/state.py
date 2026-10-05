@@ -41,15 +41,15 @@ class NestedRunState:
     live_u: Any
     live_theta: Any
     live_logl: Any
-    dead_u: list[Any]
-    dead_theta: list[Any]
-    dead_logl: list[float]
-    dead_logwt: list[float]
+    dead_u: Any  # (iteration, ndim) array-like
+    dead_theta: Any
+    dead_logl: Any  # (iteration,) array-like
+    dead_logwt: Any
     logz_dead: float
     logx_final: float
     ncall: int
-    replacement_ncall: list[int]
-    insertion_indices: list[int]
+    replacement_ncall: Any
+    insertion_indices: Any
     replacement_failures: int
     iteration: int
     success: bool
@@ -60,6 +60,9 @@ class NestedRunState:
     # Cluster tracker state (``cluster_swap``): {"log": dict, "arrays": dict
     # with "labels" and "u", or None}.
     clusters: dict[str, Any] | None = None
+    # Birth contours (optional fields; None when unknown).
+    live_birth: Any = None
+    dead_birth: Any = None
 
 
 def _npz_scalar(value):
@@ -71,10 +74,10 @@ def _npz_scalar(value):
     raise ValueError("expected scalar value in checkpoint .npz file")
 
 
-def _stack_points(points: list[Any], ndim: int):
-    if not points:
+def _stack_points(points, ndim: int):
+    if len(points) == 0:
         return np.empty((0, ndim), dtype=float)
-    return np.asarray(jnp.stack(points))
+    return np.asarray(points)
 
 
 def save_checkpoint_npz(path, state: NestedRunState, config: dict) -> None:
@@ -111,6 +114,14 @@ def save_checkpoint_npz(path, state: NestedRunState, config: dict) -> None:
             telemetry_json=np.asarray(json.dumps(state.telemetry, sort_keys=True)),
             config_json=np.asarray(json.dumps(config, sort_keys=True)),
             **_cluster_fields(state.clusters),
+            **{
+                name: np.asarray(value)
+                for name, value in (
+                    ("live_birth", state.live_birth),
+                    ("dead_birth", state.dead_birth),
+                )
+                if value is not None
+            },
         )
     os.replace(tmp_path, path)
 
@@ -162,17 +173,15 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
                 "log": json.loads(str(_npz_scalar(data["clusters_json"]))),
                 "arrays": arrays,
             }
-        dead_u = [jnp.asarray(point) for point in np.asarray(data["dead_u"])]
-        dead_theta = [jnp.asarray(point) for point in np.asarray(data["dead_theta"])]
         state = NestedRunState(
             key=jnp.asarray(data["key"]),
             live_u=jnp.asarray(data["live_u"]),
             live_theta=jnp.asarray(data["live_theta"]),
             live_logl=jnp.asarray(data["live_logl"]),
-            dead_u=dead_u,
-            dead_theta=dead_theta,
-            dead_logl=[float(x) for x in np.asarray(data["dead_logl"])],
-            dead_logwt=[float(x) for x in np.asarray(data["dead_logwt"])],
+            dead_u=np.asarray(data["dead_u"]),
+            dead_theta=np.asarray(data["dead_theta"]),
+            dead_logl=np.asarray(data["dead_logl"]),
+            dead_logwt=np.asarray(data["dead_logwt"]),
             logz_dead=float(_npz_scalar(data["logz_dead"])),
             logx_final=float(_npz_scalar(data["logx_final"])),
             ncall=int(_npz_scalar(data["ncall"])),
@@ -186,5 +195,11 @@ def load_checkpoint_npz(path) -> tuple[NestedRunState, dict]:
             scale=scale,
             telemetry=telemetry,
             clusters=clusters,
+            live_birth=(
+                np.asarray(data["live_birth"]) if "live_birth" in data.files else None
+            ),
+            dead_birth=(
+                np.asarray(data["dead_birth"]) if "dead_birth" in data.files else None
+            ),
         )
         return state, config

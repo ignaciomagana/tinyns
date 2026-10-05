@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import random
+from tests.helpers import run_ns
 
 import tinyns.callables as callables_mod
 from tinyns import NestedSampler, core
@@ -25,7 +26,6 @@ from tinyns.callables import (
     _partition_callable,
 )
 from tinyns.core import _chain_kernel
-from tinyns.run import run_static_nested
 
 NDIM = 2
 
@@ -106,7 +106,7 @@ def test_plain_function_and_equivalent_closure_are_bit_identical() -> None:
     # the parent branch (whose fixed-seed output this matches bit for bit).
     closure = make_closure_loglike(0.2, 0.1)
     runs = [
-        run_static_nested(random.PRNGKey(7), fn, plain_prior, NDIM, 50, maxiter=160)
+        run_ns(random.PRNGKey(7), fn, plain_prior, NDIM, 50, maxiter=160)
         for fn in (plain_loglike, closure)
     ]
     assert_same_result(*runs)
@@ -129,10 +129,10 @@ def test_partial_loglike_with_large_array_matches_closure(block_size) -> None:
     kwargs = {"maxiter": 96, "dlogz": 0.0}
     if block_size is not None:
         kwargs["block_size"] = block_size
-    partial_result = run_static_nested(
+    partial_result = run_ns(
         random.PRNGKey(11), partial_loglike, partial_prior, NDIM, 40, **kwargs
     )
-    closure_result = run_static_nested(
+    closure_result = run_ns(
         random.PRNGKey(11), closure_loglike, closure_prior, NDIM, 40, **kwargs
     )
     (hoisted,) = _callable_leaves(closure_loglike, closure_prior, NDIM)
@@ -189,6 +189,7 @@ def _lower_block_kernel_text(loglike, prior):
         state,
         jnp.asarray(20, dtype=jnp.int32),
         jnp.asarray(10, dtype=jnp.int32),
+        jnp.asarray(8, dtype=jnp.int32),
         None,
         *_callable_leaves(loglike, prior, NDIM),
     )
@@ -268,7 +269,7 @@ def make_closure(data):
 def run(loglike, prior=closure_prior, ndim=NDIM, **kwargs):
     kwargs.setdefault("maxiter", 96)
     kwargs.setdefault("dlogz", 0.0)
-    return run_static_nested(random.PRNGKey(11), loglike, prior, ndim, 40, **kwargs)
+    return run_ns(random.PRNGKey(11), loglike, prior, ndim, 40, **kwargs)
 
 
 @pytest.mark.usefixtures("fresh_caches")
@@ -481,23 +482,43 @@ def test_finished_runs_do_not_keep_datasets_alive(form) -> None:
     assert not callables_mod._IDENTITY_SPLITS
 
 
-# Fixed-seed fingerprints of tinyns v0.2.2 (ae330f2) on CPU with jax 0.4.34:
-# (logz.hex(), ncall, sha256[:16] of samples, samples_u and logl).
+# Fixed-seed fingerprints on CPU with jax 0.4.34, keyed by JAX_ENABLE_X64:
+# (logz.hex(), ncall, sha256[:16] of samples, samples_u and logl). x64 off: tinyns
+# v0.2.2 (ae330f2); x64 on: recorded on the v0.3 loop branch, which
+# tools/ab_bitwise.py shows bit-identical to main on the same machine.
 V022_FINGERPRINTS = {
-    "block": (
-        "-0x1.122a400000000p+2",
-        7405,
-        "ea9e454c31e2785c",
-        "b3ec3331262f69b9",
-        "b6ff6462d6dc00fa",
-    ),
-    "small_closure": (
-        "-0x1.122a400000000p+2",
-        7405,
-        "ea9e454c31e2785c",
-        "b3ec3331262f69b9",
-        "47b56e8a8af6eb32",
-    ),
+    "block": {
+        False: (
+            "-0x1.122a400000000p+2",
+            7405,
+            "ea9e454c31e2785c",
+            "b3ec3331262f69b9",
+            "b6ff6462d6dc00fa",
+        ),
+        True: (
+            "-0x1.0a0814caa64b4p+2",
+            7399,
+            "a5474aa0f59ac9cc",
+            "d81d0818ffe68725",
+            "2a684b9e6e3c53e8",
+        ),
+    },
+    "small_closure": {
+        False: (
+            "-0x1.122a400000000p+2",
+            7405,
+            "ea9e454c31e2785c",
+            "b3ec3331262f69b9",
+            "47b56e8a8af6eb32",
+        ),
+        True: (
+            "-0x1.0a0814caa64b5p+2",
+            7399,
+            "a5474aa0f59ac9cc",
+            "d81d0818ffe68725",
+            "035c407de852aa65",
+        ),
+    },
 }
 SMALL = jnp.linspace(0.1, 0.3, 50)
 
@@ -526,15 +547,16 @@ def fingerprint(result):
 @pytest.mark.parametrize("case", sorted(V022_FINGERPRINTS))
 def test_plain_functions_match_v022_bit_for_bit(case) -> None:
     loglike = small_closure_loglike if case == "small_closure" else plain_loglike
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(7), loglike, plain_prior, NDIM, 50, maxiter=300
     )
-    assert fingerprint(result) == V022_FINGERPRINTS[case]
+    expected = V022_FINGERPRINTS[case][bool(jax.config.jax_enable_x64)]
+    assert fingerprint(result) == expected
 
 
 @pytest.mark.parametrize("block_size", [1, 32])
 def test_wall_time_telemetry(block_size, capsys) -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(3),
         plain_loglike,
         plain_prior,

@@ -10,7 +10,8 @@ import pytest
 from jax import random
 
 from tinyns import NestedSampler, core
-from tinyns.run import _update_scale
+from tinyns.callables import _clear_caches
+from tinyns.loop import _update_scale
 
 NDIM, NLIVE, BLOCK = 3, 40, 8
 
@@ -144,6 +145,9 @@ def test_repeated_steps_reproduce_nested_sampler_run() -> None:
         dead_rows = np.concatenate([getattr(dead, field) for dead in blocks])
         np.testing.assert_array_equal(getattr(result, name)[:niter], dead_rows)
     np.testing.assert_array_equal(result.samples_u[niter:], state.u)
+    births = np.concatenate([dead.birth for dead in blocks] + [state.birth])
+    np.testing.assert_array_equal(result.logl_birth, births)
+    assert bool(np.all(result.logl_birth[1:] <= result.logl[1:]))
     np.testing.assert_array_equal(result.logl[niter:], state.logl)
     assert result.ncall == int(state.ncall)
     assert result.metadata["rwalk_scale_final"] == scale
@@ -152,3 +156,36 @@ def test_repeated_steps_reproduce_nested_sampler_run() -> None:
     assert result.metadata["final_logz_dead"] == float(state.logz)
     assert result.metadata["final_delta_logz"] == core.remaining_dlogz(state)
     assert math.isfinite(core.remaining_dlogz(state))
+
+
+def test_n_active_runs_a_prefix_of_the_block_in_the_same_program() -> None:
+    cfg = make_config()
+    state = core.init(random.PRNGKey(2), loglike, prior_transform, cfg)
+    full_state, full = core.step(state, loglike, prior_transform, cfg)
+    part_state, part = core.step(state, loglike, prior_transform, cfg, n_active=3)
+    assert part.valid.tolist() == [True] * 3 + [False] * (BLOCK - 3)
+    assert not bool(part_state.failed) and int(part_state.it) == 3
+    assert float(part_state.logx) == pytest.approx(-3 / NLIVE)
+    for name in ("u", "logl", "logwt", "birth", "ncall", "insertion"):
+        np.testing.assert_array_equal(
+            getattr(part, name)[:3], getattr(full, name)[:3], err_msg=name
+        )
+    assert int(part_state.ncall) == NLIVE + int(full.ncall[:3].sum())
+    assert int(full_state.it) == BLOCK
+
+
+def test_maxiter_tail_compiles_no_second_block() -> None:
+    _clear_caches()
+    try:
+        result = NestedSampler(
+            loglike,
+            prior_transform,
+            NDIM,
+            nlive=NLIVE,
+            block_size=BLOCK,
+            cluster_swap=False,
+        ).run(3, maxiter=2 * BLOCK + 3, dlogz=0.0)
+        assert result.metadata["niter"] == 2 * BLOCK + 3
+        assert core._step_kernel.cache_info().misses == 1
+    finally:
+        _clear_caches()

@@ -72,6 +72,7 @@ def test_to_dict_contains_expected_keys() -> None:
         "success",
         "message",
         "metadata",
+        "logl_birth",
     }
     assert data["metadata"] == {"status": "complete"}
     assert data["metadata"] is not result.metadata
@@ -149,12 +150,12 @@ def test_information_ignores_zero_weight_nonfinite_likelihood() -> None:
 
 
 def _small_gaussian_run():
-    from tinyns.run import run_static_nested
+    from tests.helpers import run_ns
 
     def loglike(theta):
         return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
 
-    return run_static_nested(
+    return run_ns(
         random.PRNGKey(0),
         loglike,
         lambda u: 4.0 * u - 2.0,
@@ -215,7 +216,7 @@ def test_logz_bootstrap_input_validation() -> None:
 
 
 def test_logzerr_diagnostics_explain_nonfinite_inputs() -> None:
-    from tinyns.run import _logzerr_diagnostics
+    from tinyns.result import _logzerr_diagnostics
 
     logzerr, diagnostics = _logzerr_diagnostics(
         jnp.array([0.0, -jnp.inf]),
@@ -234,7 +235,7 @@ def test_logzerr_diagnostics_explain_nonfinite_inputs() -> None:
 
 
 def test_logzerr_diagnostics_status_for_weighted_nonfinite_likelihood() -> None:
-    from tinyns.run import _logzerr_diagnostics
+    from tinyns.result import _logzerr_diagnostics
 
     logzerr, diagnostics = _logzerr_diagnostics(
         jnp.array([0.0]),
@@ -610,3 +611,16 @@ def test_result_npz_missing_required_key_raises(tmp_path) -> None:
 
     with np.testing.assert_raises(ValueError):
         NestedSamplingResult.load_npz(path)
+
+
+def test_logl_birth_round_trips_through_npz(tmp_path) -> None:
+    result = make_result()
+    path = tmp_path / "plain.npz"
+    result.save_npz(path)
+    assert NestedSamplingResult.load_npz(path).logl_birth is None
+
+    result.logl_birth = jnp.array([-jnp.inf, -3.0, -2.0, jnp.nan])
+    result.save_npz(path)
+    loaded = NestedSamplingResult.load_npz(path)
+    np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
+    assert isinstance(loaded.to_numpy()["logl_birth"], np.ndarray)

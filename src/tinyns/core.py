@@ -8,9 +8,9 @@ to every call and may be pytree callables: their array leaves (or a closure's
 large constants) are jit arguments, and the compiled kernels are cached on
 their structure (:mod:`tinyns.callables`).
 
-The host loop (:func:`tinyns.run.run_static_nested`) owns everything between
-blocks: termination, the step-scale adaptation, telemetry, checkpoints and the
-cluster tracker of the swap move.
+The host loop (:func:`tinyns.loop.run`) owns everything between blocks:
+termination, the step-scale adaptation, telemetry, checkpoints and the cluster
+tracker of the swap move.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from tinyns.callables import _kernel_cache, _split_callables
 from tinyns.clusters import loo_frames, swap_step
 
 # The live-cov step is ``scale * L z``; the scale starts here and the host loop
-# adapts it after every block (see tinyns.run).
+# adapts it after every block (see tinyns.loop).
 _INITIAL_SCALE = 0.5
 # Likelihood-call budget of one replacement: a batch of ``walks`` steps on
 # each of ``replacement_chains`` chains is retried until one chain ends above
@@ -157,7 +157,12 @@ def _evaluate_jax_batch(loglike, prior_transform, u_batch, ndim):
         raise ValueError(f"u_batch must have shape (batch, {ndim})")
     nbatch = int(u_batch.shape[0])
     theta_batch = _evaluate_jax_prior_batch(prior_transform, u_batch, ndim)
-    logl_batch = jnp.asarray(jax.vmap(loglike)(theta_batch))
+    # The live logl dtype is the default float dtype, never weakly typed: a
+    # plain-Python-float (weak) or float32 likelihood under x64 would otherwise
+    # give the lax.cond branches of the kernels different output types.
+    logl_batch = jnp.asarray(
+        jax.vmap(loglike)(theta_batch), dtype=jnp.result_type(float)
+    )
     if logl_batch.shape != (nbatch,):
         raise ValueError("loglike must return a scalar")
     return theta_batch, logl_batch
@@ -542,14 +547,18 @@ def _step_kernel(
 ):
     """Return the cached jitted block of :func:`step`: ``block_size`` iterations.
 
-    The returned ``block(state, nlive, max_batches, extras, *callable_leaves)``
-    returns ``(state, dead)``. ``nlive`` and ``max_batches`` are int32 arrays
-    (traced, not constants). The callables' array leaves and large constants
-    (``*_callable_leaves(loglike, prior_transform, ndim)``) are threaded to the
-    chain kernel, so they are jit arguments rather than compiled-in constants.
+    The returned ``block(state, nlive, max_batches, n_active, extras,
+    *callable_leaves)`` returns ``(state, dead)``. ``nlive``, ``max_batches``
+    and ``n_active`` are int32 arrays (traced, not constants), so the maxiter
+    tail reuses the compiled block. The callables' array leaves and large
+    constants (``*_callable_leaves(loglike, prior_transform, ndim)``) are
+    threaded to the chain kernel, so they are jit arguments rather than
+    compiled-in constants.
 
-    After a failed replacement the remaining iterations of the block are
-    skipped: they neither touch the live set nor advance the key.
+    After a failed replacement, and from offset ``n_active`` on, the remaining
+    iterations of the block are skipped: they neither touch the live set nor
+    advance the key. The rows of skipped iterations have ``valid`` False; only
+    a failed replacement sets ``state.failed``.
 
     With ``extras`` (the cluster frames; see :mod:`tinyns.clusters`) the chains
     also propose affine swaps between clusters and ``dead.swaps`` holds the
@@ -560,7 +569,7 @@ def _step_kernel(
 
     batch_ncall = walks * replacement_chains
 
-    def block_kernel(state, nlive, max_batches, extras, *callable_leaves):
+    def block_kernel(state, nlive, max_batches, n_active, extras, *callable_leaves):
         cluster_swap = extras is not None
         rwalk_kernel = _chain_kernel(
             loglike_spec,
@@ -701,12 +710,16 @@ def _step_kernel(
                     *([jnp.zeros(2, dtype=jnp.int32)] if cluster_swap else []),
                 )
 
-            return lax.cond(
-                active,
+            in_block = offset < n_active
+            carry, row = lax.cond(
+                active & in_block,
                 run_iteration,
                 skip_iteration,
                 (key, live_u, live_theta, live_logl, live_birth, logz_dead, *labels),
             )
+            # Iterations past n_active leave the failure flag alone.
+            active = jnp.where(in_block, carry[6], active)
+            return (*carry[:6], active, *carry[7:]), row
 
         (
             (
@@ -736,7 +749,7 @@ def _step_kernel(
         )
         logx_final_new = -(
             jnp.asarray(start_iteration, dtype=jnp.float32)
-            + jnp.asarray(block_size, dtype=jnp.float32)
+            + jnp.asarray(n_active, dtype=jnp.float32)
         ) / jnp.asarray(nlive, dtype=jnp.float32)
         dead = Dead(*block[:11], swaps=block[11] if cluster_swap else None)
         new_state = State(
@@ -815,15 +828,19 @@ def init(key, loglike, prior_transform, cfg: Config) -> State:
 
 
 def step(
-    state: State, loglike, prior_transform, cfg: Config, extras=None
+    state: State, loglike, prior_transform, cfg: Config, extras=None, *, n_active=None
 ) -> tuple[State, Dead]:
     """Run one jitted block of ``cfg.block_size`` iterations.
 
     Returns the new state and the block's :class:`Dead` rows. ``extras`` are
     the cluster frames of the swap move (host tracker, :mod:`tinyns.clusters`);
-    ``None`` runs the swap-free program. The step scale is ``state.scale``; the
-    host loop adapts it between blocks.
+    ``None`` runs the swap-free program. ``n_active`` (default: all) runs only
+    the first ``n_active`` iterations, in the same compiled program; the other
+    rows have ``valid`` False. The step scale is ``state.scale``; the host loop
+    adapts it between blocks.
     """
+    if n_active is None:
+        n_active = cfg.block_size
     (loglike_dynamic, loglike_spec), (prior_dynamic, prior_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
     )
@@ -839,6 +856,7 @@ def step(
         state,
         jnp.asarray(cfg.nlive, dtype=jnp.int32),
         jnp.asarray(cfg.max_batches, dtype=jnp.int32),
+        jnp.asarray(n_active, dtype=jnp.int32),
         extras,
         *loglike_dynamic,
         *prior_dynamic,

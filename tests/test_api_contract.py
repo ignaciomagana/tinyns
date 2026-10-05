@@ -5,8 +5,9 @@ import math
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from tests.helpers import run_ns
 
-from tinyns import NestedSampler, NestedSamplingResult, run_static_nested
+from tinyns import NestedSampler, NestedSamplingResult, core, loop
 
 
 def loglike(theta: np.ndarray) -> float:
@@ -24,11 +25,9 @@ def test_public_exports() -> None:
         "NestedSampler",
         "NestedSamplingResult",
         "LogZBootstrap",
-        "run_static_nested",
     ]
     assert tinyns.NestedSampler is NestedSampler
     assert tinyns.NestedSamplingResult is NestedSamplingResult
-    assert tinyns.run_static_nested is run_static_nested
     assert tinyns.LogZBootstrap is tinyns.result.LogZBootstrap
 
 
@@ -164,10 +163,10 @@ def test_default_sampler_runs_live_cov_block_path() -> None:
     assert math.isfinite(result.logz)
 
 
-def test_run_static_nested_defaults_match_nested_sampler() -> None:
+def test_loop_run_defaults_match_nested_sampler() -> None:
     key = np.array([0, 8], dtype=np.uint32)
-    direct = run_static_nested(
-        key, _jax_gaussian_loglike, _jax_box_prior, ndim=2, nlive=30, maxiter=32
+    direct = loop.run(
+        core.Config(2, 30), _jax_gaussian_loglike, _jax_box_prior, key, maxiter=32
     )
     facade = NestedSampler(_jax_gaussian_loglike, _jax_box_prior, ndim=2, nlive=30)
     via_sampler = facade.run(key, maxiter=32)
@@ -185,7 +184,7 @@ def test_default_walks_is_max_25_or_six_ndim(ndim: int, walks: int) -> None:
 
 
 def test_default_walks_reaches_run_metadata() -> None:
-    result = run_static_nested(
+    result = run_ns(
         np.array([0, 9], dtype=np.uint32),
         _jax_gaussian_loglike,
         _jax_box_prior,
@@ -201,7 +200,7 @@ def test_default_walks_reaches_run_metadata() -> None:
 def test_huge_walks_still_runs_one_batch_per_replacement() -> None:
     # walks * replacement_chains above the 10_000-call replacement budget
     # still runs one batch.
-    result = run_static_nested(
+    result = run_ns(
         np.array([0, 10], dtype=np.uint32),
         _jax_gaussian_loglike,
         _jax_box_prior,

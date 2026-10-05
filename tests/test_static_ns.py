@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import random
+from tests.helpers import run_ns
 
 from tinyns import core
 from tinyns.callables import _callable_specs, _clear_caches
-from tinyns.run import run_static_nested
 
 
 def _sum_squares(theta):
@@ -17,7 +18,7 @@ def _sum_squares(theta):
 
 
 def test_constant_likelihood_unit_cube_logz_close_to_zero() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(0),
         lambda theta: 0.0,
         lambda u: u,
@@ -39,7 +40,7 @@ def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None
     def prior_transform(u):
         return 20.0 * u - 10.0
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(1),
         loglike,
         prior_transform,
@@ -54,7 +55,7 @@ def test_gaussian_likelihood_uniform_prior_logz_close_to_inverse_width() -> None
 
 
 def test_result_shapes_finite_logz_and_equal_resampling() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(2),
         _sum_squares,
         lambda u: 2.0 * u - 1.0,
@@ -73,7 +74,7 @@ def test_result_shapes_finite_logz_and_equal_resampling() -> None:
 
 
 def test_static_nested_result_counts_match_metadata() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(23),
         _sum_squares,
         lambda u: u,
@@ -91,7 +92,7 @@ def test_static_nested_result_counts_match_metadata() -> None:
 
 def test_static_nested_maxiter_zero_raises() -> None:
     with pytest.raises(ValueError, match="maxiter must be a positive integer"):
-        run_static_nested(
+        run_ns(
             random.PRNGKey(24),
             _sum_squares,
             lambda u: u,
@@ -105,7 +106,7 @@ def test_replacement_failure_stops_the_run_with_a_message() -> None:
     # No point is admissible above a NaN threshold: the first replacement
     # exhausts its batches and the run stops.
     walks = 10
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(8),
         lambda theta: jnp.nan,
         lambda u: u,
@@ -132,7 +133,7 @@ def test_replacement_failure_stops_the_run_with_a_message() -> None:
 
 
 def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(5),
         lambda theta: -(theta[0] ** 2),
         lambda u: u[0],
@@ -151,7 +152,7 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
 
 
 def test_replacement_stats_metadata_after_normal_run() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(7),
         _sum_squares,
         lambda u: u,
@@ -190,7 +191,7 @@ def test_replacement_stats_metadata_after_normal_run() -> None:
 
 
 def test_insertion_indices_metadata_after_normal_run() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(70),
         _sum_squares,
         lambda u: u,
@@ -322,7 +323,7 @@ def _fake_step(*, accepted_prefix: int, replacement_ncall, moves=None):
     moves = replacement_ncall if moves is None else tuple(moves)
     calls = []
 
-    def step(state, loglike, prior_transform, cfg, extras=None):
+    def step(state, loglike, prior_transform, cfg, extras=None, *, n_active=None):
         calls.append(float(state.scale))
         worst = int(jnp.argmin(state.logl))
         offsets = jnp.arange(block_size)
@@ -365,7 +366,7 @@ def test_block_partial_failure_after_convergence_reports_success(
         _fake_step(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
     )
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(1236),
         lambda theta: 0.0,
         lambda u: u,
@@ -396,7 +397,7 @@ def test_block_partial_failure_before_convergence_remains_failure(
         _fake_step(accepted_prefix=1, replacement_ncall=(1, 1, 1, 1)),
     )
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(1237),
         lambda theta: 0.0,
         lambda u: u,
@@ -429,7 +430,7 @@ def test_block_ncall_counts_failed_offset(monkeypatch) -> None:
         _fake_step(accepted_prefix=2, replacement_ncall=(3, 3, 9, 3)),
     )
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(4242),
         lambda theta: 0.0,
         lambda u: u,
@@ -451,7 +452,7 @@ def test_block_ncall_counts_failed_offset(monkeypatch) -> None:
 
 def test_progress_interval_must_be_positive() -> None:
     with pytest.raises(ValueError, match="progress_interval"):
-        run_static_nested(
+        run_ns(
             random.PRNGKey(20),
             lambda theta: 0.0,
             lambda u: u,
@@ -464,7 +465,7 @@ def test_progress_interval_must_be_positive() -> None:
 
 def test_callback_interval_must_be_positive() -> None:
     with pytest.raises(ValueError, match="callback_interval"):
-        run_static_nested(
+        run_ns(
             random.PRNGKey(21),
             lambda theta: 0.0,
             lambda u: u,
@@ -477,7 +478,7 @@ def test_callback_interval_must_be_positive() -> None:
 
 def test_callback_must_be_callable() -> None:
     with pytest.raises(TypeError, match="callback"):
-        run_static_nested(
+        run_ns(
             random.PRNGKey(22),
             lambda theta: 0.0,
             lambda u: u,
@@ -491,7 +492,7 @@ def test_callback_must_be_callable() -> None:
 def test_callback_is_called_during_short_run() -> None:
     states = []
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(23),
         lambda theta: 0.0,
         lambda u: u,
@@ -513,7 +514,7 @@ def test_callback_can_stop_run_gracefully() -> None:
     def callback(state):
         return False if state["iter"] >= 2 else None
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(24),
         lambda theta: 0.0,
         lambda u: u,
@@ -534,7 +535,7 @@ def test_callback_can_stop_run_gracefully() -> None:
 
 
 def test_progress_true_does_not_crash(capsys) -> None:
-    run_static_nested(
+    run_ns(
         random.PRNGKey(25),
         lambda theta: 0.0,
         lambda u: u,
@@ -554,7 +555,7 @@ def test_progress_true_does_not_crash(capsys) -> None:
 
 
 def test_format_progress_line_contains_core_fields() -> None:
-    from tinyns.run import _format_progress_line
+    from tinyns.loop import _format_progress_line
 
     line = _format_progress_line(
         {
@@ -577,7 +578,7 @@ def test_format_progress_line_contains_core_fields() -> None:
 
 
 def test_progress_printer_pads_shorter_final_line(capsys) -> None:
-    from tinyns.run import _ProgressPrinter
+    from tinyns.loop import _ProgressPrinter
 
     printer = _ProgressPrinter()
     printer.print("iter=longer-line", final=False)
@@ -623,7 +624,7 @@ def test_nested_sampler_block_size_one_runs() -> None:
 
 
 def test_block_size_five_runs_and_shapes() -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(11),
         _jax_loglike,
         _jax_prior_transform,
@@ -686,7 +687,7 @@ def test_default_block_run_records_metadata() -> None:
 
 def test_block_size_one_and_32_agree_within_errors() -> None:
     kwargs = dict(walks=5, nlive=50, dlogz=0.5, maxiter=300)
-    one = run_static_nested(
+    one = run_ns(
         random.PRNGKey(113),
         _standard_gaussian_2d_loglike,
         _wide_box_prior_transform,
@@ -694,7 +695,7 @@ def test_block_size_one_and_32_agree_within_errors() -> None:
         block_size=1,
         **kwargs,
     )
-    block = run_static_nested(
+    block = run_ns(
         random.PRNGKey(113),
         _standard_gaussian_2d_loglike,
         _wide_box_prior_transform,
@@ -713,7 +714,7 @@ def test_block_ring2d_no_failures() -> None:
     from validation.targets import get_target
 
     target = get_target("ring2d")
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(114),
         target.loglike,
         target.prior_transform,
@@ -760,7 +761,7 @@ def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(block_size) -> Non
     def prior_transform(u):
         return -0.5 * width + width * u
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(3),
         loglike,
         prior_transform,
@@ -776,7 +777,7 @@ def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(block_size) -> Non
 
 @pytest.mark.parametrize("cluster_swap", [False, True])
 def test_block_size_one_supports_cluster_swap_setting(cluster_swap) -> None:
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(31),
         _jax_loglike,
         _jax_prior_transform,
@@ -795,7 +796,7 @@ def test_block_size_one_supports_cluster_swap_setting(cluster_swap) -> None:
 
 def test_static_nested_metadata_has_no_removed_option_keys() -> None:
     states = []
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(107),
         lambda theta: -0.5 * jnp.sum(theta**2),
         lambda u: 2.0 * u - 1.0,
@@ -848,7 +849,7 @@ def test_block_rwalk_supports_unhashable_callable_instances() -> None:
         def __call__(self, theta):
             return -jnp.sum(theta**2)
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(12341),
         UnhashableLogLike(),
         UnhashablePrior(),
@@ -892,7 +893,7 @@ def test_static_jax_block_kernel_cache_is_bounded() -> None:
 
 
 def test_update_scale_direction_and_clamps() -> None:
-    from tinyns.run import _update_scale
+    from tinyns.loop import _update_scale
 
     assert _update_scale(0.5, 0.05) < 0.5
     assert _update_scale(0.5, 0.75) > 0.5
@@ -909,7 +910,7 @@ def test_scale_adapts_to_block_move_acceptance(monkeypatch, moves, grows) -> Non
         accepted_prefix=4, replacement_ncall=(20, 20, 20, 20), moves=(moves,) * 4
     )
     monkeypatch.setattr(core, "step", fake)
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(123),
         _standard_gaussian_2d_loglike,
         _wide_box_prior_transform,
@@ -944,10 +945,32 @@ def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
     def prior_transform(u):
         return u
 
-    result = run_static_nested(
+    result = run_ns(
         random.PRNGKey(7), loglike, prior_transform, 3, 100, walks=25, maxiter=640
     )
     jax.effects_barrier()
     metadata = result.metadata
     assert len(calls) == result.ncall
     assert result.ncall < 100 + metadata["total_rwalk_proposals"]
+
+
+@pytest.mark.parametrize(
+    "loglike",
+    [
+        lambda theta: 0.0,  # a plain Python float: weakly typed
+        lambda theta: (-jnp.sum(theta**2)).astype(jnp.float32),
+    ],
+    ids=["python_float", "float32"],
+)
+def test_likelihood_dtype_does_not_break_x64(loglike) -> None:
+    """The kernels cast the likelihood to the default float dtype."""
+    # jax.experimental.enable_x64 is gone in newer JAX; toggle the flag directly.
+    previous = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        result = run_ns(0, loglike, lambda u: u, 2, 20, maxiter=64, dlogz=0.0)
+        assert result.logl.dtype == jnp.float64
+    finally:
+        jax.config.update("jax_enable_x64", previous)
+    assert result.metadata["niter"] == 64
+    assert math.isfinite(result.logz)
