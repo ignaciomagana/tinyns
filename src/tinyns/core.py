@@ -9,8 +9,9 @@ large constants) are jit arguments, and the compiled kernels are cached on
 their structure (:mod:`tinyns.callables`).
 
 The host loop (:func:`tinyns.loop.run`) owns everything between blocks:
-termination, the step-scale adaptation, telemetry, checkpoints and the cluster
-tracker of the swap move.
+termination, the step-scale adaptation, telemetry, checkpoints and the host
+hook of the cluster swap (:class:`tinyns.clusters.ClusterTracker`), whose
+frames reach :func:`step` as ``extras``.
 """
 
 from __future__ import annotations

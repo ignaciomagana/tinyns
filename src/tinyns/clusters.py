@@ -27,6 +27,7 @@ and the rwalk steps keep the global live covariance.
 from __future__ import annotations
 
 import itertools
+import time
 
 import jax
 import jax.numpy as jnp
@@ -264,17 +265,22 @@ def _split(x):
 
 
 class ClusterTracker:
-    """Clusters of the live points, tracked across blocks (host side, numpy).
+    """Clusters of the live points, tracked across blocks: the swap's host hook.
 
-    Nothing here touches the PRNG stream. ``log`` is JSON-serializable and,
-    with ``arrays()``, restores the tracker from a checkpoint.
+    The host loop calls :meth:`before_block` before each block and passes what
+    it returns to :func:`tinyns.core.step` as ``extras``, then calls
+    :meth:`after_block` with the block's dead rows. :meth:`state_dict` and
+    :meth:`load_state_dict` carry the tracker through a checkpoint, and
+    :meth:`summary` gives the ``cluster_*`` entries of ``result.metadata``.
+    Nothing here touches the PRNG key.
     """
 
-    def __init__(self, nlive, arrays=None, log=None):
+    def __init__(self, nlive):
         self.every = min(RECLUSTER_ITERS, max(int(nlive) // 4, 1))
         self.labels = self.u = self.fit = self._frames = None
         self.eligible = np.zeros(1, dtype=bool)
-        self.log = log or {
+        self.host_s = 0.0  # wall time spent here, for metadata["cluster_host_s"]
+        self.log = {
             "iteration": 0,  # of the last update
             "ids": [0],  # persistent id of each current cluster
             "next_id": 1,
@@ -283,40 +289,71 @@ class ClusterTracker:
             "modes": {},  # per cluster id: populations and evidence per update
             "swap": [0, 0],  # accepted, proposed
         }
-        if arrays is not None:
-            self.labels = np.asarray(arrays["labels"])
-            self.u = np.asarray(arrays["u"])
+
+    def state_dict(self):
+        """Return the checkpoint state: the JSON-serializable ``log`` and the
+        ``arrays`` (labels and live points of the last update, or None)."""
+        arrays = None if self.labels is None else {"labels": self.labels, "u": self.u}
+        return {"log": self.log, "arrays": arrays}
+
+    def load_state_dict(self, state):
+        """Restore the tracker from :meth:`state_dict` (``None`` or ``{}``: fresh)."""
+        state = state or {}
+        if state.get("log"):
+            self.log = state["log"]
+        if state.get("arrays") is not None:
+            self.labels = np.asarray(state["arrays"]["labels"])
+            self.u = np.asarray(state["arrays"]["u"])
             self._refit()
 
-    def arrays(self):
-        """Return the arrays a checkpoint needs besides ``log``."""
-        return None if self.labels is None else {"labels": self.labels, "u": self.u}
+    def before_block(self, state, dead):
+        """Return the cluster frames (``extras``) for the next block, or ``None``.
 
-    def frames(self, live_u, iteration, dead_u, dead_logwt):
-        """Return the cluster frames for the next block, or ``None``.
-
+        ``dead`` holds the dead rows so far (columns ``"u"`` and ``"logwt"``).
         Re-clusters when due. ``None`` means fewer than two eligible clusters:
-        the block then runs the plain rwalk kernel. Points replaced since the
-        last update get label -1.
+        the block runs the swap-free program. Points replaced since the last
+        update get label -1.
         """
-        last = self.log["iteration"]
+        start = time.perf_counter()
+        iteration, last = len(dead["logwt"]), self.log["iteration"]
         if self.labels is None or iteration - last >= self.every:
             self._update(
-                np.asarray(live_u, dtype=float),
-                int(iteration),
-                dead_u[last:iteration],
-                dead_logwt[last:iteration],
+                np.asarray(state.u, dtype=float),
+                iteration,
+                dead["u"][last:iteration],
+                dead["logwt"][last:iteration],
             )
-        if self._frames is None:
-            return None
-        live_u = np.asarray(live_u)
-        frames = {
-            name: value.astype(live_u.dtype) if value.dtype.kind == "f" else value
-            for name, value in self._frames.items()
-        }
-        unchanged = (live_u == self.u).all(1)
-        frames["labels"] = np.where(unchanged, self.labels, -1).astype(np.int32)
+        frames = None
+        if self._frames is not None:
+            live_u = np.asarray(state.u)
+            frames = {
+                name: value.astype(live_u.dtype) if value.dtype.kind == "f" else value
+                for name, value in self._frames.items()
+            }
+            unchanged = (live_u == self.u).all(1)
+            frames["labels"] = np.where(unchanged, self.labels, -1).astype(np.int32)
+        self.host_s += time.perf_counter() - start
         return frames
+
+    def after_block(self, state, block):
+        """Count the block's swaps; return ``block`` with rwalk-only counts.
+
+        ``block`` holds the block's valid :class:`~tinyns.core.Dead` rows (on
+        the host). The swap steps are taken out of ``moves`` and
+        ``proposals``, so the step scale adapts to the rwalk acceptance alone.
+        """
+        del state  # labels need no update: before_block relabels moved points
+        if block.swaps is None:  # the block ran without frames
+            return block
+        swaps = block.swaps
+        self.log["swap"] = [
+            int(a + b) for a, b in zip(self.log["swap"], swaps.sum(0), strict=True)
+        ]
+        return block._replace(
+            moves=block.moves - swaps[:, 0],
+            proposals=block.proposals - swaps[:, 1],
+            swaps=None,
+        )
 
     def _update(self, u, iteration, dead_u, dead_logwt):
         log = self.log
@@ -434,8 +471,23 @@ class ClusterTracker:
                 _logsumexp(dead_logwt[which == c])
             )
 
-    def summary(self, dead_u, dead_logwt, live_u, live_logwt):
-        """Return the cluster telemetry for ``result.metadata``.
+    def summary(self, dead, live_u, live_logwt):
+        """Return the ``cluster_*`` entries of ``result.metadata``.
+
+        ``dead`` holds the dead rows (columns ``"u"`` and ``"logwt"``);
+        ``live_u`` and ``live_logwt`` are the final live points and weights.
+        ``cluster_host_s`` is the wall time the tracker took, this call
+        included.
+        """
+        start = time.perf_counter()
+        out = self._summary(
+            dead["u"], dead["logwt"], np.asarray(live_u), np.asarray(live_logwt)
+        )
+        out["cluster_host_s"] = self.host_s + time.perf_counter() - start
+        return out
+
+    def _summary(self, dead_u, dead_logwt, live_u, live_logwt):
+        """Return the cluster telemetry (all but ``cluster_host_s``).
 
         ``cluster_modes`` lists every cluster that ever shared the live set
         with another one: its posterior ``mass``, its smallest population
