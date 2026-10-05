@@ -395,8 +395,11 @@ boundaries: a run with `block_size=32` and the default
 a block boundary that happens to land on a multiple of 100. A run also writes
 a final checkpoint when it ends.
 
-A checkpoint stores the active live points, accumulated dead points, PRNG key,
-iteration counters, and sampler metadata. It does not serialize user functions.
+A checkpoint is one NumPy `.npz` file (format `tinyns-ckpt-2`), written
+atomically: the live set and the run scalars (including the PRNG key, as raw
+key data, so typed and legacy keys both round-trip), the dead points so far,
+the resolved sampler configuration, the step-scale and acceptance telemetry,
+and the cluster tracker's state. It does not serialize user functions.
 To resume, reconstruct the same sampler and call:
 
 ```python
@@ -406,10 +409,12 @@ result = sampler.resume("run.checkpoint.npz")
 The sampler configuration must match the checkpoint. Checkpoints record
 `ndim`, `nlive` and the resolved `walks`, `replacement_chains`, `block_size`
 and `cluster_swap`, so a sampler built with the same (or default) arguments
-resumes it, and a mismatch raises `ValueError` naming the key. Checkpoints
-written before v0.3 are not read. A resumed run is bit-identical to an
-uninterrupted one. A checkpoint saved after a replacement failure cannot be
-resumed. Checkpoints are distinct
-from final result files saved with `result.save_npz(...)`. Checkpoints use NumPy
-`.npz` files to avoid extra dependencies. Checkpoint/resume is intended for
-static nested sampling; dynamic nested sampling is not implemented yet.
+resumes it, and a mismatch raises `ValueError` naming the key. The
+`loglike` and `prior_transform` cannot be checked: resuming with different
+callables silently continues the run with them. A run killed and resumed at
+any block boundary is bit-identical to an uninterrupted one. A checkpoint
+saved after a replacement failure cannot be resumed. Checkpoints written
+before v0.3 are not read (`ValueError: not a tinyns-ckpt-2 file`), and there
+is no converter. Checkpoints are distinct from final result files saved with
+`result.save_npz(...)`. Checkpoint/resume is intended for static nested
+sampling; dynamic nested sampling is not implemented yet.
