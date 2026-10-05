@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -963,10 +964,13 @@ def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
 )
 def test_likelihood_dtype_does_not_break_x64(loglike) -> None:
     """The kernels cast the likelihood to the default float dtype."""
-    from jax.experimental import enable_x64
-
-    with enable_x64():
+    # jax.experimental.enable_x64 is gone in newer JAX; toggle the flag directly.
+    previous = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
         result = run_ns(0, loglike, lambda u: u, 2, 20, maxiter=64, dlogz=0.0)
         assert result.logl.dtype == jnp.float64
+    finally:
+        jax.config.update("jax_enable_x64", previous)
     assert result.metadata["niter"] == 64
     assert math.isfinite(result.logz)
