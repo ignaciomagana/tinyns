@@ -34,7 +34,8 @@ def test_signatures() -> None:
     assert init["nlive"].default == 1000
     assert init["num_delete"].kind is inspect.Parameter.KEYWORD_ONLY
     run = inspect.signature(NestedSampler.run).parameters
-    assert list(run) == ["self", "key", "dlogz", "maxiter", "maxcall", "progress"]
+    assert list(run) == ["self", "key", "dlogz", "maxiter", "maxcall", "progress",
+                         "checkpoint", "batched_data"]
     assert run["dlogz"].default == 0.1
 
 
@@ -81,7 +82,7 @@ def test_run_returns_a_complete_result(capsys) -> None:
     md = result.metadata
     assert md["status"] == "converged" and md["walks"] == 25
     assert md["ncall_valid"] <= result.ncall and 0 < md["acceptance"] < 1
-    assert "tinyns: ndead=" in capsys.readouterr().out
+    assert "tinyns: niter=" in capsys.readouterr().out
     assert "num_delete: 6" in result.summary()
     assert result.resample_equal(np.asarray([0, 1], np.uint32), 10).shape == (10, 2)
 
