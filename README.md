@@ -58,8 +58,10 @@ tinyns `jax.vmap`s and `jax.jit`s them.
 | --- | --- |
 | `NestedSampler(loglike, prior_transform, ndim, ...)` | Static nested sampler (see the keyword arguments below). |
 | `NestedSamplingResult` | Result container with samples, weights, evidence estimates, status, and metadata. |
-| `result.summary()` | Human-readable run summary. |
-| `result.diagnostics()` | Plain-dict diagnostics, including ESS, call counts, and warnings. |
+| `result.summary()`, `print(result)` | Human-readable run summary, with a per-mode table when the posterior has several modes. |
+| `result.diagnostics()` | Plain-dict diagnostics, including ESS, call counts, the modes, and warnings. |
+| `result.modes()` | Per-mode mass, its seed-to-seed error bar and an `unresolved` flag (see Multimodal posteriors). |
+| `result.insertion_test(windows=3)` | Kolmogorov-Smirnov test of the insertion ranks, pooled and per stretch of the run. |
 | `result.resample_equal(key, n=None)` | Equally weighted posterior samples via systematic resampling. |
 | `result.to_numpy()` | Plain dictionary with array fields converted to NumPy arrays. |
 | `result.to_dynesty_dict()` | Lightweight dynesty-compatible dictionary using matching tinyns fields. |
@@ -181,7 +183,8 @@ For a campaign over mock datasets in one process, pass
 structure and same-shaped leaves reuse one compiled kernel, while each closure
 compiles its own. tinyns keeps no reference to a finished run's data, so a
 dataset is freed once you drop it. `result.metadata` reports `wall_time_s`,
-`compile_s` (time to the first block) and `mean_ms_per_call` (after it).
+`compile_s` (time to the first block) and `mean_ms_per_call` (after it),
+summed over a run and its resumes.
 
 Separate processes (array jobs, one dataset each) can share compiles through
 JAX's persistent cache: call
@@ -288,11 +291,14 @@ Limits:
 
 If the weight of a small or non-ellipsoidal mode matters, split the prior into
 one region per mode and run each, or run several seeds and compare.
-`result.metadata["cluster_modes"]` lists each detected mode's mass, its
-smallest live count between detection and its posterior median, and
-`urn_logit_sd`, the seed scatter of `logit(mass)` that the drift would cause
-without the swap; `cluster_swap_accepts` and `cluster_swap_proposals` count
-the swaps.
+`result.modes()` lists each mode found by clustering the posterior after the
+run (with the swap on or off): its `mass`, `min_live`, its smallest live count
+between its isolation and its posterior median, and `urn_sd`, the seed scatter
+of `logit(mass)` that the drift causes without the swap (an upper bound with
+it). A mode with `min_live < 3 * ndim` is flagged `unresolved`: raise `nlive`.
+A mode lost before the end of a run leaves no trace in it.
+`result.metadata["cluster_swap_accepts"]` and `["cluster_swap_proposals"]`
+count the swaps.
 
 ## Design philosophy
 

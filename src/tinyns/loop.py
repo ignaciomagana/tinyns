@@ -21,7 +21,7 @@ from jax.scipy.special import logsumexp
 from tinyns import checkpoint, core
 from tinyns.callables import _device_leaves
 from tinyns.clusters import ClusterTracker
-from tinyns.result import NestedSamplingResult, _logzerr_diagnostics
+from tinyns.result import NestedSamplingResult, _information
 
 # The live-cov step is ``scale * L z``. The scale starts at 0.5 and, after
 # every block, moves in log space toward 25% move acceptance. It is a
@@ -185,8 +185,7 @@ def run(
     if resume is None:
         state = core.init(key, loglike, prior_transform, cfg)
         ncall, iteration, scale = nlive, 0, core._INITIAL_SCALE
-        telemetry = {"rwalk_moves": 0, "rwalk_proposals": 0, "accept_history": []}
-        telemetry["scale_history"] = [scale]
+        telemetry = {"rwalk_moves": 0, "rwalk_proposals": 0}
     else:
         state, telemetry = resume.state, resume.telemetry
         iteration, scale = int(state.it), float(state.scale)
@@ -214,22 +213,23 @@ def run(
         logwt=(real, ()),
         birth=(real, ()),
         ncall=(np.int64, ()),
-        insertion=(np.int64, ()),
         batches=(np.int64, ()),
     )
     if resume is not None:
         rows.extend(**{name: resume.dead[name] for name in rows.columns()})
 
     initial_iteration = iteration
-    success, message, stopped_by_callback = True, "converged", False
+    success, message = True, "converged"
     final_delta_logz = math.inf
-    partial_failure = {"offset": None, "delta_logz": None, "message": None}
-    terminated_after_partial_failure = False
     printer = _ProgressPrinter() if progress else None
     rwalk_moves = int(telemetry["rwalk_moves"])
     rwalk_proposals = int(telemetry["rwalk_proposals"])
-    scale_history = [float(x) for x in telemetry["scale_history"]]
-    accept_history = [float(x) for x in telemetry["accept_history"]]
+    # Wall-time telemetry accumulates over resumes: the checkpoint holds the
+    # time, compile time and timed calls of the calls before this one.
+    timed_before = {
+        name: telemetry.get(name, 0)
+        for name in ("wall_time_s", "compile_s", "timed_ncall")
+    }
     # The cluster swap's host hook (tinyns.clusters): its extras switch the
     # swap move on in core.step once two clusters can swap.
     hook = ClusterTracker(nlive) if cfg.cluster_swap else None
@@ -237,6 +237,20 @@ def run(
         hook.load_state_dict(resume.ext.get("clusters"))
 
     last_checkpoint = initial_iteration
+
+    def timing() -> dict[str, float]:
+        """Wall time, compile time and calls timed after the first block,
+        summed over this call and the ones it resumed from. Until the first
+        block ends, all of this call's time counts as compile time."""
+        elapsed = time.perf_counter() - start
+        compile_s, calls = (elapsed, 0) if first_block is None else (
+            first_block[0], ncall - first_block[1]
+        )
+        return {
+            "wall_time_s": timed_before["wall_time_s"] + elapsed,
+            "compile_s": timed_before["compile_s"] + compile_s,
+            "timed_ncall": timed_before["timed_ncall"] + calls,
+        }
 
     def maybe_checkpoint(*, final: bool = False) -> None:
         nonlocal last_checkpoint
@@ -251,8 +265,7 @@ def run(
                 {
                     "rwalk_moves": rwalk_moves,
                     "rwalk_proposals": rwalk_proposals,
-                    "scale_history": scale_history,
-                    "accept_history": accept_history,
+                    **timing(),
                 },
                 ext=None if hook is None else {"clusters": hook.state_dict()},
             )
@@ -331,8 +344,6 @@ def run(
                 f"chain ended above the likelihood threshold in {cfg.max_batches} "
                 f"batches of {walks} steps x {chains} chains"
             )
-            partial_failure["offset"] = offset
-            partial_failure["message"] = message
             ncall += int(block.ncall[offset])
             logz_dead = float(logz_before)
             for logwt in block.logwt[:offset]:
@@ -350,7 +361,6 @@ def run(
             logwt=block.logwt,
             birth=block.birth,
             ncall=block.ncall,
-            insertion=block.insertion,
             batches=block.batches,
         )
         ncall += int(sum(int(x) for x in block.ncall))
@@ -361,18 +371,14 @@ def run(
         if block_proposals > 0:
             observed = block_moves / block_proposals
             if math.isfinite(observed):
-                accept_history.append(observed)
                 scale = _update_scale(scale, observed)
-                scale_history.append(scale)
         iteration = rows.n
         maybe_checkpoint()
         final_delta_logz = core.remaining_dlogz(state)
         if failed.size:
-            partial_failure["delta_logz"] = float(final_delta_logz)
             if iteration > 0 and final_delta_logz < dlogz:
                 success = True
                 message = "converged after partial block before replacement failure"
-                terminated_after_partial_failure = True
             maybe_checkpoint(final=True)
             break
 
@@ -385,7 +391,7 @@ def run(
         ):
             if callback(report) is False:
                 success, message = False, "stopped by callback"
-                stopped_by_callback = done = True
+                done = True
         if printer is not None and (
             iteration == 1 or iteration % progress_interval == 0 or done
         ):
@@ -393,12 +399,10 @@ def run(
         if done:
             maybe_checkpoint(final=True)
 
-    wall_time_s = time.perf_counter() - start
-    compile_s = None if first_block is None else first_block[0]
-    calls_after_first_block = 0 if first_block is None else ncall - first_block[1]
+    times = timing()
     mean_ms_per_call = (
-        1000.0 * (wall_time_s - compile_s) / calls_after_first_block
-        if calls_after_first_block > 0
+        1000.0 * (times["wall_time_s"] - times["compile_s"]) / times["timed_ncall"]
+        if times["timed_ncall"] > 0
         else None
     )
 
@@ -413,108 +417,41 @@ def run(
     else:
         samples_u, samples, logl, logwt, logl_birth = live
 
-    nlive_final = int(live_logl.size)
     logz = float(logsumexp(logwt))
-    logzerr, logzerr_diagnostics = _logzerr_diagnostics(
-        logwt, logl, logz, nlive, nlive_final
-    )
-    replacement_ncall = rows["ncall"].tolist()
-    if replacement_ncall:
-        mean_replacement_ncall = float(sum(replacement_ncall) / len(replacement_ncall))
-        max_replacement_ncall = int(max(replacement_ncall))
-        replacement_acceptance_proxy = (
-            1.0 / mean_replacement_ncall
-            if math.isfinite(mean_replacement_ncall) and mean_replacement_ncall > 0.0
-            else 0.0
-        )
-    else:
-        mean_replacement_ncall = 0.0
-        max_replacement_ncall = 0
-        replacement_acceptance_proxy = 0.0
-    replacement_batches = rows["batches"].tolist()
-    rwalk_acceptance = rwalk_moves / rwalk_proposals if rwalk_proposals > 0 else None
-
-    cluster_metadata = {"cluster_swap": bool(cfg.cluster_swap)}
+    logzerr = float(jnp.sqrt(_information(logwt, logl, logz) / nlive))
+    metadata = {
+        "walks": walks,
+        "replacement_chains": chains,
+        "block_size": int(block_size),
+        "cluster_swap": bool(cfg.cluster_swap),
+        "dlogz": dlogz,
+        "acceptance": rwalk_moves / rwalk_proposals if rwalk_proposals else None,
+        "scale_initial": core._INITIAL_SCALE,
+        "scale_final": float(scale),
+        # Summed over the calls of a resumed run. The first block of each call
+        # includes the compiles, so the per-call cost skips it.
+        "wall_time_s": float(times["wall_time_s"]),
+        "compile_s": float(times["compile_s"]),
+        "mean_ms_per_call": mean_ms_per_call,
+        "final_delta_logz": float(final_delta_logz),
+        "resumed": resume is not None,
+    }
     if hook is not None:
-        cluster_metadata.update(hook.summary(rows, live_u, live_logwt))
+        metadata.update(hook.summary())
 
     return NestedSamplingResult(
         samples_u=samples_u,
         samples=samples,
         logl=logl,
         logwt=logwt,
+        logl_birth=logl_birth,
         logz=logz,
         logzerr=logzerr,
         ncall=ncall,
+        niter=int(iteration),
         nlive=nlive,
         ndim=ndim,
         success=success,
         message=message,
-        logl_birth=logl_birth,
-        metadata={
-            "rwalk_scale_initial": core._INITIAL_SCALE,
-            "rwalk_scale_final": float(scale),
-            "rwalk_scale_min_seen": float(min(scale_history)),
-            "rwalk_scale_max_seen": float(max(scale_history)),
-            "rwalk_scale_mean": float(sum(scale_history) / len(scale_history)),
-            "rwalk_adaptation_updates": len(accept_history),
-            "rwalk_observed_accept_mean": (
-                float(sum(accept_history) / len(accept_history))
-                if accept_history
-                else 0.0
-            ),
-            **cluster_metadata,
-            # Wall time of this call (a resume counts only its own part); the
-            # first block includes the compiles, so the per-call cost skips it.
-            "wall_time_s": float(wall_time_s),
-            "compile_s": compile_s,
-            "mean_ms_per_call": mean_ms_per_call,
-            "block_size": int(block_size),
-            "dlogz": dlogz,
-            "maxiter": maxiter,
-            "niter": int(iteration),
-            "ndead": int(iteration),
-            "nlive_final": nlive_final,
-            "nposterior": int(logwt.size),
-            **logzerr_diagnostics,
-            "final_delta_logz": float(final_delta_logz),
-            "final_logx": float(state.logx),
-            "final_logz_dead": float(state.logz),
-            "final_logl_live_max": float(jnp.max(live_logl)),
-            "walks": walks,
-            "replacement_chains": chains,
-            "replacement_batch_ncall": int(walks) * int(chains),
-            "replacement_ncall": replacement_ncall,
-            "insertion_indices": jnp.asarray(rows["insertion"], dtype=int),
-            "insertion_index_nslots": nlive,
-            "insertion_index_nlive": nlive - 1,
-            "replacement_failures": int(failures),
-            "terminated_after_partial_block_failure": terminated_after_partial_failure,
-            "partial_block_failure_delta_logz": partial_failure["delta_logz"],
-            "partial_block_failure_offset": partial_failure["offset"],
-            "partial_block_failure_message": partial_failure["message"],
-            "mean_replacement_ncall": mean_replacement_ncall,
-            "max_replacement_ncall": max_replacement_ncall,
-            "mean_replacement_batches": (
-                float(sum(replacement_batches) / len(replacement_batches))
-                if replacement_batches
-                else 0.0
-            ),
-            "max_replacement_batches": int(max(replacement_batches, default=0)),
-            "replacement_acceptance_proxy": replacement_acceptance_proxy,
-            "accepted_rwalk_moves": rwalk_moves,
-            "total_rwalk_proposals": rwalk_proposals,
-            "rwalk_acceptance": rwalk_acceptance,
-            "mean_rwalk_acceptance": rwalk_acceptance,
-            "progress_interval": progress_interval,
-            "callback_interval": callback_interval,
-            "stopped_by_callback": bool(stopped_by_callback),
-            "checkpoint_path": checkpoint_path,
-            "checkpoint_interval": (
-                checkpoint_interval if checkpoint_path is not None else None
-            ),
-            "resumed_from_checkpoint": resume is not None,
-            "initial_iteration": int(initial_iteration),
-            "final_iteration": int(iteration),
-        },
+        metadata=metadata,
     )

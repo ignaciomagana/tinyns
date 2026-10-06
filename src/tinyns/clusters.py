@@ -285,8 +285,6 @@ class ClusterTracker:
             "ids": [0],  # persistent id of each current cluster
             "next_id": 1,
             "counts": [],  # [iteration, number of clusters], at changes only
-            "iters": [],  # iteration of every update
-            "modes": {},  # per cluster id: populations and evidence per update
             "swap": [0, 0],  # accepted, proposed
         }
 
@@ -310,20 +308,14 @@ class ClusterTracker:
     def before_block(self, state, dead):
         """Return the cluster frames (``extras``) for the next block, or ``None``.
 
-        ``dead`` holds the dead rows so far (columns ``"u"`` and ``"logwt"``).
-        Re-clusters when due. ``None`` means fewer than two eligible clusters:
-        the block runs the swap-free program. Points replaced since the last
-        update get label -1.
+        ``dead`` holds the dead rows so far. Re-clusters when due. ``None``
+        means fewer than two eligible clusters: the block runs the swap-free
+        program. Points replaced since the last update get label -1.
         """
         start = time.perf_counter()
         iteration, last = len(dead["logwt"]), self.log["iteration"]
         if self.labels is None or iteration - last >= self.every:
-            self._update(
-                np.asarray(state.u, dtype=float),
-                iteration,
-                dead["u"][last:iteration],
-                dead["logwt"][last:iteration],
-            )
+            self._update(np.asarray(state.u, dtype=float), iteration)
         frames = None
         if self._frames is not None:
             live_u = np.asarray(state.u)
@@ -356,10 +348,8 @@ class ClusterTracker:
             swaps=None,
         )
 
-    def _update(self, u, iteration, dead_u, dead_logwt):
+    def _update(self, u, iteration):
         log = self.log
-        if self.labels is not None:
-            self._account(dead_u, dead_logwt)
         try:
             labels = self._track(u)
         except np.linalg.LinAlgError:  # degenerate live set: back to one cluster
@@ -371,15 +361,6 @@ class ClusterTracker:
         k = len(log["ids"])
         if not log["counts"] or log["counts"][-1][1] != k:
             log["counts"].append([iteration, k])
-        log["iters"].append(iteration)
-        population = np.bincount(labels, minlength=k)
-        for c, cid in enumerate(log["ids"]):
-            mode = log["modes"].setdefault(
-                str(cid),
-                {"start": len(log["iters"]) - 1, "n": [], "swap": [], "logz": []},
-            )
-            mode["n"].append(int(population[c]))
-            mode["swap"].append(bool(self.eligible[c] and self._frames is not None))
 
     def _track(self, u):
         """Relabel the live points: warm-started hard EM, merges, then splits."""
@@ -462,99 +443,16 @@ class ClusterTracker:
             "pinv": fit["pinv"],
         }
 
-    def _account(self, dead_u, dead_logwt):
-        """Credit the evidence of the points that died since the last update."""
-        which = np.zeros(len(dead_u), dtype=int)
-        if self.fit is not None and len(dead_u):
-            which = _assign(self.fit, dead_u)
-        for c, cid in enumerate(self.log["ids"]):
-            self.log["modes"][str(cid)]["logz"].append(
-                _logsumexp(dead_logwt[which == c])
-            )
-
-    def summary(self, dead, live_u, live_logwt):
+    def summary(self):
         """Return the ``cluster_*`` entries of ``result.metadata``.
 
-        ``dead`` holds the dead rows (columns ``"u"`` and ``"logwt"``);
-        ``live_u`` and ``live_logwt`` are the final live points and weights.
-        ``cluster_host_s`` is the wall time the tracker took, this call
-        included.
+        ``cluster_host_s`` is the wall time the tracker took. The per-mode
+        masses and error bars are :meth:`tinyns.NestedSamplingResult.modes`,
+        which works with the swap on or off.
         """
-        start = time.perf_counter()
-        out = self._summary(
-            dead["u"], dead["logwt"], np.asarray(live_u), np.asarray(live_logwt)
-        )
-        out["cluster_host_s"] = self.host_s + time.perf_counter() - start
-        return out
-
-    def _summary(self, dead_u, dead_logwt, live_u, live_logwt):
-        """Return the cluster telemetry (all but ``cluster_host_s``).
-
-        ``cluster_modes`` lists every cluster that ever shared the live set
-        with another one: its posterior ``mass``, its smallest population
-        between its detection and its posterior median, and ``urn_logit_sd``,
-        the scatter of ``logit(mass)`` that the random walk of its population
-        would cause without the swap, from the run's own populations over the
-        same stretch (section 7 of the multimodal study). ``swap_fraction`` is
-        the part of that stretch during which the cluster could swap; near 1
-        the actual scatter is several times smaller than ``urn_logit_sd``.
-        """
-        log, nlive = self.log, len(live_u)
-        out = {
-            "cluster_count_history": [list(pair) for pair in log["counts"]],
-            "cluster_min_population": None,
-            "cluster_swap_accepts": int(log["swap"][0]),
-            "cluster_swap_proposals": int(log["swap"][1]),
-            "cluster_modes": [],
+        return {
+            "cluster_count_history": [list(pair) for pair in self.log["counts"]],
+            "cluster_swap_accepts": int(self.log["swap"][0]),
+            "cluster_swap_proposals": int(self.log["swap"][1]),
+            "cluster_host_s": self.host_s,
         }
-        if not log["iters"]:  # never clustered (e.g. resumed at the end)
-            return out
-        edges = log["iters"] + [len(dead_logwt)]
-        logz = _logsumexp(np.concatenate([dead_logwt, live_logwt]))
-        # Mass per update interval: the last one also holds the live points.
-        tail_logwt = np.concatenate([dead_logwt[edges[-2] :], live_logwt])
-        total = [_logsumexp(dead_logwt[a:b]) for a, b in itertools.pairwise(edges)]
-        total = np.exp(np.array(total[:-1] + [_logsumexp(tail_logwt)]) - logz)
-        tail = np.zeros(len(tail_logwt), dtype=int)
-        if self.fit is not None:
-            tail = _assign(self.fit, np.concatenate([dead_u[edges[-2] :], live_u]))
-        tail_logz = {cid: _logsumexp(tail_logwt[tail == c]) for c, cid in
-                     enumerate(log["ids"])}
-        modes = []
-        for cid, mode in log["modes"].items():
-            n = np.array(mode["n"], dtype=float)
-            alive = len(mode["logz"]) < len(n)  # still a cluster at the end
-            own = mode["logz"] + ([tail_logz[int(cid)]] if alive else [])
-            own = np.exp(np.array(own) - logz)
-            shared = (n > 0) & (n < nlive)  # another cluster exists
-            if not shared.any():
-                continue
-            first = int(np.argmax(shared))
-            stop = first + 1 + int(np.searchsorted(np.cumsum(own[first:]),
-                                                   0.5 * own[first:].sum()))
-            other = total[mode["start"] :][: len(n)] - own
-            stop_other = int(np.searchsorted(np.cumsum(other), 0.5 * other.sum())) + 1
-            g = np.clip(n / nlive, 0.5 / nlive, 1 - 0.5 / nlive)
-            steps = np.diff(edges)[mode["start"] :][: len(n)]
-            rate = np.where(shared, 2.0 * steps / nlive**2, 0.0)
-            variance = (
-                1.0 / n[first]
-                + 1.0 / (nlive - n[first])
-                + (rate * (1 - g) / g)[first:stop].sum()
-                + (rate * g / (1 - g))[first:stop_other].sum()
-            )
-            modes.append(
-                {
-                    "id": int(cid),
-                    "first_iteration": int(edges[mode["start"] + first]),
-                    "mass": float(own.sum()),
-                    "min_population": int(n[first:stop].min()),
-                    "urn_logit_sd": float(np.sqrt(variance)),
-                    "swap_fraction": float(np.mean(mode["swap"][first:stop])),
-                }
-            )
-        out["cluster_modes"] = modes
-        out["cluster_min_population"] = min(
-            (m["min_population"] for m in modes), default=None
-        )
-        return out

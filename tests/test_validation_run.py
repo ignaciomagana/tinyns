@@ -5,16 +5,16 @@ from validation.run_validation import insertion_rank_stats, main
 
 
 class _FakeResult:
-    def __init__(self, insertion_indices, metadata=None):
+    def __init__(self, insertion_indices, nlive):
         self._insertion_indices = insertion_indices
-        self.metadata = {} if metadata is None else metadata
+        self.nlive = nlive
 
     def insertion_indices(self):
         return jnp.asarray(self._insertion_indices, dtype=int)
 
 
 def test_insertion_rank_stats_missing_indices_returns_none_stats() -> None:
-    stats = insertion_rank_stats(_FakeResult([], {"insertion_index_nslots": 10}))
+    stats = insertion_rank_stats(_FakeResult([], 10))
 
     assert stats == {
         "insertion_rank_count": 0,
@@ -29,7 +29,7 @@ def test_insertion_rank_stats_missing_indices_returns_none_stats() -> None:
 
 def test_insertion_rank_stats_uniform_like_ranks_mean_near_half() -> None:
     stats = insertion_rank_stats(
-        _FakeResult(list(range(10)) * 5, {"insertion_index_nslots": 10})
+        _FakeResult(list(range(10)) * 5, 10)
     )
 
     assert stats["insertion_rank_count"] == 50
@@ -43,7 +43,7 @@ def test_insertion_rank_stats_uniform_like_ranks_mean_near_half() -> None:
 
 def test_insertion_rank_stats_biased_ranks_have_large_mean_z() -> None:
     stats = insertion_rank_stats(
-        _FakeResult([8, 9] * 50, {"insertion_index_nslots": 10})
+        _FakeResult([8, 9] * 50, 10)
     )
 
     assert stats["insertion_rank_mean_z"] is not None

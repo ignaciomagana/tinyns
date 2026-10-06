@@ -1,6 +1,7 @@
 import json
 import math
 import shutil
+import time
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +72,7 @@ def test_checkpoint_layout(tmp_path):
         assert data["state/key"].dtype == np.uint32
         assert str(data["state/key_impl"]) == ""  # an int seed: a legacy key
         assert data["state/scale"].dtype == np.float64
-    columns = ("u", "theta", "logl", "logwt", "birth", "ncall", "insertion")
+    columns = ("u", "theta", "logl", "logwt", "birth", "ncall")
     assert files == {
         "format",
         "config_json",
@@ -97,15 +98,15 @@ def test_checkpoint_layout(tmp_path):
     assert set(ckpt.telemetry) == {
         "rwalk_moves",
         "rwalk_proposals",
-        "scale_history",
-        "accept_history",
+        "wall_time_s",
+        "compile_s",
+        "timed_ncall",
     }
     assert int(ckpt.state.it) == 40
     assert all(len(ckpt.dead[name]) == 40 for name in ckpt.dead)
     assert ckpt.dead["u"].shape == (40, 2)
     assert set(ckpt.ext["clusters"]) == {"log", "labels", "u"}
     assert isinstance(ckpt.state.scale, float)
-    assert ckpt.state.scale == ckpt.telemetry["scale_history"][-1]
 
 
 def test_checkpoint_without_cluster_swap_has_no_ext(tmp_path):
@@ -260,9 +261,8 @@ def test_resume_produces_valid_result(tmp_path):
     result = make_sampler().resume(path, maxiter=6)
 
     assert math.isfinite(result.logz)
-    assert result.metadata["resumed_from_checkpoint"] is True
-    assert result.metadata["initial_iteration"] == int(ckpt.state.it)
-    assert result.metadata["final_iteration"] > int(ckpt.state.it)
+    assert result.metadata["resumed"] is True
+    assert result.niter > int(ckpt.state.it)
     assert result.ncall > host_ncall(ckpt)
 
 
@@ -316,8 +316,37 @@ def test_resume_preserves_cumulative_rwalk_telemetry(tmp_path):
 
     assert len(ckpt.dead["batches"]) == 4
     assert ckpt.telemetry["rwalk_proposals"] > 0
-    assert len(ckpt.telemetry["scale_history"]) == 5  # initial + one per block
     _assert_same_run(resumed, full)
+
+
+def test_wall_time_accumulates_over_resumes(tmp_path):
+    path = tmp_path / "timed.checkpoint.npz"
+    sampler = make_sampler(block_size=4)
+    first = sampler.run(3, maxiter=8, dlogz=0.0, checkpoint_path=path)
+    ckpt = checkpoint.load(path)
+    assert 0.0 < ckpt.telemetry["wall_time_s"] <= first.metadata["wall_time_s"]
+    assert ckpt.telemetry["compile_s"] <= ckpt.telemetry["wall_time_s"]
+    assert ckpt.telemetry["timed_ncall"] == first.ncall - 20 - int(
+        ckpt.dead["ncall"][:4].sum()
+    )  # the calls after the first block
+
+    # A run killed after 1000 s: the resumed run carries the time on.
+    def add_time(entries):
+        telemetry = json.loads(str(entries["telemetry_json"]))
+        telemetry["wall_time_s"] += 1000.0
+        telemetry["compile_s"] += 10.0
+        entries["telemetry_json"] = np.asarray(json.dumps(telemetry))
+
+    _rewrite(path, add_time)
+    start = time.perf_counter()
+    resumed = sampler.resume(path, maxiter=16, dlogz=0.0)
+    elapsed = time.perf_counter() - start
+    md = resumed.metadata
+    assert md["resumed"] is True
+    before = ckpt.telemetry["wall_time_s"] + 1000.0
+    assert before < md["wall_time_s"] <= before + elapsed
+    assert md["compile_s"] > ckpt.telemetry["compile_s"] + 10.0
+    assert md["mean_ms_per_call"] > 0.0
 
 
 def test_block_mode_writes_intermediate_checkpoints(tmp_path, monkeypatch):
@@ -338,7 +367,7 @@ def test_block_mode_writes_intermediate_checkpoints(tmp_path, monkeypatch):
         21, maxiter=400, dlogz=0.1, checkpoint_path=path, checkpoint_interval=10
     )
 
-    final_iteration = result.metadata["final_iteration"]
+    final_iteration = result.niter
     assert final_iteration > 16
     nonfinal_iterations = {it for it in saves if it < final_iteration}
     assert nonfinal_iterations, "expected intermediate block-mode checkpoints"
@@ -360,7 +389,7 @@ def test_resume_of_converged_run_reports_success(tmp_path, block_size):
 
     assert resumed.success is True
     assert "converged" in resumed.message
-    assert resumed.metadata["resumed_from_checkpoint"] is True
+    assert resumed.metadata["resumed"] is True
 
 
 def test_adapted_scale_restored_on_resume(tmp_path):
@@ -369,7 +398,7 @@ def test_adapted_scale_restored_on_resume(tmp_path):
 
     first = sampler.run(40, dlogz=0.5, checkpoint_path=path, checkpoint_interval=5)
     assert first.success is True
-    assert checkpoint.load(path).state.scale == first.metadata["rwalk_scale_final"]
+    assert checkpoint.load(path).state.scale == first.metadata["scale_final"]
     # Force a distinctive scale, clearly different from the initial 0.5.
     _rewrite(path, lambda e: e.update({"state/scale": np.asarray(0.037)}))
 
@@ -378,8 +407,8 @@ def test_adapted_scale_restored_on_resume(tmp_path):
     assert resumed.success is True
     # Already converged on resume, so no further adaptation runs: the reported
     # final scale is the restored checkpoint value.
-    assert resumed.metadata["rwalk_scale_final"] == 0.037
-    assert resumed.metadata["rwalk_scale_initial"] == 0.5
+    assert resumed.metadata["scale_final"] == 0.037
+    assert resumed.metadata["scale_initial"] == 0.5
 
 
 @pytest.mark.parametrize("block_size", [1, 4])
@@ -444,10 +473,7 @@ _RUN_SPECIFIC = {
     "compile_s",
     "mean_ms_per_call",
     "cluster_host_s",
-    "checkpoint_path",
-    "checkpoint_interval",
-    "resumed_from_checkpoint",
-    "initial_iteration",
+    "resumed",
 }
 
 
@@ -458,8 +484,9 @@ def _assert_same_run(a, b):
         np.testing.assert_array_equal(x, y, err_msg=name)
     assert a.logz == b.logz
     assert a.logzerr == b.logzerr
-    assert a.ncall == b.ncall
+    assert (a.ncall, a.niter) == (b.ncall, b.niter)
     assert (a.success, a.message) == (b.success, b.message)
+    assert a.modes() == b.modes()
     assert set(a.metadata) == set(b.metadata)
     for key in sorted(set(a.metadata) - _RUN_SPECIFIC):
         x, y = jax.device_get((a.metadata[key], b.metadata[key]))
@@ -494,7 +521,7 @@ def test_kill_and_resume_is_bit_identical(tmp_path, monkeypatch, x64):
     monkeypatch.undo()
     _assert_same_run(with_saves, full)  # writing checkpoints changes nothing
 
-    final = md["niter"]
+    final = full.niter
     boundaries = sorted(int(p.stem[2:]) for p in tmp_path.glob("it*.npz"))
     assert boundaries == list(range(16, final, 16)) + [final]
     nclusters = {
@@ -513,7 +540,7 @@ def test_kill_and_resume_is_bit_identical(tmp_path, monkeypatch, x64):
         resumed = sampler.resume(
             tmp_path / f"it{it}.npz", checkpoint_path_out=tmp_path / "out.npz"
         )
-        assert resumed.metadata["initial_iteration"] == it
+        assert resumed.metadata["resumed"] is True
         _assert_same_run(resumed, full)
 
     # Killed twice: resume to the next kill, then to the end.

@@ -50,8 +50,7 @@ def insertion_rank_stats(result) -> dict:
     if count < 2:
         return none_stats
 
-    metadata = {} if getattr(result, "metadata", None) is None else result.metadata
-    nslots = metadata.get("insertion_index_nslots")
+    nslots = getattr(result, "nlive", None)  # the ranks run over 0..nlive-1
     if nslots is None or nslots <= 0:
         return none_stats
 
@@ -109,8 +108,8 @@ def run_one(target_name: str, seed: int, args) -> dict[str, Any]:
     )
     diagnostics = result.diagnostics()
     metadata = {} if result.metadata is None else result.metadata
-    replacement_batch_ncall = diagnostics.get(
-        "replacement_batch_ncall", metadata.get("replacement_batch_ncall")
+    replacement_batch_ncall = int(metadata["walks"]) * int(
+        metadata["replacement_chains"]
     )
     replacement_mean_batches = diagnostics.get("replacement_mean_batches")
     sample_mean, sample_cov, sample_std = _posterior_moments(result, seed)

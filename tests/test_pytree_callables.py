@@ -237,7 +237,7 @@ def test_partial_loglike_checkpoint_resume_matches_uninterrupted(tmp_path) -> No
     sampler.run(21, maxiter=32, dlogz=0.0, checkpoint_path=path)
     resumed = sampler.resume(path, maxiter=64, dlogz=0.0)
 
-    assert resumed.metadata["resumed_from_checkpoint"] is True
+    assert resumed.metadata["resumed"] is True
     assert_same_result(resumed, full)
 
 
@@ -402,7 +402,7 @@ def test_hoisted_closure_checkpoint_resume_matches_uninterrupted(tmp_path) -> No
     sampler.run(21, maxiter=32, dlogz=0.0, checkpoint_path=path)
     resumed = sampler.resume(path, maxiter=64, dlogz=0.0)
 
-    assert resumed.metadata["resumed_from_checkpoint"] is True
+    assert resumed.metadata["resumed"] is True
     assert_same_result(resumed, full)
 
 

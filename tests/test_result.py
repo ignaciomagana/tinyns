@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 
 import jax.numpy as jnp
@@ -10,15 +11,19 @@ from tinyns.result import NestedSamplingResult
 
 
 def make_result() -> NestedSamplingResult:
+    """Two live points, two iterations: -3 and -2 die and are replaced by -1
+    and -0.5, each inserted above the one other live point."""
     return NestedSamplingResult(
-        samples_u=jnp.zeros((4, 2)),
+        samples_u=jnp.array([[0.1, 0.2], [0.3, 0.1], [0.5, 0.6], [0.7, 0.4]]),
         samples=jnp.arange(8, dtype=float).reshape(4, 2),
         logl=jnp.array([-3.0, -2.0, -1.0, -0.5]),
         logwt=jnp.array([-4.0, -2.0, -1.0, -0.25]),
+        logl_birth=jnp.array([-jnp.inf, -jnp.inf, -3.0, -2.0]),
         logz=-0.1,
         logzerr=0.01,
         ncall=10,
-        nlive=4,
+        niter=2,
+        nlive=2,
         ndim=2,
         message="ok",
         metadata={"status": "complete"},
@@ -64,15 +69,16 @@ def test_to_dict_contains_expected_keys() -> None:
         "samples",
         "logl",
         "logwt",
+        "logl_birth",
         "logz",
         "logzerr",
         "ncall",
+        "niter",
         "nlive",
         "ndim",
         "success",
         "message",
         "metadata",
-        "logl_birth",
     }
     assert data["metadata"] == {"status": "complete"}
     assert data["metadata"] is not result.metadata
@@ -90,13 +96,14 @@ def test_to_numpy_converts_arrays_and_preserves_to_dict_behavior() -> None:
     assert isinstance(numpy_data["logwt"], np.ndarray)
     assert isinstance(numpy_data["logz"], float)
     assert isinstance(numpy_data["ncall"], int)
+    assert isinstance(numpy_data["logl_birth"], np.ndarray)
+    assert numpy_data["niter"] == 2
     assert numpy_data["metadata"] == {"status": "complete"}
     assert dict_data["samples"] is result.samples
 
 
 def test_to_dynesty_dict_contains_lightweight_compatibility_keys() -> None:
     result = make_result()
-    result.metadata = {"replacement_acceptance_proxy": 0.25}
 
     data = result.to_dynesty_dict()
 
@@ -107,28 +114,16 @@ def test_to_dynesty_dict_contains_lightweight_compatibility_keys() -> None:
     assert data["logzerr"] == result.logzerr
     assert data["ncall"] == result.ncall
     assert data["nlive"] == result.nlive
-    assert data["eff"] == 0.25
+    assert data["niter"] == 2
+    assert data["eff"] == 100.0 * 2 / 10  # dynesty's 100 niter / ncall
 
 
-def test_to_dynesty_dict_omits_eff_without_acceptance_proxy() -> None:
+def test_str_is_the_summary() -> None:
     result = make_result()
 
-    data = result.to_dynesty_dict()
-
-    assert "eff" not in data
-
-
-def test_summary_contains_replacement_information_when_present() -> None:
-    result = make_result()
-    result.metadata = {
-        "mean_replacement_ncall": 2.5,
-        "replacement_failures": 1,
-    }
-
-    summary = result.summary()
-
-    assert "replacement mean ncall: 2.5" in summary
-    assert "replacement failures: 1" in summary
+    assert str(result) == result.summary()
+    assert "niter: 2" in str(result)
+    assert "mode" not in str(result)  # the table only for several modes
 
 
 def test_information_is_finite_and_non_negative() -> None:
@@ -170,7 +165,7 @@ def test_logz_bootstrap_reconstruction_matches_sampler() -> None:
     from tinyns.result import _simulate_logz_realizations
 
     result = _small_gaussian_run()
-    ndead = int(result.metadata["ndead"])
+    ndead = result.niter
     logl = np.asarray(result.logl, dtype=float)
     nlive = int(result.nlive)
 
@@ -215,38 +210,14 @@ def test_logz_bootstrap_input_validation() -> None:
         result.logz_bootstrap(n_realizations=8)
 
 
-def test_logzerr_diagnostics_explain_nonfinite_inputs() -> None:
-    from tinyns.result import _logzerr_diagnostics
+def test_information_is_nan_for_weighted_nonfinite_likelihood() -> None:
+    from tinyns.result import _information
 
-    logzerr, diagnostics = _logzerr_diagnostics(
-        jnp.array([0.0, -jnp.inf]),
-        jnp.array([0.0, -jnp.inf]),
-        0.0,
-        nlive=10,
-        nlive_final=1,
+    assert math.isnan(float(_information(jnp.array([0.0]), jnp.array([jnp.nan]), 0.0)))
+    information = _information(
+        jnp.array([0.0, -jnp.inf]), jnp.array([0.0, -jnp.inf]), 0.0
     )
-
-    assert math.isfinite(logzerr)
-    assert diagnostics["logzerr_status"] == "ok"
-    assert diagnostics["n_nonfinite_logl"] == 1
-    assert diagnostics["n_nonfinite_logwt"] == 1
-    assert diagnostics["n_dead_finite"] == 1
-    assert diagnostics["n_live_finite"] == 0
-
-
-def test_logzerr_diagnostics_status_for_weighted_nonfinite_likelihood() -> None:
-    from tinyns.result import _logzerr_diagnostics
-
-    logzerr, diagnostics = _logzerr_diagnostics(
-        jnp.array([0.0]),
-        jnp.array([jnp.nan]),
-        0.0,
-        nlive=10,
-        nlive_final=0,
-    )
-
-    assert math.isnan(logzerr)
-    assert diagnostics["logzerr_status"] == "nonfinite_weighted_logl"
+    assert float(information) == 0.0
 
 
 def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
@@ -258,61 +229,29 @@ def test_diagnostics_returns_plain_dict_with_warning_list() -> None:
     assert isinstance(diagnostics["warnings"], list)
     assert diagnostics["information"] == result.information()
     assert diagnostics["nposterior"] == 4
-    assert "max_weight_fraction" in diagnostics
-    assert "posterior_weight_entropy" in diagnostics
-    assert "posterior_weight_entropy_fraction" in diagnostics
-    assert "live_weight_fraction" in diagnostics
-    assert "dead_weight_fraction" in diagnostics
-    assert "final_delta_logz" in diagnostics
-    assert "final_logx" in diagnostics
-    assert "final_logz_dead" in diagnostics
-    assert "final_logl_live_max" in diagnostics
+    assert diagnostics["niter"] == 2
+    assert diagnostics["modes"] == result.modes()
+    assert diagnostics["insertion_pvalue"] == result.insertion_test()["pvalue"]
+    for name in (
+        "max_weight_fraction",
+        "posterior_weight_entropy_fraction",
+        "live_weight_fraction",
+        "dead_weight_fraction",
+        "final_delta_logz",
+        "acceptance",
+    ):
+        assert name in diagnostics
 
 
-def test_diagnostics_propagates_logzerr_status_and_finite_counts() -> None:
+def test_diagnostics_warns_on_nonfinite_logzerr_and_low_acceptance() -> None:
     result = make_result()
     result.logzerr = math.nan
-    result.metadata = {
-        "logzerr_status": "nonfinite_weighted_logl",
-        "information_H": math.nan,
-        "n_nonfinite_logl": 2,
-        "n_nonfinite_logwt": 1,
-        "n_nonfinite_weights": 0,
-        "n_dead_finite": 3,
-        "n_live_finite": 4,
-    }
+    result.metadata = {"acceptance": 0.001}
 
-    diagnostics = result.diagnostics()
+    warnings = result.diagnostics()["warnings"]
 
-    assert diagnostics["logzerr_status"] == "nonfinite_weighted_logl"
-    assert math.isnan(diagnostics["information_H"])
-    assert diagnostics["n_nonfinite_logl"] == 2
-    assert diagnostics["n_nonfinite_logwt"] == 1
-    assert diagnostics["n_nonfinite_weights"] == 0
-    assert diagnostics["n_dead_finite"] == 3
-    assert diagnostics["n_live_finite"] == 4
-    assert (
-        "logzerr estimate unavailable: nonfinite_weighted_logl"
-        in diagnostics["warnings"]
-    )
-
-
-def test_diagnostics_reports_replacement_batches_for_batched_jax_payload() -> None:
-    result = make_result()
-    result.metadata = {
-        "walks": 25,
-        "replacement_chains": 16,
-        "mean_replacement_ncall": 400.0,
-        "max_replacement_ncall": 400,
-        "replacement_acceptance_proxy": 1.0 / 400.0,
-    }
-
-    diagnostics = result.diagnostics()
-
-    assert diagnostics["replacement_batch_ncall"] == 400
-    assert diagnostics["replacement_mean_batches"] == 1.0
-    assert diagnostics["replacement_max_batches"] == 1.0
-    assert "low replacement acceptance" not in diagnostics["warnings"]
+    assert "logzerr is not finite" in warnings
+    assert "low replacement acceptance" in warnings
 
 
 def test_max_weight_fraction_returns_expected_value() -> None:
@@ -346,18 +285,16 @@ def test_degenerate_weights_have_high_max_weight_and_low_entropy_fraction() -> N
     assert result.posterior_weight_entropy_fraction() < 0.1
 
 
-def test_live_weight_fraction_uses_nlive_final_metadata() -> None:
+def test_live_weight_fraction_counts_the_samples_after_niter() -> None:
     result = make_result()
     result.logwt = jnp.log(jnp.array([0.1, 0.2, 0.3, 0.4]))
-    result.metadata = {"nlive_final": 2}
 
     assert np.isclose(result.live_weight_fraction(), 0.7)
 
 
-def test_dead_and_live_weight_fractions_sum_to_one_with_valid_metadata() -> None:
+def test_dead_and_live_weight_fractions_sum_to_one() -> None:
     result = make_result()
     result.logwt = jnp.log(jnp.array([0.1, 0.2, 0.3, 0.4]))
-    result.metadata = {"nlive_final": 2}
 
     total_weight_fraction = (
         result.dead_weight_fraction() + result.live_weight_fraction()
@@ -369,7 +306,7 @@ def test_dead_and_live_weight_fractions_sum_to_one_with_valid_metadata() -> None
 def test_diagnostics_high_live_weight_triggers_warning() -> None:
     result = make_result()
     result.logwt = jnp.log(jnp.array([0.1, 0.1, 0.4, 0.4]))
-    result.metadata = {"nlive_final": 2, "dlogz": 0.1}
+    result.metadata = {"dlogz": 0.1}
 
     diagnostics = result.diagnostics()
 
@@ -406,26 +343,18 @@ def test_diagnostics_success_with_high_final_delta_logz_triggers_warning() -> No
     )
 
 
-def test_diagnostics_includes_iteration_counts_when_present() -> None:
-    result = make_result()
-    result.metadata = {"niter": 12, "ndead": 12}
-
-    diagnostics = result.diagnostics()
-
-    assert diagnostics["niter"] == 12
-    assert diagnostics["ndead"] == 12
-
-
 def test_diagnostics_low_ess_triggers_warning() -> None:
     result = NestedSamplingResult(
         samples_u=jnp.zeros((101, 1)),
         samples=jnp.zeros((101, 1)),
         logl=jnp.zeros(101),
         logwt=jnp.concatenate([jnp.array([0.0]), jnp.full(100, -1000.0)]),
+        logl_birth=jnp.full(101, -jnp.inf),
         logz=0.0,
         logzerr=0.1,
         ncall=101,
-        nlive=10,
+        niter=0,
+        nlive=101,
         ndim=1,
     )
 
@@ -434,82 +363,88 @@ def test_diagnostics_low_ess_triggers_warning() -> None:
     assert "low posterior ESS" in diagnostics["warnings"]
 
 
-def test_insertion_indices_returns_array() -> None:
-    result = make_result()
-    result.metadata = {"insertion_indices": [0, 2, 1]}
-
-    insertion_indices = result.insertion_indices()
-
-    assert isinstance(insertion_indices, jnp.ndarray)
-    assert insertion_indices.tolist() == [0, 2, 1]
-
-
-def test_insertion_indices_missing_metadata_returns_empty_array() -> None:
+def test_insertion_indices_are_rebuilt_from_the_birth_contours() -> None:
     result = make_result()
 
-    insertion_indices = result.insertion_indices()
+    assert result.insertion_indices().tolist() == [1, 1]
 
-    assert isinstance(insertion_indices, jnp.ndarray)
-    assert insertion_indices.shape == (0,)
 
-def test_diagnostics_insertion_indices_use_slot_count_for_normalization() -> None:
-    result = make_result()
-    result.nlive = 2
-    result.metadata = {
-        "insertion_indices": jnp.tile(jnp.arange(2), 10),
-        "insertion_index_nslots": 2,
-        "insertion_index_nlive": 1,
-    }
+def _replayed_result(ranks, nlive):
+    """A result whose births insert each new point at the given ranks."""
+    rng = np.random.default_rng(0)
+    live = sorted(rng.uniform(0.0, 1.0, nlive).tolist())
+    logl, birth = [], []
+    initial = list(live)
+    births = {}
+    for rank in ranks:
+        dead = live.pop(0)
+        logl.append(dead)
+        others = live
+        lo = dead if rank == 0 else others[rank - 1]
+        hi = others[rank] if rank < len(others) else lo + 1.0
+        new = 0.5 * (lo + hi)
+        births[new] = dead
+        live.insert(rank, new)
+    birth = [births.get(x, -np.inf) for x in logl + live]
+    assert sum(b == -np.inf for b in birth) == len(initial)
+    n = len(logl) + nlive
+    return NestedSamplingResult(
+        samples_u=jnp.asarray(rng.uniform(size=(n, 1))),
+        samples=jnp.zeros((n, 1)),
+        logl=jnp.asarray(logl + live),
+        logwt=jnp.zeros(n),
+        logl_birth=jnp.asarray(birth),
+        logz=0.0,
+        logzerr=0.1,
+        ncall=n,
+        niter=len(ranks),
+        nlive=nlive,
+        ndim=1,
+    )
 
-    diagnostics = result.diagnostics()
 
-    assert (
+def test_insertion_test_passes_uniform_ranks_and_flags_biased_ones() -> None:
+    nlive = 10
+    uniform = _replayed_result(np.random.default_rng(1).integers(0, nlive, 600), nlive)
+    np.testing.assert_array_equal(
+        uniform.insertion_indices(),
+        np.random.default_rng(1).integers(0, nlive, 600),
+    )
+    test = uniform.insertion_test(windows=3)
+    assert test["n"] == 600 and test["pvalue"] > 0.01
+    assert [(w["start"], w["stop"]) for w in test["windows"]] == [
+        (0, 200),
+        (200, 400),
+        (400, 600),
+    ]
+    warning = (
         "insertion indices look non-uniform; constrained sampler may be biased or "
         "poorly mixed"
-    ) not in diagnostics["warnings"]
+    )
+    assert warning not in uniform.diagnostics()["warnings"]
+
+    # Uniform for two thirds of the run, then always inserted at the bottom:
+    # the last window sees it at once, the pooled test more weakly.
+    ranks = np.concatenate([np.tile(np.arange(nlive), 40), np.zeros(200, dtype=int)])
+    biased = _replayed_result(ranks, nlive).insertion_test(windows=3)
+    assert biased["windows"][2]["pvalue"] < 1e-6
+    assert biased["windows"][0]["pvalue"] > 0.5
+    assert warning in _replayed_result(ranks, nlive).diagnostics()["warnings"]
+    with np.testing.assert_raises(ValueError):
+        uniform.insertion_test(windows=0)
 
 
-def test_diagnostics_prefers_insertion_index_nslots_when_present() -> None:
-    result = make_result()
-    result.metadata = {
-        "insertion_indices": jnp.tile(jnp.array([0, 1]), 10),
-        "insertion_index_nslots": 2,
-        "insertion_index_nlive": 100,
-    }
+def test_ks_pvalue_matches_the_kolmogorov_law() -> None:
+    from tinyns.result import _ks_uniform
 
-    diagnostics = result.diagnostics()
-
-    assert (
-        "insertion indices look non-uniform; constrained sampler may be biased or "
-        "poorly mixed"
-    ) not in diagnostics["warnings"]
-
-
-def test_diagnostics_supports_legacy_insertion_index_nlive_only() -> None:
-    result = make_result()
-    result.metadata = {
-        "insertion_indices": jnp.tile(jnp.arange(2), 10),
-        "insertion_index_nlive": 1,
-    }
-
-    diagnostics = result.diagnostics()
-
-    assert isinstance(diagnostics, dict)
-    assert isinstance(diagnostics["warnings"], list)
-
-def test_diagnostics_bad_insertion_indices_triggers_warning() -> None:
-    result = make_result()
-    result.metadata = {
-        "insertion_indices": jnp.zeros(20, dtype=int),
-        "insertion_index_nlive": 10,
-    }
-
-    diagnostics = result.diagnostics()
-
-    assert (
-        "insertion indices look non-uniform; constrained sampler may be biased or "
-        "poorly mixed"
-    ) in diagnostics["warnings"]
+    assert _ks_uniform(np.arange(10), 10) == (0.0, 1.0)
+    ks, pvalue = _ks_uniform(np.zeros(100, dtype=int), 10)
+    assert ks == 0.9 and pvalue < 1e-20
+    # 227 of 400 ranks in the lower of two slots: D = 0.0675, at the 5%
+    # critical value 1.358 of the Kolmogorov law.
+    ks, pvalue = _ks_uniform(np.repeat([0, 1], [227, 173]), 2)
+    assert ks == 0.0675
+    assert abs(pvalue - 0.05) < 0.002
 
 
 def test_result_npz_round_trip(tmp_path) -> None:
@@ -530,6 +465,8 @@ def test_result_npz_round_trip(tmp_path) -> None:
     assert loaded.logz == result.logz
     assert loaded.logzerr == result.logzerr
     assert loaded.ncall == result.ncall
+    assert loaded.niter == result.niter
+    np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
     assert loaded.nlive == result.nlive
     assert loaded.ndim == result.ndim
     assert loaded.success == result.success
@@ -566,6 +503,15 @@ def test_result_npz_round_trip_metadata_jsonable(tmp_path) -> None:
     assert isinstance(loaded.metadata["unsupported"], str)
 
 
+def test_result_npz_without_metadata_round_trips(tmp_path) -> None:
+    result = make_result()
+    result.metadata = None
+    path = tmp_path / "none.npz"
+    result.save_npz(path)
+
+    assert NestedSamplingResult.load_npz(path).metadata is None
+
+
 def test_loaded_result_npz_still_behaves_like_result(tmp_path) -> None:
     result = make_result()
     path = tmp_path / "result.npz"
@@ -590,7 +536,9 @@ def test_result_npz_bad_format_version_raises(tmp_path) -> None:
         samples=np.zeros((1, 1)),
         logl=np.zeros(1),
         logwt=np.zeros(1),
+        logl_birth=np.zeros(1),
         logz=0.0,
+        niter=0,
         logzerr=0.0,
         ncall=1,
         nlive=1,
@@ -607,20 +555,36 @@ def test_result_npz_bad_format_version_raises(tmp_path) -> None:
 
 def test_result_npz_missing_required_key_raises(tmp_path) -> None:
     path = tmp_path / "missing.npz"
-    np.savez_compressed(path, format_version="tinyns-result-npz-v1")
+    np.savez_compressed(path, format_version="tinyns-result-npz-v2")
 
     with np.testing.assert_raises(ValueError):
         NestedSamplingResult.load_npz(path)
 
 
-def test_logl_birth_round_trips_through_npz(tmp_path) -> None:
-    result = make_result()
-    path = tmp_path / "plain.npz"
-    result.save_npz(path)
-    assert NestedSamplingResult.load_npz(path).logl_birth is None
+def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> None:
+    """The split test cuts one curved mode into pieces; modes() merges them
+    because neighbouring pieces leave no gap along their discriminant."""
+    from tinyns.clusters import ClusterTracker
+    from tinyns.result import SEPARATION_SIGMA, _gap
 
-    result.logl_birth = jnp.array([-jnp.inf, -3.0, -2.0, jnp.nan])
-    result.save_npz(path)
-    loaded = NestedSamplingResult.load_npz(path)
-    np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
-    assert isinstance(loaded.to_numpy()["logl_birth"], np.ndarray)
+    rng = np.random.default_rng(2)
+    ridge = [rng.normal(0.0, 2.0, 500)]
+    for _ in range(4):  # a 5-D Rosenbrock ridge
+        ridge.append(0.5 * ridge[-1] ** 2 - 1.0 + 0.5 * rng.normal(size=500))
+    x = np.stack(ridge, axis=1)
+    labels = ClusterTracker(500)._track(x)
+    k = int(labels.max()) + 1
+    assert k >= 2  # the split test does cut the ridge
+    touching = []
+    for a, b in itertools.combinations(range(k), 2):
+        pair = (labels == a) | (labels == b)
+        if _gap(x[pair], labels[pair] == b) <= SEPARATION_SIGMA:
+            touching.append((a, b))
+    assert len(touching) >= k - 1
+    assert {c for edge in touching for c in edge} == set(range(k))
+
+    blobs = np.concatenate(
+        [rng.normal(size=(400, 5)), rng.normal(size=(30, 5)) + [12, 0, 0, 0, 0]]
+    )
+    assert _gap(blobs, np.arange(430) >= 400) > 2 * SEPARATION_SIGMA
+
