@@ -8,6 +8,7 @@ class _FakeResult:
     def __init__(self, insertion_indices, nlive):
         self._insertion_indices = insertion_indices
         self.nlive = nlive
+        self.num_delete = 1
 
     def insertion_indices(self):
         return jnp.asarray(self._insertion_indices, dtype=int)
@@ -50,23 +51,21 @@ def test_insertion_rank_stats_biased_ranks_have_large_mean_z() -> None:
     assert stats["insertion_rank_mean_z"] > 10.0
 
 
-def test_validation_parser_accepts_replacement_chains() -> None:
+def test_validation_parser_accepts_num_delete() -> None:
     from validation.run_validation import parse_args
 
-    args = parse_args(["--replacement-chains", "4"])
+    args = parse_args(["--num-delete", "4"])
 
-    assert args.replacement_chains == 4
+    assert args.num_delete == 4
 
 
-def test_validation_cli_smoke_writes_replacement_batch_fields(tmp_path) -> None:
+def test_validation_cli_smoke_writes_rows(tmp_path) -> None:
     output = tmp_path / "validation.json"
 
     main([
         "--targets",
         "gaussian2d",
-        "--block-size",
-        "4",
-        "--replacement-chains",
+        "--num-delete",
         "2",
         "--seeds",
         "0",
@@ -83,7 +82,6 @@ def test_validation_cli_smoke_writes_replacement_batch_fields(tmp_path) -> None:
     payload = __import__("json").loads(output.read_text())
     rows = payload["results"]
     assert len(rows) == 1
-    assert rows[0]["block_size"] == 4
+    assert rows[0]["num_delete"] == 2
     assert rows[0]["walks"] == 5
-    assert rows[0]["replacement_batch_ncall"] == 10
-    assert "replacement_mean_batches" in rows[0]
+    assert "acceptance" in rows[0]

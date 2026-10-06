@@ -93,8 +93,8 @@ def _partition_callable(fn):
     (:func:`_split_callable`).
 
     The jit boundaries that use this split are the kernels of
-    :mod:`tinyns.core`: the live-point pass of ``init``, the block of ``step``
-    and the live-cov chain inside it.
+    :mod:`tinyns.core`: the live-point pass of ``init``, ``step`` and the chunk
+    kernel of the driver.
     """
     leaves, treedef = jax.tree_util.tree_flatten(fn)
     mask = tuple(_is_dynamic_leaf(leaf) for leaf in leaves)
@@ -297,8 +297,8 @@ def _clear_caches() -> None:
 def _device_leaves(fn):
     """Return ``fn`` with its numpy array leaves placed on the device.
 
-    The host loop calls this once per run, so that the compiled kernels are
-    not handed a host array (and a transfer) at every block.
+    The driver calls this once per run, so that the compiled kernels are
+    not handed a host array (and a transfer) at every chunk.
     """
     leaves, treedef = jax.tree_util.tree_flatten(fn)
     if not any(isinstance(leaf, np.ndarray) for leaf in leaves):

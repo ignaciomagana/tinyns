@@ -1,11 +1,8 @@
-"""Pytree callables and closures: large arrays are jit arguments of the kernels.
+"""Pytree callables, hoisted closure constants and the structure-keyed caches."""
 
-Pytree callables pass their array leaves; closures have their large jaxpr
-constants hoisted.
-"""
+from __future__ import annotations
 
 import gc
-import hashlib
 import logging
 import weakref
 
@@ -14,10 +11,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import random
-from tests.helpers import run_ns
 
 import tinyns.callables as callables_mod
-from tinyns import NestedSampler, core
+from tinyns import Config, NestedSampler, core
 from tinyns.callables import (
     _callable_leaves,
     _callable_specs,
@@ -25,9 +21,14 @@ from tinyns.callables import (
     _combine_callable,
     _partition_callable,
 )
-from tinyns.core import _chain_kernel
 
 NDIM = 2
+CFG = Config(NDIM, 40, num_delete=4)
+
+
+def run_ns(key, loglike, prior, ndim, nlive, num_delete=4, **kwargs):
+    sampler = NestedSampler(loglike, prior, ndim, nlive, num_delete=num_delete)
+    return sampler.run(key, **kwargs)
 
 
 def loglike_fn(data, theta):
@@ -112,8 +113,8 @@ def test_plain_function_and_equivalent_closure_are_bit_identical() -> None:
     assert_same_result(*runs)
 
 
-@pytest.mark.parametrize("block_size", [None, 1])
-def test_partial_loglike_with_large_array_matches_closure(block_size) -> None:
+@pytest.mark.parametrize("num_delete", [1, 4])
+def test_partial_loglike_with_large_array_matches_closure(num_delete) -> None:
     # The closure's 200k-element constant is hoisted to a jit argument, so the
     # two forms compile the same program and agree bit for bit.
     data = make_data(200_000)
@@ -126,9 +127,7 @@ def test_partial_loglike_with_large_array_matches_closure(block_size) -> None:
     def closure_prior(u):
         return prior_fn(BOUNDS, u)
 
-    kwargs = {"maxiter": 96, "dlogz": 0.0}
-    if block_size is not None:
-        kwargs["block_size"] = block_size
+    kwargs = {"maxiter": 96, "dlogz": 0.0, "num_delete": num_delete}
     partial_result = run_ns(
         random.PRNGKey(11), partial_loglike, partial_prior, NDIM, 40, **kwargs
     )
@@ -140,57 +139,23 @@ def test_partial_loglike_with_large_array_matches_closure(block_size) -> None:
     assert_same_result(partial_result, closure_result)
 
 
-def test_rwalk_kernel_accepts_partial_callables() -> None:
-    data = make_data(1000)
-    loglike = jax.tree_util.Partial(loglike_fn, data)
-    prior = jax.tree_util.Partial(prior_fn, BOUNDS)
-    live_u = random.uniform(random.PRNGKey(3), (16, NDIM))
-    live_logl = jax.vmap(lambda u: loglike(prior(u)))(live_u)
-    results = []
-    for fn, pt in (
-        (loglike, prior),
-        (lambda t: loglike_fn(data, t), lambda u: prior_fn(BOUNDS, u)),
-    ):
-        specs = _callable_specs(fn, pt, NDIM)
-        kernel = _chain_kernel(*specs, NDIM, 10, 1)
-        results.append(
-            kernel(
-                random.PRNGKey(5),
-                jnp.median(live_logl),
-                live_u,
-                live_logl,
-                jnp.asarray(0.5),
-                jnp.asarray(10, dtype=jnp.int32),
-                *_callable_leaves(fn, pt, NDIM),
-            )
-        )
-    for a, b in zip(*results, strict=True):
-        np.testing.assert_array_equal(a, b)
-    assert bool(results[0][5])
-
-
 def _lower_block_kernel_text(loglike, prior):
-    kernel = core._step_kernel(*_callable_specs(loglike, prior, NDIM), NDIM, 5, 4, 8)
-    live_u = jnp.full((20, NDIM), 0.5)
+    kernel = core._chunk_kernel(*_callable_specs(loglike, prior, NDIM), CFG, 8)
+    m, i32, f = CFG.nlive, jnp.int32, jnp.result_type(float)
     state = core.State(
         key=random.PRNGKey(0),
-        u=live_u,
-        theta=live_u,
-        logl=jnp.zeros((20,)),
-        birth=jnp.full((20,), -jnp.inf),
-        logz=jnp.asarray(-jnp.inf),
-        logx=jnp.asarray(0.0, dtype=jnp.float32),
-        it=jnp.asarray(0, dtype=jnp.int32),
-        scale=jnp.asarray(0.5),
-        ncall=jnp.asarray(0, dtype=jnp.int32),
-        failed=jnp.asarray(False),
+        u=jnp.full((m, NDIM), 0.5, f),
+        logl=jnp.zeros((m,), f),
+        logl_birth=jnp.full((m,), -jnp.inf, f),
+        it=i32(0),
+        logz=jnp.asarray(-jnp.inf, f),
+        log_scale=jnp.zeros((), f),
+        ncall=i32(0),
+        ncall_valid=i32(0),
+        status=i32(0),
     )
     lowered = kernel.lower(
-        state,
-        jnp.asarray(20, dtype=jnp.int32),
-        jnp.asarray(10, dtype=jnp.int32),
-        jnp.asarray(8, dtype=jnp.int32),
-        None,
+        state, i32(4), jnp.asarray(0.1, f), i32(100), i32(10**6),
         *_callable_leaves(loglike, prior, NDIM),
     )
     return lowered.as_text()
@@ -216,29 +181,12 @@ def test_block_kernel_is_cached_per_partial_instance() -> None:
     _clear_caches()
     try:
         loglike = jax.tree_util.Partial(loglike_fn, make_data(100))
-        first = core._step_kernel(
-            *_callable_specs(loglike, plain_prior, NDIM), NDIM, 5, 4, 8
-        )
-        second = core._step_kernel(
-            *_callable_specs(loglike, plain_prior, NDIM), NDIM, 5, 4, 8
-        )
+        other = jax.tree_util.Partial(loglike_fn, make_data(100) + 1.0)
+        first = core._chunk_kernel(*_callable_specs(loglike, plain_prior, NDIM), CFG, 8)
+        second = core._chunk_kernel(*_callable_specs(other, plain_prior, NDIM), CFG, 8)
         assert first is second
     finally:
         _clear_caches()
-
-
-def test_partial_loglike_checkpoint_resume_matches_uninterrupted(tmp_path) -> None:
-    path = tmp_path / "partial.checkpoint.npz"
-    loglike = jax.tree_util.Partial(loglike_fn, make_data(5_000))
-    prior = jax.tree_util.Partial(prior_fn, BOUNDS)
-    sampler = NestedSampler(loglike, prior, NDIM, nlive=30)
-
-    full = sampler.run(21, maxiter=64, dlogz=0.0)
-    sampler.run(21, maxiter=32, dlogz=0.0, checkpoint_path=path)
-    resumed = sampler.resume(path, maxiter=64, dlogz=0.0)
-
-    assert resumed.metadata["resumed"] is True
-    assert_same_result(resumed, full)
 
 
 # --- closures: large constants are hoisted ---
@@ -270,6 +218,7 @@ def run(loglike, prior=closure_prior, ndim=NDIM, **kwargs):
     kwargs.setdefault("maxiter", 96)
     kwargs.setdefault("dlogz", 0.0)
     return run_ns(random.PRNGKey(11), loglike, prior, ndim, 40, **kwargs)
+
 
 
 @pytest.mark.usefixtures("fresh_caches")
@@ -391,21 +340,6 @@ def test_make_jaxpr_failure_falls_back_to_closure_semantics(
     assert len(messages) == 2
 
 
-@pytest.mark.usefixtures("fresh_caches")
-def test_hoisted_closure_checkpoint_resume_matches_uninterrupted(tmp_path) -> None:
-    path = tmp_path / "closure.checkpoint.npz"
-    loglike = make_closure(make_data(5_000))
-    assert len(_callable_leaves(loglike, closure_prior, NDIM)) == 1
-    sampler = NestedSampler(loglike, closure_prior, NDIM, nlive=30)
-
-    full = sampler.run(21, maxiter=64, dlogz=0.0)
-    sampler.run(21, maxiter=32, dlogz=0.0, checkpoint_path=path)
-    resumed = sampler.resume(path, maxiter=64, dlogz=0.0)
-
-    assert resumed.metadata["resumed"] is True
-    assert_same_result(resumed, full)
-
-
 # --- campaigns: one compile per structure, no retained datasets (v0.2.3) ---
 
 
@@ -439,10 +373,10 @@ def test_same_shape_partials_share_one_compiled_block_kernel(backend_compiles) -
         loglike = jax.tree_util.Partial(loglike_fn, shifted_data(i))
         results.append(run(loglike, plain_prior))
         compiles.append(len(backend_compiles) - before)
-    # Dataset 0 compiles everything; datasets 1-3 reuse the block kernel and
-    # the live-point pass (v0.2.2 compiled both again for every dataset).
+    # Dataset 0 compiles everything; datasets 1-3 reuse the chunk kernel and
+    # the live-point pass.
     assert compiles[0] > 0 and compiles[1:] == [0, 0, 0]
-    info = core._step_kernel.cache_info()
+    info = core._chunk_kernel.cache_info()
     assert info.misses == 1 and info.currsize == 1
     assert len({result.logz for result in results}) == 4
 
@@ -480,94 +414,3 @@ def test_finished_runs_do_not_keep_datasets_alive(form) -> None:
     gc.collect()
     assert [ref() for ref in refs] == [None] * len(refs)
     assert not callables_mod._IDENTITY_SPLITS
-
-
-# Fixed-seed fingerprints on CPU with jax 0.4.34, keyed by JAX_ENABLE_X64:
-# (logz.hex(), ncall, sha256[:16] of samples, samples_u and logl). x64 off: tinyns
-# v0.2.2 (ae330f2); x64 on: recorded on the v0.3 loop branch, which
-# tools/ab_bitwise.py shows bit-identical to main on the same machine.
-V022_FINGERPRINTS = {
-    "block": {
-        False: (
-            "-0x1.122a400000000p+2",
-            7405,
-            "ea9e454c31e2785c",
-            "b3ec3331262f69b9",
-            "b6ff6462d6dc00fa",
-        ),
-        True: (
-            "-0x1.0a0814caa64b4p+2",
-            7399,
-            "a5474aa0f59ac9cc",
-            "d81d0818ffe68725",
-            "2a684b9e6e3c53e8",
-        ),
-    },
-    "small_closure": {
-        False: (
-            "-0x1.122a400000000p+2",
-            7405,
-            "ea9e454c31e2785c",
-            "b3ec3331262f69b9",
-            "47b56e8a8af6eb32",
-        ),
-        True: (
-            "-0x1.0a0814caa64b5p+2",
-            7399,
-            "a5474aa0f59ac9cc",
-            "d81d0818ffe68725",
-            "035c407de852aa65",
-        ),
-    },
-}
-SMALL = jnp.linspace(0.1, 0.3, 50)
-
-
-def small_closure_loglike(theta):
-    return -0.5 * jnp.sum(((theta - jnp.mean(SMALL)) / 0.1) ** 2)
-
-
-def fingerprint(result):
-    def digest(x):
-        return hashlib.sha256(np.ascontiguousarray(x).tobytes()).hexdigest()[:16]
-
-    return (
-        float(result.logz).hex(),
-        result.ncall,
-        digest(result.samples),
-        digest(result.samples_u),
-        digest(result.logl),
-    )
-
-
-@pytest.mark.skipif(
-    jax.__version__ != "0.4.34" or jax.default_backend() != "cpu",
-    reason="fingerprints were recorded with jax 0.4.34 on CPU",
-)
-@pytest.mark.parametrize("case", sorted(V022_FINGERPRINTS))
-def test_plain_functions_match_v022_bit_for_bit(case) -> None:
-    loglike = small_closure_loglike if case == "small_closure" else plain_loglike
-    result = run_ns(
-        random.PRNGKey(7), loglike, plain_prior, NDIM, 50, maxiter=300
-    )
-    expected = V022_FINGERPRINTS[case][bool(jax.config.jax_enable_x64)]
-    assert fingerprint(result) == expected
-
-
-@pytest.mark.parametrize("block_size", [1, 32])
-def test_wall_time_telemetry(block_size, capsys) -> None:
-    result = run_ns(
-        random.PRNGKey(3),
-        plain_loglike,
-        plain_prior,
-        NDIM,
-        30,
-        maxiter=96,
-        dlogz=0.0,
-        block_size=block_size,
-        progress=True,
-    )
-    metadata = result.metadata
-    assert metadata["wall_time_s"] > metadata["compile_s"] > 0.0
-    assert metadata["mean_ms_per_call"] > 0.0
-    assert "calls/s=" in capsys.readouterr().out
