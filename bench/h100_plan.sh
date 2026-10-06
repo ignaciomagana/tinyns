@@ -6,9 +6,9 @@
 #
 #   bench/h100_plan.sh build-envs   # clones + env/bench + env/bench_jaxns (~15 min)
 #   bench/h100_plan.sh smoke        # 1 seed of each sampler on gauss_d2 (~5 min)
-#   bench/h100_plan.sh emit-jobs    # writes queue/bench_{gpu,cpu}_jobs.txt
+#   bench/h100_plan.sh emit-jobs    # writes $JOBDIR/bench_{gpu,cpu}_jobs.txt
 #   bench/h100_plan.sh cpu-pool [SLOTS] [CORES_PER_SLOT]   # runs the CPU lines
-#   bench/h100_plan.sh summarize    # table.md from runs/bench_baseline/*.jsonl
+#   bench/h100_plan.sh summarize    # table.md from $OUT/results_{gpu,cpu}.jsonl
 #
 # The existing env/core and src/tinyns (3c768e5, used by the reference runs)
 # are left alone. Two new trees are created:
@@ -25,11 +25,15 @@
 # - GPU samplers (tinyns 0.x, BlackJAX NSS, JAXNS): one queue line per
 #   (sampler, target, all seeds). The lines go to the existing GPU queue, with
 #   cat queue/bench_gpu_jobs.txt >> queue/jobs.txt. Each line runs one process
-#   at a time on the GPU, and the two qworkers keep the GPU busy.
+#   at a time and holds $P/gpu.lock while it runs, so the two qworkers never
+#   time two runs on the GPU at once (wall times stay comparable).
 # - CPU samplers (dynesty, UltraNest, Nautilus): one line per
 #   (sampler, target, block of 5 seeds), in queue/bench_cpu_jobs.txt. They are
 #   run by `cpu-pool`: SLOTS workers, each pinned with taskset to its own
 #   CORES_PER_SLOT cores. Cores 0-3 stay free for the GPU jobs' host threads.
+#   js2h100 has only 20 cores, so the v1 sweep runs these lines on Hilda's
+#   CPU Slurm instead (bench/slurm_cpu.sh), emitted with BENCH_PY, BENCH_RUN,
+#   OUT and JOBDIR pointing at Hilda paths.
 #
 # Seeds:
 # - 20 per target for logZ calibration (gauss, rosen, funnel, loggamma, eggbox);
@@ -70,12 +74,17 @@
 set -euo pipefail
 
 P=${P:-/media/volume/datasets/tinyns-darksirens}
-PYTHON=${PYTHON:-python3}                # needs >= 3.10
+PYTHON=${PYTHON:-python3.11}             # jax 0.10 and numpy 2.4 need >= 3.11
 REPO=https://github.com/ignaciomagana/tinyns.git
 BENCH_BRANCH=${BENCH_BRANCH:-agent/v1-bench}   # switch to v1 once merged
 SRC=$P/src/tinyns-bench
 SRC0X=$P/src/tinyns-0x
-OUT=runs/bench_baseline                  # relative to $P, like other queue lines
+OUT=${OUT:-runs/bench_v1}                # relative to $P, like other queue lines
+TAG=${TAG:-v1-bench}
+JOBDIR=${JOBDIR:-$P/queue}               # where emit-jobs writes the job files
+BENCH_PY=${BENCH_PY:-env/bench/bin/python}
+BENCH_PY_JAXNS=${BENCH_PY_JAXNS:-env/bench_jaxns/bin/python}
+BENCH_RUN=${BENCH_RUN:-src/tinyns-bench/bench/run.py}
 NLIVE=${NLIVE:-500}
 EMIT_CPU_HIGH_D=${EMIT_CPU_HIGH_D:-1}    # 0: skip CPU samplers at d >= 32
 EMIT_V1=${EMIT_V1:-0}                    # 1: also emit tinyns_v1 GPU lines
@@ -89,6 +98,9 @@ sepM_d10 sepM_d18 sepM_d32 mix3_d10"
 ndim() { echo "${1##*_d}"; }
 
 build_envs() {
+  # pip's cache and temp files go on the data volume (the root disk is small).
+  export PIP_CACHE_DIR=$P/cache/pip TMPDIR=$P/cache/tmp
+  mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
   cd "$P/src"
   [ -d "$SRC" ] || git clone "$REPO" "$SRC"
   git -C "$SRC" fetch origin
@@ -119,9 +131,9 @@ build_envs() {
 # Command prefix for a sampler (relative to $P, as queue lines are).
 runner() {
   case $1 in
-    jaxns*) echo "env/bench_jaxns/bin/python src/tinyns-bench/bench/run.py" ;;
-    tinyns_v02*) echo "env TINYNS_V02_SRC=$SRC0X/src env/bench/bin/python src/tinyns-bench/bench/run.py" ;;
-    *) echo "env/bench/bin/python src/tinyns-bench/bench/run.py" ;;
+    jaxns*) echo "$BENCH_PY_JAXNS $BENCH_RUN" ;;
+    tinyns_v02*) echo "env TINYNS_V02_SRC=$SRC0X/src $BENCH_PY $BENCH_RUN" ;;
+    *) echo "$BENCH_PY $BENCH_RUN" ;;
   esac
 }
 
@@ -135,21 +147,21 @@ smoke() {
 }
 
 gpu_line() {  # sampler target seeds
-  echo "$(runner $1) --sampler $1 --target $2 --seeds $3 --nlive $NLIVE" \
-       "--out $OUT/gpu.jsonl --timeout 3600 --exclusive --jax-cache cache/jax_bench" \
-       "--tag baseline-h100"
+  echo "flock gpu.lock $(runner $1) --sampler $1 --target $2 --seeds $3 --nlive $NLIVE" \
+       "--out $OUT/results_gpu.jsonl --timeout 3600 --exclusive --jax-cache cache/jax_bench" \
+       "--tag $TAG-h100"
 }
 
 cpu_lines() {  # sampler target nseeds
   local s=$1 t=$2 n=$3 a
   for ((a = 0; a < n; a += 5)); do
     echo "$(runner $s) --sampler $s --target $t --seeds $a-$((a + 4 < n - 1 ? a + 4 : n - 1))" \
-         "--nlive $NLIVE --out $OUT/cpu.jsonl --timeout 14400 --exclusive --tag baseline-h100-cpu"
+         "--nlive $NLIVE --out $OUT/results_cpu.jsonl --timeout 14400 --exclusive --tag $TAG-cpu"
   done
 }
 
 emit_jobs() {
-  local g=$P/queue/bench_gpu_jobs.txt c=$P/queue/bench_cpu_jobs.txt t d n
+  local g=$JOBDIR/bench_gpu_jobs.txt c=$JOBDIR/bench_cpu_jobs.txt t d n
   : > "$g"; : > "$c"
   for t in $CALIB $MIXT; do
     d=$(ndim $t)
@@ -204,7 +216,7 @@ case ${1:-} in
   cpu-pool) shift; cpu_pool "$@" ;;
   summarize)
     cd "$P"
-    env/bench/bin/python src/tinyns-bench/bench/summarize.py $OUT/gpu.jsonl $OUT/cpu.jsonl \
+    $BENCH_PY src/tinyns-bench/bench/summarize.py $OUT/results_gpu.jsonl $OUT/results_cpu.jsonl \
       --out $OUT/table.md && echo "$P/$OUT/table.md" ;;
   *) sed -n '2,12p' "$0"; exit 1 ;;
 esac

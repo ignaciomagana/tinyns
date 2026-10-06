@@ -220,14 +220,32 @@ def run_one(spec, target_name, seed, cfg, env, timeout):
     return msg
 
 
+def cpu_model() -> str | None:
+    """The CPU model name from /proc/cpuinfo (Linux), else platform.processor()."""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    import platform
+
+    return platform.processor() or None
+
+
 def make_record(args, spec, target, seed, cfg, msg, sha, device):
     hw = dict(
         host=socket.gethostname(),
         gpu=msg.get("gpu"),
         platform=msg.get("platform", device),
+        cpu_model=cpu_model(),
         cpu_threads=len(os.sched_getaffinity(0)),
         exclusive=bool(args.exclusive),
     )
+    if os.environ.get("SLURM_JOB_ID"):
+        hw["slurm_job"] = os.environ.get("SLURM_JOB_ID")
+        hw["slurm_partition"] = os.environ.get("SLURM_JOB_PARTITION")
     rec = dict(
         schema=SCHEMA,
         sampler=spec,

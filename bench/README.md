@@ -10,6 +10,7 @@ bench/
   run.py               CLI: one sampler x one target x seeds -> results.jsonl
   summarize.py         JSONL -> Markdown table per sampler x target
   h100_plan.sh         env build + sweep job lines for js2h100 (review before use)
+  slurm_cpu.sh         the CPU sampler lines as a Slurm array (Hilda)
   requirements-*.txt   pins for the two envs
   tests/               pytest (collected by the repo's CI)
 ```
@@ -152,7 +153,7 @@ How `run.py` works:
 - `schema, sampler, sampler_version, git_sha, target, ndim, seed`
 - `truth {logz, logz_source, mode_mass}`
 - `config {<resolved sampler settings>, variant, cli {nlive, dlogz, opts}}`
-- `hw {host, gpu, platform, cpu_threads, exclusive}, jax, x64`
+- `hw {host, gpu, platform, cpu_model, cpu_threads, exclusive[, slurm_job, slurm_partition]}, jax, x64`
 - `status (ok/timeout/error), error, wall_s, compile_s, ncall, ncall_valid`
 - `logz, logzerr, mode_mass, n_samples, ess (Kish), ts`
 

@@ -6,8 +6,9 @@
 Defaults resolve in ``Config``: ``num_delete = max(1, nlive // 10)`` chains run
 vmapped per step, ``walks = max(25, 6 * ndim)`` steps each. ``ncall`` counts
 every evaluation, including out-of-cube lanes that the vmapped chains accept
-and waste; ``metadata["ncall_valid"]`` counts only the in-cube ones. v1 does
-not report a compile time, so ``compile_s`` is None (it is inside ``wall_s``).
+and waste; ``metadata["ncall_valid"]`` counts only the in-cube ones.
+``compile_s`` is ``metadata["compile_s"]``: v1 compiles its kernel in a
+zero-step chunk and times it apart (it is inside ``wall_s``).
 
 This adapter ignores ``TINYNS_V02_SRC``; only ``tinyns_v02`` reads it. Within a
 single Python process the first adapter to import ``tinyns`` decides which
