@@ -361,6 +361,11 @@ class NestedSamplingResult:
         pooled ``n``, ``ks`` distance and ``pvalue``, and the same per
         window (with its ``start`` and ``stop`` iteration) under
         ``"windows"``.
+
+        With ``num_delete > 1`` the ranks of one step share its survivors,
+        so they are not independent and the p-values are somewhat
+        anti-conservative (on 2-D Gaussians with ``num_delete=50``, 5-12% of
+        runs fall below 0.05 instead of 5%).
         """
 
         if int(windows) < 1:
