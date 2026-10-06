@@ -32,7 +32,12 @@ class NestedSampler:
         that skips the likelihood of out-of-cube proposals, for expensive
         likelihoods.
     walks:
-        Steps per replacement chain, default ``max(25, 6 * ndim)``.
+        Steps per replacement chain, default ``max(25, 6 * ndim, ndim**2 // 6)``
+        (:func:`tinyns.core.default_walks`): 6 steps per dimension up to 36
+        dimensions, ``ndim / 6`` per dimension beyond. Calibrated on correlated
+        Gaussians up to 64 dimensions; strongly curved targets need more (a
+        10-D Rosenbrock valley needs 12 to 25 ``* ndim`` for an honest
+        ``logzerr``). If in doubt, rerun with twice the walks and compare.
     """
 
     def __init__(

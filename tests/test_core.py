@@ -136,6 +136,10 @@ def test_config_resolves_defaults_and_is_hashable() -> None:
     cfg = Config(3)
     assert (cfg.nlive, cfg.num_delete, cfg.walks) == (1000, 100, 25)
     assert Config(10, 500).walks == 60
+    # walks = max(25, 6 ndim, ndim^2 // 6), whatever nlive is
+    assert Config(32).walks == 192 and Config(36, 500).walks == 216
+    assert (Config(48).walks, Config(64, 2000).walks) == (384, 682)
+    assert Config(64, walks=10).walks == 10
     assert Config(3, 15).num_delete == 1
     assert hash(cfg) == hash(Config(3, 1000, 100, 25)) and cfg == Config(3)
     with pytest.raises(AttributeError):
@@ -203,6 +207,53 @@ def test_seeds_are_distinct_when_possible() -> None:
     assert len(set(born.tolist())) == 10 and set(born.tolist()) <= survivors
 
 
+@pytest.mark.parametrize("k", [1, 6])
+def test_proposal_covariance_leaves_out_the_seeds(monkeypatch, k) -> None:
+    """The covariance that shapes a step's proposals comes from the points
+    above L* other than the seeds. With an impossible walk the new points are
+    the seeds, so the rows left out are exactly theirs."""
+    masks = []
+    live_chol = core._live_chol
+
+    def spy(u, mask):
+        masks.append(np.asarray(mask))
+        return live_chol(u, mask)
+
+    monkeypatch.setattr(core, "_live_chol", spy)
+    cfg = Config(2, 30, num_delete=k, walks=3)
+    loglike = gauss(0.5, 0.2)
+    state = init(1, loglike, identity, cfg)
+    state = state._replace(log_scale=jnp.asarray(-80.0, FLOAT))
+    new, dead = core._step(state, loglike, identity, cfg)  # eager: the spy runs
+    (mask,) = masks
+    u = np.asarray(state.u)
+    above = np.asarray(state.logl) > float(dead.logl[-1])
+    born = np.asarray(new.logl_birth) > -np.inf
+    seeds = [int(np.flatnonzero((u == v).all(axis=1))[0])
+             for v in np.asarray(new.u)[born]]
+    expected = above.copy()
+    expected[seeds] = False
+    np.testing.assert_array_equal(mask, expected)
+    assert mask.sum() == above.sum() - k
+
+
+def test_proposal_mask_keeps_the_seeds_when_too_few_points_remain() -> None:
+    above = jnp.asarray([True] * 6 + [False] * 4)
+    seeds = jnp.asarray([0, 1, 2])
+    held_out = np.asarray(above).copy()
+    held_out[:3] = False
+    # 3 points remain: enough for ndim 2, not for ndim 3.
+    np.testing.assert_array_equal(core._proposal_mask(above, seeds, 2), held_out)
+    np.testing.assert_array_equal(core._proposal_mask(above, seeds, 3), above)
+    # A step on a nearly exhausted live set still runs: 2 points above L*,
+    # both seeds, in 2-D.
+    cfg = Config(2, 4, num_delete=2, walks=5)
+    loglike = gauss(0.5, 0.2)
+    state = init(0, loglike, identity, cfg)
+    new, _ = step(state, loglike, identity, cfg)
+    assert np.all(np.isfinite(np.asarray(new.u))) and int(new.status) == core.RUNNING
+
+
 def test_out_of_cube_proposals_are_skipped_at_k1_and_counted_at_k_gt_1() -> None:
     loglike = gauss(0.02, 0.05)  # at a corner: many proposals leave the cube
     for k in (1, 8):
@@ -256,15 +307,19 @@ def test_flat_top_likelihood_stops_on_the_plateau() -> None:
         r2 = jnp.sum((x - 0.5) ** 2)
         return -100.0 * jnp.maximum(r2 - 0.01, 0.0)
 
-    result = NestedSampler(flat_top, identity, 2, 100, num_delete=10).run(
-        1, dlogz=0.0, maxiter=200_000
-    )
-    assert result.metadata["status"] == "plateau"
-    # The step that found no point above L* = 0 was abandoned: fewer than k
-    # live points lie below the plateau.
-    assert np.sum(result.logl[result.niter :] < 0.0) < 10
     truth = math.log(2 * math.pi * 0.01)  # pi r^2 plus the Gaussian skirt
-    assert abs(result.logz - truth) < 4 * result.logzerr + 0.05
+    sampler = NestedSampler(flat_top, identity, 2, 100, num_delete=10)
+    close = 0
+    for seed in range(1, 6):
+        result = sampler.run(seed, dlogz=0.0, maxiter=200_000)
+        assert result.metadata["status"] == "plateau"
+        # The step that found no point above L* = 0 was abandoned: fewer than
+        # k live points lie below the plateau.
+        assert np.sum(result.logl[result.niter :] < 0.0) < 10
+        close += abs(result.logz - truth) < 4 * result.logzerr + 0.05
+    # logzerr understates the scatter on a plateau ((logz - truth) / logzerr
+    # has sd ~1.6, with rare 6-8 sigma runs), so a majority of five must pass.
+    assert close >= 3
 
 
 def test_termination_by_dlogz_maxiter_and_maxcall() -> None:

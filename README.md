@@ -44,7 +44,7 @@ NaN likelihood counts as `-inf`.
 ```python
 NestedSampler(loglike, prior_transform, ndim, nlive=1000, *,
               num_delete=None,  # None -> max(1, nlive // 10), at most nlive // 2
-              walks=None)       # None -> max(25, 6 * ndim)
+              walks=None)       # None -> max(25, 6 * ndim, ndim**2 // 6)
 sampler.run(key, *, dlogz=0.1, maxiter=None, maxcall=None, progress=False,
             checkpoint=None, batched_data=False)
 ```
@@ -71,6 +71,29 @@ that never moves returns its seed. The step multiplier `s` adapts toward 25%
 acceptance inside every step. With `num_delete=1` the single chain is not
 vmapped, so an out-of-cube proposal skips the likelihood: use it for expensive
 likelihoods.
+
+### Choosing `walks`
+
+The default is `walks = max(25, 6 * ndim, ndim**2 // 6)`
+(`tinyns.core.default_walks`): 6 steps per dimension up to 36 dimensions, then
+`ndim / 6` per dimension (384 steps at 48, 682 at 64). The proposal covariance
+of a step is built from the live points above `L*` other than the chains'
+seeds, so a chain's proposals do not depend on where it starts and its end
+point is uniform inside the contour however short the walk. (With the seed
+included, its pull on the covariance biased logZ upward by an amount that grew
+with `ndim` and shrank with `nlive`.) What remains is mixing: early in a run,
+while the prior box still cuts the likelihood contours, the likelihood rank
+along a chain takes 2 to 3 `ndim` steps to decorrelate (about 9 steps later
+on). Above about 48 dimensions `6 * ndim` steps are too few for that phase:
+they left +0.36 nats at 64 dimensions. The default keeps the logZ bias below
+its scatter on correlated Gaussians from 2 to 64 dimensions with 250 to 2000
+live points.
+
+Strongly curved targets need longer walks than their dimension suggests. A
+10-D Rosenbrock valley needs 12 to 25 `* ndim`: at the default (60) logZ
+scatters 2.3 times more than `logzerr` says. Neal's funnel in 10-D is fine
+at the default. If in doubt, rerun with twice the walks and check that logZ
+moves by less than `logzerr`.
 
 The `k` deaths of a step are counted at live counts `m, m-1, ..., m-k+1`
 (Fowlie, Handley & Su), so the expected log prior volume after `it` steps is
