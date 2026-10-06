@@ -11,8 +11,15 @@
 #   bench/h100_plan.sh summarize    # table.md from runs/bench_baseline/*.jsonl
 #
 # The existing env/core and src/tinyns (3c768e5, used by the reference runs)
-# are left alone. The new clones go to src/tinyns-bench (this branch; v1 after
-# the PR merges) and src/tinyns-0x (release/0.x = 2f67111).
+# are left alone. Two new trees are created:
+# - src/tinyns-bench, a clone of this branch (v1 once the PR merges). It holds
+#   the harness and is pip-installed -e into env/bench, so `import tinyns`
+#   there is v1.
+# - src/tinyns-0x, a worktree at release/0.x = 2f67111. tinyns 0.x is never
+#   installed. The tinyns_v02 queue lines run with
+#   TINYNS_V02_SRC=src/tinyns-0x/src, which only that adapter reads and puts
+#   first on sys.path. tinyns_v1 always imports the installed v1. Without the
+#   variable, tinyns_v02 exits with code 2 and writes no record.
 #
 # How the work is split:
 # - GPU samplers (tinyns 0.x, BlackJAX NSS, JAXNS): one queue line per
@@ -71,6 +78,8 @@ SRC0X=$P/src/tinyns-0x
 OUT=runs/bench_baseline                  # relative to $P, like other queue lines
 NLIVE=${NLIVE:-500}
 EMIT_CPU_HIGH_D=${EMIT_CPU_HIGH_D:-1}    # 0: skip CPU samplers at d >= 32
+EMIT_V1=${EMIT_V1:-0}                    # 1: also emit tinyns_v1 GPU lines
+                                         # (off while its walks default is recalibrated)
 
 CALIB="gauss_d2 gauss_d8 gauss_d16 gauss_d32 gauss_d64 rosen_d2 rosen_d10
 funnel_d10 loggamma_d2 loggamma_d10 loggamma_d30 eggbox_d2"
@@ -91,12 +100,16 @@ build_envs() {
   "$PYTHON" -m venv "$P/env/bench"
   "$P/env/bench/bin/pip" install --upgrade pip
   "$P/env/bench/bin/pip" install -r "$SRC/bench/requirements-bench.txt"
-  "$P/env/bench/bin/pip" install -e "$SRC"           # tinyns v1 (once PR 1 lands)
+  "$P/env/bench/bin/pip" install -e "$SRC"           # tinyns v1
 
   "$PYTHON" -m venv "$P/env/bench_jaxns"
   "$P/env/bench_jaxns/bin/pip" install --upgrade pip
   "$P/env/bench_jaxns/bin/pip" install -r "$SRC/bench/requirements-bench_jaxns.txt"
 
+  # The two tinyns trees: the installed v1, and 0.x through TINYNS_V02_SRC.
+  "$P/env/bench/bin/python" -c "import tinyns; print('v1:', tinyns.__version__, tinyns.__file__)"
+  TINYNS_V02_SRC=$SRC0X/src "$P/env/bench/bin/python" -c \
+    "import sys; sys.path.insert(0, '$SRC0X/src'); import tinyns; print('0.x:', tinyns.__version__, tinyns.__file__)"
   for e in bench bench_jaxns; do
     "$P/env/$e/bin/python" -c "import jax; print('$e', jax.__version__, jax.devices())"
   done
@@ -114,7 +127,7 @@ runner() {
 
 smoke() {
   cd "$P"
-  for s in tinyns_v02 blackjax_nss dynesty ultranest nautilus jaxns; do
+  for s in tinyns_v02 tinyns_v1 blackjax_nss dynesty ultranest nautilus jaxns; do
     $(runner $s) --sampler $s --target gauss_d2 --seeds 0 --nlive 100 \
       --opt n_live=200 --out $OUT/smoke.jsonl --timeout 900 || true
   done
@@ -144,6 +157,7 @@ emit_jobs() {
     for s in tinyns_v02 blackjax_nss jaxns jaxns:nlive; do
       gpu_line $s $t "0-$((n - 1))" >> "$g"
     done
+    if ((EMIT_V1)); then gpu_line tinyns_v1 $t "0-$((n - 1))" >> "$g"; fi
     local nc=$n
     if ((d >= 32)); then
       nc=10

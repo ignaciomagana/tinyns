@@ -52,7 +52,7 @@ recomputes the cached quadrature values.
 | spec | device | notes |
 |---|---|---|
 | `tinyns_v02[:noswap]` | gpu | `release/0.x` = 2f67111; see below |
-| `tinyns_v1[:k1]` | gpu | planned v1 API; unavailable until v1 PR 1 lands |
+| `tinyns_v1[:k1]` | gpu | the installed v1 package; `k1` is `num_delete=1` |
 | `blackjax_nss` | gpu | `blackjax.nss`, `num_delete = nlive/10`, `num_inner_steps = max(5, 2d)` |
 | `dynesty[:rwalk100]` | cpu | `bound='multi', sample='auto'`, or `sample='rwalk', walks=100` |
 | `ultranest[:slice]` | cpu | MLFriends, or `SliceSampler(nsteps=2d, mixture directions)` |
@@ -91,13 +91,31 @@ There are two venvs, because jaxns 3 pins `tfp-nightly` and `jaxctx`.
 ```bash
 python3 -m venv env/bench
 env/bench/bin/pip install -r bench/requirements-bench.txt
-env/bench/bin/pip install -e <tinyns v1 checkout>
-git worktree add ../tinyns-0x release/0.x    # tinyns 0.x, imported via TINYNS_V02_SRC
+env/bench/bin/pip install -e .              # this checkout: tinyns v1
+git worktree add ../tinyns-0x origin/release/0.x   # tinyns 0.x source tree (2f67111)
 export TINYNS_V02_SRC=$PWD/../tinyns-0x/src
 
 python3 -m venv env/bench_jaxns
 env/bench_jaxns/bin/pip install -r bench/requirements-bench_jaxns.txt
 ```
+
+**Two tinyns versions, one env.** The repo and the installed package are v1,
+so `import tinyns` gives v1. `tinyns_v02` needs the `release/0.x` source tree.
+`TINYNS_V02_SRC` must point at that tree's `src` directory (the one that
+contains `tinyns/`). The adapter puts it first on `sys.path` before it imports
+`tinyns`. This works because every seed runs in its own process.
+
+- Without `TINYNS_V02_SRC`, `tinyns_v02` reports itself unavailable: it
+  writes no record and exits with code 2. It never runs v1 under the 0.x
+  label.
+- `tinyns_v1` ignores the variable and always imports the installed v1.
+  Within a single Python process (pytest, for example), whichever adapter
+  imports `tinyns` first decides which tree is loaded.
+- `sampler_version` records the path tinyns was imported from, so a record
+  shows which tree it used.
+
+A `git archive origin/release/0.x src | tar -x -C <dir>` copy works as well as
+a worktree.
 
 For a CPU-only machine, use `jax` in place of `jax[cuda12]`. Run every script
 from the repo root, or point at it by path: `run.py` puts the repo root on
