@@ -46,13 +46,14 @@
 #     JAXNS nlive  ~11 h
 #     total        ~47 h
 #   CPU pool, in slot-hours of 4 cores:
-#     dynesty default ~19, dynesty rwalk100 ~25, UltraNest ~4 (d <= 10),
+#     dynesty default ~35, dynesty rwalk100 ~25, UltraNest ~4 (d <= 10),
 #     UltraNest slice ~46 (d > 10), Nautilus ~113, Nautilus discard ~113
-#     total ~320 slot-h: ~40 h on 8 slots, ~46 h on 7.
+#     total ~335 slot-h: ~42 h on 8 slots, ~48 h on 7.
 # - Nautilus at d >= 32 (35-110 min per seed, mostly network training) and
 #   dynesty's rslice at d > 20 (estimated, not validated) are the uncertain
 #   tail. dynesty default can also stall on mixtures through its bootstrap
-#   expansion: one sepW_d4 seed took 1M+ calls, against 74k for another. The
+#   expansion: on sepW_d4, two of three seeds took 4.1M and 7.4M calls (11 and
+#   18 min), against 74k calls (20 s) for the third. The
 #   4 h per-seed CPU timeout caps such runs, and EMIT_CPU_HIGH_D=0 drops the
 #   CPU samplers at d >= 32.
 #
