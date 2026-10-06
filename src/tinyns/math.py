@@ -7,10 +7,12 @@ are easy to validate independently before the sampler itself is implemented.
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax.numpy as jnp
 from jax import random
 
-from tinyns.types import ArrayLike
+ArrayLike = Any
 
 
 def logsumexp(values: ArrayLike) -> float:

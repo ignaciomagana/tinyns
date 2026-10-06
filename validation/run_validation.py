@@ -50,8 +50,9 @@ def insertion_rank_stats(result) -> dict:
     if count < 2:
         return none_stats
 
-    nslots = getattr(result, "nlive", None)  # the ranks run over 0..nlive-1
-    if nslots is None or nslots <= 0:
+    # The ranks run over 0..nlive-num_delete.
+    nslots = getattr(result, "nlive", 0) - getattr(result, "num_delete", 1) + 1
+    if nslots <= 0:
         return none_stats
 
     normalized_ranks = (insertion_indices + 0.5) / float(nslots)
@@ -95,23 +96,17 @@ def run_one(target_name: str, seed: int, args) -> dict[str, Any]:
         target.prior_transform,
         ndim=target.ndim,
         nlive=args.nlive,
+        num_delete=args.num_delete,
         walks=args.walks,
-        replacement_chains=args.replacement_chains,
-        block_size=args.block_size,
     )
     result = sampler.run(
         jax.random.PRNGKey(seed),
         dlogz=args.dlogz,
         maxiter=args.maxiter,
         progress=args.progress,
-        progress_interval=args.progress_interval,
     )
     diagnostics = result.diagnostics()
     metadata = {} if result.metadata is None else result.metadata
-    replacement_batch_ncall = int(metadata["walks"]) * int(
-        metadata["replacement_chains"]
-    )
-    replacement_mean_batches = diagnostics.get("replacement_mean_batches")
     sample_mean, sample_cov, sample_std = _posterior_moments(result, seed)
 
     logz_error = None
@@ -148,8 +143,7 @@ def run_one(target_name: str, seed: int, args) -> dict[str, Any]:
         "dlogz": args.dlogz,
         "maxiter": args.maxiter,
         "walks": metadata.get("walks"),
-        "replacement_chains": args.replacement_chains,
-        "block_size": args.block_size,
+        "num_delete": result.num_delete,
         "seed": seed,
         "ndim": target.ndim,
         "logz": float(result.logz),
@@ -173,10 +167,7 @@ def run_one(target_name: str, seed: int, args) -> dict[str, Any]:
         "success": bool(result.success),
         "message": str(result.message),
         "warnings": diagnostics.get("warnings", []),
-        "replacement_mean_ncall": diagnostics.get("replacement_mean_ncall", 0.0),
-        "replacement_batch_ncall": replacement_batch_ncall,
-        "replacement_mean_batches": replacement_mean_batches,
-        "replacement_failures": diagnostics.get("replacement_failures", 0),
+        "acceptance": metadata.get("acceptance"),
         "sample_mean": sample_mean,
         "sample_cov": sample_cov,
         "posterior_mean": sample_mean,
@@ -202,18 +193,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--walks", type=int, default=None, help="Default: the sampler default."
     )
-    parser.add_argument("--replacement-chains", type=int, default=1)
-    parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument(
+        "--num-delete", type=int, default=None, help="Default: the sampler default."
+    )
     parser.add_argument(
         "--progress",
         action="store_true",
         help="Show tinyns progress output for each validation run.",
-    )
-    parser.add_argument(
-        "--progress-interval",
-        type=int,
-        default=100,
-        help="Progress print interval passed to NestedSampler.run.",
     )
     parser.add_argument("--output", type=str, default=None)
     return parser.parse_args(argv)
