@@ -1,0 +1,9 @@
+# env/bench_jaxns: jaxns 3 in its own env (it pins tfp-nightly and jaxctx).
+# Python >= 3.10. For a CPU-only env replace jax[cuda12] with jax.
+jax[cuda12]==0.10.2
+jaxns==3.0.0
+jaxctx==1.2.0
+tfp-nightly==0.26.0.dev20261005
+numpy==2.4.6
+scipy==1.17.1
+pytest
