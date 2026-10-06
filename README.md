@@ -6,8 +6,8 @@ number of dimensions, and it returns the evidence and weighted posterior
 samples. Every step runs on the device; the host syncs once per chunk of steps.
 
 This is the v1 development branch: the API below is a hard break from v0.x
-(no compatibility shims, no old-checkpoint readers). Checkpoints, batched
-keys and multimodal moves are being added in the next pull requests.
+(no compatibility shims, no old-checkpoint readers). Multimodal moves are
+being added in the next pull requests.
 
 ## Install
 
@@ -45,13 +45,15 @@ NaN likelihood counts as `-inf`.
 NestedSampler(loglike, prior_transform, ndim, nlive=1000, *,
               num_delete=None,  # None -> max(1, nlive // 10), at most nlive // 2
               walks=None)       # None -> max(25, 6 * ndim)
-sampler.run(key, *, dlogz=0.1, maxiter=None, maxcall=None, progress=False)
+sampler.run(key, *, dlogz=0.1, maxiter=None, maxcall=None, progress=False,
+            checkpoint=None, batched_data=False)
 ```
 
 Any other keyword raises `TypeError`. `key` is a PRNG key or an int seed. The
 run stops when the live points hold less than `dlogz` of the evidence, before
 more than `maxiter` dead points, once `maxcall` likelihood calls are reached,
 or on a likelihood plateau (no live point above the deleted ones).
+`progress=True` prints one line per chunk of steps.
 
 The functional core is exported too: `Config`, `init(key, loglike,
 prior_transform, cfg)`, `step(state, loglike, prior_transform, cfg) -> (state,
@@ -84,6 +86,28 @@ host in float64. `result.nlive_i` holds the live count at every death.
 `insertion_test()` (ranks of the new points among the `nlive - num_delete`
 survivors of their step), `modes()`, `logz_bootstrap()`, `resample_equal()`,
 `save_npz()`/`load_npz()`, `to_numpy()` and `to_dynesty_dict()`.
+
+## Checkpoints
+
+`run(key, checkpoint="run.npz")` writes one `.npz` file atomically at most
+every 10 minutes and at the end. If the file exists, the run resumes from it,
+and the result is bit-identical to an uninterrupted run (each step splits the
+PRNG key it carries, so the random stream depends on the step count only, not
+on where the chunks end). A checkpoint written with a different config, key,
+x64 flag or float dtype is refused. A run stopped by `maxiter` or `maxcall`
+continues when called again with a larger limit; `metadata["wall_time_s"]`
+adds up every session.
+
+## Batches of runs
+
+`run(jax.random.split(key, B))` runs `B` independent runs in one compiled
+program and returns a list of `B` results; with `batched_data=True` the
+arrays of a `Partial` likelihood carry a leading axis of `B`, one dataset per
+run (simulation-based calibration, mock campaigns). The step is vmapped over
+the runs inside the loop, and a finished run waits, frozen, for the others.
+Each run is a draw from the same distribution as its separate run but is not
+bit-identical to it, since vmap changes XLA's summation order: in float64 the
+two agree to roundoff, in float32 they can part late in the run.
 
 ## Data in the likelihood
 

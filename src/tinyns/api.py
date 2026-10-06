@@ -61,13 +61,34 @@ class NestedSampler:
         maxiter: int | None = None,
         maxcall: int | None = None,
         progress: bool = False,
-    ) -> NestedSamplingResult:
+        checkpoint=None,
+        batched_data: bool = False,
+    ) -> NestedSamplingResult | list[NestedSamplingResult]:
         """Run nested sampling from ``key`` (a PRNG key or an int seed).
 
         Stops once the live points hold less than ``dlogz`` of the evidence,
         before more than ``maxiter`` dead points, once ``maxcall`` likelihood
         evaluations are reached (checked after each step), or on a likelihood
-        plateau. ``progress`` prints one line per chunk of steps.
+        plateau. ``progress`` prints one line per chunk of steps: dead points,
+        ``logz``, the dlogz remainder, calls, calls per second, the chain
+        acceptance and the step scale.
+
+        ``checkpoint`` is a file path. If the file exists, the run resumes
+        from it; a checkpoint written with a different config, x64 flag,
+        float dtype, key or batch is refused (``ValueError``). The run writes
+        it atomically at a chunk boundary at most every 10 minutes and at the
+        end. A resumed run is bit-identical to an uninterrupted one, and
+        ``metadata["wall_time_s"]`` adds up the time of every session. A
+        checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
+        under this call's limits. The callables are not stored or checked.
+
+        ``key`` may be a batch of keys (``jax.random.split(key, B)``): the
+        ``B`` runs go through one compiled program (the step is vmapped over
+        the runs) and a list of ``B`` results is returned. Each equals the
+        run of its key alone. With ``batched_data=True`` every array leaf of
+        a pytree ``loglike`` or ``prior_transform`` (e.g.
+        ``jax.tree_util.Partial(fn, data)`` with ``data`` stacked over runs)
+        carries the same leading axis of ``B``: run ``i`` sees slice ``i``.
         """
         return core.run(
             key,
@@ -78,4 +99,6 @@ class NestedSampler:
             maxiter=maxiter,
             maxcall=maxcall,
             progress=progress,
+            checkpoint=checkpoint,
+            batched_data=batched_data,
         )
