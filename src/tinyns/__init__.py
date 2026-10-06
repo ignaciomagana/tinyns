@@ -1,12 +1,17 @@
-"""tinyns: a tiny dynesty-style nested sampler for JAX likelihoods."""
+"""tinyns: a tiny, full-JAX nested sampler."""
 
 from tinyns.api import NestedSampler
+from tinyns.core import Config, finalise, init, step
 from tinyns.result import LogZBootstrap, NestedSamplingResult
 
 __all__ = [
     "NestedSampler",
+    "Config",
+    "init",
+    "step",
+    "finalise",
     "NestedSamplingResult",
     "LogZBootstrap",
 ]
 
-__version__ = "0.2.5"
+__version__ = "1.0.0.dev0"

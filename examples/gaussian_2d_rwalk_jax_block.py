@@ -1,4 +1,4 @@
-"""Recommended fast-path 2D Gaussian example using cached JAX block rwalk."""
+"""A 2D Gaussian with the default sampler settings."""
 
 import sys
 from pathlib import Path
@@ -26,8 +26,8 @@ def loglike(theta):
 def main():
     key = jax.random.PRNGKey(0)
 
-    # The defaults: live-cov rwalk in jitted blocks of block_size=32
-    # iterations, walks=max(25, 6 * ndim) and the cluster swap.
+    # The defaults: num_delete=max(1, nlive // 10) replacements per step, each
+    # a live-covariance random walk of walks=max(25, 6 * ndim) steps.
     sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=200)
 
     result = sampler.run(key, dlogz=0.1)

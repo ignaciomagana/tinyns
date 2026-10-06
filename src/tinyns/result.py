@@ -27,16 +27,18 @@ from tinyns.math import (
     normalize_log_weights,
     systematic_resample,
 )
-from tinyns.types import ArrayLike
 
-_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v2"
-_RESULT_NPZ_ARRAYS = ("samples_u", "samples", "logl", "logwt", "logl_birth")
+ArrayLike = Any
+
+_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v3"
+_RESULT_NPZ_ARRAYS = ("samples_u", "samples", "logl", "logwt", "logl_birth", "nlive_i")
 _RESULT_NPZ_SCALARS = {
     "logz": float,
     "logzerr": float,
     "ncall": int,
     "niter": int,
     "nlive": int,
+    "num_delete": int,
     "ndim": int,
     "success": bool,
     "message": str,
@@ -152,47 +154,47 @@ def _np_logsumexp(values, axis):
     return np.squeeze(out, axis=axis)
 
 
-def _simulate_logz_realizations(dead_logl, live_logl, nlive, log_shrinkage):
-    """Recompute log-evidence for jittered prior-volume shrinkage sequences.
+def _log_weights(logl, nlive_i, log_t=None):
+    """Return the log posterior weights of samples in death order.
 
-    Reproduces the sampler's own evidence convention (a left-Riemann dead-point
-    width ``X_i - X_{i+1}`` plus an equal ``X_final / nlive`` share for each
-    surviving live point), but with the deterministic ``log X_i = -i / nlive``
-    schedule replaced by the per-realization ``log_shrinkage`` random walk.
-
-    Parameters
-    ----------
-    dead_logl:
-        Dead-point log-likelihoods in removal order, shape ``(ndead,)``.
-    live_logl:
-        Final live-point log-likelihoods, shape ``(nlive_final,)``.
-    nlive:
-        Constant live-point count used during sampling.
-    log_shrinkage:
-        Per-step ``log t_i`` values, shape ``(n_realizations, ndead)``. Each
-        ``t_i`` is a prior-volume shrinkage factor.
+    Sample ``i`` dies with ``nlive_i[i]`` live points and shrinks the prior
+    volume by ``t_i``: ``log X_i = sum_{j<=i} log t_j``, with the expected
+    ``log t_i = -1 / nlive_i[i]`` unless ``log_t`` (any leading shape, the
+    last axis over the samples) is given. Sample ``i`` takes the width
+    ``X_{i-1} - X_i`` (``X_{-1} = 1``) and the last sample takes all the
+    volume left, ``X_{N-2}``, so a constant likelihood ``L`` gives ``Z = L``.
     """
-
-    dead_logl = np.asarray(dead_logl, dtype=float)
-    live_logl = np.asarray(live_logl, dtype=float)
-    log_shrinkage = np.asarray(log_shrinkage, dtype=float)
-    n_realizations = log_shrinkage.shape[0]
-
-    zeros = np.zeros((n_realizations, 1))
-    log_x = np.concatenate([zeros, np.cumsum(log_shrinkage, axis=1)], axis=1)
-    # Dead-point widths: log(exp(log_x[i]) - exp(log_x[i + 1])) with log_x[i]
-    # strictly greater than log_x[i + 1] because every shrinkage is < 1.
-    upper = log_x[:, :-1]
-    lower = log_x[:, 1:]
+    logl = np.asarray(logl, dtype=np.float64)
+    if log_t is None:
+        log_t = -1.0 / np.asarray(nlive_i, dtype=np.float64)
+    log_t = np.asarray(log_t, dtype=np.float64)
+    log_x = np.cumsum(log_t, axis=-1)
+    log_prev = np.concatenate([np.zeros_like(log_x[..., :1]), log_x[..., :-1]], -1)
     with np.errstate(divide="ignore"):
-        log_width = upper + np.log1p(-np.exp(lower - upper))
-    dead_logwt = log_width + dead_logl[None, :]
+        log_width = log_prev + np.log(-np.expm1(log_t))
+    log_width[..., -1] = log_prev[..., -1]
+    return log_width + logl
 
-    log_x_final = log_x[:, -1:]
-    live_logwt = log_x_final - math.log(nlive) + live_logl[None, :]
 
-    all_logwt = np.concatenate([dead_logwt, live_logwt], axis=1)
-    return _np_logsumexp(all_logwt, axis=1)
+def _evidence(logl, nlive_i):
+    """Return ``(logwt, logz, logzerr)`` in float64 (see :func:`_log_weights`).
+
+    ``logzerr = sqrt(sum_i dH_i / n_i)``, with ``dH_i`` the increment of the
+    running information at sample ``i`` and ``n_i = nlive_i[i]``; at a
+    constant live count ``n`` it is Skilling's ``sqrt(H / n)``.
+    """
+    logl = np.asarray(logl, dtype=np.float64)
+    logwt = _log_weights(logl, nlive_i)
+    logz = float(_np_logsumexp(logwt, axis=0))
+    if not math.isfinite(logz):
+        return logwt, logz, math.nan
+    p = np.exp(logwt - logz)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        c = np.cumsum(p)
+        a = np.cumsum(np.where(p > 0.0, p * logl, 0.0))
+        h = np.where(c > 0.0, a / c - np.log(c) - logz, 0.0)
+    var = np.sum(np.diff(h, prepend=0.0) / np.asarray(nlive_i, dtype=np.float64))
+    return logwt, logz, math.sqrt(max(float(var), 0.0))
 
 
 @dataclass(kw_only=True)
@@ -200,7 +202,10 @@ class NestedSamplingResult:
     """Container for completed nested-sampling outputs.
 
     The samples are the ``niter`` dead points in the order they died, then
-    the final live points.
+    the final live points by increasing likelihood. ``num_delete`` points die
+    per step, so the live counts at the deaths (``nlive_i``) cycle through
+    ``nlive, nlive - 1, ..., nlive - num_delete + 1`` and end with
+    ``nlive, ..., 1`` over the final live points.
     """
 
     samples_u: ArrayLike
@@ -219,6 +224,9 @@ class NestedSamplingResult:
     """Likelihood contour each sample was born above (``-inf`` for the initial
     live points), aligned with ``logl``."""
 
+    nlive_i: ArrayLike
+    """Number of live points when each sample died (dynesty's ``samples_n``)."""
+
     logz: float
     """Estimated log evidence."""
 
@@ -233,6 +241,9 @@ class NestedSamplingResult:
 
     nlive: int
     """Number of live points used by the sampler."""
+
+    num_delete: int
+    """Live points deleted and replaced per step."""
 
     ndim: int
     """Number of sampled dimensions."""
@@ -300,33 +311,42 @@ class NestedSamplingResult:
     @cached_property
     def _births(self) -> tuple[np.ndarray, np.ndarray]:
         """Birth iteration of every sample (-1: initial live point), and the
-        insertion index of the point born at each iteration.
+        insertion index of every point born during the run.
 
-        Rebuilt from ``logl_birth``: the point born at iteration ``i`` has
-        the contour ``logl[i]`` of the point that died there, so sorting the
-        births orders them by iteration, and replaying the deaths and births
-        on a sorted list of the live likelihoods gives each insertion rank.
+        Rebuilt from ``logl_birth``: the ``num_delete`` points born at a step
+        share its contour, the likelihood of the last point that died there,
+        so sorting the births orders them by step. A point born at the step
+        whose deaths are ``i - num_delete + 1 .. i`` has birth iteration
+        ``i``. Replaying the deaths and births on a sorted list of the live
+        likelihoods gives each new point's rank among the survivors.
         """
         logl = np.asarray(self.logl, dtype=float)
         order = np.argsort(np.asarray(self.logl_birth, dtype=float), kind="stable")
-        n0 = len(logl) - int(self.niter)  # never born during the run
+        k, niter = int(self.num_delete), int(self.niter)
+        n0 = len(logl) - niter  # never born during the run
         born = np.full(len(logl), -1)
-        insertion = np.zeros(len(logl) - n0, dtype=int)
+        insertion = np.zeros(niter, dtype=int)
         values = logl.tolist()
-        live = sorted(values[k] for k in order[:n0])
-        for i, k in enumerate(order[n0:].tolist()):
-            del live[0]  # the point that died at iteration i
-            born[k] = i
-            insertion[i] = bisect.bisect_right(live, values[k])
-            bisect.insort(live, values[k])
+        live = sorted(values[i] for i in order[:n0])
+        births = order[n0:].tolist()
+        for step in range(niter // k):
+            del live[:k]  # the step's deaths
+            group = births[step * k : (step + 1) * k]
+            for j, i in enumerate(group):
+                born[i] = (step + 1) * k - 1
+                insertion[step * k + j] = bisect.bisect_right(live, values[i])
+            for i in group:
+                bisect.insort(live, values[i])
         return born, insertion
 
     def insertion_indices(self) -> np.ndarray:
-        """Return the insertion index of the point born at each iteration.
+        """Return the insertion index of every point born during the run.
 
-        The index is the number of the other ``nlive - 1`` live points with a
-        likelihood at or below the new point's, so it is uniform on
-        ``0..nlive-1`` for a correct constrained sampler.
+        The index is the number of the ``nlive - num_delete`` surviving live
+        points of its step with a likelihood at or below the new point's, so
+        it is uniform on ``0..nlive-num_delete`` for a correct constrained
+        sampler (the new points of one step are ranked against the survivors
+        only, not against each other).
         """
 
         return self._births[1]
@@ -335,7 +355,7 @@ class NestedSamplingResult:
         """Return a Kolmogorov-Smirnov test of the insertion indices.
 
         The indices (:meth:`insertion_indices`) are tested against the uniform
-        law on ``0..nlive-1`` over the whole run and in ``windows`` equal
+        law on ``0..nlive-num_delete`` over the whole run and in ``windows`` equal
         stretches of it, so that a bias confined to part of the run (the
         narrow posterior bulk, say) is not diluted by the rest. Returns the
         pooled ``n``, ``ks`` distance and ``pvalue``, and the same per
@@ -350,7 +370,8 @@ class NestedSamplingResult:
         def test(start, stop):
             ks, pvalue = math.nan, math.nan
             if stop > start:
-                ks, pvalue = _ks_uniform(ranks[start:stop], int(self.nlive))
+                nslots = int(self.nlive) - int(self.num_delete) + 1
+                ks, pvalue = _ks_uniform(ranks[start:stop], nslots)
             return {"start": start, "stop": stop, "n": stop - start, "ks": ks,
                     "pvalue": pvalue}
 
@@ -477,45 +498,33 @@ class NestedSamplingResult:
     ) -> LogZBootstrap:
         """Return simulated-weights (jittered) log-evidence realizations.
 
-        The analytic ``logzerr = sqrt(H / nlive)`` is a Gaussian approximation
-        of the prior-volume path uncertainty. This estimator instead draws the
-        per-step shrinkage ``t_i`` directly from its ``Beta(nlive, 1)`` law
-        (``log t_i = log(U_i) / nlive`` with ``U_i`` uniform), rebuilds the
-        weights over the stored dead-point likelihood sequence, and recomputes
-        ``logz`` for ``n_realizations`` independent volume paths. It is pure
-        post-processing -- no resampling of the likelihood is performed.
+        The analytic ``logzerr`` is a Gaussian approximation of the
+        prior-volume path uncertainty. This estimator instead draws every
+        shrinkage ``t_i`` from its ``Beta(n_i, 1)`` law (``log t_i = log(U_i) /
+        n_i`` with ``U_i`` uniform and ``n_i = nlive_i[i]``, final live points
+        included), rebuilds the weights over the stored likelihoods with the
+        sampler's convention (:func:`_log_weights`) and recomputes ``logz`` for
+        ``n_realizations`` independent volume paths. It is pure
+        post-processing: no likelihood is evaluated.
 
         The returned ``logzerr`` (the realization standard deviation) captures
-        the skewed path uncertainty that ``sqrt(H / nlive)`` structurally
-        cannot. It does not capture sampling bias (e.g. under-decorrelated
-        walks), so it is a lower bound on the true single-run uncertainty; a
-        biased ``insertion_rank`` distribution can still inflate seed-to-seed
-        scatter beyond this estimate.
-
-        The final live points reuse the sampler's equal ``X_final / nlive``
-        split with the jittered ``X_final``; their volume subdivision is not
-        additionally jittered, so results are least conservative when the final
-        live set carries a large posterior weight fraction.
+        the skewed path uncertainty. It does not capture sampling bias (e.g.
+        under-decorrelated walks), so it is a lower bound on the true
+        single-run uncertainty; a biased insertion-rank distribution can still
+        inflate seed-to-seed scatter beyond this estimate.
         """
 
         if int(n_realizations) < 1:
             raise ValueError("n_realizations must be at least 1")
-        nlive = int(self.nlive)
-        if nlive <= 0:
-            raise ValueError("nlive must be a positive integer")
-
-        logl = np.asarray(self.logl, dtype=float)
-        ndead = int(self.niter)
-        dead_logl = logl[:ndead]
-        live_logl = logl[ndead:]
+        nlive_i = np.asarray(self.nlive_i, dtype=float)
+        if nlive_i.size == 0 or np.any(nlive_i <= 0):
+            raise ValueError("nlive_i must hold positive live counts")
 
         rng = np.random.default_rng(seed)
-        uniforms = rng.random((int(n_realizations), ndead))
+        uniforms = rng.random((int(n_realizations), nlive_i.size))
         with np.errstate(divide="ignore"):
-            log_shrinkage = np.log(uniforms) / nlive
-        samples = _simulate_logz_realizations(
-            dead_logl, live_logl, nlive, log_shrinkage
-        )
+            log_t = np.log(uniforms) / nlive_i
+        samples = _np_logsumexp(_log_weights(self.logl, nlive_i, log_t), axis=1)
 
         finite = samples[np.isfinite(samples)]
         if finite.size == 0:
@@ -605,6 +614,7 @@ class NestedSamplingResult:
             "niter": int(self.niter),
             "ncall": int(self.ncall),
             "nlive": int(self.nlive),
+            "num_delete": int(self.num_delete),
             "ndim": int(self.ndim),
             "nposterior": nposterior,
             "posterior_ess": posterior_ess,
@@ -641,7 +651,7 @@ class NestedSamplingResult:
         lines = [
             f"logz: {self.logz} +/- {self.logzerr}",
             f"niter: {self.niter}  ncall: {self.ncall}  nlive: {self.nlive}  "
-            f"ndim: {self.ndim}",
+            f"num_delete: {self.num_delete}  ndim: {self.ndim}",
             f"posterior ESS: {self.posterior_ess():.1f}",
             f"insertion KS p-value: {insertion['pvalue']:.3g} (windows: "
             + ", ".join(f"{w['pvalue']:.3g}" for w in insertion["windows"])
@@ -743,5 +753,6 @@ class NestedSamplingResult:
             "ncall": int(self.ncall),
             "niter": int(self.niter),
             "nlive": int(self.nlive),
+            "samples_n": np.asarray(self.nlive_i),
             "eff": 100.0 * int(self.niter) / max(int(self.ncall), 1),
         }

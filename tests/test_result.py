@@ -19,11 +19,13 @@ def make_result() -> NestedSamplingResult:
         logl=jnp.array([-3.0, -2.0, -1.0, -0.5]),
         logwt=jnp.array([-4.0, -2.0, -1.0, -0.25]),
         logl_birth=jnp.array([-jnp.inf, -jnp.inf, -3.0, -2.0]),
+        nlive_i=np.array([2, 2, 2, 1]),
         logz=-0.1,
         logzerr=0.01,
         ncall=10,
         niter=2,
         nlive=2,
+        num_delete=1,
         ndim=2,
         message="ok",
         metadata={"status": "complete"},
@@ -70,11 +72,13 @@ def test_to_dict_contains_expected_keys() -> None:
         "logl",
         "logwt",
         "logl_birth",
+        "nlive_i",
         "logz",
         "logzerr",
         "ncall",
         "niter",
         "nlive",
+        "num_delete",
         "ndim",
         "success",
         "message",
@@ -144,39 +148,28 @@ def test_information_ignores_zero_weight_nonfinite_likelihood() -> None:
     assert result.information() == 0.0
 
 
-def _small_gaussian_run():
-    from tests.helpers import run_ns
+def _small_gaussian_run(num_delete=None):
+    from tinyns import NestedSampler
 
     def loglike(theta):
         return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
 
-    return run_ns(
-        random.PRNGKey(0),
-        loglike,
-        lambda u: 4.0 * u - 2.0,
-        ndim=2,
-        nlive=50,
-        dlogz=0.3,
-        maxiter=200000,
+    sampler = NestedSampler(
+        loglike, lambda u: 4.0 * u - 2.0, 2, 50, num_delete=num_delete
     )
+    return sampler.run(random.PRNGKey(0), dlogz=0.3)
 
 
 def test_logz_bootstrap_reconstruction_matches_sampler() -> None:
-    from tinyns.result import _simulate_logz_realizations
+    from tinyns.result import _log_weights, _np_logsumexp
 
-    result = _small_gaussian_run()
-    ndead = result.niter
-    logl = np.asarray(result.logl, dtype=float)
-    nlive = int(result.nlive)
-
-    # Feeding the deterministic shrinkage log t_i = -1 / nlive must reproduce
-    # the sampler's own logz, confirming the weight convention matches.
-    log_shrinkage = np.full((1, ndead), -1.0 / nlive)
-    reconstructed = _simulate_logz_realizations(
-        logl[:ndead], logl[ndead:], nlive, log_shrinkage
-    )[0]
-
-    assert abs(float(reconstructed) - float(result.logz)) < 1e-5
+    for k in (1, 5):
+        result = _small_gaussian_run(k)
+        # Feeding the expected shrinkage log t_i = -1 / n_i must reproduce the
+        # sampler's own logz, confirming the weight convention matches.
+        log_t = -1.0 / np.asarray(result.nlive_i, dtype=float)[None, :]
+        logwt = _log_weights(result.logl, result.nlive_i, log_t)
+        assert abs(float(_np_logsumexp(logwt, axis=1)[0]) - result.logz) < 1e-12
 
 
 def test_logz_bootstrap_is_deterministic_and_sane() -> None:
@@ -205,7 +198,7 @@ def test_logz_bootstrap_input_validation() -> None:
     with np.testing.assert_raises(ValueError):
         result.logz_bootstrap(n_realizations=0)
 
-    result.nlive = 0
+    result.nlive_i = np.array([2, 2, 0, 1])
     with np.testing.assert_raises(ValueError):
         result.logz_bootstrap(n_realizations=8)
 
@@ -350,11 +343,13 @@ def test_diagnostics_low_ess_triggers_warning() -> None:
         logl=jnp.zeros(101),
         logwt=jnp.concatenate([jnp.array([0.0]), jnp.full(100, -1000.0)]),
         logl_birth=jnp.full(101, -jnp.inf),
+        nlive_i=101 - np.arange(101),
         logz=0.0,
         logzerr=0.1,
         ncall=101,
         niter=0,
         nlive=101,
+        num_delete=1,
         ndim=1,
     )
 
@@ -369,38 +364,62 @@ def test_insertion_indices_are_rebuilt_from_the_birth_contours() -> None:
     assert result.insertion_indices().tolist() == [1, 1]
 
 
-def _replayed_result(ranks, nlive):
-    """A result whose births insert each new point at the given ranks."""
+def _replayed_result(ranks, nlive, k=1):
+    """A result whose births insert each new point at the given ranks among
+    the survivors of its step (``k`` deaths and births per step)."""
     rng = np.random.default_rng(0)
     live = sorted(rng.uniform(0.0, 1.0, nlive).tolist())
-    logl, birth = [], []
+    logl, births = [], {}
     initial = list(live)
-    births = {}
-    for rank in ranks:
-        dead = live.pop(0)
-        logl.append(dead)
-        others = live
-        lo = dead if rank == 0 else others[rank - 1]
-        hi = others[rank] if rank < len(others) else lo + 1.0
-        new = 0.5 * (lo + hi)
-        births[new] = dead
-        live.insert(rank, new)
+    for step in range(len(ranks) // k):
+        dead = live[:k]
+        del live[:k]
+        logl += dead
+        survivors = list(live)
+        for rank in ranks[step * k : (step + 1) * k]:
+            lo = dead[-1] if rank == 0 else survivors[rank - 1]
+            hi = survivors[rank] if rank < len(survivors) else lo + 1.0
+            new = lo + (hi - lo) * rng.uniform(0.01, 0.99)
+            births[new] = dead[-1]
+            live.append(new)
+        live.sort()
     birth = [births.get(x, -np.inf) for x in logl + live]
     assert sum(b == -np.inf for b in birth) == len(initial)
     n = len(logl) + nlive
+    nlive_i = np.concatenate(
+        [np.tile(nlive - np.arange(k), len(logl) // k), nlive - np.arange(nlive)]
+    )
     return NestedSamplingResult(
         samples_u=jnp.asarray(rng.uniform(size=(n, 1))),
         samples=jnp.zeros((n, 1)),
-        logl=jnp.asarray(logl + live),
+        logl=np.asarray(logl + live),  # float64: no ties after many births
         logwt=jnp.zeros(n),
-        logl_birth=jnp.asarray(birth),
+        logl_birth=np.asarray(birth),
+        nlive_i=nlive_i,
         logz=0.0,
         logzerr=0.1,
         ncall=n,
-        niter=len(ranks),
+        niter=len(logl),
         nlive=nlive,
+        num_delete=k,
         ndim=1,
     )
+
+
+def test_insertion_replay_with_several_deaths_per_step() -> None:
+    nlive, k = 12, 4
+    rng = np.random.default_rng(3)
+    ranks = rng.integers(0, nlive - k + 1, 400)
+    result = _replayed_result(ranks, nlive, k)
+    rebuilt = result.insertion_indices().reshape(-1, k)
+    np.testing.assert_array_equal(
+        np.sort(rebuilt, axis=1), np.sort(ranks.reshape(-1, k), axis=1)
+    )
+    born = result._births[0]
+    assert set(born[born >= 0].tolist()) == set(range(k - 1, 400, k))
+    assert result.insertion_test()["pvalue"] > 0.01
+    top = np.full_like(ranks, nlive - k)  # always above every survivor
+    assert _replayed_result(top, nlive, k).insertion_test()["pvalue"] < 1e-6
 
 
 def test_insertion_test_passes_uniform_ranks_and_flags_biased_ones() -> None:
@@ -467,7 +486,9 @@ def test_result_npz_round_trip(tmp_path) -> None:
     assert loaded.ncall == result.ncall
     assert loaded.niter == result.niter
     np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
+    np.testing.assert_array_equal(loaded.nlive_i, result.nlive_i)
     assert loaded.nlive == result.nlive
+    assert loaded.num_delete == result.num_delete
     assert loaded.ndim == result.ndim
     assert loaded.success == result.success
     assert loaded.message == result.message
@@ -537,6 +558,8 @@ def test_result_npz_bad_format_version_raises(tmp_path) -> None:
         logl=np.zeros(1),
         logwt=np.zeros(1),
         logl_birth=np.zeros(1),
+        nlive_i=np.ones(1),
+        num_delete=1,
         logz=0.0,
         niter=0,
         logzerr=0.0,
@@ -555,7 +578,7 @@ def test_result_npz_bad_format_version_raises(tmp_path) -> None:
 
 def test_result_npz_missing_required_key_raises(tmp_path) -> None:
     path = tmp_path / "missing.npz"
-    np.savez_compressed(path, format_version="tinyns-result-npz-v2")
+    np.savez_compressed(path, format_version="tinyns-result-npz-v3")
 
     with np.testing.assert_raises(ValueError):
         NestedSamplingResult.load_npz(path)
