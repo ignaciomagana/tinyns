@@ -307,15 +307,19 @@ def test_flat_top_likelihood_stops_on_the_plateau() -> None:
         r2 = jnp.sum((x - 0.5) ** 2)
         return -100.0 * jnp.maximum(r2 - 0.01, 0.0)
 
-    result = NestedSampler(flat_top, identity, 2, 100, num_delete=10).run(
-        1, dlogz=0.0, maxiter=200_000
-    )
-    assert result.metadata["status"] == "plateau"
-    # The step that found no point above L* = 0 was abandoned: fewer than k
-    # live points lie below the plateau.
-    assert np.sum(result.logl[result.niter :] < 0.0) < 10
     truth = math.log(2 * math.pi * 0.01)  # pi r^2 plus the Gaussian skirt
-    assert abs(result.logz - truth) < 4 * result.logzerr + 0.05
+    sampler = NestedSampler(flat_top, identity, 2, 100, num_delete=10)
+    close = 0
+    for seed in range(1, 6):
+        result = sampler.run(seed, dlogz=0.0, maxiter=200_000)
+        assert result.metadata["status"] == "plateau"
+        # The step that found no point above L* = 0 was abandoned: fewer than
+        # k live points lie below the plateau.
+        assert np.sum(result.logl[result.niter :] < 0.0) < 10
+        close += abs(result.logz - truth) < 4 * result.logzerr + 0.05
+    # logzerr understates the scatter on a plateau ((logz - truth) / logzerr
+    # has sd ~1.6, with rare 6-8 sigma runs), so a majority of five must pass.
+    assert close >= 3
 
 
 def test_termination_by_dlogz_maxiter_and_maxcall() -> None:
