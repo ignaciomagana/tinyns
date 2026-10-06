@@ -147,7 +147,7 @@ smoke() {
 }
 
 gpu_line() {  # sampler target seeds
-  echo "flock gpu.lock $(runner $1) --sampler $1 --target $2 --seeds $3 --nlive $NLIVE" \
+  echo "flock gpu.lock env XLA_PYTHON_CLIENT_PREALLOCATE=false $(runner $1) --sampler $1 --target $2 --seeds $3 --nlive $NLIVE" \
        "--out $OUT/results_gpu.jsonl --timeout 3600 --exclusive --jax-cache cache/jax_bench" \
        "--tag $TAG-h100"
 }
