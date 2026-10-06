@@ -20,6 +20,7 @@ from tinyns.clusters import (
     _assign,
     _fisher,
     _fit,
+    _ridge,
 )
 from tinyns.math import (
     effective_sample_size_from_log_weights,
@@ -45,6 +46,12 @@ _RESULT_NPZ_SCALARS = {
 # is the population-conditional gate of the cluster swap: modes above it are
 # weighed reliably, modes below it are not.
 UNRESOLVED_PER_DIM = 3.0
+# Two clusters are one mode unless, at the earlier of their posterior medians,
+# their live points leave a gap of this many within-cluster standard deviations
+# along the discriminant direction. The split test also cuts one curved mode
+# (a banana) into linear pieces, which touch: gaps of -0.5 to 1.1 there,
+# against 22 to 32 between the separated modes of the validation targets.
+SEPARATION_SIGMA = 3.0
 # The modes are clustered from up to this many equal-weight posterior points
 # (and no more than the posterior ESS, so few distinct points do not split).
 _MODE_DRAWS = 2000
@@ -82,6 +89,19 @@ def _information(logwt, logl, logz: float):
     contributing = (weights > 0.0) & finite
     information = jnp.sum(jnp.where(contributing, weights * (logl - logz), 0.0))
     return jnp.maximum(information, 0.0)
+
+
+def _gap(x, side) -> float:
+    """Empty stretch between ``x[~side]`` and ``x[side]`` along the Fisher
+    discriminant, in within-set standard deviations (negative if they overlap)."""
+    a, b = x[~side], x[side]
+    if not len(a) or not len(b):
+        return math.inf
+    dev = np.concatenate([a - a.mean(0), b - b.mean(0)])
+    within = _ridge(dev.T @ dev / max(len(x) - 2, 1))
+    w = np.linalg.solve(within, b.mean(0) - a.mean(0))
+    p = x @ w / math.sqrt(max(w @ within @ w, 1e-300))
+    return float(p[side].min() - p[~side].max())
 
 
 def _ks_uniform(ranks, nslots: int) -> tuple[float, float]:
@@ -344,10 +364,15 @@ class NestedSamplingResult:
 
         Pure post-processing (section 7 of the multimodal study). An
         equal-weight draw of the posterior is clustered with the cluster
-        swap's split test; every sample is labelled by its nearest cluster,
-        and each mode's live count ``n(t)`` is rebuilt from the birth and
-        death iterations. The mode is isolated from the first iteration at
-        which its live points and the others pass the same split test (if they
+        swap's split test; every sample is labelled by its nearest cluster.
+        That test also cuts a curved mode into touching pieces, so two
+        clusters count as separate modes only if their live points, at the
+        earlier of their posterior medians, leave a gap of
+        ``SEPARATION_SIGMA`` within-cluster standard deviations along the
+        discriminant direction; touching clusters are merged. Each mode's
+        live count ``n(t)`` is rebuilt from the birth and death iterations.
+        The mode is isolated from the first iteration at which its live
+        points and the others pass the same split test (if they
         never do before the earlier of the two posterior medians, there is no
         drift term and ``isolation_iteration`` is that median). From
         then on chains cannot leave it, so ``n`` does a random walk (the urn)
@@ -384,21 +409,37 @@ class NestedSamplingResult:
             return one
         label = _assign(_fit(draw, labels, k), u)
         born, index = self._births[0], np.arange(len(u))
+
+        def median(mask):
+            cw = np.cumsum(weights * mask)
+            return min(int(np.searchsorted(cw, 0.5 * cw[-1])), niter - 1)
+
+        def alive(t):
+            return (born < t) & (index >= t)
+
+        # Merge clusters that touch (pieces of one mode): union by root.
+        root = list(range(k))
+        for a, b in itertools.combinations(range(k), 2):
+            pair = alive(min(median(label == a), median(label == b)))
+            pair &= (label == a) | (label == b)
+            if not _gap(u[pair], label[pair] == b) > SEPARATION_SIGMA:
+                old, new = root[b], root[a]
+                root = [new if r == old else r for r in root]
+        label = np.unique(np.asarray(root), return_inverse=True)[1][label]
+        k = int(label.max()) + 1
+        if k < 2:
+            return one
         threshold = max(SPLIT_J_PER_DIM * (ndim + 2), SPLIT_J_ABS)
         out = []
         for mine in (label == c for c in range(k)):
             net = np.bincount(born[mine & (born >= 0)], minlength=niter) - mine[:niter]
             n = np.sum(mine & (born < 0)) + np.concatenate([[0], np.cumsum(net)[:-1]])
 
-            def median(mask):
-                cw = np.cumsum(weights * mask)
-                return min(int(np.searchsorted(cw, 0.5 * cw[-1])), niter - 1)
-
             def isolated(t, mine=mine):
-                alive = (born < t) & (index >= t)
-                side = mine[alive]
-                return 0 < side.sum() < alive.sum() and (
-                    _fisher(u[alive], side) >= threshold
+                live = alive(t)
+                side = mine[live]
+                return 0 < side.sum() < side.size and (
+                    _fisher(u[live], side) >= threshold
                 )
 
             stop, stop_rest = median(mine), median(~mine)

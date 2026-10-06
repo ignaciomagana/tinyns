@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 
 import jax.numpy as jnp
@@ -558,3 +559,32 @@ def test_result_npz_missing_required_key_raises(tmp_path) -> None:
 
     with np.testing.assert_raises(ValueError):
         NestedSamplingResult.load_npz(path)
+
+
+def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> None:
+    """The split test cuts one curved mode into pieces; modes() merges them
+    because neighbouring pieces leave no gap along their discriminant."""
+    from tinyns.clusters import ClusterTracker
+    from tinyns.result import SEPARATION_SIGMA, _gap
+
+    rng = np.random.default_rng(2)
+    ridge = [rng.normal(0.0, 2.0, 500)]
+    for _ in range(4):  # a 5-D Rosenbrock ridge
+        ridge.append(0.5 * ridge[-1] ** 2 - 1.0 + 0.5 * rng.normal(size=500))
+    x = np.stack(ridge, axis=1)
+    labels = ClusterTracker(500)._track(x)
+    k = int(labels.max()) + 1
+    assert k >= 2  # the split test does cut the ridge
+    touching = []
+    for a, b in itertools.combinations(range(k), 2):
+        pair = (labels == a) | (labels == b)
+        if _gap(x[pair], labels[pair] == b) <= SEPARATION_SIGMA:
+            touching.append((a, b))
+    assert len(touching) >= k - 1
+    assert {c for edge in touching for c in edge} == set(range(k))
+
+    blobs = np.concatenate(
+        [rng.normal(size=(400, 5)), rng.normal(size=(30, 5)) + [12, 0, 0, 0, 0]]
+    )
+    assert _gap(blobs, np.arange(430) >= 400) > 2 * SEPARATION_SIGMA
+

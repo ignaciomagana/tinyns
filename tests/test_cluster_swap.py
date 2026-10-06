@@ -348,6 +348,21 @@ def test_modes_flag_an_under_populated_mode() -> None:
     assert flagged >= 1
 
 
+def banana5(theta):
+    y = (theta - 0.5) * 10.0
+    ridge = (y[1:] - 0.5 * y[:-1] ** 2 + 1.0) ** 2
+    return -0.5 * (y[0] ** 2 / 4.0 + jnp.sum(ridge) / 0.25)
+
+
+def test_curved_unimodal_run_reports_one_mode() -> None:
+    """The split test cuts a 5-D banana into pieces (2 of these seeds on the
+    dev machine); they touch, so modes() reports one mode and no warning."""
+    for seed in range(2):
+        result = NestedSampler(banana5, lambda u: u, 5, nlive=250).run(seed)
+        assert len(result.modes()) == 1
+        assert not any("mode" in w for w in result.diagnostics()["warnings"])
+
+
 def test_unimodal_run_reports_one_mode() -> None:
     result = run_ns(3, gauss4, lambda u: u, 4, 100)
     assert result.modes() == [
