@@ -53,13 +53,15 @@ def banana5(theta):
 
 
 def test_curved_unimodal_runs_report_one_mode() -> None:
-    """The split test can cut a 5-D banana into pieces that modes() fails to
-    merge in about one run in six; a majority of five must report one mode."""
-    ones = sum(
-        len(NestedSampler(banana5, lambda u: u, 5, nlive=250).run(seed).modes()) == 1
-        for seed in range(5)
-    )
-    assert ones >= 3
+    """The split test cuts a 5-D banana into pieces, and stuck chains leave
+    clumps of near-copies in its tips; modes() must merge or drop them all.
+    No run in 96 (x64 off and on) reported a second mode at nlive 500."""
+    ones = 0
+    for seed in range(5):
+        result = NestedSampler(banana5, lambda u: u, 5, nlive=500).run(seed)
+        warnings = result.diagnostics()["warnings"]
+        ones += len(result.modes()) == 1 and not any("mode" in w for w in warnings)
+    assert ones >= 4
 
 
 def test_unimodal_run_reports_one_mode() -> None:

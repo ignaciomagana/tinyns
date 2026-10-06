@@ -53,10 +53,14 @@ UNRESOLVED_PER_DIM = 3.0
 # along the discriminant direction. The split test also cuts one curved mode
 # (a banana) into linear pieces, which touch: gaps of -0.5 to 1.1 there,
 # against 22 to 32 between the separated modes of the validation targets.
+# Before that, a cluster with at most ndim distinct live points at its own
+# posterior median is dropped: it spans no volume, and the stuck chains of a
+# banana's tip leave such clumps of near-copies 7 to 50 deviations out.
 SEPARATION_SIGMA = 3.0
 # The modes are clustered from up to this many equal-weight posterior points
 # (and no more than the posterior ESS, so few distinct points do not split).
 _MODE_DRAWS = 2000
+_FRAME = ("mu", "chol", "logdet", "count")  # the cluster fit that _assign reads
 
 
 def _jsonable(value):
@@ -95,7 +99,12 @@ def _information(logwt, logl, logz: float):
 
 def _gap(x, side) -> float:
     """Empty stretch between ``x[~side]`` and ``x[side]`` along the Fisher
-    discriminant, in within-set standard deviations (negative if they overlap)."""
+    discriminant, in within-set standard deviations (negative if they overlap).
+
+    Repeated rows count once: an unmoved chain returns a copy of its seed, and
+    copies would shrink the within-set scatter without adding information."""
+    x, first = np.unique(x, axis=0, return_index=True)  # copies of a seed: once
+    side = np.asarray(side)[first]
     a, b = x[~side], x[side]
     if not len(a) or not len(b):
         return math.inf
@@ -395,8 +404,15 @@ class NestedSamplingResult:
         clusters count as separate modes only if their live points, at the
         earlier of their posterior medians, leave a gap of
         ``SEPARATION_SIGMA`` within-cluster standard deviations along the
-        discriminant direction; touching clusters are merged. Each mode's
-        live count ``n(t)`` is rebuilt from the birth and death iterations.
+        discriminant direction; touching clusters are merged. Before that,
+        a cluster with at most ``ndim`` distinct live points at its own
+        posterior median is dropped and its samples go to the nearest
+        remaining cluster: so few points span no volume, and the gap next to
+        them cannot tell a separate mode from a thinly sampled tail, such as
+        the clump of near-copies that stuck chains leave in the tip of a
+        banana. A real mode that small would be ``unresolved`` anyway. Each
+        mode's live count ``n(t)`` is rebuilt from the birth and death
+        iterations.
         The mode is isolated from the first iteration at which its live
         points and the others pass the same split test (if they
         never do before the earlier of the two posterior medians, there is no
@@ -433,7 +449,8 @@ class NestedSamplingResult:
         k = len(tracker.log["ids"])
         if k < 2:
             return one
-        label = _assign(_fit(draw, labels, k), u)
+        fit = _fit(draw, labels, k)
+        label = _assign(fit, u)
         born, index = self._births[0], np.arange(len(u))
 
         def median(mask):
@@ -443,6 +460,17 @@ class NestedSamplingResult:
         def alive(t):
             return (born < t) & (index >= t)
 
+        # Drop clusters with at most ndim distinct live points at their
+        # posterior median; their samples go to the nearest remaining cluster.
+        keep = np.array([
+            len(np.unique(u[alive(median(label == c)) & (label == c)], axis=0)) > ndim
+            for c in range(k)
+        ])
+        if keep.sum() < 2:
+            return one
+        if not keep.all():
+            label = _assign({name: fit[name][keep] for name in _FRAME}, u)
+            k = int(keep.sum())
         # Merge clusters that touch (pieces of one mode): union by root.
         root = list(range(k))
         for a, b in itertools.combinations(range(k), 2):
