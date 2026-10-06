@@ -5,6 +5,7 @@ import math
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax import random
 
 from tinyns.result import NestedSamplingResult
@@ -609,5 +610,10 @@ def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> Non
     blobs = np.concatenate(
         [rng.normal(size=(400, 5)), rng.normal(size=(30, 5)) + [12, 0, 0, 0, 0]]
     )
-    assert _gap(blobs, np.arange(430) >= 400) > 2 * SEPARATION_SIGMA
+    side = np.arange(430) >= 400
+    assert _gap(blobs, side) > 2 * SEPARATION_SIGMA
+    # Copies of one point (an unmoved chain returns its seed) count once.
+    copies = np.concatenate([blobs, np.repeat(blobs[400:401], 25, axis=0)])
+    with_copies = _gap(copies, np.concatenate([side, np.ones(25, bool)]))
+    assert with_copies == pytest.approx(_gap(blobs, side))
 
