@@ -12,7 +12,9 @@ host in float64.
 
 :func:`run` is the driver: a jitted ``lax.while_loop`` runs up to ``n_steps``
 steps into a preallocated buffer of dead rows, and the host syncs once per
-chunk. ``loglike`` and ``prior_transform`` may be pytree callables
+chunk, prints progress and writes checkpoints (:mod:`tinyns.checkpoint`). A
+batch of keys runs as one program that vmaps :func:`step` inside the loop.
+``loglike`` and ``prior_transform`` may be pytree callables
 (``jax.tree_util.Partial(fn, data)``): their array leaves are jit arguments
 and the compiled kernels are cached on their structure
 (:mod:`tinyns.callables`), so datasets of one shape share one compile.
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import time
 from typing import Any, NamedTuple
 
@@ -31,7 +34,13 @@ import numpy as np
 from jax import lax, random
 from jax.scipy.special import logsumexp
 
-from tinyns.callables import _device_leaves, _kernel_cache, _split_callables
+from tinyns import checkpoint as _checkpoint
+from tinyns.callables import (
+    _device_leaves,
+    _kernel_cache,
+    _partition_callable,
+    _split_callables,
+)
 from tinyns.result import NestedSamplingResult, _evidence
 
 # Run status codes (State.status).
@@ -57,9 +66,12 @@ _MAX_SCALE = 10.0
 
 # Driver: a chunk holds at most this many e-folds of prior volume (its dead
 # buffer is preallocated at that size) and the host aims for chunks of about
-# this many seconds, growing them at most 4x per chunk from one step.
+# this many seconds, growing them at most 4x per chunk from one step. Chunk
+# lengths may follow the wall clock: the random stream depends on the step
+# count only. A checkpoint is written at a chunk boundary at most this often.
 _CHUNK_EFOLDS = 4.0
 _CHUNK_SECONDS = 45.0
+_CHECKPOINT_SECONDS = 600.0
 _INT32_MAX = 2**31 - 1
 
 
@@ -360,10 +372,34 @@ def _rebuild(loglike_spec, prior_spec, leaves):
     return loglike_spec.rebuild(leaves[:n]), prior_spec.rebuild(leaves[n:])
 
 
+def _select(mask, new, old):
+    """Per lane, ``new`` where ``mask`` else ``old`` (``mask`` has shape ``(B,)``).
+
+    Typed PRNG keys are selected through their key data.
+    """
+
+    def pick(a, b):
+        if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
+            impl = random.key_impl(a)
+            data = pick(random.key_data(a), random.key_data(b))
+            return random.wrap_key_data(data, impl=impl)
+        return jnp.where(mask.reshape(mask.shape + (1,) * (a.ndim - 1)), a, b)
+
+    return jax.tree_util.tree_map(pick, new, old)
+
+
 @_kernel_cache
-def _init_kernel(loglike_spec, prior_spec, cfg: Config):
-    def kernel(key, *leaves):
+def _init_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
+    """Jitted :func:`_init`; ``axes`` (a batched run) vmaps it over the keys,
+    with ``axes[i]`` the batch axis (``0`` or ``None``) of callable leaf ``i``."""
+
+    def lane(key, leaves):
         return _init(key, *_rebuild(loglike_spec, prior_spec, leaves), cfg)
+
+    def kernel(key, *leaves):
+        if axes is None:
+            return lane(key, leaves)
+        return jax.vmap(lane, in_axes=(0, axes))(key, leaves)
 
     return jax.jit(kernel)
 
@@ -377,44 +413,76 @@ def _step_kernel(loglike_spec, prior_spec, cfg: Config):
 
 
 @_kernel_cache
-def _chunk_kernel(loglike_spec, prior_spec, cfg: Config, capacity: int):
+def _chunk_kernel(loglike_spec, prior_spec, cfg: Config, capacity: int, axes=None):
     """Jitted chunk: up to ``min(n_steps, capacity)`` steps into a dead buffer.
 
     ``n_steps``, ``dlogz``, ``max_steps`` and ``call_budget`` are traced, so
     the driver changes them without recompiling. Returns the state, the
-    buffer of ``capacity`` steps of :class:`Dead` rows, the number of steps
-    filled and the dlogz remainder.
+    buffer of ``capacity`` steps of :class:`Dead` rows, the number of valid
+    rows and the dlogz remainder.
+
+    With ``axes`` (a batched run; see :func:`_init_kernel`) every state leaf
+    and ``call_budget`` carry a leading lane axis. The ``while_loop`` is not
+    vmapped: its body vmaps :func:`_step` over the lanes, so the loop
+    predicate and any future unbatched ``lax.cond`` stay scalar. The loop runs
+    while any lane runs; a lane that has stopped is frozen (``jnp.where``), and
+    the valid rows of each lane are a prefix of the buffer of length
+    ``count[lane]``.
     """
     d, k = cfg.ndim, cfg.num_delete
 
+    def lane_step(state, leaves):
+        return _step(state, *_rebuild(loglike_spec, prior_spec, leaves), cfg)
+
     def kernel(state, n_steps, dlogz, max_steps, call_budget, *leaves):
-        loglike, prior_transform = _rebuild(loglike_spec, prior_spec, leaves)
         dtype, i32 = state.logl.dtype, jnp.int32
+
+        def terminate(state, budget):
+            return _terminate(state, cfg, dlogz, max_steps, budget)
+
+        if axes is None:
+            lanes = ()
+
+            def step_all(state):
+                return lane_step(state, leaves)
+
+        else:
+            lanes = state.it.shape
+            terminate = jax.vmap(terminate)
+
+            def step_all(state):
+                new, dead = jax.vmap(lane_step, in_axes=(0, axes))(state, leaves)
+                return _select(state.status == RUNNING, new, state), dead
+
         rows = Dead(
-            jnp.zeros((capacity, k, d), state.u.dtype),
-            jnp.zeros((capacity, k), dtype),
-            jnp.zeros((capacity, k), dtype),
-            jnp.zeros((capacity, k), i32),
-            jnp.zeros((capacity, k), i32),
+            jnp.zeros((capacity, *lanes, k, d), state.u.dtype),
+            jnp.zeros((capacity, *lanes, k), dtype),
+            jnp.zeros((capacity, *lanes, k), dtype),
+            jnp.zeros((capacity, *lanes, k), i32),
+            jnp.zeros((capacity, *lanes, k), i32),
         )
         limit = jnp.minimum(n_steps, capacity)
 
         def cond(carry):
-            state, _, i = carry
-            return (i < limit) & (state.status == RUNNING)
+            state, _, _, i = carry
+            return (i < limit) & jnp.any(state.status == RUNNING)
 
         def body(carry):
-            state, rows, i = carry
-            state, dead = _step(state, loglike, prior_transform, cfg)
+            state, rows, count, i = carry
+            running = state.status == RUNNING
+            state, dead = step_all(state)
             rows = jax.tree_util.tree_map(
                 lambda r, x: lax.dynamic_update_index_in_dim(r, x, i, 0), rows, dead
             )
-            i = i + (state.status != PLATEAU).astype(i32)
-            return _terminate(state, cfg, dlogz, max_steps, call_budget), rows, i
+            count = count + (running & (state.status != PLATEAU)).astype(i32)
+            return terminate(state, call_budget), rows, count, i + 1
 
-        start = _terminate(state, cfg, dlogz, max_steps, call_budget)
-        state, rows, count = lax.while_loop(cond, body, (start, rows, jnp.int32(0)))
-        return state, rows, count, delta_logz(state, cfg)
+        start = terminate(state, call_budget)
+        carry = (start, rows, jnp.zeros(lanes, i32), jnp.int32(0))
+        state, rows, count, _ = lax.while_loop(cond, body, carry)
+        if axes is None:
+            return state, rows, count, delta_logz(state, cfg)
+        return state, rows, count, jax.vmap(lambda s: delta_logz(s, cfg))(state)
 
     return jax.jit(kernel)
 
@@ -428,7 +496,9 @@ def init(key, loglike, prior_transform, cfg: Config) -> State:
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
     )
-    return _init_kernel(ll_spec, pt_spec, cfg)(_as_key(key), *ll_dyn, *pt_dyn)
+    return _init_kernel(ll_spec, pt_spec, cfg, None)(
+        _as_key(key), *ll_dyn, *pt_dyn
+    )
 
 
 def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, Dead]:
@@ -524,6 +594,63 @@ def finalise(
     )
 
 
+def _key_batch(key):
+    """Return ``(key, batch)``: the key as an array and its lane count.
+
+    ``batch`` is ``None`` for one key (an int seed, a raw ``uint32`` key or a
+    typed key) and ``B`` for a batch of ``B`` keys (a leading axis).
+    """
+    key = _as_key(key)
+    if isinstance(key, np.ndarray):
+        key = jnp.asarray(key)
+    if not isinstance(key, jax.Array):
+        raise TypeError("key must be a PRNG key, a batch of keys or an int seed")
+    typed = jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key)
+    if not typed and key.dtype != jnp.uint32:
+        raise TypeError(
+            f"key must be a PRNG key, a batch of keys or an int seed, got an "
+            f"array of {key.dtype}"
+        )
+    extra = key.ndim - (0 if typed else 1)
+    if extra == 0:
+        return key, None
+    if extra == 1 and key.shape[0] >= 1:
+        return key, int(key.shape[0])
+    raise ValueError(f"key must be one key or a 1-D batch of keys, got {key.shape}")
+
+
+def _lane_axes(fn, nleaves: int, batched_data: bool) -> tuple:
+    """vmap axes of the ``nleaves`` dynamic leaves of ``fn`` in a batched run.
+
+    With ``batched_data`` the array leaves of a pytree callable carry a lane
+    axis; hoisted closure constants never do.
+    """
+    batched = batched_data and bool(_partition_callable(fn)[0])
+    return (0 if batched else None,) * nleaves
+
+
+def _lane_callable(fn, lane: int):
+    """``fn`` with every array leaf replaced by its slice ``lane``."""
+    return jax.tree_util.tree_map(
+        lambda x: x[lane] if isinstance(x, (jax.Array, np.ndarray)) else x, fn
+    )
+
+
+def _empty_dead(cfg: Config, dtype) -> Dead:
+    k, d = cfg.num_delete, cfg.ndim
+    return Dead(
+        np.zeros((0, k, d), dtype),
+        np.zeros((0, k), dtype),
+        np.zeros((0, k), dtype),
+        np.zeros((0, k), np.int32),
+        np.zeros((0, k), np.int32),
+    )
+
+
+def _concat(rows: list) -> Dead:
+    return jax.tree_util.tree_map(lambda *xs: np.concatenate(xs), *rows)
+
+
 def run(
     key,
     loglike,
@@ -534,13 +661,30 @@ def run(
     maxiter: int | None = None,
     maxcall: int | None = None,
     progress: bool = False,
-) -> NestedSamplingResult:
+    checkpoint=None,
+    batched_data: bool = False,
+):
     """Run nested sampling to termination; return the result.
 
     Stops when ``delta_logz < dlogz``, before ``maxiter`` dead points would be
     exceeded, once ``maxcall`` likelihood evaluations are reached (checked
     after each step) or on a plateau. Chunks of steps run on the device; the
-    host syncs once per chunk and sizes the next one to about 45 s.
+    host syncs once per chunk, sizes the next one to about 45 s and, with
+    ``progress``, prints one line per chunk.
+
+    ``checkpoint`` is a path: if the file exists the run resumes from it
+    (refusing a different config, x64 flag, float dtype, key or batch), and
+    the run writes it atomically at a chunk boundary at most every
+    ``_CHECKPOINT_SECONDS`` and at the end. A resumed run is bit-identical to
+    an uninterrupted one: each step splits ``state.key``, so the random stream
+    depends on the step count only, never on where the chunks end. A status of
+    ``converged``, ``maxiter`` or ``maxcall`` in the checkpoint is re-tested
+    against this call's limits, so a run stopped by ``maxiter`` continues.
+
+    A batch of keys (a leading axis of ``B``) runs ``B`` independent runs in
+    one compiled program and returns a list of ``B`` results. With
+    ``batched_data`` the array leaves of the pytree callables carry the same
+    leading lane axis (one dataset per lane).
     """
     dlogz = float(dlogz)
     if not dlogz >= 0.0:
@@ -550,71 +694,201 @@ def run(
     if maxcall is not None:
         maxcall = _check_int("maxcall", maxcall, 0)
     t0 = time.perf_counter()
+    key, batch = _key_batch(key)
+    if batched_data and batch is None:
+        raise ValueError("batched_data=True needs a batch of keys")
     loglike = _device_leaves(loglike)
     prior_transform = _device_leaves(prior_transform)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
     )
     leaves = (*ll_dyn, *pt_dyn)
-    state = _init_kernel(ll_spec, pt_spec, cfg)(_as_key(key), *leaves)
+    axes = None
+    if batch is not None:
+        axes = _lane_axes(loglike, len(ll_dyn), batched_data) + _lane_axes(
+            prior_transform, len(pt_dyn), batched_data
+        )
+        if batched_data and 0 not in axes:
+            raise ValueError(
+                "batched_data=True needs pytree callables with array leaves"
+            )
+        for leaf, axis in zip(leaves, axes, strict=True):
+            if axis == 0 and (leaf.ndim == 0 or leaf.shape[0] != batch):
+                raise ValueError(
+                    f"batched_data: every array leaf needs a leading axis of "
+                    f"{batch} lanes, got shape {leaf.shape}"
+                )
+    lanes = 1 if batch is None else batch
+    dtype = jnp.result_type(float)
+
+    resumed = checkpoint is not None and os.path.exists(checkpoint)
+    if resumed:
+        ckpt = _checkpoint.load(
+            checkpoint,
+            config=dataclasses.asdict(cfg),
+            batch=batch,
+            batched_data=batched_data,
+            key=key,
+        )
+        state = ckpt.state
+        status = np.asarray(state.status)
+        stopped = np.isin(status, (CONVERGED, MAXITER, MAXCALL))  # re-tested
+        status = np.where(stopped, RUNNING, status)
+        state = state._replace(status=jnp.asarray(status, jnp.int32))
+        rows_by_lane = [[dead] for dead in ckpt.dead]
+        ncall, ncall_valid = list(ckpt.ncall), list(ckpt.ncall_valid)
+        wall0, compile_s, nchunks = ckpt.wall_time_s, ckpt.compile_s, ckpt.chunks
+    else:
+        state = _init_kernel(ll_spec, pt_spec, cfg, axes)(key, *leaves)
+        rows_by_lane = [[_empty_dead(cfg, dtype)] for _ in range(lanes)]
+        ncall, ncall_valid = [0] * lanes, [0] * lanes
+        wall0 = compile_s = 0.0
+        nchunks = 0
+
     capacity = max(1, math.ceil(_CHUNK_EFOLDS / cfg.log_shrink))
-    kernel = _chunk_kernel(ll_spec, pt_spec, cfg, capacity)
+    kernel = _chunk_kernel(ll_spec, pt_spec, cfg, capacity, axes)
     k = cfg.num_delete
+    i32 = jnp.int32
     max_steps = _INT32_MAX if maxiter is None else min(maxiter // k, _INT32_MAX)
-    i32, dtype = jnp.int32, state.logl.dtype
-    zero = jnp.zeros((), i32)
-    ncall = ncall_valid = nchunks = 0
-    chunks, n_steps = [], 1
+    limits = (jnp.asarray(dlogz, dtype), jnp.asarray(max_steps, i32))
+
+    def budget():
+        left = [
+            _INT32_MAX if maxcall is None else min(max(maxcall - n, 0), _INT32_MAX)
+            for n in ncall
+        ]
+        return jnp.asarray(left[0] if batch is None else left, i32)
+
+    def save():
+        for rows in rows_by_lane:
+            rows[:] = [_concat(rows)]
+        _checkpoint.save(
+            checkpoint,
+            _checkpoint.Checkpoint(
+                state=state,
+                dead=[rows[0] for rows in rows_by_lane],
+                init_key=key,
+                ncall=ncall,
+                ncall_valid=ncall_valid,
+                wall_time_s=wall0 + time.perf_counter() - t0,
+                compile_s=compile_s,
+                chunks=nchunks,
+                config=dataclasses.asdict(cfg),
+                batch=batch,
+                batched_data=batched_data,
+            ),
+        )
+
+    # A zero-step chunk compiles the kernel, so compile_s is measured apart.
+    tick = time.perf_counter()
+    zero_steps = jnp.asarray(0, i32)
+    jax.block_until_ready(kernel(state, zero_steps, *limits, budget(), *leaves))
+    compile_s += time.perf_counter() - tick
+    last_save = time.perf_counter()
+    n_steps = 1
     while True:
-        budget = _INT32_MAX if maxcall is None else min(maxcall - ncall, _INT32_MAX)
         tick = time.perf_counter()
         state, rows, count, remain = kernel(
-            state,
-            jnp.asarray(n_steps, i32),
-            jnp.asarray(dlogz, dtype),
-            jnp.asarray(max_steps, i32),
-            jnp.asarray(max(budget, 0), i32),
-            *leaves,
+            state, jnp.asarray(n_steps, i32), *limits, budget(), *leaves
         )
-        count, calls, valid, status, remain, logz, rows = jax.device_get(
-            (count, state.ncall, state.ncall_valid, state.status, remain, state.logz,
-             rows)
+        count, calls, valid, status, remain, logz, it, log_scale, rows = (
+            jax.device_get((
+                count, state.ncall, state.ncall_valid, state.status, remain,
+                state.logz, state.it, state.log_scale, rows,
+            ))
         )
         elapsed = time.perf_counter() - tick
         nchunks += 1
-        ncall += int(calls)
-        ncall_valid += int(valid)
-        state = state._replace(ncall=zero, ncall_valid=zero)
-        if status == MAXCALL and (maxcall is None or ncall < maxcall):
-            status = RUNNING  # only the int32 window of the budget was used up
-            state = state._replace(status=jnp.asarray(RUNNING, i32))
-        chunks.append(jax.tree_util.tree_map(lambda r, c=int(count): r[:c], rows))
+        if batch is None:  # one lane: give every output a lane axis
+            count, calls, valid, status, remain, logz, it, log_scale = (
+                np.asarray(x)[None]
+                for x in (count, calls, valid, status, remain, logz, it, log_scale)
+            )
+            rows = jax.tree_util.tree_map(lambda r: r[:, None], rows)
+        status = np.array(status, np.int32)
+        for lane in range(lanes):
+            ncall[lane] += int(calls[lane])
+            ncall_valid[lane] += int(valid[lane])
+            n = int(count[lane])
+            rows_by_lane[lane].append(
+                jax.tree_util.tree_map(lambda r, n=n, b=lane: r[:n, b], rows)
+            )
+            if status[lane] == MAXCALL and (maxcall is None or ncall[lane] < maxcall):
+                status[lane] = RUNNING  # only the int32 window of the budget was used
+        zero = jnp.zeros_like(state.ncall)
+        state = state._replace(
+            ncall=zero,
+            ncall_valid=zero,
+            status=jnp.asarray(status[0] if batch is None else status),
+        )
+        done = not np.any(status == RUNNING)
         if progress:
-            ndead = sum(c.logl.shape[0] for c in chunks) * k
+            moves = sum(int(rows.moves[: count[b], b].sum()) for b in range(lanes))
+            nrows = int(count.sum())
             print(
-                f"tinyns: ndead={ndead} ncall={ncall} logz={float(logz):.4f} "
-                f"dlogz={float(remain):.3g} chunk={int(count)} steps "
-                f"{elapsed:.2f}s [{STATUS[int(status)]}]",
+                _progress_line(
+                    cfg, batch, status, it, logz, remain, ncall,
+                    float(calls.sum()) / max(elapsed, 1e-9),
+                    moves / (nrows * k * cfg.walks) if nrows else float("nan"),
+                    np.exp(np.asarray(log_scale, np.float64)),
+                ),
                 flush=True,
             )
-        if status != RUNNING:
+        if checkpoint is not None and (
+            done or time.perf_counter() - last_save >= _CHECKPOINT_SECONDS
+        ):
+            save()
+            last_save = time.perf_counter()
+        if done:
             break
-        per_step = elapsed / max(int(count), 1)
+        per_step = elapsed / max(int(count.max()), 1)
         n_steps = int(min(capacity, 4 * n_steps, max(1.0, _CHUNK_SECONDS / per_step)))
 
-    dead = jax.tree_util.tree_map(lambda *xs: np.concatenate(xs), *chunks)
-    return finalise(
-        state,
-        dead,
-        cfg,
-        prior_transform=prior_transform,
-        ncall=ncall,
-        metadata={
-            "ncall_valid": ncall_valid,
-            "dlogz": dlogz,
-            "maxiter": maxiter,
-            "maxcall": maxcall,
-            "chunks": nchunks,
-            "wall_time": time.perf_counter() - t0,
-        },
+    wall_time_s = wall0 + time.perf_counter() - t0
+    results = []
+    for lane in range(lanes):
+        lane_state = state
+        lane_prior = prior_transform
+        if batch is not None:
+            lane_state = jax.tree_util.tree_map(lambda x, b=lane: x[b], state)
+            if batched_data:
+                lane_prior = _lane_callable(prior_transform, lane)
+        results.append(
+            finalise(
+                lane_state,
+                _concat(rows_by_lane[lane]),
+                cfg,
+                prior_transform=lane_prior,
+                ncall=ncall[lane],
+                metadata={
+                    "ncall_valid": ncall_valid[lane],
+                    "dlogz": dlogz,
+                    "maxiter": maxiter,
+                    "maxcall": maxcall,
+                    "chunks": nchunks,
+                    "wall_time_s": wall_time_s,
+                    "compile_s": compile_s,
+                    "resumed": resumed,
+                },
+            )
+        )
+    return results[0] if batch is None else results
+
+
+def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale):
+    """One progress line: iteration, logz, dlogz, calls, calls/s, acceptance
+    and step scale (for a batch: the running lanes and the range of each)."""
+    k = cfg.num_delete
+    if batch is None:
+        return (
+            f"tinyns: niter={int(it[0]) * k} logz={float(logz[0]):.4f} "
+            f"dlogz={float(remain[0]):.3g} ncall={ncall[0]} calls/s={rate:.3g} "
+            f"acc={acc:.3f} scale={float(scale[0]):.3g} [{STATUS[int(status[0])]}]"
+        )
+    running = status == RUNNING
+    return (
+        f"tinyns: lanes running={int(running.sum())}/{batch} "
+        f"niter={int(it.min()) * k}..{int(it.max()) * k} "
+        f"dlogz<={float(np.max(remain)):.3g} ncall={sum(ncall)} "
+        f"calls/s={rate:.3g} acc={acc:.3f} scale={float(np.median(scale)):.3g}"
     )
