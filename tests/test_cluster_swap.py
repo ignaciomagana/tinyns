@@ -304,12 +304,62 @@ def test_two_mode_run_finds_and_weighs_the_minor_mode() -> None:
     mass = weights[minor].sum() / weights.sum()
     assert 0.15 < mass < 0.37  # truth 0.25
     assert abs(result.logz) < 4 * result.logzerr + 0.1  # truth 0
-    modes = md["cluster_modes"]
+    modes = result.modes()
     assert len(modes) == 2
     assert sum(m["mass"] for m in modes) == pytest.approx(1.0)
-    assert min(m["mass"] for m in modes) == pytest.approx(mass, abs=0.02)
-    assert all(m["urn_logit_sd"] > 0 for m in modes)
-    assert md["cluster_min_population"] >= 3 * 3
+    assert modes[1]["mass"] == pytest.approx(mass, abs=0.02)
+    assert all(0 < m["urn_sd"] < 1 for m in modes)
+    assert not any(m["unresolved"] for m in modes)
+    assert modes[1]["min_live"] >= 3 * 3
+
+
+def narrow_minor4(theta):
+    """4-D: a 25% mode half as wide as the main one, so 1/16 of its volume."""
+
+    def log_normal(center, sigma):
+        z = (theta - center) / sigma
+        return -0.5 * jnp.sum(z * z) - 4 * jnp.log(sigma * math.sqrt(2 * math.pi))
+
+    return jnp.logaddexp(
+        math.log(0.75) + log_normal(0.35, 0.03), math.log(0.25) + log_normal(0.7, 0.015)
+    )
+
+
+def test_modes_flag_an_under_populated_mode() -> None:
+    """With 120 live points the narrow mode holds a handful when it pinches off
+    (3 * ndim = 12 are needed). A run either loses it (no trace) or flags it."""
+    flagged = 0
+    for seed in range(4):
+        result = NestedSampler(narrow_minor4, lambda u: u, 4, nlive=120).run(seed)
+        modes = result.modes()
+        assert sum(m["mass"] for m in modes) == pytest.approx(1.0)
+        if len(modes) == 1:  # the mode was lost
+            assert modes[0]["unresolved"] is False
+            continue
+        major, minor = modes
+        assert not major["unresolved"]
+        assert minor["unresolved"] is (minor["min_live"] < 12)
+        assert 0.0 < minor["urn_sd"] < 5.0
+        assert minor["urn_sd"] == pytest.approx(major["urn_sd"])  # symmetric
+        if minor["unresolved"]:
+            flagged += 1
+            assert "unresolved: raise nlive" in result.summary()
+            assert any("unresolved" in w for w in result.diagnostics()["warnings"])
+    assert flagged >= 1
+
+
+def test_unimodal_run_reports_one_mode() -> None:
+    result = run_ns(3, gauss4, lambda u: u, 4, 100)
+    assert result.modes() == [
+        {
+            "mass": 1.0,
+            "urn_sd": 0.0,
+            "min_live": 100,
+            "isolation_iteration": 0,
+            "unresolved": False,
+        }
+    ]
+    assert "logit sd" not in result.summary()
 
 
 def test_two_mode_resume_with_swap_matches_uninterrupted(tmp_path) -> None:
@@ -323,7 +373,10 @@ def test_two_mode_resume_with_swap_matches_uninterrupted(tmp_path) -> None:
     resumed = sampler.resume(path, maxiter=1600, dlogz=0.0)
 
     assert resumed.metadata["cluster_swap_accepts"] > 0
-    assert resumed.metadata["cluster_modes"] == full.metadata["cluster_modes"]
+    assert resumed.metadata["cluster_count_history"] == (
+        full.metadata["cluster_count_history"]
+    )
+    assert resumed.modes() == full.modes()
     assert resumed.logz == full.logz
     np.testing.assert_array_equal(resumed.samples_u, full.samples_u)
     np.testing.assert_array_equal(resumed.logl, full.logl)
@@ -342,7 +395,7 @@ def test_cluster_swap_needs_a_single_replacement_chain() -> None:
         0, plain2, lambda u: u, 2, 20, maxiter=40, replacement_chains=2
     )
     assert result.metadata["cluster_swap"] is False
-    assert "cluster_modes" not in result.metadata
+    assert not any(key.startswith("cluster_swap_") for key in result.metadata)
 
 
 def test_checkpoint_without_cluster_swap_is_rejected(tmp_path) -> None:

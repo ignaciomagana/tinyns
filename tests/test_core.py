@@ -150,10 +150,11 @@ def test_repeated_steps_reproduce_nested_sampler_run() -> None:
     assert bool(np.all(result.logl_birth[1:] <= result.logl[1:]))
     np.testing.assert_array_equal(result.logl[niter:], state.logl)
     assert result.ncall == int(state.ncall)
-    assert result.metadata["rwalk_scale_final"] == scale
+    assert result.niter == niter
+    assert result.metadata["scale_final"] == scale
+    # The result rebuilds the in-kernel insertion ranks from the birth contours.
     insertion = np.concatenate([dead.insertion for dead in blocks])
-    np.testing.assert_array_equal(result.metadata["insertion_indices"], insertion)
-    assert result.metadata["final_logz_dead"] == float(state.logz)
+    np.testing.assert_array_equal(result.insertion_indices(), insertion)
     assert result.metadata["final_delta_logz"] == core.remaining_dlogz(state)
     assert math.isfinite(core.remaining_dlogz(state))
 
@@ -185,7 +186,7 @@ def test_maxiter_tail_compiles_no_second_block() -> None:
             block_size=BLOCK,
             cluster_swap=False,
         ).run(3, maxiter=2 * BLOCK + 3, dlogz=0.0)
-        assert result.metadata["niter"] == 2 * BLOCK + 3
+        assert result.niter == 2 * BLOCK + 3
         assert core._step_kernel.cache_info().misses == 1
     finally:
         _clear_caches()

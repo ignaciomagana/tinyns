@@ -84,9 +84,8 @@ def test_static_nested_result_counts_match_metadata() -> None:
         maxiter=5,
     )
 
-    assert result.samples_u.shape[0] == (
-        result.metadata["ndead"] + result.metadata["nlive_final"]
-    )
+    assert result.samples_u.shape[0] == result.niter + result.nlive
+    assert result.niter == 5
     assert result.logwt.shape[0] == result.samples.shape[0]
 
 
@@ -121,11 +120,8 @@ def test_replacement_failure_stops_the_run_with_a_message() -> None:
 
     assert result.success is False
     assert result.message.startswith("replacement failed at iteration 1")
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["partial_block_failure_offset"] == 0
-    assert result.metadata["niter"] == 0
+    assert result.niter == 0
     max_batches = 10_000 // walks
-    assert result.metadata["replacement_batch_ncall"] == walks
     # the failed replacement's calls are counted
     assert result.nlive < result.ncall <= result.nlive + max_batches * walks
     assert result.samples.shape == (3, 1)
@@ -146,51 +142,11 @@ def test_scalar_prior_transform_for_one_dimension_keeps_matrix_shape() -> None:
     assert result.samples.ndim == 2 and result.samples.shape[1] == 1
     assert result.logl.ndim == 1
     assert result.logwt.ndim == 1
-    assert result.metadata["replacement_failures"] == 0
-    assert result.metadata["nlive_final"] == result.nlive
-    assert result.metadata["nposterior"] == result.metadata["niter"] + result.nlive
+    assert not result.message.startswith("replacement failed")
+    assert result.logl.size == result.niter + result.nlive
 
 
-def test_replacement_stats_metadata_after_normal_run() -> None:
-    result = run_ns(
-        random.PRNGKey(7),
-        _sum_squares,
-        lambda u: u,
-        ndim=2,
-        nlive=10,
-        dlogz=0.1,
-        maxiter=20,
-    )
-
-    metadata = result.metadata
-    assert set(
-        [
-            "replacement_ncall",
-            "replacement_failures",
-            "mean_replacement_ncall",
-            "max_replacement_ncall",
-            "replacement_acceptance_proxy",
-            "niter",
-            "ndead",
-            "nlive_final",
-            "nposterior",
-        ]
-    ).issubset(metadata)
-    assert len(metadata["replacement_ncall"]) > 0
-    assert metadata["niter"] == len(metadata["replacement_ncall"])
-    assert metadata["ndead"] == metadata["niter"]
-    assert metadata["nlive_final"] == result.nlive
-    assert metadata["nposterior"] == result.logwt.size
-    assert metadata["replacement_failures"] == 0
-    assert metadata["mean_replacement_ncall"] > 0.0
-    assert metadata["max_replacement_ncall"] >= 1
-    assert (
-        metadata["replacement_acceptance_proxy"]
-        == 1.0 / metadata["mean_replacement_ncall"]
-    )
-
-
-def test_insertion_indices_metadata_after_normal_run() -> None:
+def test_insertion_indices_after_normal_run() -> None:
     result = run_ns(
         random.PRNGKey(70),
         _sum_squares,
@@ -201,15 +157,11 @@ def test_insertion_indices_metadata_after_normal_run() -> None:
         maxiter=20,
     )
 
-    metadata = result.metadata
-    insertion_indices = metadata["insertion_indices"]
-    assert metadata["insertion_index_nslots"] == result.nlive
-    assert metadata["insertion_index_nlive"] == result.nlive - 1
-    assert insertion_indices.shape == (len(metadata["replacement_ncall"]),)
+    insertion_indices = result.insertion_indices()
+    assert insertion_indices.shape == (result.niter,)
     assert insertion_indices.size > 0
-    assert bool(jnp.all(insertion_indices >= 0))
-    assert bool(jnp.all(insertion_indices < metadata["insertion_index_nslots"]))
-    assert bool(jnp.all(insertion_indices <= metadata["insertion_index_nlive"]))
+    assert bool(np.all(insertion_indices >= 0))
+    assert bool(np.all(insertion_indices < result.nlive))
 
 
 def _scripted_rwalk_kernel(new_logl, accepted=None):
@@ -378,13 +330,8 @@ def test_block_partial_failure_after_convergence_reports_success(
     )
 
     assert result.success is True
-    assert "converged" in result.message
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["terminated_after_partial_block_failure"] is True
-    assert result.metadata["partial_block_failure_offset"] == 1
-    assert (
-        result.metadata["partial_block_failure_delta_logz"] < result.metadata["dlogz"]
-    )
+    assert result.message == "converged after partial block before replacement failure"
+    assert result.niter == 1
     assert result.metadata["final_delta_logz"] < result.metadata["dlogz"]
 
 
@@ -411,14 +358,7 @@ def test_block_partial_failure_before_convergence_remains_failure(
 
     assert result.success is False
     assert result.message.startswith("replacement failed at iteration 2")
-    assert result.metadata["partial_block_failure_message"] == result.message
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["terminated_after_partial_block_failure"] is False
-    assert result.metadata["partial_block_failure_offset"] == 1
-    assert result.metadata["niter"] == 1
-    assert (
-        result.metadata["partial_block_failure_delta_logz"] >= result.metadata["dlogz"]
-    )
+    assert result.niter == 1
     assert result.metadata["final_delta_logz"] >= result.metadata["dlogz"]
 
 
@@ -443,9 +383,8 @@ def test_block_ncall_counts_failed_offset(monkeypatch) -> None:
     )
 
     assert result.success is False
-    assert result.metadata["replacement_failures"] == 1
-    assert result.metadata["partial_block_failure_offset"] == 2
-    assert result.metadata["replacement_ncall"] == [3, 3]
+    assert result.message.startswith("replacement failed at iteration 3")
+    assert result.niter == 2
     # nlive initial evals + successful prefix (3 + 3) + failed offset (9).
     assert result.ncall == result.nlive + 3 + 3 + 9
 
@@ -528,8 +467,7 @@ def test_callback_can_stop_run_gracefully() -> None:
 
     assert result.success is False
     assert result.message == "stopped by callback"
-    assert result.metadata["stopped_by_callback"] is True
-    assert result.metadata["niter"] == 2
+    assert result.niter == 2
     assert jnp.isfinite(result.logz)
     assert result.samples.shape[0] > 0
 
@@ -619,8 +557,6 @@ def test_nested_sampler_block_size_one_runs() -> None:
     assert result.success is True
     assert math.isfinite(result.logz)
     assert result.metadata["block_size"] == 1
-    # one scale update per block, so per iteration
-    assert result.metadata["rwalk_adaptation_updates"] == result.metadata["niter"]
 
 
 def test_block_size_five_runs_and_shapes() -> None:
@@ -638,24 +574,14 @@ def test_block_size_five_runs_and_shapes() -> None:
     assert result.success is False
     assert result.message == "maxiter=10 reached"
     assert math.isfinite(result.logz)
-    assert result.samples_u.shape == (result.metadata["nposterior"], 2)
-    assert result.samples.shape == (result.metadata["nposterior"], 2)
-    assert result.logl.shape == (result.metadata["nposterior"],)
-    assert result.logwt.shape == (result.metadata["nposterior"],)
-    assert len(result.metadata["replacement_ncall"]) == result.metadata["niter"]
-    assert result.metadata["insertion_indices"].shape == (result.metadata["niter"],)
+    assert result.niter == 10
+    assert result.samples_u.shape == (result.niter + result.nlive, 2)
+    assert result.samples.shape == (result.niter + result.nlive, 2)
+    assert result.logl.shape == (result.niter + result.nlive,)
+    assert result.logwt.shape == (result.niter + result.nlive,)
+    assert result.insertion_indices().shape == (result.niter,)
     assert result.metadata["block_size"] == 5
-    assert result.metadata["rwalk_adaptation_updates"] == 2
-    # A single chain skips the likelihood for out-of-cube proposals.
-    assert result.metadata["total_rwalk_proposals"] >= sum(
-        result.metadata["replacement_ncall"]
-    )
-    assert (
-        0
-        <= result.metadata["accepted_rwalk_moves"]
-        <= result.metadata["total_rwalk_proposals"]
-    )
-    assert 0.0 <= result.metadata["rwalk_acceptance"] <= 1.0
+    assert 0.0 <= result.metadata["acceptance"] <= 1.0
 
 
 def test_default_block_run_records_metadata() -> None:
@@ -671,18 +597,14 @@ def test_default_block_run_records_metadata() -> None:
     assert metadata["block_size"] == 32
     assert metadata["walks"] == 25
     assert metadata["replacement_chains"] == 1
-    assert metadata["replacement_batch_ncall"] == 25
-    assert metadata["replacement_failures"] == 0
     assert math.isfinite(result.logz)
     assert result.ncall > 0
-    assert metadata["niter"] > 0
-    assert metadata["rwalk_scale_initial"] == 0.5
-    assert metadata["rwalk_adaptation_updates"] == -(-metadata["niter"] // 32)
-    for name in ("final", "min_seen", "max_seen", "mean"):
-        assert math.isfinite(metadata[f"rwalk_scale_{name}"])
-    assert math.isfinite(metadata["rwalk_observed_accept_mean"])
-    assert metadata["wall_time_s"] > 0.0
-    assert metadata["compile_s"] is not None
+    assert result.niter > 0
+    assert metadata["scale_initial"] == 0.5
+    assert math.isfinite(metadata["scale_final"])
+    assert math.isfinite(metadata["acceptance"])
+    assert metadata["wall_time_s"] > metadata["compile_s"] > 0.0
+    assert metadata["resumed"] is False
 
 
 def test_block_size_one_and_32_agree_within_errors() -> None:
@@ -704,8 +626,7 @@ def test_block_size_one_and_32_agree_within_errors() -> None:
         **kwargs,
     )
 
-    assert one.metadata["replacement_failures"] == 0
-    assert block.metadata["replacement_failures"] == 0
+    assert one.success and block.success
     tolerance = max(0.5, 3.0 * max(float(block.logzerr), float(one.logzerr)))
     assert abs(float(block.logz) - float(one.logz)) < tolerance
 
@@ -727,7 +648,7 @@ def test_block_ring2d_no_failures() -> None:
     )
 
     assert math.isfinite(result.logz)
-    assert result.metadata["replacement_failures"] == 0
+    assert result.success
     assert result.ncall > 0
 
 
@@ -772,7 +693,7 @@ def test_live_cov_rwalk_recovers_correlated_gaussian_evidence(block_size) -> Non
     )
     assert result.success
     assert abs(result.logz - (-2 * math.log(width))) < 5 * result.logzerr
-    assert 0.1 < result.metadata["rwalk_acceptance"] < 0.5
+    assert 0.1 < result.metadata["acceptance"] < 0.5
 
 
 @pytest.mark.parametrize("cluster_swap", [False, True])
@@ -790,8 +711,8 @@ def test_block_size_one_supports_cluster_swap_setting(cluster_swap) -> None:
     )
 
     assert result.metadata["cluster_swap"] is cluster_swap
-    assert result.metadata["niter"] == 50
-    assert result.metadata["replacement_failures"] == 0
+    assert result.niter == 50
+    assert result.message == "maxiter=50 reached"
 
 
 def test_static_nested_metadata_has_no_removed_option_keys() -> None:
@@ -827,7 +748,7 @@ def test_static_nested_metadata_has_no_removed_option_keys() -> None:
         "chain_usage",
         "jax_block",
     )
-    assert result.metadata["niter"] == 2
+    assert result.niter == 2
     assert states
     for names in (result.metadata, states[-1]):
         stale = [
@@ -862,7 +783,7 @@ def test_block_rwalk_supports_unhashable_callable_instances() -> None:
     )
 
     assert result.success is True
-    assert result.metadata["niter"] == 2
+    assert result.niter == 2
     assert jnp.isfinite(result.logz)
 
 
@@ -926,9 +847,8 @@ def test_scale_adapts_to_block_move_acceptance(monkeypatch, moves, grows) -> Non
     assert fake.scales[0] == 0.5  # the initial scale
     assert len(fake.scales) == 2
     assert (fake.scales[1] > 0.5) is grows
-    assert (metadata["rwalk_scale_final"] > 0.5) is grows
-    assert metadata["rwalk_adaptation_updates"] == 2
-    assert metadata["rwalk_observed_accept_mean"] == pytest.approx(moves / 20)
+    assert (metadata["scale_final"] > 0.5) is grows
+    assert metadata["acceptance"] == pytest.approx(moves / 20)
 
 
 def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
@@ -949,9 +869,9 @@ def test_live_cov_single_chain_skips_out_of_cube_evaluations() -> None:
         random.PRNGKey(7), loglike, prior_transform, 3, 100, walks=25, maxiter=640
     )
     jax.effects_barrier()
-    metadata = result.metadata
     assert len(calls) == result.ncall
-    assert result.ncall < 100 + metadata["total_rwalk_proposals"]
+    # one chain of 25 proposals per replacement, some of them out of the cube
+    assert result.ncall < 100 + 25 * result.niter
 
 
 @pytest.mark.parametrize(
@@ -972,5 +892,5 @@ def test_likelihood_dtype_does_not_break_x64(loglike) -> None:
         assert result.logl.dtype == jnp.float64
     finally:
         jax.config.update("jax_enable_x64", previous)
-    assert result.metadata["niter"] == 64
+    assert result.niter == 64
     assert math.isfinite(result.logz)

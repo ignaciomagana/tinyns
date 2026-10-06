@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import json
 import math
-import numbers
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
 
+from tinyns.clusters import (
+    SPLIT_J_ABS,
+    SPLIT_J_PER_DIM,
+    ClusterTracker,
+    _assign,
+    _fisher,
+    _fit,
+)
 from tinyns.math import (
     effective_sample_size_from_log_weights,
     normalize_log_weights,
@@ -18,145 +28,76 @@ from tinyns.math import (
 )
 from tinyns.types import ArrayLike
 
-_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v1"
-_RESULT_NPZ_REQUIRED_KEYS = {
-    "samples_u",
-    "samples",
-    "logl",
-    "logwt",
-    "logz",
-    "logzerr",
-    "ncall",
-    "nlive",
-    "ndim",
-    "success",
-    "message",
-    "metadata_json",
-    "format_version",
+_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v2"
+_RESULT_NPZ_ARRAYS = ("samples_u", "samples", "logl", "logwt", "logl_birth")
+_RESULT_NPZ_SCALARS = {
+    "logz": float,
+    "logzerr": float,
+    "ncall": int,
+    "niter": int,
+    "nlive": int,
+    "ndim": int,
+    "success": bool,
+    "message": str,
 }
+# A mode whose live count falls below this many points per dimension between
+# its isolation and its posterior bulk is flagged unresolved (raise nlive). It
+# is the population-conditional gate of the cluster swap: modes above it are
+# weighed reliably, modes below it are not.
+UNRESOLVED_PER_DIM = 3.0
+# The modes are clustered from up to this many equal-weight posterior points
+# (and no more than the posterior ESS, so few distinct points do not split).
+_MODE_DRAWS = 2000
 
 
-def _metadata_to_jsonable(metadata):
-    """Return metadata converted to JSON-compatible Python values."""
-
-    if metadata is None:
-        return None
-    if isinstance(metadata, dict):
-        return {
-            str(key): _metadata_to_jsonable(value)
-            for key, value in metadata.items()
-        }
-    if isinstance(metadata, list):
-        return [_metadata_to_jsonable(value) for value in metadata]
-    if isinstance(metadata, (str, bool, int, float)) or metadata is None:
-        return metadata
-    if isinstance(metadata, np.generic):
-        return metadata.item()
-
+def _jsonable(value):
+    """``json.dumps`` fallback: NumPy and JAX values as lists, others as text."""
     try:
-        array = np.asarray(metadata)
+        array = np.asarray(value)
     except (TypeError, ValueError):
-        return str(metadata)
-
-    if array.dtype == object:
-        return str(metadata)
-    if array.ndim == 0:
-        scalar = array.item()
-        if isinstance(scalar, (str, bool, int, float)) or scalar is None:
-            return scalar
-        return str(scalar)
-    return array.tolist()
-
-
-def _metadata_from_jsonable(metadata):
-    """Return metadata loaded from its JSON-compatible representation."""
-
-    if metadata is None:
-        return None
-    if isinstance(metadata, dict):
-        return {
-            str(key): _metadata_from_jsonable(value)
-            for key, value in metadata.items()
-        }
-    if isinstance(metadata, list):
-        return [_metadata_from_jsonable(value) for value in metadata]
-    if isinstance(metadata, (str, bool, int, float)) or metadata is None:
-        return metadata
-    return str(metadata)
+        return str(value)
+    return str(value) if array.dtype == object else array.tolist()
 
 
 def _npz_scalar(value):
     """Return a Python scalar from a NumPy value loaded from ``np.load``."""
 
     array = np.asarray(value)
-    if array.shape == ():
-        return array.item()
-    if array.size == 1:
-        return array.reshape(()).item()
-    raise ValueError("expected scalar value in result .npz file")
+    if array.size != 1:
+        raise ValueError("expected scalar value in result .npz file")
+    return array.reshape(()).item()
 
 
-def _logzerr_diagnostics(
-    logwt,
-    logl,
-    logz: float,
-    nlive: int,
-    nlive_final: int,
-) -> tuple[float, dict[str, object]]:
-    """Return ``logzerr`` and diagnostics for nonfinite inputs."""
-
-    logwt = jnp.asarray(logwt)
+def _information(logwt, logl, logz: float):
+    """Return the information ``H`` as a JAX scalar (NaN when undefined)."""
+    weights = jnp.exp(jnp.asarray(logwt) - logz)
     logl = jnp.asarray(logl)
-    npoints = int(logwt.size)
-    nlive_final = max(0, min(int(nlive_final), npoints))
-    ndead = npoints - nlive_final
+    finite = jnp.isfinite(logl)
+    if (
+        not math.isfinite(logz)
+        or not bool(jnp.all(jnp.isfinite(weights)))
+        or bool(jnp.any((weights > 0.0) & ~finite))
+    ):
+        return jnp.asarray(math.nan)
+    contributing = (weights > 0.0) & finite
+    information = jnp.sum(jnp.where(contributing, weights * (logl - logz), 0.0))
+    return jnp.maximum(information, 0.0)
 
-    finite_logl = jnp.isfinite(logl)
-    finite_logwt = jnp.isfinite(logwt)
-    finite_pair = finite_logl & finite_logwt
-    diagnostics: dict[str, object] = {
-        "logzerr_status": "ok",
-        "information_H": math.nan,
-        "n_nonfinite_logl": int(jnp.sum(~finite_logl)),
-        "n_nonfinite_logwt": int(jnp.sum(~finite_logwt)),
-        "n_nonfinite_weights": 0,
-        "n_dead_finite": int(jnp.sum(finite_pair[:ndead])),
-        "n_live_finite": int(jnp.sum(finite_pair[ndead:])),
-    }
 
-    if nlive <= 0:
-        diagnostics["logzerr_status"] = "invalid_nlive"
-        return math.nan, diagnostics
-    if not math.isfinite(float(logz)):
-        diagnostics["logzerr_status"] = "nonfinite_logz"
-        return math.nan, diagnostics
+def _ks_uniform(ranks, nslots: int) -> tuple[float, float]:
+    """KS distance of ranks from the uniform law on ``0..nslots-1``, p-value.
 
-    raw_weights = jnp.exp(logwt - logz)
-    finite_weights = jnp.isfinite(raw_weights)
-    diagnostics["n_nonfinite_weights"] = int(jnp.sum(~finite_weights))
-    if diagnostics["n_nonfinite_weights"]:
-        diagnostics["logzerr_status"] = "nonfinite_posterior_weights"
-        return math.nan, diagnostics
-
-    contributing = (raw_weights > 0.0) & finite_logl
-    if bool(jnp.any((raw_weights > 0.0) & ~finite_logl)):
-        diagnostics["logzerr_status"] = "nonfinite_weighted_logl"
-        return math.nan, diagnostics
-    if not bool(jnp.any(contributing)):
-        diagnostics["logzerr_status"] = "no_finite_weighted_samples"
-        diagnostics["information_H"] = 0.0
-        return math.nan, diagnostics
-
-    information = jnp.sum(
-        jnp.where(contributing, raw_weights * (logl - logz), 0.0)
-    )
-    information = jnp.maximum(information, 0.0)
-    diagnostics["information_H"] = float(information)
-    if not math.isfinite(float(information)):
-        diagnostics["logzerr_status"] = "nonfinite_information_H"
-        return math.nan, diagnostics
-
-    return float(jnp.sqrt(information / nlive)), diagnostics
+    The p-value is the asymptotic Kolmogorov tail (Stephens' small-sample
+    correction), conservative for a discrete law.
+    """
+    n = len(ranks)
+    ecdf = np.cumsum(np.bincount(ranks, minlength=nslots)[:nslots]) / n
+    ks = float(np.max(np.abs(ecdf - np.arange(1, nslots + 1) / nslots)))
+    lam = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * ks
+    if lam < 0.2:  # the series converges slowly here; the tail is 1 - 1e-11
+        return ks, 1.0
+    terms = (2 * (-1) ** (k - 1) * math.exp(-2 * (k * lam) ** 2) for k in range(1, 101))
+    return ks, min(max(sum(terms), 0.0), 1.0)
 
 
 @dataclass(frozen=True)
@@ -234,9 +175,13 @@ def _simulate_logz_realizations(dead_logl, live_logl, nlive, log_shrinkage):
     return _np_logsumexp(all_logwt, axis=1)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class NestedSamplingResult:
-    """Container for completed nested-sampling outputs."""
+    """Container for completed nested-sampling outputs.
+
+    The samples are the ``niter`` dead points in the order they died, then
+    the final live points.
+    """
 
     samples_u: ArrayLike
     """Posterior samples in unit-cube coordinates."""
@@ -250,6 +195,10 @@ class NestedSamplingResult:
     logwt: ArrayLike
     """Unnormalized log posterior weights associated with ``samples``."""
 
+    logl_birth: ArrayLike
+    """Likelihood contour each sample was born above (``-inf`` for the initial
+    live points), aligned with ``logl``."""
+
     logz: float
     """Estimated log evidence."""
 
@@ -258,6 +207,9 @@ class NestedSamplingResult:
 
     ncall: int
     """Number of likelihood calls performed."""
+
+    niter: int
+    """Number of iterations (dead points)."""
 
     nlive: int
     """Number of live points used by the sampler."""
@@ -272,11 +224,7 @@ class NestedSamplingResult:
     """Optional human-readable sampler status message."""
 
     metadata: dict[str, Any] | None = None
-    """Additional implementation-specific metadata."""
-
-    logl_birth: ArrayLike | None = None
-    """Likelihood contour each sample was born above (``-inf`` for the initial
-    live points; ``NaN`` where unknown), aligned with ``logl``."""
+    """Run configuration and telemetry (see the CHANGELOG for the keys)."""
 
     def log_weights(self):
         """Return posterior weights normalized in log space."""
@@ -320,68 +268,168 @@ class NestedSamplingResult:
         return float(jnp.clip(fraction, 0.0, 1.0))
 
     def live_weight_fraction(self) -> float:
-        """Return posterior weight fraction in final live points.
+        """Return the posterior weight fraction in the final live points."""
 
-        The sampler records final live points as the last ``metadata["nlive_final"]``
-        weighted samples. If this metadata is missing or invalid, return ``0.0``
-        so diagnostics remain simple and conservative.
-        """
-
-        nlive_final = self._valid_nlive_final()
-        if nlive_final is None:
-            return 0.0
-        return float(jnp.sum(self.weights()[-nlive_final:]))
+        return float(jnp.sum(self.weights()[int(self.niter) :]))
 
     def dead_weight_fraction(self) -> float:
-        """Return posterior weight fraction in dead points."""
+        """Return the posterior weight fraction in the dead points."""
 
-        if self._valid_nlive_final() is None:
-            return 0.0
         return float(jnp.clip(1.0 - self.live_weight_fraction(), 0.0, 1.0))
 
-    def _valid_nlive_final(self) -> int | None:
-        """Return valid final-live count metadata, or ``None`` if invalid."""
+    @cached_property
+    def _births(self) -> tuple[np.ndarray, np.ndarray]:
+        """Birth iteration of every sample (-1: initial live point), and the
+        insertion index of the point born at each iteration.
 
-        metadata = {} if self.metadata is None else self.metadata
-        nlive_final = metadata.get("nlive_final")
-        nweights = int(jnp.asarray(self.logwt).size)
-        if (
-            nlive_final is None
-            or isinstance(nlive_final, bool)
-            or not isinstance(nlive_final, numbers.Integral)
-            or nlive_final <= 0
-            or nlive_final > nweights
-        ):
-            return None
-        return int(nlive_final)
+        Rebuilt from ``logl_birth``: the point born at iteration ``i`` has
+        the contour ``logl[i]`` of the point that died there, so sorting the
+        births orders them by iteration, and replaying the deaths and births
+        on a sorted list of the live likelihoods gives each insertion rank.
+        """
+        logl = np.asarray(self.logl, dtype=float)
+        order = np.argsort(np.asarray(self.logl_birth, dtype=float), kind="stable")
+        n0 = len(logl) - int(self.niter)  # never born during the run
+        born = np.full(len(logl), -1)
+        insertion = np.zeros(len(logl) - n0, dtype=int)
+        values = logl.tolist()
+        live = sorted(values[k] for k in order[:n0])
+        for i, k in enumerate(order[n0:].tolist()):
+            del live[0]  # the point that died at iteration i
+            born[k] = i
+            insertion[i] = bisect.bisect_right(live, values[k])
+            bisect.insort(live, values[k])
+        return born, insertion
 
-    def insertion_indices(self):
-        """Return recorded live-point insertion indices, if available."""
+    def insertion_indices(self) -> np.ndarray:
+        """Return the insertion index of the point born at each iteration.
 
-        metadata = {} if self.metadata is None else self.metadata
-        return jnp.asarray(metadata.get("insertion_indices", []), dtype=int)
+        The index is the number of the other ``nlive - 1`` live points with a
+        likelihood at or below the new point's, so it is uniform on
+        ``0..nlive-1`` for a correct constrained sampler.
+        """
+
+        return self._births[1]
+
+    def insertion_test(self, windows: int = 3) -> dict[str, Any]:
+        """Return a Kolmogorov-Smirnov test of the insertion indices.
+
+        The indices (:meth:`insertion_indices`) are tested against the uniform
+        law on ``0..nlive-1`` over the whole run and in ``windows`` equal
+        stretches of it, so that a bias confined to part of the run (the
+        narrow posterior bulk, say) is not diluted by the rest. Returns the
+        pooled ``n``, ``ks`` distance and ``pvalue``, and the same per
+        window (with its ``start`` and ``stop`` iteration) under
+        ``"windows"``.
+        """
+
+        if int(windows) < 1:
+            raise ValueError("windows must be a positive integer")
+        ranks = self.insertion_indices()
+
+        def test(start, stop):
+            ks, pvalue = math.nan, math.nan
+            if stop > start:
+                ks, pvalue = _ks_uniform(ranks[start:stop], int(self.nlive))
+            return {"start": start, "stop": stop, "n": stop - start, "ks": ks,
+                    "pvalue": pvalue}
+
+        edges = np.linspace(0, len(ranks), int(windows) + 1).astype(int).tolist()
+        out = test(0, len(ranks))
+        out["windows"] = [test(a, b) for a, b in itertools.pairwise(edges)]
+        return out
+
+    def modes(self) -> list[dict[str, Any]]:
+        """Return the posterior modes, heaviest first, with their urn error bar.
+
+        Pure post-processing (section 7 of the multimodal study). An
+        equal-weight draw of the posterior is clustered with the cluster
+        swap's split test; every sample is labelled by its nearest cluster,
+        and each mode's live count ``n(t)`` is rebuilt from the birth and
+        death iterations. The mode is isolated from the first iteration at
+        which its live points and the others pass the same split test (if they
+        never do before the earlier of the two posterior medians, there is no
+        drift term and ``isolation_iteration`` is that median). From
+        then on chains cannot leave it, so ``n`` does a random walk (the urn)
+        and the mode's mass scatters from seed to seed by ``urn_sd`` in
+        ``logit(mass)``: ``1/n + 1/(N - n)`` at isolation, plus
+        ``2 (1 - g) / (N^2 g)`` per iteration up to the mode's posterior
+        median and ``2 g / (N^2 (1 - g))`` up to the rest's, with
+        ``g = n / N``. The cluster swap removes most of that drift, so with it
+        ``urn_sd`` is an upper bound. ``min_live`` is the smallest ``n``
+        between isolation and the mode's median; below
+        ``UNRESOLVED_PER_DIM * ndim`` the mode is ``unresolved`` and its mass
+        is not reliable: raise ``nlive``. A mode lost before the end leaves no
+        trace in its own run. A unimodal run gives one mode of mass 1.
+        """
+
+        nlive, niter, ndim = int(self.nlive), int(self.niter), int(self.ndim)
+        weights = np.asarray(self.weights(), dtype=float)
+        u = np.asarray(self.samples_u, dtype=float)
+        one = [{"mass": 1.0, "urn_sd": 0.0, "min_live": nlive,
+                "isolation_iteration": 0, "unresolved": False}]
+        if niter == 0:
+            return one
+        cumulative = np.cumsum(weights)
+        ndraw = min(_MODE_DRAWS, int(self.posterior_ess()))
+        grid = (np.arange(ndraw) + 0.5) / ndraw * cumulative[-1]
+        draw = u[np.minimum(np.searchsorted(cumulative, grid), len(u) - 1)]
+        tracker = ClusterTracker(nlive)
+        try:
+            labels = tracker._track(draw)
+        except np.linalg.LinAlgError:
+            return one
+        k = len(tracker.log["ids"])
+        if k < 2:
+            return one
+        label = _assign(_fit(draw, labels, k), u)
+        born, index = self._births[0], np.arange(len(u))
+        threshold = max(SPLIT_J_PER_DIM * (ndim + 2), SPLIT_J_ABS)
+        out = []
+        for mine in (label == c for c in range(k)):
+            net = np.bincount(born[mine & (born >= 0)], minlength=niter) - mine[:niter]
+            n = np.sum(mine & (born < 0)) + np.concatenate([[0], np.cumsum(net)[:-1]])
+
+            def median(mask):
+                cw = np.cumsum(weights * mask)
+                return min(int(np.searchsorted(cw, 0.5 * cw[-1])), niter - 1)
+
+            def isolated(t, mine=mine):
+                alive = (born < t) & (index >= t)
+                side = mine[alive]
+                return 0 < side.sum() < alive.sum() and (
+                    _fisher(u[alive], side) >= threshold
+                )
+
+            stop, stop_rest = median(mine), median(~mine)
+            # Isolation precedes both bulks; one side may be gone after its own.
+            lo = hi = min(stop, stop_rest)
+            if isolated(hi):  # the first isolated iteration, by bisection
+                lo = 0
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    lo, hi = (lo, mid) if isolated(mid) else (mid + 1, hi)
+            g = np.clip(n / nlive, 0.5 / nlive, 1 - 0.5 / nlive)
+            variance = (
+                1 / max(n[lo], 0.5)
+                + 1 / max(nlive - n[lo], 0.5)
+                + np.sum((2 * (1 - g) / (nlive**2 * g))[lo:stop])
+                + np.sum((2 * g / (nlive**2 * (1 - g)))[lo:stop_rest])
+            )
+            min_live = int(n[lo : max(stop, lo + 1)].min())
+            out.append({
+                "mass": float(weights[mine].sum() / cumulative[-1]),
+                "urn_sd": float(math.sqrt(variance)),
+                "min_live": min_live,
+                "isolation_iteration": int(lo),
+                "unresolved": bool(min_live < UNRESOLVED_PER_DIM * ndim),
+            })
+        return sorted(out, key=lambda mode: -mode["mass"])
 
     def information(self) -> float:
         """Return the nested-sampling information from posterior weights."""
 
-        logl = jnp.asarray(self.logl)
-        logwt = jnp.asarray(self.logwt)
-        weights = jnp.exp(logwt - self.logz)
-        if bool(jnp.any(~jnp.isfinite(weights))):
-            return math.nan
-        contributing = (weights > 0.0) & jnp.isfinite(weights) & jnp.isfinite(logl)
-        if bool(jnp.any((weights > 0.0) & ~jnp.isfinite(logl))):
-            return math.nan
-        if not bool(jnp.any(contributing)):
-            return 0.0
-        information = float(
-            jnp.sum(jnp.where(contributing, weights * (logl - self.logz), 0.0))
-        )
-        if not math.isfinite(information):
-            return math.nan
-        if information < 0.0:
-            return 0.0
-        return information
+        return float(_information(self.logwt, self.logl, float(self.logz)))
 
     def logz_bootstrap(
         self, n_realizations: int = 256, seed: int = 0
@@ -416,14 +464,7 @@ class NestedSamplingResult:
             raise ValueError("nlive must be a positive integer")
 
         logl = np.asarray(self.logl, dtype=float)
-        npoints = int(logl.size)
-        nlive_final = self._valid_nlive_final()
-        metadata = {} if self.metadata is None else self.metadata
-        ndead = metadata.get("ndead")
-        if not isinstance(ndead, numbers.Integral) or isinstance(ndead, bool):
-            ndead = npoints - (nlive_final or 0)
-        ndead = int(max(0, min(int(ndead), npoints)))
-
+        ndead = int(self.niter)
         dead_logl = logl[:ndead]
         live_logl = logl[ndead:]
 
@@ -450,16 +491,24 @@ class NestedSamplingResult:
         )
 
     def diagnostics(self) -> dict[str, object]:
-        """Return lightweight run diagnostics as a plain dictionary."""
+        """Return run diagnostics and warnings as a plain dictionary.
+
+        Besides the weight statistics it holds the pooled insertion-test
+        p-value (``insertion_pvalue``; :meth:`insertion_test` has the
+        windows) and the posterior ``modes`` (:meth:`modes`).
+        """
 
         metadata = {} if self.metadata is None else self.metadata
         posterior_ess = self.posterior_ess()
         nposterior = int(jnp.asarray(self.logwt).size)
         max_weight_fraction = self.max_weight_fraction()
-        posterior_weight_entropy = self.posterior_weight_entropy()
         entropy_fraction = self.posterior_weight_entropy_fraction()
         live_weight_fraction = self.live_weight_fraction()
-        dead_weight_fraction = self.dead_weight_fraction()
+        insertion = self.insertion_test()
+        modes = self.modes()
+        dlogz = metadata.get("dlogz")
+        final_delta_logz = metadata.get("final_delta_logz")
+        acceptance = metadata.get("acceptance")
         warnings: list[str] = []
 
         if not self.success:
@@ -475,171 +524,59 @@ class NestedSamplingResult:
                 "final live points carry most posterior weight; consider tighter "
                 "dlogz or more live points"
             )
-        requested_dlogz = metadata.get("dlogz")
-        try:
-            requested_dlogz_float = float(requested_dlogz)
-        except (TypeError, ValueError):
-            requested_dlogz_float = None
-        if (
-            live_weight_fraction > 0.25
-            and requested_dlogz_float is not None
-            and requested_dlogz_float >= 0.1
-        ):
+        if live_weight_fraction > 0.25 and dlogz is not None and dlogz >= 0.1:
             warnings.append(
                 "large final-live weight fraction; evidence may be sensitive to "
                 "stopping"
             )
-
-        final_delta_logz = metadata.get("final_delta_logz")
-        try:
-            final_delta_logz_float = float(final_delta_logz)
-        except (TypeError, ValueError):
-            final_delta_logz_float = None
         if (
             self.success
-            and final_delta_logz_float is not None
-            and requested_dlogz_float is not None
-            and final_delta_logz_float > requested_dlogz_float
+            and None not in (final_delta_logz, dlogz)
+            and final_delta_logz > dlogz
         ):
             warnings.append("successful run has final_delta_logz above requested dlogz")
-
-        replacement_failures = metadata.get("replacement_failures")
-        if replacement_failures is not None and replacement_failures > 0:
-            warnings.append("replacement failures occurred")
-
-        logzerr_status = metadata.get("logzerr_status")
-        if logzerr_status is None:
-            logzerr_status = "ok" if math.isfinite(float(self.logzerr)) else "unknown"
-        if logzerr_status != "ok":
-            warnings.append(f"logzerr estimate unavailable: {logzerr_status}")
-
-        replacement_chains = int(metadata.get("replacement_chains", 1) or 1)
-        replacement_batch_ncall = metadata.get("replacement_batch_ncall")
-        if replacement_batch_ncall is None:
-            walks = metadata.get("walks")
-            if walks is not None:
-                replacement_batch_ncall = int(walks) * replacement_chains
-        if replacement_batch_ncall is not None:
-            replacement_batch_ncall = int(replacement_batch_ncall)
-
-        mean_replacement_ncall = metadata.get(
-            "replacement_mean_ncall", metadata.get("mean_replacement_ncall")
-        )
-        max_replacement_ncall = metadata.get("max_replacement_ncall")
-        mean_replacement_batches = None
-        max_replacement_batches = None
-        if replacement_batch_ncall is not None and replacement_batch_ncall > 0:
-            if mean_replacement_ncall is not None:
-                mean_replacement_batches = (
-                    float(mean_replacement_ncall) / replacement_batch_ncall
-                )
-            if max_replacement_ncall is not None:
-                max_replacement_batches = (
-                    float(max_replacement_ncall) / replacement_batch_ncall
-                )
-
-        replacement_acceptance_proxy = metadata.get("replacement_acceptance_proxy")
-        if replacement_chains == 1:
-            if (
-                replacement_acceptance_proxy is not None
-                and replacement_acceptance_proxy < 0.01
-            ):
-                warnings.append("low replacement acceptance")
-        elif (
-            mean_replacement_batches is not None
-            and mean_replacement_batches > 2.0
-        ):
+        if not math.isfinite(float(self.logzerr)):
+            warnings.append("logzerr is not finite")
+        if acceptance is not None and acceptance < 0.01:
             warnings.append("low replacement acceptance")
-
-        insertion_indices = self.insertion_indices()
-        insertion_index_nslots = metadata.get(
-            "insertion_index_nslots",
-            metadata.get("insertion_index_nlive", self.nlive - 1),
-        )
-        if insertion_indices.size >= 20 and insertion_index_nslots > 0:
-            normalized_ranks = (insertion_indices + 0.5) / insertion_index_nslots
-            mean_normalized_rank = float(jnp.mean(normalized_ranks))
-            rank_count = int(insertion_indices.size)
-            insertion_rank_mean_z = (mean_normalized_rank - 0.5) / math.sqrt(
-                (1.0 / 12.0) / rank_count
+        # Bonferroni over the pooled test and the windows.
+        pvalues = [insertion["pvalue"]] + [w["pvalue"] for w in insertion["windows"]]
+        if insertion["n"] >= 20 and min(pvalues) * len(pvalues) < 0.01:
+            warnings.append(
+                "insertion indices look non-uniform; constrained sampler may be "
+                "biased or poorly mixed"
             )
-            insertion_rank_std_ratio = float(jnp.std(normalized_ranks, ddof=1)) / (
-                1.0 / math.sqrt(12.0)
-            )
-            if mean_normalized_rank < 0.35 or mean_normalized_rank > 0.65:
+        for i, mode in enumerate(modes):
+            if mode["unresolved"]:
                 warnings.append(
-                    "insertion indices look non-uniform; constrained sampler may be "
-                    "biased or poorly mixed"
+                    f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
+                    f"{mode['min_live']} live points; raise nlive"
                 )
-
         if nposterior < self.nlive + 10:
             warnings.append("very few dead points")
 
-        has_insertion_rank_stats = (
-            insertion_indices.size >= 20 and insertion_index_nslots > 0
-        )
-
-        diagnostics: dict[str, object] = {
+        return {
             "success": self.success,
             "message": self.message,
             "logz": float(self.logz),
             "logzerr": float(self.logzerr),
-            "information": metadata.get("information_H", self.information()),
-            "logzerr_status": logzerr_status,
-            "information_H": metadata.get("information_H"),
-            "n_nonfinite_logl": metadata.get("n_nonfinite_logl"),
-            "n_nonfinite_logwt": metadata.get("n_nonfinite_logwt"),
-            "n_nonfinite_weights": metadata.get("n_nonfinite_weights"),
-            "n_dead_finite": metadata.get("n_dead_finite"),
-            "n_live_finite": metadata.get("n_live_finite"),
-            "posterior_ess": posterior_ess,
-            "max_weight_fraction": max_weight_fraction,
-            "posterior_weight_entropy": posterior_weight_entropy,
-            "posterior_weight_entropy_fraction": entropy_fraction,
-            "live_weight_fraction": live_weight_fraction,
-            "dead_weight_fraction": dead_weight_fraction,
+            "information": self.information(),
+            "niter": int(self.niter),
             "ncall": int(self.ncall),
             "nlive": int(self.nlive),
             "ndim": int(self.ndim),
             "nposterior": nposterior,
-            "warnings": warnings,
+            "posterior_ess": posterior_ess,
+            "max_weight_fraction": max_weight_fraction,
+            "posterior_weight_entropy_fraction": entropy_fraction,
+            "live_weight_fraction": live_weight_fraction,
+            "dead_weight_fraction": self.dead_weight_fraction(),
             "final_delta_logz": final_delta_logz,
-            "insertion_rank_mean_z": (
-                insertion_rank_mean_z if has_insertion_rank_stats else None
-            ),
-            "insertion_rank_std_ratio": (
-                insertion_rank_std_ratio if has_insertion_rank_stats else None
-            ),
-            "final_logx": metadata.get("final_logx"),
-            "final_logz_dead": metadata.get("final_logz_dead"),
-            "final_logl_live_max": metadata.get("final_logl_live_max"),
+            "acceptance": acceptance,
+            "insertion_pvalue": insertion["pvalue"],
+            "modes": modes,
+            "warnings": warnings,
         }
-
-        if "niter" in metadata:
-            diagnostics["niter"] = metadata["niter"]
-        if "ndead" in metadata:
-            diagnostics["ndead"] = metadata["ndead"]
-        diagnostics["replacement_chains"] = replacement_chains
-        if replacement_batch_ncall is not None:
-            diagnostics["replacement_batch_ncall"] = replacement_batch_ncall
-        if mean_replacement_ncall is not None:
-            diagnostics["replacement_mean_ncall"] = mean_replacement_ncall
-        if mean_replacement_batches is not None:
-            diagnostics["replacement_mean_batches"] = mean_replacement_batches
-        if max_replacement_batches is not None:
-            diagnostics["replacement_max_batches"] = max_replacement_batches
-        if replacement_failures is not None:
-            diagnostics["replacement_failures"] = replacement_failures
-        for name in (
-            "accepted_rwalk_moves",
-            "total_rwalk_proposals",
-            "rwalk_acceptance",
-            "mean_rwalk_acceptance",
-        ):
-            if name in metadata:
-                diagnostics[name] = metadata[name]
-
-        return diagnostics
 
     def resample_equal(self, key, n: int | None = None):
         """Return equally weighted posterior samples using systematic resampling."""
@@ -653,55 +590,50 @@ class NestedSamplingResult:
         return jnp.asarray(self.samples)[indices]
 
     def summary(self) -> str:
-        """Return a human-readable multi-line summary of the result."""
+        """Return a human-readable multi-line summary of the result.
 
+        With more than one posterior mode it ends with a per-mode table
+        (:meth:`modes`).
+        """
+
+        insertion = self.insertion_test()
         lines = [
-            f"logz: {self.logz}",
-            f"logzerr: {self.logzerr}",
-            f"ncall: {self.ncall}",
-            f"nlive: {self.nlive}",
+            f"logz: {self.logz} +/- {self.logzerr}",
+            f"niter: {self.niter}  ncall: {self.ncall}  nlive: {self.nlive}  "
             f"ndim: {self.ndim}",
-            f"posterior ESS: {self.posterior_ess()}",
+            f"posterior ESS: {self.posterior_ess():.1f}",
+            f"insertion KS p-value: {insertion['pvalue']:.3g} (windows: "
+            + ", ".join(f"{w['pvalue']:.3g}" for w in insertion["windows"])
+            + ")",
+            f"success: {self.success}",
+            f"message: {self.message}",
         ]
-        metadata = {} if self.metadata is None else self.metadata
-        if "mean_replacement_ncall" in metadata:
-            lines.append(
-                f"replacement mean ncall: {metadata['mean_replacement_ncall']}"
-            )
-        if "replacement_failures" in metadata:
-            lines.append(f"replacement failures: {metadata['replacement_failures']}")
-        lines.extend(
-            [
-                f"success: {self.success}",
-                f"message: {self.message}",
-            ]
-        )
+        modes = self.modes()
+        if len(modes) > 1:
+            lines.append("mode      mass  logit sd  min live")
+            for i, mode in enumerate(modes):
+                flag = "  unresolved: raise nlive" if mode["unresolved"] else ""
+                lines.append(
+                    f"{i:4d}  {mode['mass']:8.4f}  {mode['urn_sd']:8.2f}  "
+                    f"{mode['min_live']:8d}{flag}"
+                )
         return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.summary()
 
     def save_npz(self, path) -> None:
         """Save the final result to a compressed NumPy ``.npz`` file."""
 
-        metadata_json = json.dumps(_metadata_to_jsonable(self.metadata))
         np.savez_compressed(
             path,
-            samples_u=np.asarray(self.samples_u),
-            samples=np.asarray(self.samples),
-            logl=np.asarray(self.logl),
-            logwt=np.asarray(self.logwt),
-            logz=np.asarray(float(self.logz)),
-            logzerr=np.asarray(float(self.logzerr)),
-            ncall=np.asarray(int(self.ncall)),
-            nlive=np.asarray(int(self.nlive)),
-            ndim=np.asarray(int(self.ndim)),
-            success=np.asarray(bool(self.success)),
-            message=np.asarray(str(self.message)),
-            metadata_json=np.asarray(metadata_json),
+            **{name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS},
+            **{
+                name: np.asarray(kind(getattr(self, name)))
+                for name, kind in _RESULT_NPZ_SCALARS.items()
+            },
+            metadata_json=np.asarray(json.dumps(self.metadata, default=_jsonable)),
             format_version=np.asarray(_RESULT_NPZ_FORMAT_VERSION),
-            **(
-                {}
-                if self.logl_birth is None
-                else {"logl_birth": np.asarray(self.logl_birth)}
-            ),
         )
 
     @classmethod
@@ -709,8 +641,9 @@ class NestedSamplingResult:
         """Load a result previously written by :meth:`save_npz`."""
 
         with np.load(path) as data:
-            keys = set(data.files)
-            missing = sorted(_RESULT_NPZ_REQUIRED_KEYS - keys)
+            required = {*_RESULT_NPZ_ARRAYS, *_RESULT_NPZ_SCALARS}
+            required |= {"metadata_json", "format_version"}
+            missing = sorted(required - set(data.files))
             if missing:
                 joined = ", ".join(missing)
                 raise ValueError(f"missing required result .npz keys: {joined}")
@@ -721,77 +654,45 @@ class NestedSamplingResult:
                     "unknown result .npz format_version: "
                     f"{format_version!r}; expected {_RESULT_NPZ_FORMAT_VERSION!r}"
                 )
-
-            metadata_json = str(_npz_scalar(data["metadata_json"]))
-            metadata = _metadata_from_jsonable(json.loads(metadata_json))
-
             return cls(
-                samples_u=jnp.asarray(data["samples_u"]),
-                samples=jnp.asarray(data["samples"]),
-                logl=jnp.asarray(data["logl"]),
-                logwt=jnp.asarray(data["logwt"]),
-                logz=float(_npz_scalar(data["logz"])),
-                logzerr=float(_npz_scalar(data["logzerr"])),
-                ncall=int(_npz_scalar(data["ncall"])),
-                nlive=int(_npz_scalar(data["nlive"])),
-                ndim=int(_npz_scalar(data["ndim"])),
-                success=bool(_npz_scalar(data["success"])),
-                message=str(_npz_scalar(data["message"])),
-                metadata=metadata,
-                logl_birth=(
-                    jnp.asarray(data["logl_birth"]) if "logl_birth" in keys else None
-                ),
+                **{name: jnp.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
+                **{
+                    name: kind(_npz_scalar(data[name]))
+                    for name, kind in _RESULT_NPZ_SCALARS.items()
+                },
+                metadata=json.loads(str(_npz_scalar(data["metadata_json"]))),
             )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain Python dictionary representation of the result."""
 
-        return {
-            "samples_u": self.samples_u,
-            "samples": self.samples,
-            "logl": self.logl,
-            "logwt": self.logwt,
-            "logz": self.logz,
-            "logzerr": self.logzerr,
-            "ncall": self.ncall,
-            "nlive": self.nlive,
-            "ndim": self.ndim,
-            "success": self.success,
-            "message": self.message,
-            "metadata": None if self.metadata is None else dict(self.metadata),
-            "logl_birth": self.logl_birth,
-        }
+        out = {name: getattr(self, name) for name in _RESULT_NPZ_ARRAYS}
+        out.update({name: getattr(self, name) for name in _RESULT_NPZ_SCALARS})
+        out["metadata"] = None if self.metadata is None else dict(self.metadata)
+        return out
 
     def to_numpy(self) -> dict[str, object]:
         """Return a plain dictionary with array fields converted to NumPy arrays."""
 
-        return {
-            "samples_u": np.asarray(self.samples_u),
-            "samples": np.asarray(self.samples),
-            "logl": np.asarray(self.logl),
-            "logwt": np.asarray(self.logwt),
-            "logz": float(self.logz),
-            "logzerr": float(self.logzerr),
-            "ncall": int(self.ncall),
-            "nlive": int(self.nlive),
-            "ndim": int(self.ndim),
-            "success": bool(self.success),
-            "message": str(self.message),
-            "metadata": None if self.metadata is None else dict(self.metadata),
-            "logl_birth": (
-                None if self.logl_birth is None else np.asarray(self.logl_birth)
-            ),
-        }
+        out = {name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS}
+        out.update(
+            {
+                name: kind(getattr(self, name))
+                for name, kind in _RESULT_NPZ_SCALARS.items()
+            }
+        )
+        out["metadata"] = None if self.metadata is None else dict(self.metadata)
+        return out
 
     def to_dynesty_dict(self) -> dict[str, object]:
         """Return a lightweight dynesty-compatibility dictionary.
 
         This is not a full dynesty ``Results`` object, only a lightweight
         compatibility dict using dynesty-like keys where tinyns has matching
-        fields.
+        fields (``eff`` is dynesty's ``100 * niter / ncall``).
         """
 
-        result = {
+        return {
             "samples": np.asarray(self.samples),
             "samples_u": np.asarray(self.samples_u),
             "logl": np.asarray(self.logl),
@@ -799,9 +700,7 @@ class NestedSamplingResult:
             "logz": float(self.logz),
             "logzerr": float(self.logzerr),
             "ncall": int(self.ncall),
+            "niter": int(self.niter),
             "nlive": int(self.nlive),
+            "eff": 100.0 * int(self.niter) / max(int(self.ncall), 1),
         }
-        metadata = {} if self.metadata is None else self.metadata
-        if "replacement_acceptance_proxy" in metadata:
-            result["eff"] = metadata["replacement_acceptance_proxy"]
-        return result

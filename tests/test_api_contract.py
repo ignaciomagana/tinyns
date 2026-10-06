@@ -145,7 +145,7 @@ def _jax_box_prior(unit):
 
 
 def _run_metadata(result) -> dict:
-    keys = ("walks", "replacement_chains", "block_size", "rwalk_scale_initial")
+    keys = ("walks", "replacement_chains", "block_size", "scale_initial")
     return {key: result.metadata[key] for key in keys}
 
 
@@ -157,10 +157,10 @@ def test_default_sampler_runs_live_cov_block_path() -> None:
         "walks": 25,
         "replacement_chains": 1,
         "block_size": 32,
-        "rwalk_scale_initial": 0.5,
+        "scale_initial": 0.5,
     }
     assert result.metadata["cluster_swap"] is True
-    assert result.metadata["rwalk_adaptation_updates"] == 2
+    assert result.niter == 64
     assert math.isfinite(result.logz)
 
 
@@ -214,5 +214,4 @@ def test_huge_walks_still_runs_one_batch_per_replacement() -> None:
     )
 
     assert result.success is False  # maxiter
-    assert result.metadata["replacement_failures"] == 0
-    assert result.metadata["max_replacement_batches"] == 1
+    assert result.ncall == 20 + 2 * 6000 * 2  # one batch per replacement

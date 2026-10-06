@@ -9,12 +9,13 @@ A checkpoint is one ``.npz`` file, written atomically (a temporary file, then
   a typed key (``""`` for a legacy ``uint32`` key), so both round-trip exactly.
   ``state/scale`` is the host loop's step scale (float64);
 - ``dead/<column>``: the dead rows so far (``u``, ``theta``, ``logl``,
-  ``logwt``, ``birth``, ``ncall``, ``insertion``, ``batches``);
+  ``logwt``, ``birth``, ``ncall``, ``batches``);
 - ``config_json``: the resolved :class:`tinyns.core.Config` (``ndim``,
   ``nlive``, ``walks``, ``replacement_chains``, ``block_size``,
   ``cluster_swap``) plus ``tinyns_version``;
 - ``telemetry_json``: the host loop's running telemetry (``rwalk_moves``,
-  ``rwalk_proposals``, ``scale_history``, ``accept_history``);
+  ``rwalk_proposals``, and ``wall_time_s``, ``compile_s`` and ``timed_ncall``
+  summed over the run so far, so the wall time accumulates over resumes);
 - ``ext/<hook>/<name>``: a host hook's ``state_dict()``; arrays as they are,
   anything else as JSON under ``<name>.json``.
 

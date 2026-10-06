@@ -180,23 +180,19 @@ def run_one(
         niter = int(niter)
     iter_per_s, ncall_per_s = compute_rates(niter, int(result.ncall), seconds)
     warnings = diagnostics.get("warnings", [])
-    replacement_batch_ncall = int(metadata["replacement_batch_ncall"])
-    mean_replacement_ncall = float(metadata.get("mean_replacement_ncall", 0.0))
-    max_replacement_ncall = int(metadata.get("max_replacement_ncall", 0))
-    repl_batches = metadata.get("mean_replacement_batches")
-    if repl_batches is None:
-        repl_batches = (
-            mean_replacement_ncall / replacement_batch_ncall
-            if replacement_batch_ncall > 0
-            else None
-        )
-    max_repl_batches = metadata.get("max_replacement_batches")
-    if max_repl_batches is None:
-        max_repl_batches = (
-            max_replacement_ncall / replacement_batch_ncall
-            if replacement_batch_ncall > 0
-            else None
-        )
+    replacement_batch_ncall = int(metadata["walks"]) * int(
+        metadata["replacement_chains"]
+    )
+    # The result no longer records per-replacement calls: the mean is
+    # derived, the maximum is not known.
+    mean_replacement_ncall = (int(result.ncall) - args.nlive) / max(niter or 0, 1)
+    max_replacement_ncall = None
+    repl_batches = (
+        mean_replacement_ncall / replacement_batch_ncall
+        if replacement_batch_ncall > 0
+        else None
+    )
+    max_repl_batches = None
 
     return {
         "target": target_name,
@@ -223,7 +219,7 @@ def run_one(
         "likelihood_calls_per_second": ncall_per_s,
         "mean_replacement_ncall": mean_replacement_ncall,
         "max_replacement_ncall": max_replacement_ncall,
-        "replacement_failures": int(metadata.get("replacement_failures", 0)),
+        "replacement_failures": int(result.message.startswith("replacement failed")),
         "logz": float(result.logz),
         "logzerr": float(result.logzerr),
         "success": bool(result.success),
