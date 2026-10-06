@@ -21,7 +21,7 @@ python validation/summarize_validation.py validation_results.json
 
 Every run uses the default sampler (live-cov rwalk in jitted blocks). The
 harness exposes the sampler's own knobs: `--walks` (default: the sampler
-default, `max(25, 6 * ndim)`), `--replacement-chains` and `--block-size`.
+default, `max(25, 6 * ndim, ndim**2 // 6)`), `--replacement-chains` and `--block-size`.
 
 Recommended smoke-to-medium validation command:
 

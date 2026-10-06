@@ -27,7 +27,8 @@ def main():
     key = jax.random.PRNGKey(0)
 
     # The defaults: num_delete=max(1, nlive // 10) replacements per step, each
-    # a live-covariance random walk of walks=max(25, 6 * ndim) steps.
+    # a live-covariance random walk of walks=tinyns.core.default_walks(ndim)
+    # steps (25 here).
     sampler = NestedSampler(loglike, prior_transform, ndim=2, nlive=200)
 
     result = sampler.run(key, dlogz=0.1)

@@ -83,13 +83,30 @@ def _check_int(name: str, value, minimum: int) -> int:
     return int(value)
 
 
+def default_walks(ndim: int) -> int:
+    """Default chain length: ``max(25, 6 ndim, ndim^2 // 6)``.
+
+    That is 6 steps per dimension up to 36 dimensions (25 below 5), and
+    ``ndim / 6`` per dimension beyond (384 at 48, 682 at 64). Early
+    in a run, while the prior box still cuts the likelihood contours, the
+    likelihood rank along a chain decorrelates in 2 to 3 ``ndim`` steps (about
+    9 later on), and in high dimensions ``6 ndim`` steps leave a small upward
+    logZ bias from that phase. This default keeps the bias below the logZ
+    scatter on correlated Gaussians from 2 to 64 dimensions with 250 to 2000
+    live points. Curved targets need more (a 10-D Rosenbrock valley 12 to 25
+    ``ndim``).
+    """
+    return max(25, 6 * ndim, ndim * ndim // 6)
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     """Static sampler configuration (hashable: part of the compile cache key).
 
     ``nlive`` (``m``) live points; ``num_delete`` (``k``) points deleted and
     replaced per step, default ``max(1, nlive // 10)``, at most ``nlive // 2``;
-    ``walks`` steps per replacement chain, default ``max(25, 6 * ndim)``.
+    ``walks`` steps per replacement chain, default :func:`default_walks`
+    (``max(25, 6 ndim, ndim^2 // 6)``).
     """
 
     ndim: int
@@ -104,7 +121,7 @@ class Config:
         k = _check_int("num_delete", k, 1)
         if k > nlive // 2:
             raise ValueError(f"num_delete must be at most nlive // 2 = {nlive // 2}")
-        walks = max(25, 6 * ndim) if self.walks is None else self.walks
+        walks = default_walks(ndim) if self.walks is None else self.walks
         walks = _check_int("walks", walks, 1)
         for name, value in (
             ("ndim", ndim),
@@ -204,6 +221,27 @@ def _live_chol(u, mask):
     return std[:, None] * chol
 
 
+def _proposal_mask(above, seeds, ndim):
+    """The live points whose covariance shapes the step's proposals.
+
+    These are the points above ``L*`` other than the chains' seeds. With the
+    seeds left out, the proposal depends only on the other live points, and
+    (for independent live points) given them a seed is a uniform draw inside
+    the contour. A symmetric
+    Metropolis walk with a proposal fixed in advance leaves that uniform
+    distribution invariant, so the chain's end point is exactly uniform inside
+    the contour for any number of steps. A seed that also shaped its own
+    proposal would pull its chain inward by an amount of order
+    ``ndim / nlive``, which overestimated logZ unless the walks were long.
+
+    When fewer than ``ndim + 1`` points would remain (a nearly exhausted live
+    set) the seeds are kept, so the covariance still has full rank.
+    """
+    m = above.shape[0]
+    held_out = above & ~jnp.zeros((m,), bool).at[seeds].set(True)
+    return jnp.where(jnp.sum(held_out) >= ndim + 1, held_out, above)
+
+
 def _propose(key, u, chol, scale):
     """One chain proposal: the live-covariance random walk ``u + s L z``.
 
@@ -294,7 +332,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
     fill = random.categorical(k_fill, jnp.where(above, 0.0, -jnp.inf), shape=(k,))
     seeds = jnp.where(jnp.arange(k) < n_above, top, fill)
 
-    chol = _live_chol(state.u, above)
+    chol = _live_chol(state.u, _proposal_mask(above, seeds, cfg.ndim))
     scale = jnp.exp(state.log_scale)
     chain_args = (lstar, chol, scale, loglike, prior_transform, walks)
     if k == 1:  # no vmap: the cond really skips out-of-cube proposals
