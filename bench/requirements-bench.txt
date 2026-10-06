@@ -1,0 +1,13 @@
+# env/bench: every sampler except jaxns. Python >= 3.10.
+# Versions validated on CPU (Hilda, 2026-10-06). For a CPU-only env replace
+# jax[cuda12] with jax.
+jax[cuda12]==0.10.2
+blackjax==1.7.1
+dynesty==3.1.0
+ultranest==4.5.2
+nautilus-sampler==1.0.6
+numpy==2.4.6
+scipy==1.17.1
+pytest
+# tinyns is installed separately (see README): the v1 checkout with
+# `pip install -e`, and tinyns 0.x through TINYNS_V02_SRC.
