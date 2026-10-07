@@ -45,6 +45,24 @@ def test_two_mode_runs_find_both_modes() -> None:
         assert not any(m["unresolved"] for m in modes)
 
 
+def test_unresolved_flags_a_mode_below_five_points_per_dimension() -> None:
+    """``unresolved`` is ``min_live < 5 ndim``: at nlive 60 the 25% mode of
+    the 3-D target holds about 15 live points, on either side of the
+    threshold from seed to seed; at nlive 400 it holds about 100."""
+    from tinyns import result as result_module
+
+    assert result_module.UNRESOLVED_PER_DIM == 5.0
+    flags = []
+    for seed in range(6):
+        result = NestedSampler(two_modes, lambda u: u, 3, nlive=60).run(seed)
+        for mode in result.modes():
+            assert mode["unresolved"] == (mode["min_live"] < 15)
+            flags.append(mode["unresolved"])
+        warned = sum("unresolved" in w for w in result.diagnostics()["warnings"])
+        assert warned == sum(m["unresolved"] for m in result.modes())
+    assert any(flags)
+
+
 def banana5(theta):
     y = (theta - 0.5) * 10.0
     ridge = (y[1:] - 0.5 * y[:-1] ** 2 + 1.0) ** 2

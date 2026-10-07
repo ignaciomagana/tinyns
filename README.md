@@ -88,10 +88,10 @@ its chain's clusters and covariances are fitted to the other two folds only
 (as emcee moves each half of its walkers with the other half). In the v1
 bake-off the hop cut the seed-to-seed scatter of minor-mode weights about 7x
 at the same number of likelihood calls. `result.modes()` reports each mode's
-mass, an urn error bar and its smallest live count (a mode that held fewer
-than `3 * ndim` live points is flagged unresolved: raise `nlive`). A mode
-needs about `5 * ndim` live points for its own walk to mix: below that its
-weight keeps a bias of a few percent (see the CHANGELOG).
+mass, an urn error bar and its smallest live count. A mode needs about
+`5 * ndim` live points for its own walk to mix; below that its weight keeps a
+bias of a few percent (see the CHANGELOG), and `modes()` flags it unresolved:
+raise `nlive`.
 
 ### Choosing `walks`
 

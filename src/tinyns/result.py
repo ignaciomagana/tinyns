@@ -36,9 +36,13 @@ _RESULT_NPZ_SCALARS = {
     "message": str,
 }
 # A mode whose live count falls below this many points per dimension between
-# its isolation and its posterior bulk is flagged unresolved (raise nlive):
-# modes above it are weighed reliably, modes below it are not.
-UNRESOLVED_PER_DIM = 3.0
+# its isolation and its posterior bulk is flagged unresolved (raise nlive). A
+# covariance-adapted walk needs about that many points to learn a mode's
+# shape: on one Gaussian with the shape of the minor mode of the 18-D
+# bake-off target, 1.7, 3.3 and 6.7 points per dimension left logZ 4.35,
+# 0.21 and 0.03 too high, and the bake-off cells whose minor mode held fewer
+# than 5 per dimension kept a weight bias or a large scatter.
+UNRESOLVED_PER_DIM = 5.0
 # Two clusters are one mode unless, at each of their posterior medians, their
 # live points leave a gap of this many within-cluster standard deviations
 # along the discriminant direction. The split test also cuts one curved mode

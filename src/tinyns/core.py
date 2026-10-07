@@ -75,7 +75,10 @@ _CHUNK_EFOLDS = 4.0
 _CHUNK_SECONDS = 45.0
 _CHECKPOINT_SECONDS = 600.0
 _INT32_MAX = 2**31 - 1
-_PLAIN_BRANCH = True
+# The frames a chain looks up at every step when no clustering has more in use
+# (kernel 1 of :func:`_kernel_level`).
+_FEW = 2
+_KERNELS = 3
 
 
 def _check_int(name: str, value, minimum: int) -> int:
@@ -298,7 +301,7 @@ def _walk_mask(above, other, seeds, ndim):
 
 def _chain(
     key, u, logl, lstar, chol, scale, loglike, prior_transform, walks, skip,
-    frames, hop=True, local=False, fold=None, plain=False,
+    frames, hop=True, local=False, fold=None, plain=False, near=None,
 ):
     """A fixed-length constrained Metropolis chain from ``(u, logl)``.
 
@@ -346,33 +349,37 @@ def _chain(
     def evaluate(v):
         return _loglike_u(loglike, prior_transform, v, dtype)
 
+    near = frames if near is None else near
     if fold is None:
-        mine = frames
+        mine, every = near, frames
 
         def live_step(z):
             return chol @ z
 
-        def frame_chol(c):
-            return frames.chol[c]
+        def frame_chol(fr, c):
+            return fr.chol[c]
 
         def offsets(v):
-            return jnp.einsum("cij,cj->ci", frames.ichol, v - frames.mu)
+            return jnp.einsum("cij,cj->ci", near.ichol, v - near.mu)
 
     else:
         if tracked:
-            mine = _modes.Frames(*(
-                None if name in ("chol", "ichol") else getattr(frames, name)[fold]
-                for name in _modes.Frames._fields
-            ))
+            mine, every = (
+                _modes.Frames(*(
+                    None if name in ("chol", "ichol") else getattr(fr, name)[fold]
+                    for name in _modes.Frames._fields
+                ))
+                for fr in (near, frames)
+            )
 
         def live_step(z):
             return jnp.einsum("fij,j->fi", chol, z)[fold]
 
-        def frame_chol(c):
-            return frames.chol[fold, c]
+        def frame_chol(fr, c):
+            return fr.chol[fold, c]
 
         def offsets(v):
-            y = jnp.einsum("fcij,fcj->fci", frames.ichol, v - frames.mu)
+            y = jnp.einsum("fcij,fcj->fci", near.ichol, v - near.mu)
             return y[fold]
 
     # The step keys. A hop step splits its key in two: one for the walk step
@@ -409,8 +416,8 @@ def _chain(
 
         def draw(key):
             k_c, k_x, k_acc = random.split(key, 3)
-            c = _modes.hop_frame(k_c, mine.eligible, mine.logdet)
-            point = _modes.hop_point(k_x, mine.mu[c], frame_chol(c))
+            c = _modes.hop_frame(k_c, every.eligible, every.logdet)
+            point = _modes.hop_point(k_x, every.mu[c], frame_chol(frames, c))
             return point, random.uniform(k_acc, (), dtype)
 
         hop_points, hop_uniforms = jax.vmap(draw)(pair[:, 1])
@@ -422,7 +429,7 @@ def _chain(
         z = random.normal(k_z, u.shape, u.dtype)
         move = live_step(z)
         if local:
-            move = jnp.where(use_local, frame_chol(c) @ z, move)
+            move = jnp.where(use_local, frame_chol(near, c) @ z, move)
         prop = u + scale * move
         hop = jnp.asarray(False)
         if tracked and n_hops > 0:
@@ -630,22 +637,49 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     return jnp.where(rank < n_fold[dead_fold], tops[dead_fold, rank], fill)
 
 
-def _uses_frames(state: State, cfg: Config):
-    """Whether any clustering holds two walk clusters or two eligible ones
-    (the moves read the frames only then; :func:`_chain`, ``plain``)."""
+def _used(frames: _modes.Frames, cfg: Config):
+    """The frames the moves of ``cfg`` can read: the walk clusters and the
+    eligible ones."""
+    used = jnp.zeros_like(frames.active)
+    if cfg._local:
+        used |= _modes.walk_frames(frames)
+    if cfg._hop and cfg.walks >= _modes.HOP_EVERY:
+        used |= frames.eligible
+    return used
+
+
+def _kernel_level(state: State, cfg: Config):
+    """Which chain kernel a step needs: 0, 1 or 2 (an unbatched int32, the
+    largest over the clusterings and, for a batch of runs, over the lanes).
+
+    0: no clustering holds two walk clusters or two eligible ones, so the
+    chains are symmetric walks in the live covariance and read no frame
+    (:func:`_chain`, ``plain``). 1: no clustering has more than ``_FEW``
+    frames in use, and the chains look up those alone. 2: all ``C_MAX``.
+    """
     frames = _frames(state)
     multi = jnp.asarray(False)
     if cfg._local:
         multi |= jnp.any(jnp.sum(_modes.walk_frames(frames), axis=-1) >= 2)
     if cfg._hop and cfg.walks >= _modes.HOP_EVERY:
         multi |= jnp.any(jnp.sum(frames.eligible, axis=-1) >= 2)
-    return multi
+    few = jnp.all(jnp.sum(_used(frames, cfg), axis=-1) <= _FEW)
+    return jnp.where(multi, jnp.where(few, 1, 2), 0).astype(jnp.int32)
 
 
-def _step(state: State, loglike, prior_transform, cfg: Config, multi=None):
-    """One step. ``multi`` (:func:`_uses_frames`) selects the chains' kernel
-    through a ``lax.cond``; a batch of runs passes one unbatched value (true
-    if any lane uses its frames), so that the ``cond`` stays a branch."""
+def _few(frames: _modes.Frames, cfg: Config) -> _modes.Frames:
+    """The first ``_FEW`` frames in use of every clustering (in slot order)."""
+    order = jnp.argsort(~_used(frames, cfg), axis=-1, stable=True)[:, :_FEW]
+    return _modes.Frames(*(
+        jnp.take_along_axis(a, order.reshape(order.shape + (1,) * (a.ndim - 2)), 1)
+        for a in frames
+    ))
+
+
+def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
+    """One step. ``level`` (:func:`_kernel_level`) selects the chains' kernel
+    through a ``lax.switch``; a batch of runs passes one unbatched value (the
+    largest of its lanes), so that the ``switch`` stays a branch."""
     m, k, walks = cfg.nlive, cfg.num_delete, cfg.walks
     dtype = state.logl.dtype
     # The k lowest points, by increasing likelihood; L* is the highest of them.
@@ -670,36 +704,41 @@ def _step(state: State, loglike, prior_transform, cfg: Config, multi=None):
     frames = _frames(state)  # frames[j]: fitted outside fold j
     scale = jnp.exp(state.log_scale)
 
-    def chains(plain):
-        def chain(key, i, mine=None):
-            """The chain seeded at live point ``i``; ``mine`` (one unbatched
-            chain): the kernel of its fold, sliced out."""
+    def chains(kernel):
+        """The step's chains with kernel 0, 1 or 2 (:func:`_kernel_level`)."""
+        near = _few(frames, cfg) if kernel == 1 else frames
+
+        def chain(key, i, lone=False):
+            """The chain seeded at live point ``i``; ``lone`` (one unbatched
+            chain): its fold's kernel is sliced out."""
             j = fold[i]
-            kernel = (chols, frames, j) if mine is None else (*mine(j), None)
+            mine = (chols, frames, near, j)
+            if lone:
+                mine = (*jax.tree_util.tree_map(lambda a: a[j], mine[:3]), None)
             return _chain(
-                key, state.u[i], state.logl[i], lstar, kernel[0], scale, loglike,
-                prior_transform, walks, mine is not None, kernel[1], cfg._hop,
-                cfg._local, kernel[2], plain,
+                key, state.u[i], state.logl[i], lstar, mine[0], scale, loglike,
+                prior_transform, walks, lone, mine[1], cfg._hop, cfg._local,
+                mine[3], kernel == 0, mine[2],
             )
 
         def run(_):
             if k == 1:  # no vmap: the cond really skips out-of-cube proposals
-                out = chain(k_chain, seeds[0], lambda j: (
-                    chols[j], jax.tree_util.tree_map(lambda a: a[j], frames)
-                ))
-                return tuple(x[None] for x in out)
+                return tuple(x[None] for x in chain(k_chain, seeds[0], True))
             return jax.vmap(chain)(random.split(k_chain, k), seeds)
 
         return run
 
-    if not _PLAIN_BRANCH:
-        out = chains(False)(None)
-    elif not (cfg._local or (cfg._hop and walks >= _modes.HOP_EVERY)):
-        out = chains(True)(None)
+    kernels = [chains(i) for i in range(3)]
+    if not (cfg._local or (cfg._hop and walks >= _modes.HOP_EVERY)):
+        out = kernels[0](None)
+    elif _KERNELS == 1:
+        out = kernels[2](None)
     else:
-        if multi is None:
-            multi = _uses_frames(state, cfg)
-        out = lax.cond(multi, chains(False), chains(True), None)
+        if level is None:
+            level = _kernel_level(state, cfg)
+        if _KERNELS == 2:
+            kernels[1] = kernels[2]
+        out = lax.switch(level, kernels, None)
     new_u, new_logl, moves, nev, nvalid, hops, hop_tries = out
 
     insertion = jnp.sum(
@@ -853,8 +892,8 @@ def _chunk_kernel(loglike_spec, prior_spec, cfg: Config, capacity: int, axes=Non
     ``count[lane]``. Mode tracking reclusters before a step through an
     unbatched ``lax.cond`` (:func:`_maybe_recluster`).
     """
-    def lane_step(state, leaves, multi=None):
-        return _step(state, *_rebuild(loglike_spec, prior_spec, leaves), cfg, multi)
+    def lane_step(state, leaves, level=None):
+        return _step(state, *_rebuild(loglike_spec, prior_spec, leaves), cfg, level)
 
     def kernel(state, n_steps, dlogz, max_steps, call_budget, *leaves):
         i32 = jnp.int32
@@ -874,9 +913,9 @@ def _chunk_kernel(loglike_spec, prior_spec, cfg: Config, capacity: int, axes=Non
 
             def step_all(state):
                 state = _maybe_recluster(state, cfg, batched=True)
-                multi = _uses_frames(state, cfg)  # unbatched: any lane
+                level = _kernel_level(state, cfg)  # unbatched: of all lanes
                 new, dead = jax.vmap(lane_step, in_axes=(0, axes, None))(
-                    state, leaves, multi
+                    state, leaves, level
                 )
                 return _select(state.status == RUNNING, new, state), dead
 
