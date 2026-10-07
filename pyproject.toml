@@ -40,6 +40,10 @@ packages = ["src/tinyns"]
 [tool.pytest.ini_options]
 testpaths = ["tests", "bench/tests"]
 pythonpath = ["src", "."]
+# Heavy statistical gates are marked slow and skipped by default; run them
+# with `pytest -m slow` (the last -m wins).
+addopts = "-m 'not slow'"
+markers = ["slow: heavy statistical gates (run with -m slow)"]
 
 [tool.ruff]
 line-length = 88

@@ -168,3 +168,29 @@ def test_parse_seeds():
     from bench.run import parse_seeds
 
     assert parse_seeds("0-3,7") == [0, 1, 2, 3, 7]
+
+
+def test_bakeoff_runner_and_summary(tmp_path) -> None:
+    """One tiny cell per arm (N and C), then the decision tables."""
+    import jax
+    from bench.bakeoff import emit, summarize
+    from bench.bakeoff import run as bakeoff
+
+    out = tmp_path / "bakeoff.jsonl"
+    for arm in ("N", "C"):
+        bakeoff.main([
+            "--target", "sepW_d4", "--arm", arm, "--nlive", "100", "--k", "10",
+            "--seeds", "0-1", "--out", str(out),
+            "--x64" if jax.config.jax_enable_x64 else "--no-x64",
+        ])
+    recs = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(recs) == 4 and {r["arm"] for r in recs} == {"N", "C"}
+    for r in recs:
+        assert abs(sum(r["mode_mass"]) - 1) < 1e-6
+        assert len(r["minor_live"]) == 1 and r["isolation_niter"][0] > 0
+    assert all(r["hop_tries"] > 0 for r in recs if r["arm"] == "C")
+    report = tmp_path / "report.md"
+    summarize.main([str(out), "--out", str(report)])
+    text = report.read_text()
+    assert "## Decision" in text and "| sepW_d4 | 100 | 10 | C |" in text
+    assert len(list(emit.cells())) == 152

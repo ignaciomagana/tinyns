@@ -5,9 +5,11 @@ same directory, ``fsync``, then ``os.replace``, so a crash leaves either the
 previous checkpoint or the new one, never a torn file. It holds
 
 - ``state/<field>``: the :class:`tinyns.core.State` leaves (with a leading
-  lane axis for a batched run). The PRNG key is stored as its raw ``uint32``
-  key data, with ``state/key_impl`` naming the implementation of a typed key
-  (``""`` for a raw ``uint32`` key), so both kinds round-trip exactly;
+  lane axis for a batched run), including the mode-tracking fields (cluster
+  labels, ``fitted`` flags and cluster statistics) when they are used. The
+  PRNG key is stored as its raw ``uint32`` key data, with ``state/key_impl``
+  naming the implementation of a typed key (``""`` for a raw ``uint32``
+  key), so both kinds round-trip exactly;
 - ``init_key`` (and ``init_key_impl``): the key the run started from, so a
   resume with a different key is refused;
 - ``dead/<lane>/<column>``: the dead rows of each lane so far, ``(steps, k,
@@ -105,6 +107,8 @@ def save(path, ckpt: Checkpoint) -> None:
     arrays = {}
     state = ckpt.state
     for name, value in state._asdict().items():
+        if value is None:  # mode-tracking fields of the arm N
+            continue
         if name == "key":
             data, impl = key_to_numpy(value)
             arrays["state/key"] = data
@@ -116,7 +120,8 @@ def save(path, ckpt: Checkpoint) -> None:
     arrays["init_key_impl"] = np.asarray(impl)
     for lane, dead in enumerate(ckpt.dead):
         for name, value in dead._asdict().items():
-            arrays[f"dead/{lane}/{name}"] = np.asarray(value)
+            if value is not None:
+                arrays[f"dead/{lane}/{name}"] = np.asarray(value)
     meta = {
         "format": FORMAT,
         "tinyns_version": __version__,
@@ -216,6 +221,8 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
             )
         fields = {}
         for name in State._fields:
+            if f"state/{name}" not in data.files:
+                continue  # an absent (None) field, e.g. mode tracking off
             if name == "key":
                 fields[name] = key_from_numpy(
                     data["state/key"], str(data["state/key_impl"][()])
@@ -224,7 +231,11 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 fields[name] = jnp.asarray(data[f"state/{name}"])
         lanes = 1 if batch is None else batch
         dead = [
-            Dead(*(np.asarray(data[f"dead/{lane}/{name}"]) for name in Dead._fields))
+            Dead(**{
+                name: np.asarray(data[f"dead/{lane}/{name}"])
+                for name in Dead._fields
+                if f"dead/{lane}/{name}" in data.files
+            })
             for lane in range(lanes)
         ]
     return Checkpoint(

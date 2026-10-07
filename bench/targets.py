@@ -19,7 +19,8 @@ each mode at ``x`` and ``mode_mass`` holds the exact posterior masses
 same function, applied to its weighted (or equal-weight) samples.
 
 Names: ``gauss_d{d}``, ``rosen_d{d}``, ``funnel_d{d}``, ``loggamma_d{d}``,
-``eggbox_d2``, ``sepW_d{d}``, ``sepM_d{d}``, ``connW_d{d}`` and ``mix3_d10``.
+``eggbox_d2``, ``sepW_d{d}``, ``sepM_d{d}``, ``connW_d{d}`` and ``mix3_d10``;
+``sepWtw_d{d}`` is ``sepW`` with a banana-twisted main mode.
 ``BENCH_TARGETS`` lists the ones in the standard sweep.
 """
 
@@ -157,7 +158,7 @@ def rosenbrock_logz_quadrature(d: int, n: int = 20001, chunk: int = 512) -> floa
 
 
 # rosenbrock_logz_quadrature(d) with n = 20001 (see --check).
-ROSEN_LOGZ = {2: -5.8041324, 10: -43.1083552}
+ROSEN_LOGZ = {2: -5.8041324, 4: -15.1016907, 10: -43.1083552}
 
 
 def rosenbrock(d: int) -> Target:
@@ -388,7 +389,7 @@ SHAPES = {
 OFF = {"sep": 10.0, "conn": 4.0}
 
 
-def build_two_mode(d, w2, variant="sep", shape="M", seed=0):
+def build_two_mode(d, w2, variant="sep", shape="M", seed=0, twist=0.0):
     """Two-component mixture in the unit cube (verbatim port of mm_targets.build).
 
     main mode: sigmas log-spaced over [0.002, 0.0632] (shuffled), AR(1) rho 0.8
@@ -396,6 +397,12 @@ def build_two_mode(d, w2, variant="sep", shape="M", seed=0):
     dims, AR(1) |rho| 0.8 over a different ordering, offset along the 2 (d = 4)
     or 3 smallest-sigma dims with total norm OFF[variant] marginal sigmas
     ('sep' 10, i.e. 5.8 sigma per dim at d >= 10; 'conn' 4).
+
+    ``twist`` bends the main mode into a banana with the prototype's
+    volume-preserving shear: its density is N1 evaluated at
+    ``y_j - twist * sigma_j * (y_i / sigma_i)^2`` (``i`` the widest dim, ``j``
+    the narrowest dim that is not offset), so logZ and the mode masses are
+    unchanged.
     """
     rng = np.random.default_rng(seed)
     sig = np.geomspace(SIG_MIN, SIG_MAX, d)
@@ -433,6 +440,8 @@ def build_two_mode(d, w2, variant="sep", shape="M", seed=0):
         variant=variant,
         shape=shape,
         vol_ratio=fac_val**n_narrow,
+        twist=float(twist),
+        twist_dims=(int(order[-1]), int(order[n_off])),
     )
 
 
@@ -491,8 +500,14 @@ def mixture_target(name: str, t: dict) -> Target:
 
     trunc = sum(w[k] * outside(means[k], t["sigs"][k]) for k in range(len(w)))
 
+    twist = float(t.get("twist", 0.0))
+    ti, tj = t.get("twist_dims", (0, 1))
+    si, sj = float(t["sigs"][0][ti]), float(t["sigs"][0][tj])
+
     def comps(x):
         y = x[None, :] - M
+        if twist:  # banana shear of the main mode (component 0) only
+            y = y.at[0, tj].add(-twist * sj * (y[0, ti] / si) ** 2)
         return A - 0.5 * jnp.einsum("ki,kij,kj->k", y, P, y)
 
     def loglike(x):
@@ -516,6 +531,7 @@ def mixture_target(name: str, t: dict) -> Target:
             variant=t.get("variant"),
             shape=t.get("shape"),
             vol_ratio=t.get("vol_ratio"),
+            twist=t.get("twist", 0.0),
             truncated_mass_bound=float(trunc),
         ),
     )
@@ -523,6 +539,7 @@ def mixture_target(name: str, t: dict) -> Target:
 
 # ----------------------------------------------------------------- registry
 MINOR_WEIGHT = 0.06
+TWIST = 0.3  # the banana-twisted variants, e.g. ``sepWtw_d10`` (prototype value)
 
 BENCH_TARGETS = (
     [f"gauss_d{d}" for d in (2, 8, 16, 32, 64)]
@@ -554,9 +571,10 @@ def _split(name: str) -> tuple[str, int]:
 def mixture_spec(name: str) -> dict | None:
     """The component weights, means and covariances of a mixture target."""
     fam, d = _split(name)
-    mm = re.fullmatch(r"(sep|conn)([WMSX])", fam)
+    mm = re.fullmatch(r"(sep|conn)([WMSX])(tw)?", fam)
     if mm:
-        return build_two_mode(d, MINOR_WEIGHT, mm.group(1), mm.group(2))
+        twist = TWIST if mm.group(3) else 0.0
+        return build_two_mode(d, MINOR_WEIGHT, mm.group(1), mm.group(2), twist=twist)
     if fam == "mix3":
         return build_three_mode(d)
     return None

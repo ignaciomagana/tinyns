@@ -29,6 +29,7 @@ recomputes the cached quadrature values.
 | `eggbox_d2` | 2 | 2-D quadrature, 235.856 | not scored (18) |
 | `sepW_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 |
 | `connW_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 |
+| `sepWtw_d{d}` | any | analytic, 0 | 0.94 / 0.06 (banana-twisted main mode) |
 | `sepM_d{10,18,32}` | 10-32 | analytic, 0 | 0.94 / 0.06 |
 | `mix3_d10` | 10 | analytic, 0 | 0.7 / 0.2 / 0.1 |
 
@@ -168,6 +169,34 @@ How `run.py` works:
 - `lost`: the fraction of seeds where some minor mode has under 10% of its
   true mass.
 - Medians of `ncall`, `wall s` and `compile s`.
+
+## Multimodality bake-off (`bench/bakeoff/`)
+
+The v1 plan's bake-off of the inter-mode moves (`Config._mode`, see
+`tinyns/modes.py`): `N` (none), `B_ell`, `B_t`, `C`, `BC`.
+
+```bash
+python bench/bakeoff/run.py --target sepW_d18 --arm C --nlive 500 --k 50 \
+    --seeds 0-39 --out results.jsonl      # one cell: 40 seeds, one batched run
+python bench/bakeoff/emit.py > jobs.txt   # queue lines of the full grid (152 cells)
+python bench/bakeoff/emit.py --estimate   # its H100 time estimate
+python bench/bakeoff/summarize.py results.jsonl --out report.md
+```
+
+- `run.py` runs all seeds of a cell as one batched tinyns run (`core.run`
+  with a batch of keys), so a cell is one GPU job, and writes one
+  `tinyns-bakeoff-1` line per seed: logZ, logzerr, ncall, ncall_valid, the
+  batch's wall and compile time, the oracle mode masses and their Kish
+  effective sizes, the hop acceptance, the cluster history, the oracle
+  isolation and the detection iteration, and the oracle live count of each
+  minor mode every quarter e-fold.
+- `summarize.py` applies the plan's decision rule: per-cell tables (logit sd
+  with a bootstrap CI against the exact-draw floor, lost fraction, logit and
+  Z/truth biases, logZ bias and scatter/logzerr, hop acceptance, detection
+  lag, calls and wall time relative to `N`), the eliminations, the user gate
+  (logit sd at most 0.4 in every resolvable cell) and the score.
+- `emit.py` writes one `flock gpu.lock` queue line per cell, in the format of
+  `h100_plan.sh` (paths relative to `$P` on js2h100).
 
 ## Tests
 
