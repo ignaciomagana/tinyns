@@ -154,10 +154,9 @@ def _lower_block_kernel_text(loglike, prior):
         ncall_valid=i32(0),
         status=i32(0),
         label=jnp.zeros((m,), i32),
-        fitted=jnp.zeros((m,), bool),
-        mode_mu=jnp.zeros((modes.C_MAX, NDIM), f),
-        mode_scat=jnp.zeros((modes.C_MAX, NDIM, NDIM), f),
-        mode_count=jnp.zeros((modes.C_MAX,), f),
+        mode_mu=jnp.zeros((2, modes.C_MAX, NDIM), f),
+        mode_scat=jnp.zeros((2, modes.C_MAX, NDIM, NDIM), f),
+        mode_count=jnp.zeros((2, modes.C_MAX), f),
     )
     lowered = kernel.lower(
         state, i32(4), jnp.asarray(0.1, f), i32(100), i32(10**6),

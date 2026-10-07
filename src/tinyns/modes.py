@@ -1,4 +1,4 @@
-"""On-device mode tracking and the inter-mode hop of the replacement chains.
+"""On-device mode tracking, the inter-mode hop and the local random walk.
 
 Why: a replacement chain starts from a live point and cannot cross between
 separated modes, so the number of live points in each mode does a random walk
@@ -7,26 +7,41 @@ exact for the constrained prior and restores the balance: the flux between
 two modes vanishes when their populations are in proportion to their
 volumes, and the frames only set how fast the populations relax. In the v1
 bake-off (``bench/bakeoff/``) it cut the seed-to-seed logit sd of minor-mode
-masses about 7x at the same number of likelihood calls.
+masses about 7x at the same number of likelihood calls. Within a mode, a walk
+in the global live covariance mixes poorly when the modes differ in shape (it
+is dominated by the largest one), so the walk uses the covariance of the
+current point's cluster.
 
-**Clustering** (:func:`recluster`, pure JAX, static shapes, ``C_MAX`` slots).
-Every ``Config.recluster_every`` steps (about a quarter of an e-fold) the live
-points are relabelled: warm-started hard EM from the current labels, merges of
-cluster pairs whose Fisher separation ``J = dm^T Sw^-1 dm`` fell below half
-the split threshold, then top-down splits. A split of a cluster is 2-means in
-the cluster's whitened coordinates from four starts (farthest points, and the
-best one-dimensional cuts along the independent-component directions),
-refined by hard EM; the best ``J`` (deflated for small clusters) is accepted
-if it is at least ``max(25, 1.5 (d + 2))`` and both parts have at least 3
-points. A single convex mode gives ``J`` of 10 to 16 however it is cut.
-Each cluster has a frame: its mean and the Cholesky factor of its covariance
-shrunk toward the pooled within-cluster covariance (prior weight ``0.1 d``
-points). A frame is *eligible* for the hop if its volume share predicts
-at least ``2 d`` live points (``m V_c / sum V >= 2 d``) and it has more than
-``d`` members; the most populated cluster always is. A rule on the live
-count instead would switch the hop on only while a cluster is
-over-populated and so drain it. The labels are also the record that
-:meth:`tinyns.NestedSamplingResult.modes` reads.
+**Two halves (cross-fitting).** The live slots form two fixed halves (even
+and odd indices). Each new point fills a dead slot and is seeded from a live
+point above ``L*`` of the same half, so a point and all its descendants stay
+in one half. Each half is clustered on its own, and the kernel of a chain
+seeded in half ``h`` (the hop's frames, the walk's cluster frames and the
+live covariance it falls back to) is built from half ``1 - h`` alone. This is
+the two-ensemble split of emcee's parallel stretch move (Foreman-Mackey et
+al. 2013, after Goodman and Weare 2010), which updates each half of the
+walkers with moves built from the other half.
+
+**Clustering** (:func:`recluster`, pure JAX, static shapes, ``C_MAX`` slots per
+half). Every ``Config.recluster_every`` steps (about a quarter of an e-fold)
+the points of each half are relabelled: warm-started hard EM from the current
+labels, merges of cluster pairs whose Fisher separation ``J = dm^T Sw^-1 dm``
+fell below half the split threshold, then top-down splits. A split of a
+cluster is 2-means in the cluster's whitened coordinates from four starts
+(farthest points, and the best one-dimensional cuts along the
+independent-component directions), refined by hard EM; the best ``J``
+(deflated for small clusters) is accepted if it is at least ``max(25, 1.5 (d
++ 2))`` and both parts have at least 3 points. A single convex mode gives
+``J`` of 10 to 16 however it is cut. Each cluster has a frame: its mean and
+the Cholesky factor of its covariance shrunk toward the pooled within-cluster
+covariance (prior weight ``0.1 d`` points). A frame is *eligible* for the hop
+if its volume share predicts at least ``2 d`` live points (``m V_c / sum V >=
+2 d``) and it has more than ``d`` members; the most populated cluster always
+is. A frame *walks* (:func:`walk_frames`) if it has more than ``d`` members.
+The labels are also the record that :meth:`tinyns.NestedSamplingResult.modes`
+reads (half 1's slots are reported as ``C_MAX + slot``; ``modes()`` merges
+labels of the two halves that cover one mode). New live points take the label
+of the nearest frame of their half until the next recluster.
 
 **The hop.** Every ``HOP_EVERY``-th step of a chain (``P_HOP = 1 /
 HOP_EVERY``) is an independence Metropolis-Hastings step from the uniform law
@@ -35,39 +50,45 @@ on the union of the eligible frames' ellipsoids ``|L^-1 (x - mu)|^2 <= d +
 uniformly in its ellipsoid, so the proposal density ``q(x)`` is proportional
 to the number of ellipsoids containing ``x``. The proposal ``x'`` is accepted
 iff it is in the cube, above ``L*`` and ``U < q(x) / q(x')``; a start outside
-every ellipsoid (``q(x) = 0``) never moves. The other steps are the global
-live-covariance random walk, and with fewer than two eligible frames the hop
-step is a random-walk step. The private ``Config._hop=False`` turns the hop
-off (the clustering still runs), for comparisons.
+every ellipsoid (``q(x) = 0``) never moves. With fewer than two eligible
+frames the hop step is a walk step. The private ``Config._hop=False`` turns
+the hop off (the clustering still runs), for comparisons.
 
-**Why the hop is exact.** Given the other live points (and the dead
-points), a chain's seed is uniform in the constrained region ``{L > L*}``. A
-kernel that leaves that uniform law invariant and does not depend on the seed
-returns a point with the same law, for any number of steps. The hop leaves it
-invariant for *fixed* frames: it is independence MH with the Hastings ratio
-``q(x) / q(x')`` for the target uniform on ``{L > L*}``, restricted to the
-union of the ellipsoids (the points outside it stay put). The schedule of
-hop and walk steps is fixed in advance (a composition of invariant kernels)
-and the frames do not change during a chain. What remains is that the frames
-must not depend on the seed. They are fitted at the last recluster from the
-live points of that time, which may include the seed. If so (the per-point
-``fitted`` flag), the chain uses frames refitted without it: the mean,
-scatter matrix and count of the seed's cluster get a rank-one downdate, and
-everything derived from them (the pooled covariance the frames are shrunk
-toward, every frame's Cholesky factor, the volume shares and the
-eligibility) is recomputed from the downdated statistics
-(:func:`chain_frames`). With ``k`` chains per step each chain removes only
-its own seed. A seed born after the last recluster is in no frame's
-statistics and the frames are used as they are. The partition of the other
-points is taken as given; their labels came out of a clustering that saw the
-seed, a dependence of one point in ``m`` on hard-EM labels that the downdate
-does not remove (as in any population-adapted proposal, the live points are
-also not exactly independent; see the CHANGELOG's known issues). Without the
-downdate a seed always sits inside the frame fitted to it while the reverse
-flux covers only the frame's true volume, and small clusters drain.
+**The local walk.** The other steps propose ``y = x + s L_c(x) z``, with
+``c(x)`` the nearest walking frame (Mahalanobis distance) and ``L_c`` its
+Cholesky factor; ``s`` is the global step scale, adapted to a walk
+acceptance of 1/4. The proposal is not symmetric when ``c(y) != c(x)``, so
+``y`` is accepted iff it is in the cube, above ``L*`` and ``U < N(x | y, s^2
+S_c(y)) / N(y | x, s^2 S_c(x))``. With fewer than two walking frames the walk
+uses the live covariance of the other half (symmetric). The private
+``Config._local=False`` always uses that covariance, for comparisons.
 
-New live points take the label of their nearest frame (``fitted`` false);
-:func:`recluster` relabels everything and marks every live point fitted.
+**Why the chains are exact.** For independent live points, given the points
+of half ``1 - h`` (and the dead points), a seed drawn from the points of half
+``h`` above ``L*`` is uniform in the constrained region ``{L > L*}``. A kernel
+that leaves that uniform law invariant and depends only on half ``1 - h``
+returns a point with the same law, for any number of steps. The hop and the
+local walk each leave it invariant for fixed frames (Metropolis-Hastings with
+the exact ratio of proposal densities, restricted to the cube and ``{L >
+L*}``), the schedule of hop and walk steps is fixed in advance (a
+composition of invariant kernels), and the frames and covariances do not
+change during a chain. Nothing of the seed's half enters its kernel: not the
+seed, not its partition (the other half is clustered without it), and not its
+ancestors, which are in its own half. What remains is common to every
+MCMC-driven nested sampler: a new point is correlated with its seed (and so,
+weakly, with the kernels later built from its half), and the step scale
+adapts on past chains.
+
+The v1 hop instead refitted the seed's cluster without the seed (a rank-one
+downdate of the full-set statistics). That removed the seed but not its
+ancestors and near-copies: in a mode whose walk mixes poorly (the global
+covariance of a differently shaped mode), a chain often returns close to its
+seed, both are fitted at the next recluster, and the copy then sits inside a
+frame fitted to its parent, so it hops out more readily than a uniform point
+and the small mode drains. On sepW_d18 the downdate left a minor-mode logit
+bias of -0.014 +- 0.002 at nlive 2000 and -0.18 +- 0.02 at nlive 500; the
+seed's influence on the partition itself was nil on a fixed two-mode live set
+(no other label changed in 10^5 chains).
 """
 
 from __future__ import annotations
@@ -85,6 +106,7 @@ C_MAX = 8  # cluster slots (static shapes)
 HOP_EVERY = 10  # every 10th chain step is the hop: P_HOP = 0.1
 SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
+WALK_MIN_POINTS = 3  # a cluster gives the walk its covariance from this size
 SHRINK = 0.1  # frame covariances: prior weight 0.1 d points on the pooled one
 ELIGIBLE_PER_DIM = 2.0  # a frame hops if its volume share predicts 2 d points
 ELL_R2_PER_DIM = 1.0  # hop ellipsoids: Mahalanobis^2 <= (d + 2) * this
@@ -217,30 +239,6 @@ def _eligible(logdet, count, active, nlive, d):
     return eligible.at[largest].set(active[largest])
 
 
-def downdate(st: Stats, x, label, weight) -> Stats:
-    """``st`` with point ``x`` removed from cluster ``label`` (if ``weight``).
-
-    ``weight`` is 1 (the point is in the statistics) or 0 (unchanged).
-    """
-    mu, scat, count = st
-    a = label
-    n = count[a]
-    w = jnp.asarray(weight, mu.dtype) * (n > 0.5)
-    left = n - w
-    dx = x - mu[a]
-    mu_a = mu[a] - w * dx / jnp.maximum(left, 1.0)
-    scat_a = scat[a] - (w * n / jnp.maximum(left, 1.0)) * jnp.outer(dx, dx)
-    empty = left < 0.5
-    mu_a = jnp.where(empty, 0.0, mu_a)
-    scat_a = jnp.where(empty, 0.0, scat_a)
-    return Stats(mu.at[a].set(mu_a), scat.at[a].set(scat_a), count.at[a].set(left))
-
-
-def chain_frames(st: Stats, seed_u, seed_label, seed_fitted, nlive: int) -> Frames:
-    """The frames of one chain: refitted without its seed if the seed was fitted."""
-    return frames(downdate(st, seed_u, seed_label, seed_fitted), nlive)
-
-
 def mahalanobis(fr: Frames, x):
     """Squared Mahalanobis distance of ``x`` to every frame (``inf`` if
     inactive) and the whitened offsets ``L^-1 (x - mu)``, shape ``(C, d)``."""
@@ -259,9 +257,9 @@ def nearest(fr: Frames, x):
 
 
 def walk_frames(fr: Frames):
-    """The frames that give the random walk its covariance: active, with more
-    than ``d`` members (a full-rank scatter)."""
-    return fr.active & (fr.count > fr.mu.shape[-1])
+    """The frames that give the random walk its covariance: active, with at
+    least ``WALK_MIN_POINTS`` members."""
+    return fr.active & (fr.count >= WALK_MIN_POINTS)
 
 
 def hop_enabled(fr: Frames):
@@ -542,11 +540,13 @@ def _split_loop(u, labels, js, parts):
 def recluster_lanes(u, labels):
     """:func:`recluster` for a batch of independent live sets: ``u`` of shape
     ``(B, m, d)`` and ``labels`` ``(B, m)``; returns batched labels and stats.
+    Rows labelled ``-1`` (padding) stay out of every cluster.
 
     Call it with the lane axis explicit (not under ``vmap``): the split search
     then skips the slots that no lane occupies.
     """
-    labels = jnp.where(labels < 0, -1, jnp.clip(labels, 0, C_MAX - 1)).astype(jnp.int32)
+    labels = jnp.where(labels < 0, -1, jnp.clip(labels, 0, C_MAX - 1))
+    labels = labels.astype(jnp.int32)
     labels = jax.vmap(lambda u, lab: _refine(u, lab, C_MAX, REFINE_ITERS))(u, labels)
     labels = jax.vmap(_merge)(u, labels)
     js, parts = _split_slots(u, labels)
@@ -556,7 +556,8 @@ def recluster_lanes(u, labels):
 
 def recluster(u, labels):
     """Relabel the live points ``u`` starting from ``labels``; return
-    ``(labels, stats)`` (labels in ``0..C_MAX-1``; slots keep their ids).
+    ``(labels, stats)`` (labels in ``0..C_MAX-1``, ``-1`` rows stay out;
+    slots keep their ids).
 
     Hard EM from the current labels, then merges (the pair of lowest ``J``,
     while it is below half the split threshold), then splits (the best split

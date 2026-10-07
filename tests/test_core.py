@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import random
 
 from tinyns import Config, NestedSampler, core, finalise, init, modes, step
 
@@ -75,10 +76,9 @@ def fake_run(dead_logl, live_logl, m, k):
         ncall_valid=np.int32(0),
         status=np.int32(core.CONVERGED),
         label=np.zeros(m, np.int32),
-        fitted=np.zeros(m, bool),
-        mode_mu=np.zeros((modes.C_MAX, 1)),
-        mode_scat=np.zeros((modes.C_MAX, 1, 1)),
-        mode_count=np.zeros(modes.C_MAX),
+        mode_mu=np.zeros((2, modes.C_MAX, 1)),
+        mode_scat=np.zeros((2, modes.C_MAX, 1, 1)),
+        mode_count=np.zeros((2, modes.C_MAX)),
     )
     zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(
@@ -206,23 +206,32 @@ def test_init_and_step_shapes_dtypes_and_order() -> None:
 
 def test_seeds_are_distinct_when_possible() -> None:
     """With an impossible walk (scale ~ 0) every chain returns its seed, so the
-    new points are the seeds: distinct live points above L*."""
+    new points are the seeds: live points above L* of the half of the slot
+    they fill, distinct unless that half has too few."""
     cfg = Config(2, 30, num_delete=10, walks=3)
     loglike = gauss(0.5, 0.2)
     state = init(1, loglike, identity, cfg)
     state = state._replace(log_scale=jnp.asarray(-80.0, FLOAT))
     new, dead = step(state, loglike, identity, cfg)
-    survivors = set(np.asarray(state.logl).tolist())
-    survivors -= set(np.asarray(dead.logl).tolist())
-    born = np.asarray(new.logl)[np.asarray(new.logl_birth) > -np.inf]
-    assert len(set(born.tolist())) == 10 and set(born.tolist()) <= survivors
+    u, logl = np.asarray(state.u), np.asarray(state.logl)
+    above = logl > float(dead.logl[-1])
+    filled = np.flatnonzero(np.asarray(new.logl_birth) > -np.inf)
+    seeds = np.array([int(np.flatnonzero((u == v).all(axis=1))[0])
+                      for v in np.asarray(new.u)[filled]])
+    assert np.all(above[seeds])
+    half = np.arange(30) % 2
+    for h in (0, 1):
+        mine = seeds[half[filled] == h]
+        assert np.all(half[mine] == h)
+        assert len(set(mine.tolist())) == min(len(mine), int(above[half == h].sum()))
 
 
 @pytest.mark.parametrize("k", [1, 6])
-def test_proposal_covariance_leaves_out_the_seeds(monkeypatch, k) -> None:
-    """The covariance that shapes a step's proposals comes from the points
-    above L* other than the seeds. With an impossible walk the new points are
-    the seeds, so the rows left out are exactly theirs."""
+def test_seeds_and_walk_covariance_are_cross_fitted(monkeypatch, k) -> None:
+    """Each new point is seeded from a live point of its own half (the parity
+    of the dead slot it fills), and the walk covariance of the chains seeded
+    in half h comes from the points of the other half above L*. With an
+    impossible walk the new points are the seeds."""
     masks = []
     live_chol = core._live_chol
 
@@ -236,26 +245,46 @@ def test_proposal_covariance_leaves_out_the_seeds(monkeypatch, k) -> None:
     state = init(1, loglike, identity, cfg)
     state = state._replace(log_scale=jnp.asarray(-80.0, FLOAT))
     new, dead = core._step(state, loglike, identity, cfg)  # eager: the spy runs
-    (mask,) = masks
     u = np.asarray(state.u)
     above = np.asarray(state.logl) > float(dead.logl[-1])
-    born = np.asarray(new.logl_birth) > -np.inf
+    half = np.arange(30) % 2
+    for h, mask in enumerate(masks):
+        np.testing.assert_array_equal(mask, above & (half != h))
+    filled = np.flatnonzero(np.asarray(new.logl_birth) > -np.inf)
     seeds = [int(np.flatnonzero((u == v).all(axis=1))[0])
-             for v in np.asarray(new.u)[born]]
-    expected = above.copy()
-    expected[seeds] = False
-    np.testing.assert_array_equal(mask, expected)
-    assert mask.sum() == above.sum() - k
+             for v in np.asarray(new.u)[filled]]
+    assert len(set(seeds)) == k and all(above[seeds])
+    np.testing.assert_array_equal(half[seeds], half[filled])
 
 
-def test_proposal_mask_keeps_the_seeds_when_too_few_points_remain() -> None:
+def test_seeds_fall_back_when_a_half_runs_short() -> None:
+    """A half with too few points above L* reuses them; a half with none
+    borrows from the other half."""
+    above = jnp.asarray([True, False, True, False, False, False, True, False])
+    worst = jnp.asarray([1, 3, 5, 4])  # three odd slots, one even
+    seeds = np.asarray(core._seeds(
+        random.PRNGKey(0), random.PRNGKey(1), above, worst, FLOAT
+    ))
+    assert seeds[3] in (0, 2, 6)  # the even slot: an even point above L*
+    assert all(above[np.asarray(seeds)])  # odd slots: none above, any half
+    above = jnp.asarray([True, True, True, False, False, False, True, False])
+    seeds = np.asarray(core._seeds(
+        random.PRNGKey(0), random.PRNGKey(1), above, worst, FLOAT
+    ))
+    assert set(seeds[:3].tolist()) == {1}  # the only odd point, reused
+
+
+def test_walk_mask_falls_back_when_too_few_points_remain() -> None:
     above = jnp.asarray([True] * 6 + [False] * 4)
-    seeds = jnp.asarray([0, 1, 2])
+    other = jnp.asarray([True, False] * 5)  # 3 even points above L*
+    seeds = jnp.asarray([1, 3])
+    np.testing.assert_array_equal(
+        core._walk_mask(above, other, seeds, 2), np.asarray(above & other)
+    )
     held_out = np.asarray(above).copy()
-    held_out[:3] = False
-    # 3 points remain: enough for ndim 2, not for ndim 3.
-    np.testing.assert_array_equal(core._proposal_mask(above, seeds, 2), held_out)
-    np.testing.assert_array_equal(core._proposal_mask(above, seeds, 3), above)
+    held_out[[1, 3]] = False  # 4 points: the step's seeds left out
+    np.testing.assert_array_equal(core._walk_mask(above, other, seeds, 3), held_out)
+    np.testing.assert_array_equal(core._walk_mask(above, other, seeds, 4), above)
     # A step on a nearly exhausted live set still runs: 2 points above L*,
     # both seeds, in 2-D.
     cfg = Config(2, 4, num_delete=2, walks=5)
