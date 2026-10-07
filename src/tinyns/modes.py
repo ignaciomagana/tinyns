@@ -8,40 +8,44 @@ two modes vanishes when their populations are in proportion to their
 volumes, and the frames only set how fast the populations relax. In the v1
 bake-off (``bench/bakeoff/``) it cut the seed-to-seed logit sd of minor-mode
 masses about 7x at the same number of likelihood calls. Within a mode, a walk
-in the global live covariance mixes poorly when the modes differ in shape (it
-is dominated by the largest one), so the walk uses the covariance of the
-current point's cluster.
+in the covariance of all live points mixes poorly when the modes differ in
+shape (that covariance is the largest mode's, plus the offsets between
+modes), so the walk uses the covariance of the current point's cluster.
 
-**Two halves (cross-fitting).** The live slots form two fixed halves (even
-and odd indices). Each new point fills a dead slot and is seeded from a live
-point above ``L*`` of the same half, so a point and all its descendants stay
-in one half. Each half is clustered on its own, and the kernel of a chain
-seeded in half ``h`` (the hop's frames, the walk's cluster frames and the
-live covariance it falls back to) is built from half ``1 - h`` alone. This is
-the two-ensemble split of emcee's parallel stretch move (Foreman-Mackey et
-al. 2013, after Goodman and Weare 2010), which updates each half of the
-walkers with moves built from the other half.
+**Folds (cross-fitting).** The live slots form ``K = Config._folds`` fixed
+folds (slot index mod ``K``, default 3). Each new point fills a dead slot and
+is seeded from a live point above ``L*`` of the same fold, so a point and all
+its descendants stay in one fold. Clustering ``j`` is of the points outside
+fold ``j``, and the kernel of a chain seeded in fold ``j`` (the hop's frames,
+the walk's cluster frames and the live covariance the walk falls back to) is
+built from those points alone. This generalizes the two-ensemble split of
+emcee's parallel stretch move (Foreman-Mackey et al. 2013, after Goodman and
+Weare 2010), which moves each half of the walkers with proposals built from
+the other half; ``K = 3`` fits every frame to two thirds of the live points.
 
 **Clustering** (:func:`recluster`, pure JAX, static shapes, ``C_MAX`` slots per
-half). Every ``Config.recluster_every`` steps (about a quarter of an e-fold)
-the points of each half are relabelled: warm-started hard EM from the current
-labels, merges of cluster pairs whose Fisher separation ``J = dm^T Sw^-1 dm``
-fell below half the split threshold, then top-down splits. A split of a
-cluster is 2-means in the cluster's whitened coordinates from four starts
-(farthest points, and the best one-dimensional cuts along the
-independent-component directions), refined by hard EM; the best ``J``
-(deflated for small clusters) is accepted if it is at least ``max(25, 1.5 (d
-+ 2))`` and both parts have at least 3 points. A single convex mode gives
-``J`` of 10 to 16 however it is cut. Each cluster has a frame: its mean and
-the Cholesky factor of its covariance shrunk toward the pooled within-cluster
-covariance (prior weight ``0.1 d`` points). A frame is *eligible* for the hop
-if its volume share predicts at least ``2 d`` live points (``m V_c / sum V >=
-2 d``) and it has more than ``d`` members; the most populated cluster always
-is. A frame *walks* (:func:`walk_frames`) if it has more than ``d`` members.
-The labels are also the record that :meth:`tinyns.NestedSamplingResult.modes`
-reads (half 1's slots are reported as ``C_MAX + slot``; ``modes()`` merges
-labels of the two halves that cover one mode). New live points take the label
-of the nearest frame of their half until the next recluster.
+clustering, the ``K`` clusterings as lanes of one call). Every
+``Config.recluster_every`` steps (about a quarter of an e-fold) each
+clustering is refreshed: warm-started hard EM from the current labels, merges
+of cluster pairs whose Fisher separation ``J = dm^T Sw^-1 dm`` fell below half
+the split threshold, then top-down splits. A split of a cluster is 2-means in
+the cluster's whitened coordinates from four starts (farthest points, and the
+best one-dimensional cuts along the independent-component directions),
+refined by hard EM; the best ``J`` (deflated for small clusters) is accepted
+if it is at least ``max(25, 1.5 (d + 2))`` and both parts have at least 3
+points. A single convex mode gives ``J`` of 10 to 16 however it is cut. Each
+cluster has a frame: its mean and the Cholesky factor of its covariance shrunk
+toward the pooled within-cluster covariance (prior weight ``0.1 d`` points).
+A frame is *eligible* for the hop if its volume share predicts at least ``2
+d`` live points (``m V_c / sum V >= 2 d``) and it has more than ``d``
+members; the most populated cluster always is. A frame *walks*
+(:func:`walk_frames`) if it has at least ``WALK_MIN_POINTS = 3`` members (a
+small mode keeps its own covariance, shrunk toward the pooled one, until it
+is nearly gone). New live points take the label of the nearest frame of each
+clustering until the next recluster. The labels are also the record that
+:meth:`tinyns.NestedSamplingResult.modes` reads: a point's slot in the
+clustering of the next fold (which contains it), as ``j * C_MAX + slot``;
+``modes()`` merges the labels of different clusterings that cover one mode.
 
 **The hop.** Every ``HOP_EVERY``-th step of a chain (``P_HOP = 1 /
 HOP_EVERY``) is an independence Metropolis-Hastings step from the uniform law
@@ -56,39 +60,53 @@ the hop off (the clustering still runs), for comparisons.
 
 **The local walk.** The other steps propose ``y = x + s L_c(x) z``, with
 ``c(x)`` the nearest walking frame (Mahalanobis distance) and ``L_c`` its
-Cholesky factor; ``s`` is the global step scale, adapted to a walk
-acceptance of 1/4. The proposal is not symmetric when ``c(y) != c(x)``, so
-``y`` is accepted iff it is in the cube, above ``L*`` and ``U < N(x | y, s^2
-S_c(y)) / N(y | x, s^2 S_c(x))``. With fewer than two walking frames the walk
-uses the live covariance of the other half (symmetric). The private
+Cholesky factor; ``s`` is the global step scale, adapted to a walk acceptance
+of 1/4. The proposal is not symmetric when ``c(y) != c(x)``, so ``y`` is
+accepted iff it is in the cube, above ``L*`` and ``U < N(x | y, s^2 S_c(y)) /
+N(y | x, s^2 S_c(x))``. With fewer than two walking frames the walk uses the
+live covariance of the points outside the fold (symmetric). The private
 ``Config._local=False`` always uses that covariance, for comparisons.
 
 **Why the chains are exact.** For independent live points, given the points
-of half ``1 - h`` (and the dead points), a seed drawn from the points of half
-``h`` above ``L*`` is uniform in the constrained region ``{L > L*}``. A kernel
-that leaves that uniform law invariant and depends only on half ``1 - h``
-returns a point with the same law, for any number of steps. The hop and the
-local walk each leave it invariant for fixed frames (Metropolis-Hastings with
-the exact ratio of proposal densities, restricted to the cube and ``{L >
-L*}``), the schedule of hop and walk steps is fixed in advance (a
-composition of invariant kernels), and the frames and covariances do not
-change during a chain. Nothing of the seed's half enters its kernel: not the
-seed, not its partition (the other half is clustered without it), and not its
-ancestors, which are in its own half. What remains is common to every
-MCMC-driven nested sampler: a new point is correlated with its seed (and so,
-weakly, with the kernels later built from its half), and the step scale
-adapts on past chains.
+outside fold ``j`` (and the dead points), a seed drawn from the points of fold
+``j`` above ``L*`` is uniform in the constrained region ``{L > L*}``. A kernel
+that leaves that uniform law invariant and depends only on the points outside
+fold ``j`` returns a point with the same law, for any number of steps. The hop
+and the local walk each leave it invariant for fixed frames
+(Metropolis-Hastings with the exact ratio of proposal densities, restricted
+to the cube and ``{L > L*}``), the schedule of hop and walk steps is fixed in
+advance (a composition of invariant kernels), and the frames and covariances
+do not change during a chain. Nothing of the seed's fold enters its kernel:
+not the seed, not the clustering of the other points (fold ``j`` is left out
+of it), and not the seed's ancestors, which are in fold ``j``. The restoring
+force of the hop on the points of fold ``j`` (how well the frames cover each
+mode) depends on the populations of the other folds, not on fold ``j``'s.
+What remains is common to every MCMC-driven nested sampler: a new point is
+correlated with its seed, and the step scale adapts on past chains.
 
-The v1 hop instead refitted the seed's cluster without the seed (a rank-one
-downdate of the full-set statistics). That removed the seed but not its
-ancestors and near-copies: in a mode whose walk mixes poorly (the global
-covariance of a differently shaped mode), a chain often returns close to its
-seed, both are fitted at the next recluster, and the copy then sits inside a
-frame fitted to its parent, so it hops out more readily than a uniform point
-and the small mode drains. On sepW_d18 the downdate left a minor-mode logit
-bias of -0.014 +- 0.002 at nlive 2000 and -0.18 +- 0.02 at nlive 500; the
-seed's influence on the partition itself was nil on a fixed two-mode live set
-(no other label changed in 10^5 chains).
+The v1 hop refitted the seed's cluster without the seed (a rank-one downdate
+of the statistics of all live points) and walked in the covariance of all
+live points but the step's seeds. On sepW_d18 at nlive 2000 that left the
+minor mode 1.25 +- 0.16% light. The downdate's known gap, the seed's influence
+on the other points' labels, was not the cause: re-clustering a fixed two-mode
+live set with and without the seed (4.4e5 chains, sepW and connW at d = 10
+and 18, nlive 500 and 2000) changed no other label. The cause was mixing
+within the minor mode: there the global walk accepted 0.08 of its steps at d
+= 18 (0.26 in the main mode; 0.06 against 0.26 at d = 32), so chains returned
+near-copies of their seeds, which sat inside frames fitted to their parents
+and hopped out too readily. The local walk accepts 0.3 to 0.4 in either mode
+and removes the bias (+0.2 +- 0.2% with the downdate, 0.0 +- 0.2% with two
+folds). The folds also take the seed's ancestors out of the walk covariance:
+on sepW_d32 at nlive 500 the seed-free covariance of all live points left
+logZ 0.24 +- 0.05 high, with or without the hop, and cross-fitted kernels
+0.04 +- 0.04.
+
+A mode with fewer than about ``5 d`` live points cannot be sampled reliably by
+any covariance-adapted walk: on one Gaussian with the shape of sepW_d18's
+minor mode, nlive 30, 60 and 120 give logZ 4.35 +- 0.07, 0.21 +- 0.05 and
+0.03 +- 0.04 too high. A minor mode that small (sepW_d18 at nlive 500: 30 to
+70 points; the d = 32 targets) keeps a bias of a few percent whatever the
+moves; see the CHANGELOG.
 """
 
 from __future__ import annotations

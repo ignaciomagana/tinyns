@@ -9,7 +9,7 @@ the paths with ``BENCH_PY``, ``BAKEOFF_RUN``, ``OUT`` and ``TAG``.
 
 Grid (plan, "Bake-off"):
 
-- mixtures: ``sepW_d{4,10,18,32}``, ``sepM_d{10,18,32}``, ``connW_d{10,18}``,
+- mixtures: ``sepW_d{4,10,18,32}``, ``sepM_d{10,18,32}``, ``connW_d{10,18,32}``,
   ``mix3_d10`` and the banana-twisted ``sepWtw_d10``;
 - controls: correlated Gaussians ``gauss_d{18,32}``, ``rosen_d4``,
   ``funnel_d10``;
@@ -39,7 +39,8 @@ ARMS = ("N", "B_ell")
 MIXTURES = (
     [f"sepW_d{d}" for d in (4, 10, 18, 32)]
     + [f"sepM_d{d}" for d in (10, 18, 32)]
-    + ["connW_d10", "connW_d18", "mix3_d10", "sepWtw_d10"]
+    + [f"connW_d{d}" for d in (10, 18, 32)]
+    + ["mix3_d10", "sepWtw_d10"]
 )
 CONTROLS = ["gauss_d18", "gauss_d32", "rosen_d4", "funnel_d10"]
 NLIVE = (500, 2000)
@@ -56,6 +57,7 @@ EFOLDS = {
     "sepM_d32": 130,
     "connW_d10": 45,
     "connW_d18": 75,
+    "connW_d32": 130,
     "mix3_d10": 45,
     "sepWtw_d10": 45,
     "gauss_d18": 55,
