@@ -225,11 +225,10 @@ def test_step_reclusters_on_schedule() -> None:
     cfg = Config(D, 40, 4, 10)
     state = core.init(1, two_gaussians, lambda u: u, cfg)
     state, _ = core.step(state, two_gaussians, lambda u: u, cfg)
-    # The points outside each fold are clustered: one cluster of 40 - 40 / K.
+    # The points outside each fold are clustered: one cluster each.
     assert bool(jnp.all(state.mode_count[:, 1:] == 0))
-    np.testing.assert_array_equal(
-        state.mode_count[:, 0], [40 - 40 // cfg._folds] * cfg._folds
-    )
+    sizes = [40 - len(range(j, 40, cfg._folds)) for j in range(cfg._folds)]
+    np.testing.assert_array_equal(state.mode_count[:, 0], sizes)
 
 
 def test_batched_run_matches_single_runs_with_the_hop() -> None:

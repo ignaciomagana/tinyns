@@ -127,7 +127,7 @@ class Config:
     walks: int | None = None
     _hop: bool = True
     _local: bool = True
-    _folds: int = 4
+    _folds: int = 3
 
     def __post_init__(self):
         ndim = _check_int("ndim", self.ndim, 1)
@@ -580,7 +580,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
         for j in range(folds)
     ])
     frames = jax.tree_util.tree_map(  # frames[j]: fitted outside fold j
-        lambda *a: jnp.stack(a), *(_modes.frames(_stats(state, j), m) for j in range(folds))
+        lambda *a: jnp.stack(a),
+        *(_modes.frames(_stats(state, j), m) for j in range(folds)),
     )
     scale = jnp.exp(state.log_scale)
 

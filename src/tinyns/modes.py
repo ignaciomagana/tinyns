@@ -529,7 +529,13 @@ def _split_loop(u, labels, js, parts):
         labels, js, parts = carry
         c = jnp.argmax(js)
         slot = jnp.argmin(occupied(labels))  # the first free slot
-        labels = jnp.where(parts[c], slot, labels).astype(jnp.int32)
+        # The part that moves is the one without the cluster's first row, so
+        # the slots do not depend on the orientation of the cut (the sign of
+        # an eigenvector, which batched and single solvers can choose apart).
+        member = labels == c
+        part = parts[c]
+        part = jnp.where(part[jnp.argmax(member)], member & ~part, part)
+        labels = jnp.where(part, slot, labels).astype(jnp.int32)
         pair = jnp.stack([c, slot])
         new_j, new_parts = jax.vmap(lambda s: _split(u, labels == s))(pair)
         return labels, js.at[pair].set(new_j), parts.at[pair].set(new_parts)

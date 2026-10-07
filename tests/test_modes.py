@@ -91,10 +91,11 @@ def test_modes_do_not_depend_on_slot_ids_or_reuse() -> None:
     assert len(modes) == 2
     labels = np.asarray(result.labels)
     minor = np.asarray(result.samples)[:, 0] > 0.55
-    early = np.flatnonzero(minor & (labels == labels[~minor][-1]))
+    early = np.flatnonzero(minor & np.isin(labels, labels[~minor]))
     assert len(early) > 0  # minor points that died before the split
-    labels = (labels + 3) % 8  # other slot ids
-    labels[: result.niter // 4] = 7  # a slot used in the prior phase only
+    ids = labels.max() + 2
+    labels = (labels + 3) % ids  # other slot ids
+    labels[: result.niter // 4] = ids  # a slot used in the prior phase only
     result.labels = labels
     relabelled = result.modes()
     assert len(relabelled) == 2
