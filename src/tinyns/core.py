@@ -40,6 +40,7 @@ from tinyns.callables import (
     _device_leaves,
     _kernel_cache,
     _partition_callable,
+    _split_callable,
     _split_callables,
 )
 from tinyns.result import NestedSamplingResult, _evidence
@@ -340,6 +341,7 @@ def _chain(
     d = u.shape[0]
     n_hops = walks // _modes.HOP_EVERY if hop else 0
     tracked = (local or n_hops > 0) and not plain
+    local = local and tracked
 
     def evaluate(v):
         return _loglike_u(loglike, prior_transform, v, dtype)
@@ -373,46 +375,78 @@ def _chain(
             y = jnp.einsum("fcij,fcj->fci", frames.ichol, v - frames.mu)
             return y[fold]
 
+    # The step keys. A hop step splits its key in two: one for the walk step
+    # it becomes when the hop is off, one for the hop.
+    keys = random.split(key, walks)
+    at_hop = np.zeros(walks, bool)
+    at_hop[_modes.HOP_EVERY - 1 : n_hops * _modes.HOP_EVERY : _modes.HOP_EVERY] = True
+    hop_index = np.cumsum(at_hop) - at_hop  # the number of the hop at a hop step
+    if n_hops > 0:
+        pair = jax.vmap(random.split)(keys[at_hop])
+        keys = keys.at[np.flatnonzero(at_hop)].set(pair[:, 0])
+
     if tracked:
         walkable = _modes.walk_frames(mine)
         use_local = (jnp.sum(walkable) >= 2) if local else jnp.asarray(False)
+
+        def locate(v):
+            """The offsets of ``v`` to the frames, their squared lengths and
+            the nearest walk frame."""
+            y = offsets(v)
+            r2 = jnp.sum(y * y, axis=-1)
+            c = jnp.argmin(jnp.where(walkable, r2, jnp.inf)).astype(jnp.int32)
+            return c, y, r2
+
+        place = locate(u)
+    else:
+        place = (jnp.zeros((), jnp.int32),) + (jnp.zeros((), dtype),) * 2
+
+    if tracked and n_hops > 0:
+        # The hop proposals do not depend on the chain's state (an
+        # independence sampler), so they are drawn here, for all its hop
+        # steps at once, and a hop step only looks one up.
         enabled = _modes.hop_enabled(mine)
 
-        def locate(v):
-            """The offsets of ``v`` to the frames and its nearest walk frame."""
-            y = offsets(v)
-            r2 = jnp.where(walkable, jnp.sum(y * y, axis=-1), jnp.inf)
-            return jnp.argmin(r2).astype(jnp.int32), y
+        def draw(key):
+            k_c, k_x, k_acc = random.split(key, 3)
+            c = _modes.hop_frame(k_c, mine.eligible, mine.logdet)
+            point = _modes.hop_point(k_x, mine.mu[c], frame_chol(c))
+            return point, random.uniform(k_acc, (), dtype)
 
-    else:
+        hop_points, hop_uniforms = jax.vmap(draw)(pair[:, 1])
 
-        def locate(v):
-            return jnp.zeros((), jnp.int32), jnp.zeros((), dtype)
-
-    def propose(key, u, c):
-        """A walk proposal from ``u`` (label ``c``): the point, its normal
-        draw and the key of its Hastings test."""
+    def step(carry, xs):
+        key, is_hop, index = xs
+        u, logl, c, y, r2, moves, nev, nvalid, hops, tries = carry
         k_z, k_u = random.split(key)
         z = random.normal(k_z, u.shape, u.dtype)
-        step = live_step(z)
-        if tracked and local:
-            step = jnp.where(use_local, frame_chol(c) @ z, step)
-        return u + scale * step, z, k_u
+        move = live_step(z)
+        if local:
+            move = jnp.where(use_local, frame_chol(c) @ z, move)
+        prop = u + scale * move
+        hop = jnp.asarray(False)
+        if tracked and n_hops > 0:
+            hop = is_hop & enabled
+            prop = jnp.where(hop, hop_points[index], prop)
+        c_new, y_new, r2_new = c, y, r2
+        if tracked:  # whiten the proposal, once
+            c_new, y_new, r2_new = locate(prop)
+        ok = jnp.asarray(True)
+        if local:
+            # U < N(x | y, s^2 S_c(y)) / N(y | x, s^2 S_c(x)), with
+            # L_c(y)^-1 (x - y) / s from the two points' offsets.
+            back = (y[c_new] - y_new[c_new]) / scale
+            log_ratio = (
+                0.5 * (jnp.sum(z * z) - jnp.sum(back * back))
+                + mine.logdet[c] - mine.logdet[c_new]
+            )
+            ok = ~use_local | (jnp.log(random.uniform(k_u, (), dtype)) < log_ratio)
+        if tracked and n_hops > 0:
+            h_ok = _modes.hop_accept(hop_uniforms[index], mine.eligible, r2_new, r2, d)
+            ok = jnp.where(hop, h_ok, ok)
 
-    def hastings(key, z, c, y, c_new, y_new):
-        """The test ``U < N(x | y, s^2 S_c(y)) / N(y | x, s^2 S_c(x))``."""
-        back = (y[c_new] - y_new[c_new]) / scale  # L_c(y)^-1 (x - y) / s
-        log_ratio = (
-            0.5 * (jnp.sum(z * z) - jnp.sum(back * back))
-            + mine.logdet[c] - mine.logdet[c_new]
-        )
-        return jnp.log(random.uniform(key, (), dtype)) < log_ratio
-
-    def update(carry, prop, pre, hop, c_new, y_new):
-        u, logl, c, y, moves, nev, nvalid, hops, tries = carry
-        hop = jnp.asarray(hop)
         inside = jnp.all((prop >= 0.0) & (prop <= 1.0))
-        call = inside & pre
+        call = inside & ok
         clipped = jnp.clip(prop, 0.0, 1.0)
         if skip:
             new = lax.cond(
@@ -427,67 +461,18 @@ def _chain(
         logl = jnp.where(accept, new, logl)
         c = jnp.where(accept, c_new, c)
         y = jnp.where(accept, y_new, y)
+        r2 = jnp.where(accept, r2_new, r2)
         moves = moves + accept.astype(jnp.int32)
         hops = hops + (accept & hop).astype(jnp.int32)
         tries = tries + hop.astype(jnp.int32)
         nvalid = nvalid + call.astype(jnp.int32)
-        return u, logl, c, y, moves, nev, nvalid, hops, tries
-
-    def walk_step(carry, key):
-        u, _, c, y = carry[:4]
-        prop, z, k_u = propose(key, u, c)
-        if not (tracked and local):  # symmetric: no test and no lookup
-            return update(carry, prop, True, False, c, y), None
-        c_new, y_new = locate(prop)
-        ok = ~use_local | hastings(k_u, z, c, y, c_new, y_new)
-        return update(carry, prop, ok, False, c_new, y_new), None
-
-    def hop_step(carry, key):
-        """The hop, or a walk step when it is off: one proposal is whitened
-        either way."""
-        k_walk, k_hop = random.split(key)
-        u, _, c, y = carry[:4]
-        w_prop, z, k_u = propose(k_walk, u, c)
-        if not tracked:
-            return update(carry, w_prop, True, False, c, y)
-        if not local:  # the walk did not keep the offsets up to date
-            y = offsets(u)
-        k_c, k_x, k_acc = random.split(k_hop, 3)
-        target = _modes.hop_frame(k_c, mine.eligible, mine.logdet)
-        h_prop = _modes.hop_point(k_x, mine.mu[target], frame_chol(target))
-        prop = jnp.where(enabled, h_prop, w_prop)
-        c_new, y_new = locate(prop)
-        h_ok = _modes.hop_test(
-            k_acc, mine.eligible, jnp.sum(y_new * y_new, axis=-1),
-            jnp.sum(y * y, axis=-1), d,
-        )
-        w_ok = True
-        if local:
-            w_ok = ~use_local | hastings(k_u, z, c, y, c_new, y_new)
-        ok = jnp.where(enabled, h_ok, w_ok)
-        return update(carry, prop, ok, enabled, c_new, y_new)
+        return (u, logl, c, y, r2, moves, nev, nvalid, hops, tries), None
 
     zero = jnp.zeros((), jnp.int32)
-    carry = (u, logl, *locate(u), zero, zero, zero, zero, zero)
-
-    def result(carry):
-        u, logl, _, _, *counts = carry
-        return (u, logl, *counts)
-
-    keys = random.split(key, walks)
-    if n_hops == 0:
-        carry, _ = lax.scan(walk_step, carry, keys)
-        return result(carry)
-
-    def cycle(carry, keys):
-        carry, _ = lax.scan(walk_step, carry, keys[:-1])
-        return hop_step(carry, keys[-1]), None
-
-    head = n_hops * _modes.HOP_EVERY
-    cycles = keys[:head].reshape((n_hops, _modes.HOP_EVERY) + keys.shape[1:])
-    carry, _ = lax.scan(cycle, carry, cycles)
-    carry, _ = lax.scan(walk_step, carry, keys[head:])
-    return result(carry)
+    carry = (u, logl, *place, zero, zero, zero, zero, zero)
+    xs = (keys, jnp.asarray(at_hop), jnp.asarray(hop_index, jnp.int32))
+    (u, logl, _, _, _, *counts), _ = lax.scan(step, carry, xs)
+    return (u, logl, *counts)
 
 
 def _init(key, loglike, prior_transform, cfg: Config) -> State:
@@ -553,7 +538,8 @@ def _reported_label(label, slot_fold, folds: int):
     ``modes()`` merges the labels of different clusterings that cover one
     mode."""
     j = (slot_fold + 1) % folds
-    return jnp.take_along_axis(label, j[None, :], 0)[0] + _modes.C_MAX * j
+    xp = np if isinstance(label, np.ndarray) else jnp
+    return xp.take_along_axis(label, j[None, :], 0)[0] + _modes.C_MAX * j
 
 
 def _recluster(state: State, batched: bool = False) -> State:
@@ -987,9 +973,9 @@ def finalise(
         np.asarray(dead.logl_birth, np.float64).reshape(-1),
         np.asarray(state.logl_birth, np.float64)[order],
     ])
-    live_label = np.asarray(_reported_label(
-        jnp.asarray(state.label), _fold(m, cfg._folds), cfg._folds
-    ))
+    live_label = _reported_label(
+        np.asarray(state.label), np.arange(m) % cfg._folds, cfg._folds
+    )
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)
@@ -1010,8 +996,7 @@ def finalise(
     status = int(state.status)
     samples = u
     if prior_transform is not None:
-        theta = jax.vmap(prior_transform)(jnp.asarray(u, state.u.dtype))
-        samples = np.asarray(theta).reshape(len(u), -1)
+        samples = _transform(prior_transform, u, state.u.dtype)
     info = {
         "status": STATUS[status],
         "num_delete": k,
@@ -1045,6 +1030,40 @@ def finalise(
         message=_MESSAGES[status],
         metadata={**info, **(metadata or {})},
     )
+
+
+# Rows per call of the compiled prior transform of :func:`finalise`.
+_TRANSFORM_BLOCK = 8192
+
+
+@_kernel_cache
+def _transform_kernel(prior_spec):
+    def kernel(u, *leaves):
+        return jax.vmap(prior_spec.rebuild(leaves))(u)
+
+    return jax.jit(kernel)
+
+
+def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
+    """``prior_transform`` of every row of ``u``, as a ``(len(u), -1)`` array.
+
+    The rows go through one compiled kernel in blocks of ``_TRANSFORM_BLOCK``
+    (the last one padded), so the lanes of a batch, whose sample counts
+    differ, share one compile.
+    """
+    n, d = u.shape
+    leaves, spec = _split_callable(
+        prior_transform, (d, np.dtype(dtype).name),
+        lambda: jax.ShapeDtypeStruct((d,), dtype),
+    )
+    kernel = _transform_kernel(spec)
+    pad = -n % _TRANSFORM_BLOCK
+    padded = np.concatenate([u, np.full((pad, d), 0.5, u.dtype)]).astype(dtype)
+    out = [
+        np.asarray(kernel(padded[start : start + _TRANSFORM_BLOCK], *leaves))
+        for start in range(0, n + pad, _TRANSFORM_BLOCK)
+    ]
+    return np.concatenate(out).reshape(n + pad, -1)[:n]
 
 
 def _mode_info(dead: Dead, k: int, hops, hop_tries) -> dict:
@@ -1329,6 +1348,8 @@ def run(
 
     wall_time_s = wall0 + time.perf_counter() - t0
     results = []
+    # The lanes are sliced on the host (finalise does not read the key).
+    state = jax.device_get(state._replace(key=None))
     for lane in range(lanes):
         lane_state = state
         lane_prior = prior_transform

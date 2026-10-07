@@ -311,8 +311,9 @@ def hop_point(key, mu, chol):
     return mu + r * (chol @ _unit_ball(key, d, mu.dtype))
 
 
-def hop_test(key, eligible, r2_new, r2_old, d: int):
-    """The hop's Metropolis-Hastings test ``U q(new) < q(old)``.
+def hop_accept(uniform, eligible, r2_new, r2_old, d: int):
+    """The hop's Metropolis-Hastings test ``U q(new) < q(old)`` for the
+    uniform draw ``U``.
 
     ``q`` is the number of eligible ellipsoids that hold a point, read from
     its squared Mahalanobis distances ``r2`` to the ``C_MAX`` frames; a
@@ -321,8 +322,7 @@ def hop_test(key, eligible, r2_new, r2_old, d: int):
     r2max = ELL_R2_PER_DIM * (d + 2.0)
     n_new = jnp.sum(eligible & (r2_new <= r2max))
     n_old = jnp.sum(eligible & (r2_old <= r2max))
-    accept = random.uniform(key, (), r2_new.dtype) * n_new < n_old
-    return accept & (n_new >= 1)
+    return (uniform * n_new < n_old) & (n_new >= 1)
 
 
 def propose_hop(key, u, fr: Frames):
@@ -339,7 +339,8 @@ def propose_hop(key, u, fr: Frames):
     c = hop_frame(k_c, fr.eligible, fr.logdet)
     new = hop_point(k_x, fr.mu[c], fr.chol[c])
     r2_new, r2_old = mahalanobis(fr, new)[0], mahalanobis(fr, u)[0]
-    return new, hop_test(k_acc, fr.eligible, r2_new, r2_old, u.shape[0])
+    uniform = random.uniform(k_acc, (), u.dtype)
+    return new, hop_accept(uniform, fr.eligible, r2_new, r2_old, u.shape[0])
 
 
 # ------------------------------------------------------------ clustering
@@ -354,8 +355,8 @@ def _assign(fr: Frames, x, keep):
     log_weight = jnp.log(jnp.maximum(fr.count, 1e-30) / total)
     offset = 2.0 * fr.logdet - 2.0 * log_weight  # (C,)
     dev = x[None, :, :] - fr.mu[:, None, :]  # (K, m, d)
-    z = solve_triangular(fr.chol, jnp.swapaxes(dev, 1, 2), lower=True)  # (K, d, m)
-    score = jnp.sum(z * z, axis=1) + offset[:, None]
+    z = jnp.einsum("kij,kmj->kmi", fr.ichol, dev)
+    score = jnp.sum(z * z, axis=2) + offset[:, None]
     score = jnp.where(fr.active[:, None], score, jnp.inf)
     return jnp.where(keep, jnp.argmin(score, axis=0), -1).astype(jnp.int32)
 
@@ -531,62 +532,84 @@ def _merge(u, labels):
     return lax.while_loop(cond, body, (labels, j0))[0]
 
 
-def _split_slots(u, labels):
-    """The best split of every slot of every lane: ``(J, part)``, shapes
-    ``(B, C)`` and ``(B, C, m)``.
+def _split_all(u, labels):
+    """Split every lane's clusters top-down: ``u`` ``(B, m, d)``, ``labels``
+    ``(B, m)``; returns the labels.
 
-    The slots run in sequence, and a slot that no lane could split (fewer
-    than ``max(6, 4 d)`` members in every lane, e.g. an empty slot) is
-    skipped by a ``lax.cond`` whose predicate is unbatched: the search costs
-    the occupied slots only, also for a batch of runs.
+    In each lane: the best split of every cluster that can split (at least
+    ``max(6, 4 d)`` members) is searched; while the best of them passes the
+    threshold and a slot is free it is applied, and the two clusters it made
+    are searched in turn.
+
+    One loop serves all lanes. An iteration applies the due split of every
+    lane that has no search pending, then searches one cluster in every lane
+    that has one pending (:func:`_split`, vmapped over the lanes). The loop's
+    predicate and the ``lax.cond`` around the search are unbatched, so the
+    search runs as many times as the busiest lane needs: the number of
+    clusters of the lane with the most, plus two per split.
     """
     lanes, m, d = u.shape
-    size = jnp.sum(labels[:, None, :] == jnp.arange(C_MAX)[None, :, None], axis=-1)
-    need = jnp.any(size >= max(2 * MIN_SPLIT_POINTS, 4 * d), axis=0)  # (C,)
+    threshold = split_threshold(d)
+    min_size = max(2 * MIN_SPLIT_POINTS, 4 * d)
+    slots = jnp.arange(C_MAX)
+    lane = jnp.arange(lanes)
 
-    def slot(xs):
-        c, go = xs
+    def sizes(labels):
+        return jnp.sum(labels[:, None, :] == slots[None, :, None], axis=-1)
+
+    def due(labels, js, todo):
+        """Lanes whose best split passes, with a free slot and no search
+        pending."""
+        full = jnp.all(sizes(labels) > 0, axis=1)
+        return (jnp.max(js, axis=1) >= threshold) & ~full & ~jnp.any(todo, axis=1)
+
+    def cond(carry):
+        labels, js, _, todo = carry
+        return jnp.any(todo) | jnp.any(due(labels, js, todo))
+
+    def body(carry):
+        labels, js, parts, todo = carry
+        # Apply the best split where it is due. The part that moves to the
+        # first free slot is the one without the cluster's first row, so the
+        # slots do not depend on the orientation of the cut (the sign of an
+        # eigenvector, which batched and single solvers can choose apart).
+        go = due(labels, js, todo)
+        c = jnp.argmax(js, axis=1)
+        free = jnp.argmin(sizes(labels) > 0, axis=1)
+        member = labels == c[:, None]
+        part = parts[lane, c]
+        first = jnp.take_along_axis(part, jnp.argmax(member, axis=1)[:, None], 1)
+        part = jnp.where(first, member & ~part, part) & go[:, None]
+        labels = jnp.where(part, free[:, None], labels).astype(jnp.int32)
+        changed = go[:, None] & (
+            (slots[None, :] == c[:, None]) | (slots[None, :] == free[:, None])
+        )
+        js = jnp.where(changed, 0.0, js)
+        todo = todo | (changed & (sizes(labels) >= min_size))
+        # Search the first pending cluster of every lane that has one.
+        has = jnp.any(todo, axis=1)
+        pick = jnp.argmax(todo, axis=1)
+        target = jnp.where(has, pick, C_MAX)  # C_MAX: no row has this label
 
         def search(_):
-            return jax.vmap(lambda u, lab: _split(u, lab == c))(u, labels)
+            return jax.vmap(lambda u, lab, c: _split(u, lab == c))(u, labels, target)
 
         def skip(_):
             return jnp.zeros((lanes,), u.dtype), jnp.zeros((lanes, m), bool)
 
-        return lax.cond(go, search, skip, None)
+        j, p = lax.cond(jnp.any(has), search, skip, None)
+        done = has[:, None] & (slots[None, :] == pick[:, None])
+        js = jnp.where(done, j[:, None], js)
+        parts = jnp.where(done[:, :, None], p[:, None, :], parts)
+        return labels, js, parts, todo & ~done
 
-    js, parts = lax.map(slot, (jnp.arange(C_MAX), need))
-    return jnp.swapaxes(js, 0, 1), jnp.swapaxes(parts, 0, 1)
-
-
-def _split_loop(u, labels, js, parts):
-    """Apply the best split while one passes the threshold and a slot is free;
-    the two clusters a split changes are searched again."""
-    threshold = split_threshold(u.shape[1])
-
-    def occupied(labels):
-        return jnp.any(labels[None, :] == jnp.arange(C_MAX)[:, None], axis=1)
-
-    def cond(carry):
-        labels, js, _ = carry
-        return (jnp.max(js) >= threshold) & ~jnp.all(occupied(labels))
-
-    def body(carry):
-        labels, js, parts = carry
-        c = jnp.argmax(js)
-        slot = jnp.argmin(occupied(labels))  # the first free slot
-        # The part that moves is the one without the cluster's first row, so
-        # the slots do not depend on the orientation of the cut (the sign of
-        # an eigenvector, which batched and single solvers can choose apart).
-        member = labels == c
-        part = parts[c]
-        part = jnp.where(part[jnp.argmax(member)], member & ~part, part)
-        labels = jnp.where(part, slot, labels).astype(jnp.int32)
-        pair = jnp.stack([c, slot])
-        new_j, new_parts = jax.vmap(lambda s: _split(u, labels == s))(pair)
-        return labels, js.at[pair].set(new_j), parts.at[pair].set(new_parts)
-
-    return lax.while_loop(cond, body, (labels, js, parts))[0]
+    carry = (
+        labels,
+        jnp.zeros((lanes, C_MAX), u.dtype),
+        jnp.zeros((lanes, C_MAX, m), bool),
+        sizes(labels) >= min_size,
+    )
+    return lax.while_loop(cond, body, carry)[0]
 
 
 def recluster_lanes(u, labels):
@@ -600,9 +623,14 @@ def recluster_lanes(u, labels):
     labels = jnp.where(labels < 0, -1, jnp.clip(labels, 0, C_MAX - 1))
     labels = labels.astype(jnp.int32)
     labels = jax.vmap(lambda u, lab: _refine(u, lab, C_MAX, REFINE_ITERS))(u, labels)
-    labels = jax.vmap(_merge)(u, labels)
-    js, parts = _split_slots(u, labels)
-    labels = jax.vmap(_split_loop)(u, labels, js, parts)
+    occupied = jnp.any(labels[:, None, :] == jnp.arange(C_MAX)[None, :, None], axis=-1)
+    labels = lax.cond(  # nothing to merge unless a lane holds two clusters
+        jnp.any(jnp.sum(occupied, axis=1) >= 2),
+        lambda labels: jax.vmap(_merge)(u, labels),
+        lambda labels: labels,
+        labels,
+    )
+    labels = _split_all(u, labels)
     return labels, jax.vmap(lambda u, lab: stats(u, lab, C_MAX))(u, labels)
 
 
