@@ -293,54 +293,46 @@ def hop_enabled(fr: Frames):
     return jnp.sum(fr.eligible) >= 2
 
 
-def _unit_ball(key, d, dtype):
-    k_dir, k_rad = random.split(key)
-    z = random.normal(k_dir, (d,), dtype)
-    return z / jnp.linalg.norm(z) * random.uniform(k_rad, (), dtype) ** (1.0 / d)
+def hop_proposal(key, eligible, logdet, frame):
+    """Draw a hop proposal: ``(point, uniform)``.
 
-
-def hop_frame(key, eligible, logdet):
-    """An eligible frame drawn in proportion to its volume."""
-    return random.categorical(key, jnp.where(eligible, logdet, -jnp.inf))
-
-
-def hop_point(key, mu, chol):
-    """A uniform draw in the hop ellipsoid of the frame ``(mu, chol)``."""
+    ``point`` is uniform in the ellipsoid ``|L^-1 (x - mu)|^2 <= d + 2`` of an
+    eligible frame chosen in proportion to its volume (``eligible`` and
+    ``logdet`` of the ``C_MAX`` frames; ``frame(c)`` returns ``(mu, L)`` of
+    frame ``c``), and ``uniform`` is the draw of its Metropolis-Hastings test
+    (:func:`hop_accept`). The proposal does not depend on the chain's point.
+    One normal vector and three uniforms: the frame by inversion of the
+    volumes' distribution, the radius ``U^(1/d)`` and the test.
+    """
+    k_dir, k_uni = random.split(key)
+    dtype = logdet.dtype
+    uni = random.uniform(k_uni, (3,), dtype)
+    logv = jnp.where(eligible, logdet, -jnp.inf)
+    cdf = jnp.cumsum(jnp.where(eligible, jnp.exp(logv - jnp.max(logv)), 0.0))
+    c = jnp.sum(cdf <= uni[0] * cdf[-1])  # the first frame with cdf above
+    last = eligible.shape[0] - 1 - jnp.argmax(eligible[::-1])
+    mu, chol = frame(jnp.minimum(c, last))
     d = mu.shape[0]
-    r = math.sqrt(ELL_R2_PER_DIM * (d + 2.0))
-    return mu + r * (chol @ _unit_ball(key, d, mu.dtype))
+    z = random.normal(k_dir, (d,), dtype)
+    ball = z / jnp.linalg.norm(z) * uni[1] ** (1.0 / d)
+    point = mu + math.sqrt(ELL_R2_PER_DIM * (d + 2.0)) * (chol @ ball)
+    return point, uni[2]
 
 
 def hop_accept(uniform, eligible, r2_new, r2_old, d: int):
     """The hop's Metropolis-Hastings test ``U q(new) < q(old)`` for the
     uniform draw ``U``.
 
-    ``q`` is the number of eligible ellipsoids that hold a point, read from
-    its squared Mahalanobis distances ``r2`` to the ``C_MAX`` frames; a
-    proposal in no ellipsoid (it cannot be drawn) is refused.
+    The proposal density ``q`` is proportional to the number of eligible
+    ellipsoids that hold a point, read from its squared Mahalanobis
+    distances ``r2`` to the frames; a proposal in no ellipsoid (it cannot be
+    drawn) is refused. The caller also requires the proposal in the cube and
+    above ``L*``.
     """
     r2max = ELL_R2_PER_DIM * (d + 2.0)
     n_new = jnp.sum(eligible & (r2_new <= r2max))
     n_old = jnp.sum(eligible & (r2_old <= r2max))
     return (uniform * n_new < n_old) & (n_new >= 1)
-
-
-def propose_hop(key, u, fr: Frames):
-    """Propose the hop from ``u``; return ``(u_new, ok)``.
-
-    ``u_new`` is uniform in the ellipsoid of an eligible frame chosen in
-    proportion to its volume. ``ok`` is the Metropolis-Hastings test ``U
-    q(u_new) < q(u)``, with ``q`` the number of eligible ellipsoids that
-    contain a point; the caller also requires ``u_new`` in the cube and above
-    ``L*``. :func:`tinyns.core._chain` makes the same three draws from the
-    same keys, with the whitened offsets it already holds.
-    """
-    k_c, k_x, k_acc = random.split(key, 3)
-    c = hop_frame(k_c, fr.eligible, fr.logdet)
-    new = hop_point(k_x, fr.mu[c], fr.chol[c])
-    r2_new, r2_old = mahalanobis(fr, new)[0], mahalanobis(fr, u)[0]
-    uniform = random.uniform(k_acc, (), u.dtype)
-    return new, hop_accept(uniform, fr.eligible, r2_new, r2_old, u.shape[0])
 
 
 # ------------------------------------------------------------ clustering
@@ -542,11 +534,12 @@ def _split_all(u, labels):
     are searched in turn.
 
     One loop serves all lanes. An iteration applies the due split of every
-    lane that has no search pending, then searches up to two pending clusters
-    in every lane (:func:`_split`, vmapped). The loop's predicate and the
-    ``lax.switch`` around the search (none, one or two clusters per lane) are
-    unbatched, so the number of search rounds is that of the busiest lane:
-    half its number of clusters, plus one per split.
+    lane that has no search pending, then searches one cluster in every lane
+    that has one pending (:func:`_split`, vmapped over the lanes). The loop's
+    predicate and the ``lax.cond`` around the search are unbatched, so the
+    search runs as many times as the busiest lane needs: the number of
+    clusters of the lane with the most, plus two per split. (Searching two
+    clusters of a lane at once was no faster on a GPU and compiled slower.)
     """
     lanes, m, d = u.shape
     threshold = split_threshold(d)
@@ -586,36 +579,22 @@ def _split_all(u, labels):
         )
         js = jnp.where(changed, 0.0, js)
         todo = todo | (changed & (sizes(labels) >= min_size))
-        # Search the first pending clusters of every lane that has any: two
-        # per lane at once if a lane has two (a round costs about the same
-        # time on a GPU either way), else one (half the work).
-        first = jnp.argmax(todo, axis=1)
-        rest = todo & (slots[None, :] != first[:, None])
-        pick = jnp.stack([first, jnp.argmax(rest, axis=1)], axis=1)  # (B, 2)
-        has = jnp.stack([jnp.any(todo, axis=1), jnp.any(rest, axis=1)], axis=1)
+        # Search the first pending cluster of every lane that has one.
+        has = jnp.any(todo, axis=1)
+        pick = jnp.argmax(todo, axis=1)
         target = jnp.where(has, pick, C_MAX)  # C_MAX: no row has this label
 
-        def search(width):
-            def run(_):
-                j, p = jax.vmap(
-                    lambda u, lab, cs: jax.vmap(lambda c: _split(u, lab == c))(cs)
-                )(u, labels, target[:, :width])
-                pad = ((0, 0), (0, 2 - width))
-                return jnp.pad(j, pad), jnp.pad(p, pad + ((0, 0),))
+        def search(_):
+            return jax.vmap(lambda u, lab, c: _split(u, lab == c))(u, labels, target)
 
-            return run
+        def skip(_):
+            return jnp.zeros((lanes,), u.dtype), jnp.zeros((lanes, m), bool)
 
-        j, p = lax.switch(
-            jnp.any(has[:, 0]).astype(jnp.int32) + jnp.any(has[:, 1]),
-            [search(0), search(1), search(2)],
-            None,
-        )
-        for i in range(2):
-            done = has[:, i, None] & (slots[None, :] == pick[:, i, None])
-            js = jnp.where(done, j[:, i, None], js)
-            parts = jnp.where(done[:, :, None], p[:, i, None, :], parts)
-            todo = todo & ~done
-        return labels, js, parts, todo
+        j, p = lax.cond(jnp.any(has), search, skip, None)
+        done = has[:, None] & (slots[None, :] == pick[:, None])
+        js = jnp.where(done, j[:, None], js)
+        parts = jnp.where(done[:, :, None], p[:, None, :], parts)
+        return labels, js, parts, todo & ~done
 
     carry = (
         labels,

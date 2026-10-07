@@ -299,9 +299,56 @@ def _walk_mask(above, other, seeds, ndim):
     return jnp.where(jnp.sum(mask) >= ndim + 1, mask, above)
 
 
+def _hop_steps(walks: int, n_hops: int) -> np.ndarray:
+    """The steps of a chain that are hops: every ``HOP_EVERY``-th (static)."""
+    at_hop = np.zeros(walks, bool)
+    at_hop[_modes.HOP_EVERY - 1 : n_hops * _modes.HOP_EVERY : _modes.HOP_EVERY] = True
+    return at_hop
+
+
+def _step_keys(key, walks: int, hop: bool):
+    """The keys of a chain: ``(keys, hop_keys)``.
+
+    ``keys[i]`` are the two keys of step ``i`` (its normal vector and its
+    Hastings test). A hop step first splits its key in two, one for the walk
+    step it becomes when the hop is off and one, in ``hop_keys``, for the
+    hop (``None`` for a chain without hop steps).
+    """
+    n_hops = walks // _modes.HOP_EVERY if hop else 0
+    keys = random.split(key, walks)
+    hop_keys = None
+    if n_hops > 0:
+        at_hop = _hop_steps(walks, n_hops)
+        pair = jax.vmap(random.split)(keys[at_hop])
+        keys = keys.at[np.flatnonzero(at_hop)].set(pair[:, 0])
+        hop_keys = pair[:, 1]
+    return jax.vmap(random.split)(keys), hop_keys
+
+
+def _hop_draws(hop_keys, frames: _modes.Frames, fold=None):
+    """The proposals of all the hop steps of a chain and the uniforms of
+    their tests, ``(points, uniforms)``.
+
+    A hop proposal does not depend on the chain's point (an independence
+    sampler), so the chain draws them before it runs
+    (:func:`tinyns.modes.hop_proposal`) and a hop step looks one up.
+    ``frames`` are those of the chain's kernel, or with ``fold`` those of
+    every fold.
+    """
+    at = () if fold is None else (fold,)
+
+    def draw(key):
+        return _modes.hop_proposal(
+            key, frames.eligible[at], frames.logdet[at],
+            lambda c: (frames.mu[(*at, c)], frames.chol[(*at, c)]),
+        )
+
+    return jax.vmap(draw)(hop_keys)
+
+
 def _chain(
     key, u, logl, lstar, chol, scale, loglike, prior_transform, walks, skip,
-    frames, hop=True, local=False, fold=None, plain=False, near=None,
+    frames, hop=True, local=False, fold=None, plain=False, near=None, draws=None,
 ):
     """A fixed-length constrained Metropolis chain from ``(u, logl)``.
 
@@ -351,46 +398,40 @@ def _chain(
 
     near = frames if near is None else near
     if fold is None:
-        mine, every = near, frames
+        mine = near
 
         def live_step(z):
             return chol @ z
 
-        def frame_chol(fr, c):
-            return fr.chol[c]
+        def frame_chol(c):
+            return near.chol[c]
 
         def offsets(v):
             return jnp.einsum("cij,cj->ci", near.ichol, v - near.mu)
 
     else:
         if tracked:
-            mine, every = (
-                _modes.Frames(*(
-                    None if name in ("chol", "ichol") else getattr(fr, name)[fold]
-                    for name in _modes.Frames._fields
-                ))
-                for fr in (near, frames)
-            )
+            mine = _modes.Frames(*(
+                None if name in ("chol", "ichol") else getattr(near, name)[fold]
+                for name in _modes.Frames._fields
+            ))
 
         def live_step(z):
             return jnp.einsum("fij,j->fi", chol, z)[fold]
 
-        def frame_chol(fr, c):
-            return fr.chol[fold, c]
+        def frame_chol(c):
+            return near.chol[fold, c]
 
         def offsets(v):
             y = jnp.einsum("fcij,fcj->fci", near.ichol, v - near.mu)
             return y[fold]
 
-    # The step keys. A hop step splits its key in two: one for the walk step
-    # it becomes when the hop is off, one for the hop.
-    keys = random.split(key, walks)
-    at_hop = np.zeros(walks, bool)
-    at_hop[_modes.HOP_EVERY - 1 : n_hops * _modes.HOP_EVERY : _modes.HOP_EVERY] = True
+    if draws is None:
+        keys, hop_keys = _step_keys(key, walks, hop)
+        draws = (keys, *(_hop_draws(hop_keys, frames, fold) if tracked and n_hops else (None, None)))
+    keys, hop_points, hop_uniforms = draws
+    at_hop = _hop_steps(walks, n_hops)
     hop_index = np.cumsum(at_hop) - at_hop  # the number of the hop at a hop step
-    if n_hops > 0:
-        pair = jax.vmap(random.split)(keys[at_hop])
-        keys = keys.at[np.flatnonzero(at_hop)].set(pair[:, 0])
 
     if tracked:
         walkable = _modes.walk_frames(mine)
@@ -409,27 +450,15 @@ def _chain(
         place = (jnp.zeros((), jnp.int32),) + (jnp.zeros((), dtype),) * 2
 
     if tracked and n_hops > 0:
-        # The hop proposals do not depend on the chain's state (an
-        # independence sampler), so they are drawn here, for all its hop
-        # steps at once, and a hop step only looks one up.
         enabled = _modes.hop_enabled(mine)
 
-        def draw(key):
-            k_c, k_x, k_acc = random.split(key, 3)
-            c = _modes.hop_frame(k_c, every.eligible, every.logdet)
-            point = _modes.hop_point(k_x, every.mu[c], frame_chol(frames, c))
-            return point, random.uniform(k_acc, (), dtype)
-
-        hop_points, hop_uniforms = jax.vmap(draw)(pair[:, 1])
-
     def step(carry, xs):
-        key, is_hop, index = xs
+        (k_z, k_u), is_hop, index = xs
         u, logl, c, y, r2, moves, nev, nvalid, hops, tries = carry
-        k_z, k_u = random.split(key)
         z = random.normal(k_z, u.shape, u.dtype)
         move = live_step(z)
         if local:
-            move = jnp.where(use_local, frame_chol(near, c) @ z, move)
+            move = jnp.where(use_local, frame_chol(c) @ z, move)
         prop = u + scale * move
         hop = jnp.asarray(False)
         if tracked and n_hops > 0:
@@ -704,41 +733,63 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     frames = _frames(state)  # frames[j]: fitted outside fold j
     scale = jnp.exp(state.log_scale)
 
+    hopping = cfg._hop and walks >= _modes.HOP_EVERY
+    switching = cfg._local or hopping
+    if switching and level is None:
+        level = _kernel_level(state, cfg)
+    # What the chains draw before they run: the keys of their steps and, if
+    # any frame is in use, their hop proposals (the same for every kernel).
+    chain_keys = k_chain[None] if k == 1 else random.split(k_chain, k)
+    chain_fold = fold[seeds]
+    step_keys, hop_keys = jax.vmap(lambda key: _step_keys(key, walks, cfg._hop))(
+        chain_keys
+    )
+    hop_draws = (None, None)
+    if hopping:
+        n_hops = walks // _modes.HOP_EVERY
+        hop_draws = lax.cond(
+            level > 0,
+            lambda: jax.vmap(lambda keys, j: _hop_draws(keys, frames, j))(
+                hop_keys, chain_fold
+            ),
+            lambda: (jnp.zeros((k, n_hops, cfg.ndim), dtype), jnp.zeros((k, n_hops), dtype)),
+        )
+
     def chains(kernel):
         """The step's chains with kernel 0, 1 or 2 (:func:`_kernel_level`)."""
         near = _few(frames, cfg) if kernel == 1 else frames
 
-        def chain(key, i, lone=False):
-            """The chain seeded at live point ``i``; ``lone`` (one unbatched
-            chain): its fold's kernel is sliced out."""
-            j = fold[i]
+        def chain(i, j, draws, lone=False):
+            """The chain seeded at live point ``i`` of fold ``j``; ``lone``
+            (one unbatched chain): its fold's kernel is sliced out."""
             mine = (chols, frames, near, j)
             if lone:
                 mine = (*jax.tree_util.tree_map(lambda a: a[j], mine[:3]), None)
             return _chain(
-                key, state.u[i], state.logl[i], lstar, mine[0], scale, loglike,
+                None, state.u[i], state.logl[i], lstar, mine[0], scale, loglike,
                 prior_transform, walks, lone, mine[1], cfg._hop, cfg._local,
-                mine[3], kernel == 0, mine[2],
+                mine[3], kernel == 0, mine[2], draws,
             )
 
-        def run(_):
+        def run():
+            draws = (step_keys, *hop_draws)
             if k == 1:  # no vmap: the cond really skips out-of-cube proposals
-                return tuple(x[None] for x in chain(k_chain, seeds[0], True))
-            return jax.vmap(chain)(random.split(k_chain, k), seeds)
+                first = jax.tree_util.tree_map(lambda a: a[0], draws)
+                out = chain(seeds[0], chain_fold[0], first, True)
+                return tuple(x[None] for x in out)
+            return jax.vmap(chain)(seeds, chain_fold, draws)
 
         return run
 
     kernels = [chains(i) for i in range(3)]
-    if not (cfg._local or (cfg._hop and walks >= _modes.HOP_EVERY)):
-        out = kernels[0](None)
+    if not switching:
+        out = kernels[0]()
     elif _KERNELS == 1:
-        out = kernels[2](None)
+        out = kernels[2]()
     else:
-        if level is None:
-            level = _kernel_level(state, cfg)
         if _KERNELS == 2:
             kernels[1] = kernels[2]
-        out = lax.switch(level, kernels, None)
+        out = lax.switch(level, kernels)
     new_u, new_logl, moves, nev, nvalid, hops, hop_tries = out
 
     insertion = jnp.sum(
@@ -1279,11 +1330,12 @@ def run(
         rows_by_lane = [[dead] for dead in ckpt.dead]
         ncall, ncall_valid = list(ckpt.ncall), list(ckpt.ncall_valid)
         wall0, compile_s, nchunks = ckpt.wall_time_s, ckpt.compile_s, ckpt.chunks
+        sampling_s = ckpt.sampling_s
     else:
         state = _init_kernel(ll_spec, pt_spec, cfg, axes)(key, *leaves)
         rows_by_lane = [[_empty_dead(cfg, dtype)] for _ in range(lanes)]
         ncall, ncall_valid = [0] * lanes, [0] * lanes
-        wall0 = compile_s = 0.0
+        wall0 = compile_s = sampling_s = 0.0
         nchunks = 0
 
     capacity = max(1, math.ceil(_CHUNK_EFOLDS / cfg.log_shrink))
@@ -1313,6 +1365,7 @@ def run(
                 ncall_valid=ncall_valid,
                 wall_time_s=wall0 + time.perf_counter() - t0,
                 compile_s=compile_s,
+                sampling_s=sampling_s,
                 chunks=nchunks,
                 config=dataclasses.asdict(cfg),
                 batch=batch,
@@ -1339,6 +1392,7 @@ def run(
             ))
         )
         elapsed = time.perf_counter() - tick
+        sampling_s += elapsed
         nchunks += 1
         if batch is None:  # one lane: give every output a lane axis
             count, calls, valid, status, remain, logz, it, log_scale = (
@@ -1411,6 +1465,7 @@ def run(
                     "chunks": nchunks,
                     "wall_time_s": wall_time_s,
                     "compile_s": compile_s,
+                    "sampling_s": sampling_s,
                     "resumed": resumed,
                 },
             )

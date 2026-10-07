@@ -6,8 +6,10 @@
 All seeds run as one batched tinyns run (``core.run`` with a batch of keys:
 one compiled program, the step vmapped over the seeds), so a cell is one GPU
 job. One ``tinyns-bakeoff-1`` JSON line per seed is appended to ``--out``
-under ``flock``. ``wall_s`` and ``compile_s`` are the batch's (shared by all
-its seeds); ``wall_per_seed_s`` divides the wall time by the seed count.
+under ``flock``. ``wall_s``, ``compile_s`` and ``sampling_s`` (the time in
+the compiled chunks, without the compilation, the first live points and the
+host-side results) are the batch's (shared by all its seeds);
+``wall_per_seed_s`` divides the wall time by the seed count.
 
 Per seed the record holds the evidence (``logz``, ``logzerr``), the calls
 (``ncall``, ``ncall_valid``), the oracle mode masses (the target's
@@ -205,6 +207,7 @@ def main(argv=None):
         wall_s=wall,
         wall_per_seed_s=wall / len(seeds),
         compile_s=results[0].metadata.get("compile_s"),
+        sampling_s=results[0].metadata.get("sampling_s"),
         tinyns=__version__,
         git_sha=git_sha(),
         jax=jax.__version__,

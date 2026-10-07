@@ -1,12 +1,12 @@
-"""Checkpoints of the :func:`tinyns.core.run` driver (format ``tinyns-ckpt-4``).
+"""Checkpoints of the :func:`tinyns.core.run` driver (format ``tinyns-ckpt-5``).
 
 A checkpoint is one ``.npz`` file, written atomically: a temporary file in the
 same directory, ``fsync``, then ``os.replace``, so a crash leaves either the
 previous checkpoint or the new one, never a torn file. It holds
 
 - ``state/<field>``: the :class:`tinyns.core.State` leaves (with a leading
-  lane axis for a batched run), including the mode-tracking fields (cluster
-  labels and the cluster statistics of each half). The
+  lane axis for a batched run), including the mode-tracking fields (the
+  cluster labels and the cluster frames of each clustering). The
   PRNG key is stored as its raw ``uint32`` key data, with ``state/key_impl``
   naming the implementation of a typed key (``""`` for a raw ``uint32``
   key), so both kinds round-trip exactly;
@@ -16,8 +16,8 @@ previous checkpoint or the new one, never a torn file. It holds
   ...)``, one entry per :class:`tinyns.core.Dead` column;
 - ``meta_json``: the format, the tinyns version, the resolved ``Config``, the
   x64 flag and float dtype, the lane count and ``batched_data``, the host call
-  counters (Python ints, one per lane), the accumulated ``wall_time_s`` and
-  ``compile_s`` and the number of chunks.
+  counters (Python ints, one per lane), the accumulated ``wall_time_s``,
+  ``compile_s`` and ``sampling_s`` and the number of chunks.
 
 Files of any other format are refused; there is no reader for older formats.
 """
@@ -37,7 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import random
 
-FORMAT = "tinyns-ckpt-4"
+FORMAT = "tinyns-ckpt-5"
 
 
 def _is_typed_key(key) -> bool:
@@ -90,6 +90,7 @@ class Checkpoint:
     ncall_valid: list
     wall_time_s: float
     compile_s: float
+    sampling_s: float
     chunks: int
     config: dict
     batch: int | None
@@ -131,6 +132,7 @@ def save(path, ckpt: Checkpoint) -> None:
         "ncall_valid": [int(n) for n in ckpt.ncall_valid],
         "wall_time_s": float(ckpt.wall_time_s),
         "compile_s": float(ckpt.compile_s),
+        "sampling_s": float(ckpt.sampling_s),
         "chunks": int(ckpt.chunks),
     }
     arrays["meta_json"] = np.asarray(json.dumps(meta, sort_keys=True))
@@ -165,7 +167,7 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
     """Read the checkpoint at ``path`` for a run of ``config`` from ``key``.
 
     Raises ``ValueError`` naming the mismatch when the file is not a
-    ``tinyns-ckpt-4`` checkpoint, or when its config, x64 flag, float dtype,
+    ``tinyns-ckpt-5`` checkpoint, or when its config, x64 flag, float dtype,
     lane count, ``batched_data`` or starting key differ from this run's.
     Returns a :class:`Checkpoint`.
     """
@@ -240,6 +242,7 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
         ncall_valid=[int(n) for n in meta["ncall_valid"]],
         wall_time_s=float(meta["wall_time_s"]),
         compile_s=float(meta["compile_s"]),
+        sampling_s=float(meta["sampling_s"]),
         chunks=int(meta["chunks"]),
         config=meta["config"],
         batch=meta["batch"],

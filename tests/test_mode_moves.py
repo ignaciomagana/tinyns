@@ -97,6 +97,41 @@ def z_score(fraction, n):
     )
 
 
+def test_hop_proposal_is_uniform_on_the_eligible_ellipsoids() -> None:
+    """A frame in proportion to its volume (never one that is not eligible),
+    a point uniform in its ellipsoid, and a uniform draw for the test."""
+    dtype = jnp.result_type(float)
+    scales = np.array([0.02, 0.03, 0.05, 0.01])
+    mu = jnp.asarray([[0.2] * D, [0.5] * D, [0.8] * D, [0.5, 0.2, 0.8]], dtype)
+    chol = jnp.asarray(scales[:, None, None] * np.eye(D), dtype)
+    logdet = jnp.asarray(D * np.log(scales), dtype)
+    eligible = jnp.asarray([True, True, False, True])
+    n = 40_000
+
+    def draw(key):
+        point, uniform = modes.hop_proposal(
+            key, eligible, logdet, lambda c: (mu[c], chol[c])
+        )
+        r2 = jnp.sum(((point - mu) / jnp.asarray(scales, dtype)[:, None]) ** 2, 1)
+        return jnp.argmin(r2), jnp.min(r2), uniform
+
+    c, r2, uniform = map(np.asarray, jax.jit(jax.vmap(draw))(
+        random.split(random.PRNGKey(0), n)
+    ))
+    share = np.where(eligible, scales**D, 0.0)
+    share /= share.sum()
+    for frame in range(4):
+        sd = math.sqrt(share[frame] * (1 - share[frame]) / n)
+        assert abs(np.mean(c == frame) - share[frame]) <= 4 * sd
+    # In its ellipsoid r^2 <= d + 2, with (r^2 / (d + 2))^(d / 2) uniform.
+    t = (r2 / (D + 2.0)) ** (D / 2)
+    assert t.max() <= 1.0 + 1e-5
+    for x in (t, uniform):
+        assert abs(x.mean() - 0.5) < 4 * math.sqrt(1 / 12 / n)
+        assert abs(np.mean(x < 0.1) - 0.1) < 4 * math.sqrt(0.09 / n)
+    assert 0.0 <= uniform.min() and uniform.max() < 1.0
+
+
 def test_hop_keeps_the_constrained_prior() -> None:
     n = 20_000
     fraction, hops, tries = invariance(n, seed=2)
@@ -213,6 +248,35 @@ def test_without_the_hop_the_clustering_still_runs() -> None:
     assert Config(D, 40, 4, 10).recluster_every == 3
     with pytest.raises(TypeError, match="_hop"):
         Config(D, 40, 4, 10, _hop="N")
+
+
+def test_the_chain_kernels_agree() -> None:
+    """A step picks the cheapest chain kernel its frames allow
+    (``core._kernel_level``): plain walks while no clustering has two
+    clusters, then the frames in use, compacted. Each must return what the
+    general kernel does (to roundoff: in float32 a rare Metropolis decision
+    may flip)."""
+    cfg = Config(D, 200, 20, 20)
+    step = jax.jit(lambda state, level: core._step(
+        state, two_gaussians, lambda u: u, cfg, level
+    )[0])
+    recluster = jax.jit(lambda state: core._maybe_recluster(state, cfg))
+    state = core.init(3, two_gaussians, lambda u: u, cfg)
+    seen = set()
+    for _ in range(80):
+        state = recluster(state)
+        level = int(core._kernel_level(state, cfg))
+        mine = step(state, jnp.int32(level))
+        if level not in seen:
+            seen.add(level)
+            general = step(state, jnp.int32(2))
+            if jax.config.jax_enable_x64:
+                np.testing.assert_allclose(mine.u, general.u, atol=1e-9)
+                np.testing.assert_array_equal(mine.ncall_valid, general.ncall_valid)
+            else:
+                assert np.mean(np.asarray(mine.logl == general.logl)) > 0.95
+        state = mine
+    assert {0, 1} <= seen
 
 
 def test_one_chain_per_step_hops() -> None:
