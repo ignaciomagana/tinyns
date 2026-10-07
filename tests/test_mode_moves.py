@@ -97,6 +97,58 @@ def z_score(fraction, n):
     )
 
 
+def test_chain_reads_its_own_fold_and_the_compact_frames() -> None:
+    """In a step the chains share the frames of every fold and each looks up
+    its own (and, when few are in use, a compact copy of those). Both must
+    return the chain that the fold's frames alone give."""
+    dtype = jnp.result_type(float)
+    rng = np.random.default_rng(3)
+    cfg = Config(D, 2 * NFIT, walks=WALKS)
+
+    def fit(n):
+        others = uniform_region(rng, n)
+        ball = np.argmin(((others[:, None] - CENTERS) ** 2).sum(-1), axis=1)
+        others = jnp.asarray(others, dtype)
+        st = modes.stats(others, jnp.asarray(ball, jnp.int32), modes.C_MAX)
+        return modes.frames(st, n), core._live_chol(others, jnp.ones(n, bool))
+
+    kernels = [fit(n) for n in (2 * NFIT, 3 * NFIT, 4 * NFIT)]  # one per fold
+    assert [int(jnp.sum(fr.eligible)) for fr, _ in kernels] == [2, 2, 2]
+    frames = jax.tree_util.tree_map(lambda *a: jnp.stack(a), *(fr for fr, _ in kernels))
+    chols = jnp.stack([chol for _, chol in kernels])
+    few = core._few(frames, cfg)
+    assert few.mu.shape[1] == core._FEW < modes.C_MAX
+    n = 2000
+    seeds = jnp.asarray(uniform_region(rng, n), dtype)
+    keys = random.split(random.PRNGKey(5), n)
+    folds = jnp.asarray(rng.integers(0, 3, n), jnp.int32)
+
+    def chain(key, s, j, stacked, near):
+        fr, chol = jax.tree_util.tree_map(lambda a: a[j], (frames, chols))
+        args = (chols, frames, j, near) if stacked else (chol, fr, None, None)
+        return core._chain(
+            key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), args[0],
+            jnp.asarray(SCALE, dtype), region_loglike, lambda v: v, WALKS, False,
+            args[1], True, True, args[2], False, args[3],
+        )
+
+    def run(stacked, near=None):
+        return jax.jit(jax.vmap(lambda k, s, j: chain(k, s, j, stacked, near)))(
+            keys, seeds, folds
+        )
+
+    alone = run(False)
+    assert int(jnp.sum(alone[5])) > 0.02 * int(jnp.sum(alone[6])) > 0  # hops
+    for other in (run(True), run(True, few)):
+        if jax.config.jax_enable_x64:
+            np.testing.assert_allclose(other[0], alone[0], atol=1e-9)
+            for a, b in zip(other[2:], alone[2:], strict=True):
+                np.testing.assert_array_equal(a, b)
+        else:  # a roundoff difference can flip a Metropolis decision
+            same = np.all(np.isclose(other[0], alone[0], atol=1e-4), axis=1)
+            assert same.mean() > 0.95
+
+
 def test_hop_proposal_is_uniform_on_the_eligible_ellipsoids() -> None:
     """A frame in proportion to its volume (never one that is not eligible),
     a point uniform in its ellipsoid, and a uniform draw for the test."""
