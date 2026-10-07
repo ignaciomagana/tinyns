@@ -3,8 +3,11 @@ per-mode insertion ranks and duplicate rates.
 usage: e2e.py target nlive seeds_lo seeds_hi batch out.jsonl [cfg_json]"""
 import bisect, json, math, sys, time
 import numpy as np
+import os
 import jax, jax.numpy as jnp
-from tinyns import core
+from tinyns import core, modes
+if os.environ.get("TINYNS_WALK_MIN"):  # experiments: the walk-frame size
+    modes.WALK_MIN_POINTS = int(os.environ["TINYNS_WALK_MIN"])
 from bench.targets import get_target, mixture_spec
 name, m, lo, hi, B, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
 extra = json.loads(sys.argv[7]) if len(sys.argv) > 7 else {}
@@ -25,7 +28,11 @@ def per_mode_insertion(r, mode, nmodes):
     births = order[n0:]
     ranks = [[] for _ in range(nmodes)]
     steps = [[] for _ in range(nmodes)]
+    traj = []
+    stride = max(1, int(r.nlive) // (4 * k))
     for step in range(niter // k):
+        if step % stride == 0:
+            traj.append([step * k, float(logl[max(step * k - 1, 0)]), [len(x) for x in lives]])
         for i in range(step * k, (step + 1) * k):  # deaths of this step (dead rows in order)
             lst = lives[mode[i]]
             j = bisect.bisect_left(lst, logl[i])
@@ -40,7 +47,7 @@ def per_mode_insertion(r, mode, nmodes):
                 steps[mode[i]].append(step)
         for i in group:
             bisect.insort(lives[mode[i]], logl[i])
-    return [np.array(x) for x in ranks], [np.array(x) for x in steps]
+    return [np.array(x) for x in ranks], [np.array(x) for x in steps], traj
 
 
 for s0 in range(lo, hi, B):
@@ -52,7 +59,7 @@ for s0 in range(lo, hi, B):
     with open(out, "a") as f:
         for s, r in zip(seeds, res):
             md = r.metadata
-            rec = dict(target=name, nlive=m, seed=s, cfg=extra, logz=float(r.logz), logzerr=float(r.logzerr),
+            rec = dict(target=name, nlive=m, seed=s, cfg=extra, walk_min=os.environ.get("TINYNS_WALK_MIN"), logz=float(r.logz), logzerr=float(r.logzerr),
                        truth=tg.logz, ncall=int(r.ncall), niter=int(r.niter), hop_acc=md.get("hop_acceptance"),
                        acc=md.get("acceptance"), unmoved=md.get("unmoved_fraction"), hist=md.get("mode_history"),
                        wall=wall / len(seeds))
@@ -62,7 +69,8 @@ for s0 in range(lo, hi, B):
                 rr = np.nan_to_num(np.concatenate([np.asarray(resp(x[i:i + 65536])) for i in range(0, len(x), 65536)]))
                 rec["mass"] = (w[:, None] * rr).sum(0).tolist(); rec["truth_mass"] = list(tg.mode_mass)
                 mode = rr.argmax(1)
-                ranks, steps = per_mode_insertion(r, mode, rr.shape[1])
+                ranks, steps, traj = per_mode_insertion(r, mode, rr.shape[1])
+                rec["traj"] = traj
                 # after the minor mode's isolation, roughly: second half of the run
                 half = r.niter // r.num_delete // 2
                 rec["ins"] = [dict(n=int(len(a)), mean=float(a.mean()) if len(a) else None,

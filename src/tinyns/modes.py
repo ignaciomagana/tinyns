@@ -82,6 +82,7 @@ from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import logsumexp
 
 C_MAX = 8  # cluster slots (static shapes)
+WALK_MIN_POINTS = 3  # experiments: a cluster gives the walk its covariance from this size
 HOP_EVERY = 10  # every 10th chain step is the hop: P_HOP = 0.1
 SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
@@ -261,7 +262,7 @@ def nearest(fr: Frames, x):
 def walk_frames(fr: Frames):
     """The frames that give the random walk its covariance: active, with more
     than ``d`` members (a full-rank scatter)."""
-    return fr.active & (fr.count > fr.mu.shape[-1])
+    return fr.active & (fr.count >= WALK_MIN_POINTS)
 
 
 def hop_enabled(fr: Frames):
