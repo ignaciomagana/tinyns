@@ -22,8 +22,8 @@ m / 10``) of ``walks`` sequential chain steps, whatever ``m``. The model:
 55 us per chain step (the PR 1 H100 speed run: gauss_d32, m 500, k 50,
 walks 192, 952 steps in 10 s, one run, float32), times 1.5 for 40 batched
 lanes at m 500 and 3 at m 2000, plus one recluster every ``recluster_every``
-steps at 20 ms (m 500) or 60 ms (m 2000) (both arms cluster), plus 60 s of
-compilation per cell. ``k = 1`` cells run ``m T`` steps. ``T`` per target is
+steps at 7 ms (m 500) or 20 ms (m 2000) (both arms cluster; 4 to 8 and 8 to
+32 ms measured on the H100), plus 60 s of compilation per cell. ``k = 1`` cells run ``m T`` steps. ``T`` per target is
 the information plus a few e-folds (from the prototype geometry and the
 Gaussian truths). Treat the result as good to a factor of 2-3; the CPU
 smoke run gives the relative cost of the arms.
@@ -66,7 +66,7 @@ EFOLDS = {
     "funnel_d10": 45,
 }
 STEP_US, LANE_FACTOR = 55.0, {500: 1.5, 2000: 3.0}
-RECLUSTER_S, COMPILE_S = {500: 0.02, 2000: 0.06}, 60.0
+RECLUSTER_S, COMPILE_S = {500: 0.007, 2000: 0.02}, 60.0
 
 
 def walks(d):
