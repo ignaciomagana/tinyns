@@ -338,16 +338,24 @@ def hop_accept(uniform, eligible, r2_new, r2_old, d: int):
 # ------------------------------------------------------------ clustering
 
 
-def _assign(fr: Frames, x, keep):
+def _assign(fr: Frames, x, keep, whitened: bool = False):
     """Hard-EM classification: ``argmin r^2 + 2 log det L - 2 log weight``.
 
-    Rows with ``keep`` false get label -1.
+    Rows with ``keep`` false get label -1. ``whitened``: ``x`` is of order one
+    (the whitened coordinates of a cluster), and ``L^-1 (x - mu)`` is taken
+    as ``L^-1 x - L^-1 mu``, one product with ``x`` for all the clusters. (In
+    the unit cube a late cluster is a tiny box far from the origin, and that
+    difference would lose its digits in float32.)
     """
     total = jnp.maximum(jnp.sum(fr.count), 1.0)
     log_weight = jnp.log(jnp.maximum(fr.count, 1e-30) / total)
     offset = 2.0 * fr.logdet - 2.0 * log_weight  # (C,)
-    dev = x[None, :, :] - fr.mu[:, None, :]  # (K, m, d)
-    z = jnp.einsum("kij,kmj->kmi", fr.ichol, dev)
+    if whitened:
+        z = jnp.einsum("kij,mj->kmi", fr.ichol, x)
+        z = z - jnp.einsum("kij,kj->ki", fr.ichol, fr.mu)[:, None, :]
+    else:
+        dev = x[None, :, :] - fr.mu[:, None, :]  # (K, m, d)
+        z = jnp.einsum("kij,kmj->kmi", fr.ichol, dev)
     score = jnp.sum(z * z, axis=2) + offset[:, None]
     score = jnp.where(fr.active[:, None], score, jnp.inf)
     return jnp.where(keep, jnp.argmin(score, axis=0), -1).astype(jnp.int32)
@@ -369,16 +377,17 @@ def _until_fixed(step, state, iters: int):
     return lax.while_loop(cond, body, (0, state, jnp.asarray(True)))[1]
 
 
-def _refine(x, labels, nslots: int, iters: int):
+def _refine(x, labels, nslots: int, iters: int, whitened: bool = False):
     """Hard EM over ``nslots`` clusters: refit and reassign, up to ``iters``
     times (until the labels repeat).
 
-    Rows labelled -1 stay out. Slots that empty out stay empty.
+    Rows labelled -1 stay out. Slots that empty out stay empty. ``whitened``:
+    see :func:`_assign`.
     """
     keep = labels >= 0
 
     def step(labels):
-        return _assign(frames(stats(x, labels, nslots)), x, keep)
+        return _assign(frames(stats(x, labels, nslots)), x, keep, whitened)
 
     return _until_fixed(step, labels, iters)
 
@@ -441,13 +450,17 @@ def _split(x, mask):
     mean = (w @ x) / jnp.maximum(n, 1.0)
     xc = (x - mean) * w[:, None]
     chol, _ = _cholesky(_ridge(xc.T @ xc / jnp.maximum(n - 1.0, 1.0)))
-    y = solve_triangular(chol, xc.T, lower=True).T  # whitened; 0 outside
+    ichol = solve_triangular(chol, jnp.eye(d, dtype=dtype), lower=True)
+    y = xc @ ichol.T  # whitened; 0 outside
     r2 = jnp.sum(y * y, axis=1)
     far = y[jnp.argmax(jnp.where(mask, r2, -jnp.inf))]
     far2 = y[jnp.argmax(jnp.where(mask, jnp.sum((y - far) ** 2, axis=1), -jnp.inf))]
+    total = w @ y
 
     def nearer(c0, c1):
-        return jnp.sum((y - c1) ** 2, axis=1) < jnp.sum((y - c0) ** 2, axis=1)
+        """The rows nearer to ``c1`` than to ``c0``: ``|y - c1|^2 < |y -
+        c0|^2``, as one product with ``y``."""
+        return 2.0 * (y @ (c0 - c1)) < jnp.sum(c0 * c0) - jnp.sum(c1 * c1)
 
     kurt = (y * (w * r2)[:, None]).T @ y / jnp.maximum(n, 1.0)
     _, vecs = jnp.linalg.eigh(kurt)
@@ -469,13 +482,14 @@ def _split(x, mask):
         def lloyd(part):
             weight = part.astype(dtype)
             n1 = jnp.sum(weight)
-            c1 = (weight @ y) / jnp.maximum(n1, 1.0)
-            c0 = ((w - weight) @ y) / jnp.maximum(n - n1, 1.0)
+            sum1 = weight @ y
+            c1 = sum1 / jnp.maximum(n1, 1.0)
+            c0 = (total - sum1) / jnp.maximum(n - n1, 1.0)
             return nearer(c0, c1) & mask
 
         part = _until_fixed(lloyd, part, LLOYD_ITERS)
         labels = jnp.where(mask, part.astype(jnp.int32), -1)
-        labels = _refine(y, labels, 2, SPLIT_EM_ITERS)
+        labels = _refine(y, labels, 2, SPLIT_EM_ITERS, whitened=True)
         part = (labels == 1).astype(dtype)
         n1 = jnp.sum(part)
         ok = (jnp.minimum(n1, n - n1) >= MIN_SPLIT_POINTS) & big
