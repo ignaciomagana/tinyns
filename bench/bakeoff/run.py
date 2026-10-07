@@ -1,6 +1,6 @@
 """Run one bake-off cell: (target, arm, nlive, k) for a list of seeds.
 
-    python bench/bakeoff/run.py --target sepW_d18 --arm C --nlive 500 --k 50 \\
+    python bench/bakeoff/run.py --target sepW_d18 --arm B_ell --nlive 500 --k 50 \\
         --seeds 0-39 --out results.jsonl
 
 All seeds run as one batched tinyns run (``core.run`` with a batch of keys:
@@ -23,7 +23,9 @@ detection diagnostics:
   two clusters (``eligible_niter``: two frames eligible for the moves);
 - ``minor_live[k]``: the oracle live count of minor mode ``k`` (live points
   whose responsibility for it exceeds 1/2) every ``live_stride`` deaths, so
-  the summary can read it at any detection time, also for the arm ``N``.
+  the summary can read it at any detection time, also for the arm ``N``;
+- ``modes``: :meth:`tinyns.NestedSamplingResult.modes` (mass, urn sd,
+  min_live, unresolved), the per-mode report read from the run's labels.
 """
 
 from __future__ import annotations
@@ -44,7 +46,8 @@ if str(ROOT) not in sys.path:
 from bench.run import append_jsonl, cpu_model, git_sha, parse_seeds  # noqa: E402
 
 SCHEMA = "tinyns-bakeoff-1"
-ARMS = ("N", "B_ell", "B_t", "C", "BC")
+# B_ell is tinyns's always-on hop; N turns it off (the private Config._hop).
+ARMS = ("N", "B_ell")
 
 
 def isolation_levels(target) -> list[float] | None:
@@ -122,6 +125,7 @@ def lane_record(target, result, resp, args, seed, cfg, extra):
         hop_tries=result.metadata.get("hop_tries"),
         hop_acceptance=result.metadata.get("hop_acceptance"),
         mode_history=result.metadata.get("mode_history"),
+        modes=result.modes(),
     )
     hist = rec["mode_history"] or []
     rec["detection_niter"] = next((n for n, c, _ in hist if c >= 2), None)
@@ -169,7 +173,9 @@ def main(argv=None):
     target = get_target(args.target)
     seeds = parse_seeds(args.seeds)
     k = args.k if args.k is not None else max(1, args.nlive // 10)
-    cfg = core.Config(target.ndim, args.nlive, k, args.walks, _mode=args.arm)
+    cfg = core.Config(
+        target.ndim, args.nlive, k, args.walks, _hop=args.arm == "B_ell"
+    )
     keys = jax.numpy.stack([jax.random.PRNGKey(s) for s in seeds])
     t0 = time.perf_counter()
     results = core.run(

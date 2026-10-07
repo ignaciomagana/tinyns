@@ -276,13 +276,17 @@ def _callable_specs(loglike, prior_transform, ndim: int):
 
 # The compiled-kernel builders of tinyns.core, cached on the callables' specs
 # and their static arguments. JAX's own jit cache keys the compiled programs on
-# the shapes and dtypes of the array arguments.
+# the shapes and dtypes of the array arguments. The cache is small: on a CPU a
+# compiled run program (with the mode tracking) holds about 2000 memory
+# mappings, and Linux stops a process at 65530 by default
+# (vm.max_map_count), so 32 configs per kernel aborted the compiler.
+_KERNEL_CACHE_SIZE = 8
 _KERNEL_CACHES: list = []
 
 
 def _kernel_cache(build):
     """Cache a kernel builder ``build(loglike_spec, prior_spec, *static)``."""
-    cached = functools.lru_cache(maxsize=32)(build)
+    cached = functools.lru_cache(maxsize=_KERNEL_CACHE_SIZE)(build)
     _KERNEL_CACHES.append(cached)
     return cached
 

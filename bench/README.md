@@ -172,13 +172,17 @@ How `run.py` works:
 
 ## Multimodality bake-off (`bench/bakeoff/`)
 
-The v1 plan's bake-off of the inter-mode moves (`Config._mode`, see
-`tinyns/modes.py`): `N` (none), `B_ell`, `B_t`, `C`, `BC`.
+The v1 plan's bake-off of the inter-mode moves (see `tinyns/modes.py`). It
+chose `B_ell`, now tinyns's always-on hop (report:
+`/hildafs/projects/phy220048p/magana/darksirens-core-data/tinyns_h100_2026-09-30/v1_bakeoff/REPORT.md`);
+the losing arms `B_t`, `C` and `BC` are deleted. The runner keeps two arms for
+re-tests: `B_ell` (the default) and `N` (the private `Config._hop=False`:
+random-walk steps only; the clustering still runs).
 
 ```bash
-python bench/bakeoff/run.py --target sepW_d18 --arm C --nlive 500 --k 50 \
+python bench/bakeoff/run.py --target sepW_d18 --arm B_ell --nlive 500 --k 50 \
     --seeds 0-39 --out results.jsonl      # one cell: 40 seeds, one batched run
-python bench/bakeoff/emit.py > jobs.txt   # queue lines of the full grid (152 cells)
+python bench/bakeoff/emit.py > jobs.txt   # queue lines of the full grid (62 cells)
 python bench/bakeoff/emit.py --estimate   # its H100 time estimate
 python bench/bakeoff/summarize.py results.jsonl --out report.md
 ```
@@ -188,8 +192,8 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
   `tinyns-bakeoff-1` line per seed: logZ, logzerr, ncall, ncall_valid, the
   batch's wall and compile time, the oracle mode masses and their Kish
   effective sizes, the hop acceptance, the cluster history, the oracle
-  isolation and the detection iteration, and the oracle live count of each
-  minor mode every quarter e-fold.
+  isolation and the detection iteration, the oracle live count of each
+  minor mode every quarter e-fold, and `result.modes()`.
 - `summarize.py` applies the plan's decision rule: per-cell tables (logit sd
   with a bootstrap CI against the exact-draw floor, lost fraction, logit and
   Z/truth biases, logZ bias and scatter/logzerr, hop acceptance, detection

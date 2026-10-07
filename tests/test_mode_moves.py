@@ -1,11 +1,11 @@
-"""Inter-mode moves (:mod:`tinyns.modes`): exactness and integration.
+"""The inter-mode hop (:mod:`tinyns.modes`): exactness and integration.
 
-The invariance test is the gate of the moves: on a fixed two-mode live set,
+The invariance test is the gate of the hop: on a fixed two-mode live set,
 chains started from seeds drawn uniformly in the constrained region must end
 in each mode in proportion to its volume. The seed is one of the points the
 frames were fitted to, so the test fails unless the leave-one-out refit
 removes it (the control without it is biased). ``pytest -m slow`` runs it
-with 10^5 chains per arm.
+with 10^5 chains.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ CENTERS = np.array([[0.30, 0.35, 0.40], [0.72, 0.62, 0.55]])
 RADII = np.array([0.16, 0.11])
 MINOR_FRACTION = RADII[1] ** D / np.sum(RADII**D)  # 0.2453
 NFIT = 40  # live points the frames are fitted to (the seed is one of them)
-WALKS = 40  # four move steps per chain
+WALKS = 40  # four hop steps per chain
 SCALE = 0.3
 
 
@@ -43,7 +43,7 @@ def uniform_region(rng, n):
     return CENTERS[ball] + RADII[ball][:, None] * z
 
 
-def invariance(arm: str, nchains: int, loo: bool = True, seed: int = 0):
+def invariance(nchains: int, loo: bool = True, seed: int = 0):
     """Fraction of chain end points in the minor ball, and the hop counts."""
     dtype = jnp.result_type(float)
     rng = np.random.default_rng(seed)
@@ -64,7 +64,7 @@ def invariance(arm: str, nchains: int, loo: bool = True, seed: int = 0):
         u, _, _, _, _, hops, tries = core._chain(
             key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), chol,
             jnp.asarray(SCALE, dtype), region_loglike, lambda v: v, WALKS, False,
-            arm, fr,
+            fr,
         )
         return jnp.sum((u - CENTERS[1]) ** 2) <= RADII[1] ** 2, hops, tries
 
@@ -88,36 +88,33 @@ def z_score(fraction, n):
     )
 
 
-@pytest.mark.parametrize("arm", ["B_ell", "B_t", "C", "BC"])
-def test_moves_keep_the_constrained_prior(arm) -> None:
+def test_hop_keeps_the_constrained_prior() -> None:
     n = 20_000
-    fraction, hops, tries = invariance(arm, n)
+    fraction, hops, tries = invariance(n)
     assert tries == n * (WALKS // modes.HOP_EVERY)  # two eligible frames
     assert hops > 0.02 * tries
     assert abs(z_score(fraction, n)) < 4.0
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("arm", ["B_ell", "B_t", "C", "BC"])
-def test_moves_keep_the_constrained_prior_1e5(arm) -> None:
-    """The PR 3 gate: 10^5 chains, within 3 sigma of the volume fraction."""
+def test_hop_keeps_the_constrained_prior_1e5() -> None:
+    """The gate: 10^5 chains, within 3 sigma of the volume fraction."""
     n = 100_000
-    fraction, hops, tries = invariance(arm, n, seed=1)
+    fraction, hops, tries = invariance(n, seed=1)
     z = z_score(fraction, n)
-    print(f"{arm}: minor fraction {fraction:.4f} (volume {MINOR_FRACTION:.4f}) "
+    print(f"minor fraction {fraction:.4f} (volume {MINOR_FRACTION:.4f}) "
           f"z={z:+.2f} hop acceptance {hops / tries:.3f}")
     assert abs(z) < 3.0
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("arm", ["B_ell", "C"])
-def test_without_leave_one_out_the_moves_are_biased(arm) -> None:
+def test_without_leave_one_out_the_hop_is_biased() -> None:
     """The control: frames that contain the seed bias the mode fractions, so
     the invariance test has the power to see a missing downdate."""
     n = 100_000
-    fraction, _, _ = invariance(arm, n, loo=False, seed=1)
+    fraction, _, _ = invariance(n, loo=False, seed=1)
     z = z_score(fraction, n)
-    print(f"{arm} without LOO: minor fraction {fraction:.4f} z={z:+.2f}")
+    print(f"without LOO: minor fraction {fraction:.4f} z={z:+.2f}")
     assert abs(z) > 3.0
 
 
@@ -137,19 +134,6 @@ def test_downdate_matches_a_refit() -> None:
         np.testing.assert_array_equal(a, b)
 
 
-def test_swap_is_an_involution() -> None:
-    rng = np.random.default_rng(4)
-    x = jnp.asarray(uniform_region(rng, 200))
-    labels, st = modes.recluster(x, jnp.zeros(200, jnp.int32))
-    fr = modes.frames(st, 200)
-    assert int(jnp.sum(fr.eligible)) == 2
-    for i in range(20):
-        new, ok = modes._propose_swap(random.PRNGKey(i), x[i], fr)
-        back, _ = modes._propose_swap(random.PRNGKey(i), new, fr)
-        if ok:
-            np.testing.assert_allclose(back, x[i], atol=1e-4)
-
-
 def two_gaussians(theta):
     def log_normal(center, sigma):
         z = (theta - center) / sigma
@@ -161,13 +145,11 @@ def two_gaussians(theta):
     )
 
 
-@pytest.mark.parametrize("arm", ["B_ell", "B_t", "C", "BC"])
-def test_runs_with_each_arm(arm) -> None:
-    cfg = Config(D, 200, 20, 20, _mode=arm)
+def test_run_hops_between_modes() -> None:
+    cfg = Config(D, 200, 20, 20)
     result = core.run(3, two_gaussians, lambda u: u, cfg)
     assert abs(result.logz) < 5 * result.logzerr + 0.2  # truth 0
     meta = result.metadata
-    assert meta["mode"] == arm
     assert meta["hop_tries"] > 0 and meta["hops"] > 0
     assert max(c for _, c, _ in meta["mode_history"]) >= 2
     minor = np.asarray(result.samples)[:, 0] > 0.5
@@ -175,33 +157,39 @@ def test_runs_with_each_arm(arm) -> None:
     assert 0.1 < w[minor].sum() / w.sum() < 0.45  # truth 0.25
 
 
-def test_arm_n_has_no_mode_fields() -> None:
-    cfg = Config(D, 40, 4, 10)
-    state = core.init(0, two_gaussians, lambda u: u, cfg)
-    assert state.label is None and state.mode_mu is None
-    _, dead = core.step(state, two_gaussians, lambda u: u, cfg)
-    assert dead.hops is None
-    assert core.Config(D, 40, 4, 10, _mode="C").recluster_every == 3
+def test_without_the_hop_the_clustering_still_runs() -> None:
+    """``_hop=False`` (the comparison arm N of the bake-off): random-walk
+    steps only, but the labels are still recorded for modes()."""
+    cfg = Config(D, 200, 20, 20, _hop=False)
+    result = core.run(3, two_gaussians, lambda u: u, cfg)
+    meta = result.metadata
+    assert meta["hop_tries"] == 0 and meta["hop_acceptance"] is None
+    assert max(c for _, c, _ in meta["mode_history"]) >= 2
+    assert len(result.labels) == len(result.logl)
+    assert len(result.modes()) == 2
+    assert Config(D, 40, 4, 10).recluster_every == 3
+    with pytest.raises(TypeError, match="_hop"):
+        Config(D, 40, 4, 10, _hop="N")
 
 
-def test_one_chain_per_step_with_an_arm() -> None:
-    cfg = Config(D, 100, 1, 20, _mode="C")
+def test_one_chain_per_step_hops() -> None:
+    cfg = Config(D, 100, 1, 20)
     result = core.run(5, two_gaussians, lambda u: u, cfg, maxiter=3000)
     assert result.metadata["hop_tries"] > 0
 
 
 def test_step_reclusters_on_schedule() -> None:
-    cfg = Config(D, 40, 4, 10, _mode="B_t")
+    cfg = Config(D, 40, 4, 10)
     state = core.init(1, two_gaussians, lambda u: u, cfg)
     state, _ = core.step(state, two_gaussians, lambda u: u, cfg)
     assert bool(jnp.all(state.mode_count[1:] == 0)) and state.mode_count[0] == 40
     assert int(jnp.sum(state.fitted)) == 40 - 4  # the new points are not fitted
 
 
-def test_batched_run_matches_single_runs_with_an_arm() -> None:
+def test_batched_run_matches_single_runs_with_the_hop() -> None:
     """As in test_batch: equal to roundoff in float64; in float32 a roundoff
     difference can flip a Metropolis decision, so only the start must agree."""
-    cfg = Config(D, 60, 6, 10, _mode="BC")
+    cfg = Config(D, 60, 6, 10)
     keys = random.split(random.PRNGKey(2), 3)
     batch = core.run(keys, two_gaussians, lambda u: u, cfg, maxiter=1200)
     for key, result in zip(keys, batch, strict=True):
@@ -218,7 +206,7 @@ def test_batched_run_matches_single_runs_with_an_arm() -> None:
 
 
 def test_checkpoint_round_trip_with_cluster_state(tmp_path, monkeypatch) -> None:
-    cfg = Config(D, 60, 6, 10, _mode="C")
+    cfg = Config(D, 60, 6, 10)
     path = tmp_path / "run.npz"
     whole = core.run(4, two_gaussians, lambda u: u, cfg)
     # Stop after a few steps, then resume from the checkpoint.
@@ -229,6 +217,6 @@ def test_checkpoint_round_trip_with_cluster_state(tmp_path, monkeypatch) -> None
     assert resumed.metadata["resumed"]
     np.testing.assert_array_equal(resumed.logl, whole.logl)
     assert resumed.metadata["mode_history"] == whole.metadata["mode_history"]
-    other = Config(D, 60, 6, 10, _mode="B_t")
-    with pytest.raises(ValueError, match="_mode"):
+    other = Config(D, 60, 6, 10, _hop=False)
+    with pytest.raises(ValueError, match="_hop"):
         core.run(4, two_gaussians, lambda u: u, other, checkpoint=path)

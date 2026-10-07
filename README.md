@@ -6,8 +6,7 @@ number of dimensions, and it returns the evidence and weighted posterior
 samples. Every step runs on the device; the host syncs once per chunk of steps.
 
 This is the v1 development branch: the API below is a hard break from v0.x
-(no compatibility shims, no old-checkpoint readers). Multimodal moves are
-being added in the next pull requests.
+(no compatibility shims, no old-checkpoint readers).
 
 ## Install
 
@@ -72,6 +71,23 @@ acceptance inside every step. With `num_delete=1` the single chain is not
 vmapped, so an out-of-cube proposal skips the likelihood: use it for expensive
 likelihoods.
 
+### Multimodal posteriors
+
+A random-walk chain cannot cross between separated modes, so without help the
+number of live points in each mode drifts from step to step (a Polya urn) and
+the mode weights scatter from seed to seed. tinyns clusters the live points on
+the device every quarter e-fold (`tinyns/modes.py`: hard EM, merges and Fisher
+splits in 8 cluster slots) and makes every 10th chain step an inter-mode
+*hop*: an independence Metropolis-Hastings step from the union of the
+clusters' moment-matched ellipsoids. It is exact for the constrained prior
+(each chain's ellipsoids are refit without its own seed), and in the v1
+bake-off it cut the seed-to-seed scatter of minor-mode weights about 7x at the
+same number of likelihood calls. `result.modes()` reports each mode's mass,
+an urn error bar and its smallest live count (a mode that held fewer than
+`3 * ndim` live points is flagged unresolved: raise `nlive`). See the
+CHANGELOG for the known open issues (a 1-2% underweighting of minor modes at
+10 to 18 dimensions, and biased weights at 32).
+
 ### Choosing `walks`
 
 The default is `walks = max(25, 6 * ndim, ndim**2 // 6)`
@@ -104,7 +120,8 @@ host in float64. `result.nlive_i` holds the live count at every death.
 ## The result
 
 `NestedSamplingResult` holds `samples`, `samples_u`, `logl`, `logwt`,
-`logl_birth`, `nlive_i`, `logz`, `logzerr`, `ncall`, `niter`, `nlive`,
+`logl_birth`, `nlive_i`, `labels` (each sample's cluster when it died),
+`logz`, `logzerr`, `ncall`, `niter`, `nlive`,
 `num_delete` and `metadata`. Methods: `summary()`, `diagnostics()`,
 `insertion_test()` (ranks of the new points among the `nlive - num_delete`
 survivors of their step), `modes()`, `logz_bootstrap()`, `resample_equal()`,

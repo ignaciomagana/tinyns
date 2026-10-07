@@ -29,8 +29,11 @@ the same (target, nlive, num_delete), so the ``N`` cells use the same time.
    ``N`` (geometric means over the cells).
 2. User gate: logit sd at most 0.4 in every resolvable cell.
 3. Score: geometric mean over the resolvable cells of sd / floor. Arms within
-   20% of the best score are ranked by cost (calls, then wall time). ``BC``
-   is adopted only if it beats both ``B_t`` and ``C`` by more than 20%.
+   20% of the best score are ranked by cost (calls, then wall time).
+
+The v1 bake-off chose ``B_ell``, now the always-on hop; the runner keeps the
+two arms ``N`` (``Config._hop=False``) and ``B_ell`` for re-tests, and records
+of the deleted arms (``B_t``, ``C``, ``BC``) are skipped.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ from collections import defaultdict
 
 import numpy as np
 
-ARMS = ("N", "B_ell", "B_t", "C", "BC")
+ARMS = ("N", "B_ell")
 LOST = 1e-3  # a mode with mass below this fraction of its truth is lost
 BIAS_SE = 3.0
 CONTROL_SCATTER = 1.3
@@ -58,7 +61,7 @@ def load(paths):
     for path in paths:
         with open(path, encoding="utf-8") as f:
             recs.extend(json.loads(line) for line in f if line.strip())
-    return recs
+    return [r for r in recs if r["arm"] in ARMS]
 
 
 def logit(p):
@@ -258,13 +261,6 @@ def decide(rows):
         return verdict, None, ["no arm survives the elimination and the user gate"]
     best = min(verdict[a]["score"] for a in alive)
     tied = [a for a in alive if verdict[a]["score"] <= (1 + TIE) * best]
-    if "BC" in tied:
-        singles = [verdict[a]["score"] for a in ("B_t", "C") if a in verdict]
-        if not all(verdict["BC"]["score"] < s / (1 + TIE) for s in singles):
-            tied.remove("BC")
-            notes.append("BC does not beat both B_t and C by more than 20%")
-    if not tied:
-        tied = [a for a in alive if a != "BC"]
     tied.sort(key=lambda a: (verdict[a]["calls"], verdict[a]["wall"]))
     if len(tied) > 1:
         notes.append(f"within 20% of the best score: {', '.join(tied)}; cheapest wins")
