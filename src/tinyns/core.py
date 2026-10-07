@@ -78,7 +78,6 @@ _INT32_MAX = 2**31 - 1
 # The frames a chain looks up at every step when no clustering has more in use
 # (kernel 1 of :func:`_kernel_level`).
 _FEW = 2
-_KERNELS = 3
 
 
 def _check_int(name: str, value, minimum: int) -> int:
@@ -798,15 +797,10 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
 
         return run
 
-    kernels = [chains(i) for i in range(3)]
-    if not switching:
-        out = kernels[0]()
-    elif _KERNELS == 1:
-        out = kernels[2]()
+    if switching:
+        out = lax.switch(level, [chains(i) for i in range(3)])
     else:
-        if _KERNELS == 2:
-            kernels[1] = kernels[2]
-        out = lax.switch(level, kernels)
+        out = chains(0)()
     new_u, new_logl, moves, nev, nvalid, hops, hop_tries = out
 
     insertion = jnp.sum(

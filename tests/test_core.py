@@ -79,7 +79,7 @@ def fake_run(dead_logl, live_logl, m, k):
         ncall_valid=np.int32(0),
         status=np.int32(core.CONVERGED),
         label=np.zeros((FOLDS, m), np.int32),
-        **core._empty_frames(1, FOLDS, np.float64),
+        **core._empty_frames(1, FOLDS, FLOAT),
     )
     zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(
