@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tinyns import Config, NestedSampler, core, finalise, init, step
+from tinyns import Config, NestedSampler, core, finalise, init, modes, step
 
 FLOAT = jnp.result_type(float)
 
@@ -74,13 +74,24 @@ def fake_run(dead_logl, live_logl, m, k):
         ncall=np.int32(0),
         ncall_valid=np.int32(0),
         status=np.int32(core.CONVERGED),
+        label=np.zeros(m, np.int32),
+        fitted=np.zeros(m, bool),
+        mode_mu=np.zeros((modes.C_MAX, 1)),
+        mode_scat=np.zeros((modes.C_MAX, 1, 1)),
+        mode_count=np.zeros(modes.C_MAX),
     )
+    zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(
         u=rng.uniform(size=(steps, k, 1)),
         logl=dead_logl,
         logl_birth=np.full((steps, k), -np.inf),
-        insertion=np.zeros((steps, k), np.int32),
+        insertion=zeros,
         moves=np.ones((steps, k), np.int32),
+        label=zeros,
+        hops=zeros,
+        hop_tries=zeros,
+        nclusters=zeros,
+        neligible=zeros,
     )
     return state, dead
 

@@ -13,20 +13,12 @@ from typing import Any
 import jax.numpy as jnp
 import numpy as np
 
-from tinyns.clusters import (
-    SPLIT_J_ABS,
-    SPLIT_J_PER_DIM,
-    ClusterTracker,
-    _assign,
-    _fisher,
-    _fit,
-    _ridge,
-)
 from tinyns.math import (
     effective_sample_size_from_log_weights,
     normalize_log_weights,
     systematic_resample,
 )
+from tinyns.modes import split_threshold
 
 ArrayLike = Any
 
@@ -44,12 +36,11 @@ _RESULT_NPZ_SCALARS = {
     "message": str,
 }
 # A mode whose live count falls below this many points per dimension between
-# its isolation and its posterior bulk is flagged unresolved (raise nlive). It
-# is the population-conditional gate of the cluster swap: modes above it are
-# weighed reliably, modes below it are not.
+# its isolation and its posterior bulk is flagged unresolved (raise nlive):
+# modes above it are weighed reliably, modes below it are not.
 UNRESOLVED_PER_DIM = 3.0
-# Two clusters are one mode unless, at the earlier of their posterior medians,
-# their live points leave a gap of this many within-cluster standard deviations
+# Two clusters are one mode unless, at each of their posterior medians, their
+# live points leave a gap of this many within-cluster standard deviations
 # along the discriminant direction. The split test also cuts one curved mode
 # (a banana) into linear pieces, which touch: gaps of -0.5 to 1.1 there,
 # against 22 to 32 between the separated modes of the validation targets.
@@ -57,10 +48,6 @@ UNRESOLVED_PER_DIM = 3.0
 # posterior median is dropped: it spans no volume, and the stuck chains of a
 # banana's tip leave such clumps of near-copies 7 to 50 deviations out.
 SEPARATION_SIGMA = 3.0
-# The modes are clustered from up to this many equal-weight posterior points
-# (and no more than the posterior ESS, so few distinct points do not split).
-_MODE_DRAWS = 2000
-_FRAME = ("mu", "chol", "logdet", "count")  # the cluster fit that _assign reads
 
 
 def _jsonable(value):
@@ -95,6 +82,64 @@ def _information(logwt, logl, logz: float):
     contributing = (weights > 0.0) & finite
     information = jnp.sum(jnp.where(contributing, weights * (logl - logz), 0.0))
     return jnp.maximum(information, 0.0)
+
+
+def _ridge(cov):
+    """Add a relative ridge of ``1e-12`` times the mean variance."""
+    ndim = cov.shape[-1]
+    scale = max(float(np.trace(cov)) / ndim, 1e-300)
+    return cov + 1e-12 * scale * np.eye(ndim)
+
+
+def _fisher(x, side) -> float:
+    """Fisher separation ``J = dm^T Sw^-1 dm`` of ``x[~side]`` and ``x[side]``."""
+    a, b = x[~side], x[side]
+    dm = b.mean(0) - a.mean(0)
+    a, b = a - a.mean(0), b - b.mean(0)
+    within = _ridge((a.T @ a + b.T @ b) / max(len(x) - 2, 1))
+    return float(dm @ np.linalg.solve(within, dm))
+
+
+def _mahalanobis2(x, point) -> float:
+    """Squared Mahalanobis distance of ``point`` to the rows ``x`` (their mean
+    and covariance); ``inf`` for fewer than two rows."""
+    if len(x) < 2:
+        return math.inf
+    dev = x - x.mean(0)
+    cov = _ridge(dev.T @ dev / (len(x) - 1))
+    dm = point - x.mean(0)
+    return float(dm @ np.linalg.solve(cov, dm))
+
+
+def _nearest_mode(u, weights, label, k):
+    """Hard-EM classification of the rows ``u`` among ``k`` modes.
+
+    Each mode's frame is the posterior-weighted mean and covariance of its
+    samples, shrunk toward the pooled one with a weight of ``ndim`` effective
+    samples; a row goes to the mode of least ``r^2 + 2 log det L - 2 log
+    mass``.
+    """
+    ndim = u.shape[1]
+    fits, pooled, total = [], np.zeros((ndim, ndim)), 0.0
+    for c in range(k):
+        w = weights * (label == c)
+        mass = w.sum()
+        mu = w @ u / mass
+        dev = u - mu
+        cov = (dev * w[:, None]).T @ dev / mass
+        ess = mass * mass / np.sum(w * w)
+        fits.append((mass, mu, cov, ess))
+        pooled += cov * ess
+        total += ess
+    pooled /= total
+    score = []
+    for mass, mu, cov, ess in fits:
+        rho = ndim / (ess + ndim)
+        chol = np.linalg.cholesky(_ridge((1 - rho) * cov + rho * pooled))
+        z = np.linalg.solve(chol, (u - mu).T)
+        logdet = np.sum(np.log(np.diag(chol)))
+        score.append(np.sum(z * z, axis=0) + 2 * logdet - 2 * math.log(mass))
+    return np.argmin(np.asarray(score), axis=0)
 
 
 def _gap(x, side) -> float:
@@ -235,6 +280,11 @@ class NestedSamplingResult:
 
     nlive_i: ArrayLike
     """Number of live points when each sample died (dynesty's ``samples_n``)."""
+
+    labels: ArrayLike | None = None
+    """Cluster slot of each sample when it died (the final live points: at the
+    end of the run), from the on-device clustering (:mod:`tinyns.modes`);
+    :meth:`modes` reads it. ``None`` for a result built by hand."""
 
     logz: float
     """Estimated log evidence."""
@@ -397,60 +447,75 @@ class NestedSamplingResult:
     def modes(self) -> list[dict[str, Any]]:
         """Return the posterior modes, heaviest first, with their urn error bar.
 
-        Pure post-processing (section 7 of the multimodal study). An
-        equal-weight draw of the posterior is clustered with the cluster
-        swap's split test; every sample is labelled by its nearest cluster.
-        That test also cuts a curved mode into touching pieces, so two
-        clusters count as separate modes only if their live points, at the
-        earlier of their posterior medians, leave a gap of
-        ``SEPARATION_SIGMA`` within-cluster standard deviations along the
-        discriminant direction; touching clusters are merged. Before that,
-        a cluster with at most ``ndim`` distinct live points at its own
-        posterior median is dropped and its samples go to the nearest
-        remaining cluster: so few points span no volume, and the gap next to
-        them cannot tell a separate mode from a thinly sampled tail, such as
-        the clump of near-copies that stuck chains leave in the tip of a
-        banana. A real mode that small would be ``unresolved`` anyway. Each
-        mode's live count ``n(t)`` is rebuilt from the birth and death
-        iterations.
-        The mode is isolated from the first iteration at which its live
-        points and the others pass the same split test (if they
-        never do before the earlier of the two posterior medians, there is no
-        drift term and ``isolation_iteration`` is that median). From
-        then on chains cannot leave it, so ``n`` does a random walk (the urn)
-        and the mode's mass scatters from seed to seed by ``urn_sd`` in
-        ``logit(mass)``: ``1/n + 1/(N - n)`` at isolation, plus
-        ``2 (1 - g) / (N^2 g)`` per iteration up to the mode's posterior
-        median and ``2 g / (N^2 (1 - g))`` up to the rest's, with
-        ``g = n / N``. The cluster swap removes most of that drift, so with it
-        ``urn_sd`` is an upper bound. ``min_live`` is the smallest ``n``
-        between isolation and the mode's median; below
+        Pure post-processing of the cluster labels the run recorded
+        (:attr:`labels`: each sample's cluster when it died, from the
+        on-device clustering that drives the inter-mode hop), so it runs no
+        clustering and compiles nothing, and its modes are the clusters the
+        sampler balanced. The clustering's split test also cuts a curved mode
+        into touching pieces, its slots are reused over a run, and a slot
+        holds different points at different times, so the labels become modes
+        in four passes:
+
+        1. a label carrying less than one effective posterior sample (mass
+           times the posterior ESS below 1, e.g. a piece split off early in
+           the run and merged back) joins the heaviest label;
+        2. a label with at most ``ndim`` distinct live points at its own
+           posterior median joins the label nearest to it then (Mahalanobis
+           distance of its mean to the other labels' live points): so few
+           points span no volume, and the gap next to them cannot tell a
+           separate mode from a thinly sampled tail, such as the clump of
+           near-copies that stuck chains leave in the tip of a banana. A real
+           mode that small would be ``unresolved`` anyway;
+        3. two labels count as separate modes only if their live points leave
+           a gap of ``SEPARATION_SIGMA`` within-cluster standard deviations
+           along the discriminant direction at each of the two posterior
+           medians (where both have live points); touching labels are merged,
+           one pair at a time, until every pair is separated. Pieces of a
+           curved mode that look apart at one time touch at the other;
+        4. every sample is relabelled by its nearest mode (hard-EM
+           classification with each mode's posterior-weighted mean and
+           covariance), so that a mode keeps its points where the run's
+           clustering had them in another slot (before it split the mode
+           off, or after a merge near the end of the run).
+
+        Each mode's live count ``n(t)`` is rebuilt from the birth and death
+        iterations. The mode is isolated from the first iteration at which
+        its live points and the others pass the split test's threshold
+        (:func:`tinyns.modes.split_threshold`; if they never do before the
+        earlier of the two posterior medians, there is no drift term and
+        ``isolation_iteration`` is that median). From then on random-walk
+        chains cannot leave it, so without the hop ``n`` does a random walk
+        (the urn) and the mode's mass scatters from seed to seed by
+        ``urn_sd`` in ``logit(mass)``: ``1/n + 1/(N - n)`` at isolation,
+        plus ``2 (1 - g) / (N^2 g)`` per iteration up to the mode's posterior
+        median and ``2 g / (N^2 (1 - g))`` up to the rest's, with ``g = n /
+        N``. The hop removes most of that drift (about 7x less scatter in the
+        v1 bake-off), so ``urn_sd`` is an upper bound. ``min_live`` is the
+        smallest ``n`` between isolation and the mode's median; below
         ``UNRESOLVED_PER_DIM * ndim`` the mode is ``unresolved`` and its mass
         is not reliable: raise ``nlive``. A mode lost before the end leaves no
-        trace in its own run. A unimodal run gives one mode of mass 1.
+        trace in its own run. A unimodal run (or a result without
+        :attr:`labels`) gives one mode of mass 1.
         """
 
+        one = [{"mass": 1.0, "urn_sd": 0.0, "min_live": int(self.nlive),
+                "isolation_iteration": 0, "unresolved": False}]
+        if int(self.niter) == 0 or self.labels is None:
+            return one
+        try:
+            return self._modes(one)
+        except np.linalg.LinAlgError:  # a degenerate set of samples
+            return one
+
+    def _modes(self, one: list) -> list[dict[str, Any]]:
         nlive, niter, ndim = int(self.nlive), int(self.niter), int(self.ndim)
         weights = np.asarray(self.weights(), dtype=float)
         u = np.asarray(self.samples_u, dtype=float)
-        one = [{"mass": 1.0, "urn_sd": 0.0, "min_live": nlive,
-                "isolation_iteration": 0, "unresolved": False}]
-        if niter == 0:
-            return one
-        cumulative = np.cumsum(weights)
-        ndraw = min(_MODE_DRAWS, int(self.posterior_ess()))
-        grid = (np.arange(ndraw) + 0.5) / ndraw * cumulative[-1]
-        draw = u[np.minimum(np.searchsorted(cumulative, grid), len(u) - 1)]
-        tracker = ClusterTracker(nlive)
-        try:
-            labels = tracker._track(draw)
-        except np.linalg.LinAlgError:
-            return one
-        k = len(tracker.log["ids"])
+        label = np.unique(np.asarray(self.labels), return_inverse=True)[1]
+        k = int(label.max()) + 1 if label.size else 0
         if k < 2:
             return one
-        fit = _fit(draw, labels, k)
-        label = _assign(fit, u)
+        cumulative = np.cumsum(weights)
         born, index = self._births[0], np.arange(len(u))
 
         def median(mask):
@@ -460,30 +525,64 @@ class NestedSamplingResult:
         def alive(t):
             return (born < t) & (index >= t)
 
-        # Drop clusters with at most ndim distinct live points at their
-        # posterior median; their samples go to the nearest remaining cluster.
-        keep = np.array([
-            len(np.unique(u[alive(median(label == c)) & (label == c)], axis=0)) > ndim
+        def compact(label):
+            return np.unique(label, return_inverse=True)[1]
+
+        # 1. Labels without posterior mass join the heaviest.
+        mass = np.bincount(label, weights, minlength=k)
+        light = mass * self.posterior_ess() < cumulative[-1]
+        label = compact(np.where(light[label], np.argmax(mass), label))
+        k = int(label.max()) + 1
+        # 2. Labels with at most ndim distinct live points at their posterior
+        # median join the nearest other label.
+        when = [median(label == c) for c in range(k)]
+        tiny = [
+            len(np.unique(u[alive(when[c]) & (label == c)], axis=0)) <= ndim
             for c in range(k)
-        ])
-        if keep.sum() < 2:
+        ]
+        if k - sum(tiny) < 2:
             return one
-        if not keep.all():
-            label = _assign({name: fit[name][keep] for name in _FRAME}, u)
-            k = int(keep.sum())
-        # Merge clusters that touch (pieces of one mode): union by root.
-        root = list(range(k))
-        for a, b in itertools.combinations(range(k), 2):
-            pair = alive(min(median(label == a), median(label == b)))
-            pair &= (label == a) | (label == b)
-            if not _gap(u[pair], label[pair] == b) > SEPARATION_SIGMA:
-                old, new = root[b], root[a]
-                root = [new if r == old else r for r in root]
-        label = np.unique(np.asarray(root), return_inverse=True)[1][label]
+        root = np.arange(k)
+        for c in np.flatnonzero(tiny):
+            live = alive(when[c])
+            mine = u[live & (label == c)]
+            centre = mine.mean(0) if len(mine) else u[label == c].mean(0)
+            dist = [
+                math.inf if tiny[b] else _mahalanobis2(u[live & (label == b)], centre)
+                for b in range(k)
+            ]
+            heaviest = max((b for b in range(k) if not tiny[b]), key=lambda b: mass[b])
+            root[c] = int(np.argmin(dist)) if math.isfinite(min(dist)) else heaviest
+        label = compact(root[label])
+        k = int(label.max()) + 1
+        # 3. Merge labels that touch (pieces of one mode), one pair at a time,
+        # until every pair is separated.
+        def separated(a, b, label):
+            gaps = []
+            for t in sorted({median(label == a), median(label == b)}):
+                pair = alive(t) & ((label == a) | (label == b))
+                side = label[pair] == b
+                if side.any() and not side.all():
+                    gaps.append(_gap(u[pair], side))
+            return bool(gaps) and min(gaps) > SEPARATION_SIGMA
+
+        merged = True
+        while merged and k > 1:
+            merged = False
+            for a, b in itertools.combinations(range(k), 2):
+                if not separated(a, b, label):
+                    label = compact(np.where(label == b, a, label))
+                    k, merged = k - 1, True
+                    break
+        if k < 2:
+            return one
+        # 4. Relabel every sample by its nearest mode, so that n(t) counts the
+        # points of a mode also where the run's clustering had merged it.
+        label = compact(_nearest_mode(u, weights, label, k))
         k = int(label.max()) + 1
         if k < 2:
             return one
-        threshold = max(SPLIT_J_PER_DIM * (ndim + 2), SPLIT_J_ABS)
+        threshold = split_threshold(ndim)
         out = []
         for mine in (label == c for c in range(k)):
             net = np.bincount(born[mine & (born >= 0)], minlength=niter) - mine[:niter]
@@ -707,11 +806,14 @@ class NestedSamplingResult:
         return self.summary()
 
     def save_npz(self, path) -> None:
-        """Save the final result to a compressed NumPy ``.npz`` file."""
+        """Save the final result to a compressed NumPy ``.npz`` file (with
+        :attr:`labels` when present)."""
 
+        labels = {} if self.labels is None else {"labels": np.asarray(self.labels)}
         np.savez_compressed(
             path,
             **{name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS},
+            **labels,
             **{
                 name: np.asarray(kind(getattr(self, name)))
                 for name, kind in _RESULT_NPZ_SCALARS.items()
@@ -740,6 +842,7 @@ class NestedSamplingResult:
                 )
             return cls(
                 **{name: jnp.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
+                labels=np.asarray(data["labels"]) if "labels" in data.files else None,
                 **{
                     name: kind(_npz_scalar(data[name]))
                     for name, kind in _RESULT_NPZ_SCALARS.items()

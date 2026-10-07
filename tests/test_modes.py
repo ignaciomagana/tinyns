@@ -1,4 +1,5 @@
-"""``NestedSamplingResult.modes()`` on sampler runs (post-processing only)."""
+"""``NestedSamplingResult.modes()`` on sampler runs: post-processing of the
+cluster labels the run recorded."""
 
 from __future__ import annotations
 
@@ -27,23 +28,21 @@ def two_modes(theta):
 
 
 def test_two_mode_runs_find_both_modes() -> None:
-    """modes() is the v0.3 post-processing heuristic (replaced in v1 PR 3); it
-    misses one run in about eight, so a majority of five runs must pass."""
-    found = 0
+    """Both modes in every run (96 of 96 runs of this target at nlive 400, x64
+    off and on, minor mass 0.217-0.283; the v0.3 heuristic missed 11)."""
     for seed in range(5):
         result = NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(seed)
         weights = np.asarray(result.weights())
         minor = np.asarray(result.samples)[:, 0] > 0.55
         mass = weights[minor].sum() / weights.sum()
-        assert 0.08 < mass < 0.5  # truth 0.25; the urn drifts without a mode move
+        assert 0.15 < mass < 0.35  # truth 0.25; the hop keeps the urn balanced
         assert abs(result.logz) < 4 * result.logzerr + 0.1  # truth 0
         modes = result.modes()
+        assert len(modes) == 2
         assert sum(m["mass"] for m in modes) == pytest.approx(1.0)
-        if len(modes) == 2:
-            found += 1
-            assert modes[1]["mass"] == pytest.approx(mass, abs=0.02)
-            assert all(0 < m["urn_sd"] < 1 for m in modes)
-    assert found >= 3
+        assert modes[1]["mass"] == pytest.approx(mass, abs=0.005)
+        assert all(0 < m["urn_sd"] < 1 for m in modes)
+        assert not any(m["unresolved"] for m in modes)
 
 
 def banana5(theta):
@@ -55,7 +54,8 @@ def banana5(theta):
 def test_curved_unimodal_runs_report_one_mode() -> None:
     """The split test cuts a 5-D banana into pieces, and stuck chains leave
     clumps of near-copies in its tips; modes() must merge or drop them all.
-    No run in 96 (x64 off and on) reported a second mode at nlive 500."""
+    No run in 192 (nlive 500 and 1000, x64 off and on) reported a second
+    mode."""
     ones = 0
     for seed in range(5):
         result = NestedSampler(banana5, lambda u: u, 5, nlive=500).run(seed)
@@ -79,3 +79,24 @@ def test_unimodal_run_reports_one_mode() -> None:
         }
     ]
     assert "logit sd" not in result.summary()
+
+
+def test_modes_do_not_depend_on_slot_ids_or_reuse() -> None:
+    """The run's labels are cluster slots: a mode's slot id is arbitrary, a
+    slot freed early can hold other points later, and a mode's first points
+    die in the bulk's slot before the clustering splits it off. modes()
+    relabels every sample by its nearest mode, so the masses do not change."""
+    result = NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(0)
+    modes = result.modes()
+    assert len(modes) == 2
+    labels = np.asarray(result.labels)
+    minor = np.asarray(result.samples)[:, 0] > 0.55
+    early = np.flatnonzero(minor & (labels == labels[~minor][-1]))
+    assert len(early) > 0  # minor points that died before the split
+    labels = (labels + 3) % 8  # other slot ids
+    labels[: result.niter // 4] = 7  # a slot used in the prior phase only
+    result.labels = labels
+    relabelled = result.modes()
+    assert len(relabelled) == 2
+    assert relabelled[1]["mass"] == pytest.approx(modes[1]["mass"], abs=1e-6)
+    assert relabelled[1]["min_live"] == modes[1]["min_live"]

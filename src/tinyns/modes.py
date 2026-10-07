@@ -1,11 +1,13 @@
-"""On-device mode tracking and the inter-mode moves of the replacement chains.
+"""On-device mode tracking and the inter-mode hop of the replacement chains.
 
 Why: a replacement chain starts from a live point and cannot cross between
 separated modes, so the number of live points in each mode does a random walk
-(a Polya urn) and the mode weights drift from seed to seed. An inter-mode
-move that is exact for the constrained prior restores the balance: the flux
-between two modes vanishes when their populations are in proportion to their
-volumes, and the frames below only set how fast the populations relax.
+(a Polya urn) and the mode weights drift from seed to seed. The hop below is
+exact for the constrained prior and restores the balance: the flux between
+two modes vanishes when their populations are in proportion to their
+volumes, and the frames only set how fast the populations relax. In the v1
+bake-off (``bench/bakeoff/``) it cut the seed-to-seed logit sd of minor-mode
+masses about 7x at the same number of likelihood calls.
 
 **Clustering** (:func:`recluster`, pure JAX, static shapes, ``C_MAX`` slots).
 Every ``Config.recluster_every`` steps (about a quarter of an e-fold) the live
@@ -19,63 +21,50 @@ if it is at least ``max(25, 1.5 (d + 2))`` and both parts have at least 3
 points. A single convex mode gives ``J`` of 10 to 16 however it is cut.
 Each cluster has a frame: its mean and the Cholesky factor of its covariance
 shrunk toward the pooled within-cluster covariance (prior weight ``0.1 d``
-points). A frame is *eligible* for the moves if its volume share predicts
+points). A frame is *eligible* for the hop if its volume share predicts
 at least ``2 d`` live points (``m V_c / sum V >= 2 d``) and it has more than
 ``d`` members; the most populated cluster always is. A rule on the live
-count instead would switch the moves on only while a cluster is
-over-populated and so drain it.
+count instead would switch the hop on only while a cluster is
+over-populated and so drain it. The labels are also the record that
+:meth:`tinyns.NestedSamplingResult.modes` reads.
 
-**Moves** (the private static ``Config._mode``). Every ``HOP_EVERY``-th step of
-a chain is the arm's move (``P_HOP = 1 / HOP_EVERY``), the others the global
-live-covariance random walk; with fewer than two eligible frames the move step
-is a random-walk step. The arms:
+**The hop.** Every ``HOP_EVERY``-th step of a chain (``P_HOP = 1 /
+HOP_EVERY``) is an independence Metropolis-Hastings step from the uniform law
+on the union of the eligible frames' ellipsoids ``|L^-1 (x - mu)|^2 <= d +
+2``: a frame is chosen in proportion to its volume and a point drawn
+uniformly in its ellipsoid, so the proposal density ``q(x)`` is proportional
+to the number of ellipsoids containing ``x``. The proposal ``x'`` is accepted
+iff it is in the cube, above ``L*`` and ``U < q(x) / q(x')``; a start outside
+every ellipsoid (``q(x) = 0``) never moves. The other steps are the global
+live-covariance random walk, and with fewer than two eligible frames the hop
+step is a random-walk step. The private ``Config._hop=False`` turns the hop
+off (the clustering still runs), for comparisons.
 
-``N``
-    the random walk only.
-``B_ell``
-    independence Metropolis-Hastings from the uniform law on the union of the
-    eligible frames' ellipsoids ``|L^-1 (x - mu)|^2 <= d + 2`` (a frame chosen
-    in proportion to its volume), so ``q(x)`` is proportional to the number of
-    ellipsoids containing ``x``; accepted iff ``x'`` is in the cube, above
-    ``L*`` and ``U < q(x) / q(x')``.
-``B_t``
-    the same with a Student-t mixture (``nu = 4``, covariance ``1.5^2 L L^T``,
-    weights proportional to the frame volume), which has full support.
-``C``
-    the affine swap ``u' = mu_b + L_b L_a^-1 (u - mu_a)``, with ``a`` the
-    nearest frame of ``u`` (Mahalanobis) and ``b`` uniform among the other
-    eligible frames; accepted iff ``u'`` is in the cube, its nearest frame is
-    ``b``, ``U < det L_b / det L_a`` and ``L(u') > L*``.
-``BC``
-    the move steps alternate between ``B_t`` and ``C``.
-
-**Why the moves are exact.** Given the other live points (and the dead
+**Why the hop is exact.** Given the other live points (and the dead
 points), a chain's seed is uniform in the constrained region ``{L > L*}``. A
 kernel that leaves that uniform law invariant and does not depend on the seed
-returns a point with the same law, for any number of steps. Each move above
-leaves it invariant for *fixed* frames: B is independence MH with the
-Hastings ratio ``q(x) / q(x')``; C is a deterministic involution (``T_ab`` and
-``T_ba`` are inverse maps with constant Jacobian ``det L_b / det L_a``) whose
-forward and reverse selection probabilities are equal (``1 / (n_eligible -
-1)``, both ends nearest to their own frame), so the MH-Green ratio is the
-Jacobian. The schedule of move and walk steps is fixed in advance (a
-composition of invariant kernels) and the frames do not change during a
-chain. What remains is that the frames must not depend on the seed. They are
-fitted at the last recluster from the live points of that time, which may
-include the seed. If so (the per-point ``fitted`` flag), the chain uses frames
-refitted without it: the mean, scatter matrix and count of the seed's cluster
-get a rank-one downdate, and everything derived from them (the pooled
-covariance the frames are shrunk toward, every frame's Cholesky factor, the
-volume shares and the eligibility) is recomputed from the downdated
-statistics (:func:`chain_frames`). With ``k`` chains per step each chain
-removes only its own seed. A seed born after the last recluster is in no
-frame's statistics and the frames are used as they are. The partition of the
-other points is taken as given; their labels came out of a clustering that
-saw the seed, a dependence of one point in ``m`` on hard-EM labels that the
-downdate does not remove (as in any population-adapted proposal, the live
-points are also not exactly independent). Without the downdate a seed always
-sits inside the frame fitted to it while the reverse flux covers only the
-frame's true volume, and small clusters drain.
+returns a point with the same law, for any number of steps. The hop leaves it
+invariant for *fixed* frames: it is independence MH with the Hastings ratio
+``q(x) / q(x')`` for the target uniform on ``{L > L*}``, restricted to the
+union of the ellipsoids (the points outside it stay put). The schedule of
+hop and walk steps is fixed in advance (a composition of invariant kernels)
+and the frames do not change during a chain. What remains is that the frames
+must not depend on the seed. They are fitted at the last recluster from the
+live points of that time, which may include the seed. If so (the per-point
+``fitted`` flag), the chain uses frames refitted without it: the mean,
+scatter matrix and count of the seed's cluster get a rank-one downdate, and
+everything derived from them (the pooled covariance the frames are shrunk
+toward, every frame's Cholesky factor, the volume shares and the
+eligibility) is recomputed from the downdated statistics
+(:func:`chain_frames`). With ``k`` chains per step each chain removes only
+its own seed. A seed born after the last recluster is in no frame's
+statistics and the frames are used as they are. The partition of the other
+points is taken as given; their labels came out of a clustering that saw the
+seed, a dependence of one point in ``m`` on hard-EM labels that the downdate
+does not remove (as in any population-adapted proposal, the live points are
+also not exactly independent; see the CHANGELOG's known issues). Without the
+downdate a seed always sits inside the frame fitted to it while the reverse
+flux covers only the frame's true volume, and small clusters drain.
 
 New live points take the label of their nearest frame (``fitted`` false);
 :func:`recluster` relabels everything and marks every live point fitted.
@@ -92,15 +81,13 @@ from jax import lax, random
 from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import logsumexp
 
-ARMS = ("N", "B_ell", "B_t", "C", "BC")
 C_MAX = 8  # cluster slots (static shapes)
-HOP_EVERY = 10  # every 10th chain step is the arm's move: P_HOP = 0.1
+HOP_EVERY = 10  # every 10th chain step is the hop: P_HOP = 0.1
 SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
 SHRINK = 0.1  # frame covariances: prior weight 0.1 d points on the pooled one
-ELIGIBLE_PER_DIM = 2.0  # a frame moves if its volume share predicts 2 d points
-ELL_R2_PER_DIM = 1.0  # B_ell ellipsoids: Mahalanobis^2 <= (d + 2) * this
-T_NU, T_SCALE = 4.0, 1.5  # B_t components: Student-t, nu = 4, scale x 1.5
+ELIGIBLE_PER_DIM = 2.0  # a frame hops if its volume share predicts 2 d points
+ELL_R2_PER_DIM = 1.0  # hop ellipsoids: Mahalanobis^2 <= (d + 2) * this
 LLOYD_ITERS = 30  # 2-means iterations of a split
 SPLIT_EM_ITERS = 8  # hard-EM iterations refining a split
 REFINE_ITERS = 2  # warm-started hard-EM iterations of a recluster
@@ -268,39 +255,12 @@ def nearest(fr: Frames, x):
     return jnp.argmin(r2, axis=-1).astype(jnp.int32)
 
 
-# --------------------------------------------------------------- the moves
+# ----------------------------------------------------------------- the hop
 
 
-def move_enabled(fr: Frames):
-    """The move needs two eligible frames; otherwise its steps random-walk."""
+def hop_enabled(fr: Frames):
+    """The hop needs two eligible frames; otherwise its steps random-walk."""
     return jnp.sum(fr.eligible) >= 2
-
-
-def propose(arm: str, key, u, fr: Frames, index):
-    """Propose the arm's move from ``u``; return ``(u_new, ok)``.
-
-    ``ok`` holds every acceptance test that needs no likelihood (the
-    Metropolis-Hastings ratio and, for the swap, the nearest-frame test); the
-    caller also requires ``u_new`` in the cube and above ``L*``. ``index`` is
-    the move's index within the chain (``BC`` alternates on it).
-    """
-    if arm == "B_ell":
-        return _propose_ellipsoid(key, u, fr)
-    if arm == "B_t":
-        return _propose_student(key, u, fr)
-    if arm == "C":
-        return _propose_swap(key, u, fr)
-    if arm == "BC":
-        k_t, k_s = random.split(key)
-        u_t, ok_t = _propose_student(k_t, u, fr)
-        u_s, ok_s = _propose_swap(k_s, u, fr)
-        swap = index % 2 == 1
-        return jnp.where(swap, u_s, u_t), jnp.where(swap, ok_s, ok_t)
-    raise ValueError(f"unknown arm {arm!r}")
-
-
-def _volume_logits(fr: Frames):
-    return jnp.where(fr.eligible, fr.logdet, -jnp.inf)
 
 
 def _unit_ball(key, d, dtype):
@@ -309,11 +269,19 @@ def _unit_ball(key, d, dtype):
     return z / jnp.linalg.norm(z) * random.uniform(k_rad, (), dtype) ** (1.0 / d)
 
 
-def _propose_ellipsoid(key, u, fr: Frames):
+def propose_hop(key, u, fr: Frames):
+    """Propose the hop from ``u``; return ``(u_new, ok)``.
+
+    ``u_new`` is uniform in the ellipsoid of an eligible frame chosen in
+    proportion to its volume. ``ok`` is the Metropolis-Hastings test ``U
+    q(u_new) < q(u)``, with ``q`` the number of eligible ellipsoids that
+    contain a point; the caller also requires ``u_new`` in the cube and above
+    ``L*``.
+    """
     d = u.shape[0]
     r2max = ELL_R2_PER_DIM * (d + 2.0)
     k_c, k_x, k_acc = random.split(key, 3)
-    c = random.categorical(k_c, _volume_logits(fr))
+    c = random.categorical(k_c, jnp.where(fr.eligible, fr.logdet, -jnp.inf))
     new = fr.mu[c] + math.sqrt(r2max) * (fr.chol[c] @ _unit_ball(k_x, d, u.dtype))
 
     def n_in(x):
@@ -322,47 +290,6 @@ def _propose_ellipsoid(key, u, fr: Frames):
     n_new, n_old = n_in(new), n_in(u)
     accept = random.uniform(k_acc, (), u.dtype) * n_new < n_old
     return new, accept & (n_new >= 1)
-
-
-def _log_student_mixture(fr: Frames, x):
-    """``log q(x)`` up to a constant: the frame weights (proportional to the
-    volume) cancel the frames' normalizations, leaving the kernels' sum."""
-    d = x.shape[0]
-    r2 = mahalanobis(fr, x)[0] / T_SCALE**2
-    terms = -0.5 * (T_NU + d) * jnp.log1p(r2 / T_NU)
-    return logsumexp(jnp.where(fr.eligible, terms, -jnp.inf))
-
-
-def _propose_student(key, u, fr: Frames):
-    d = u.shape[0]
-    k_c, k_z, k_g, k_acc = random.split(key, 4)
-    c = random.categorical(k_c, _volume_logits(fr))
-    z = random.normal(k_z, (d,), u.dtype)
-    chi2 = 2.0 * random.gamma(k_g, 0.5 * T_NU, (), u.dtype)
-    new = fr.mu[c] + T_SCALE * jnp.sqrt(T_NU / chi2) * (fr.chol[c] @ z)
-    log_ratio = _log_student_mixture(fr, u) - _log_student_mixture(fr, new)
-    accept = jnp.log(random.uniform(k_acc, (), u.dtype)) < log_ratio
-    return new, accept
-
-
-def _propose_swap(key, u, fr: Frames):
-    r_pick, r_acc = random.uniform(key, (2,), u.dtype)
-    dist, y = mahalanobis(fr, u)
-    a = jnp.argmin(dist)
-    others = fr.eligible & (jnp.arange(C_MAX) != a)
-    n_others = jnp.sum(others)
-    # b is uniform among the other eligible frames. The reverse move starts
-    # nearest to b and picks a among as many, so only the Jacobian is left.
-    pick = jnp.minimum(jnp.floor(r_pick * n_others).astype(jnp.int32), n_others - 1)
-    b = jnp.argmax(jnp.cumsum(others) == pick + 1)
-    new = fr.mu[b] + fr.chol[b] @ y[a]
-    accept = (
-        fr.eligible[a]
-        & (n_others > 0)
-        & (jnp.argmin(mahalanobis(fr, new)[0]) == b)
-        & (jnp.log(r_acc) < fr.logdet[b] - fr.logdet[a])
-    )
-    return new, accept
 
 
 # ------------------------------------------------------------ clustering

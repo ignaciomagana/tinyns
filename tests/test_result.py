@@ -21,6 +21,7 @@ def make_result() -> NestedSamplingResult:
         logwt=jnp.array([-4.0, -2.0, -1.0, -0.25]),
         logl_birth=jnp.array([-jnp.inf, -jnp.inf, -3.0, -2.0]),
         nlive_i=np.array([2, 2, 2, 1]),
+        labels=np.array([0, 0, 0, 0], np.int32),
         logz=-0.1,
         logzerr=0.01,
         ncall=10,
@@ -488,6 +489,7 @@ def test_result_npz_round_trip(tmp_path) -> None:
     assert loaded.niter == result.niter
     np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
     np.testing.assert_array_equal(loaded.nlive_i, result.nlive_i)
+    np.testing.assert_array_equal(loaded.labels, result.labels)
     assert loaded.nlive == result.nlive
     assert loaded.num_delete == result.num_delete
     assert loaded.ndim == result.ndim
@@ -588,7 +590,7 @@ def test_result_npz_missing_required_key_raises(tmp_path) -> None:
 def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> None:
     """The split test cuts one curved mode into pieces; modes() merges them
     because neighbouring pieces leave no gap along their discriminant."""
-    from tinyns.clusters import ClusterTracker
+    from tinyns import modes
     from tinyns.result import SEPARATION_SIGMA, _gap
 
     rng = np.random.default_rng(2)
@@ -596,7 +598,8 @@ def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> Non
     for _ in range(4):  # a 5-D Rosenbrock ridge
         ridge.append(0.5 * ridge[-1] ** 2 - 1.0 + 0.5 * rng.normal(size=500))
     x = np.stack(ridge, axis=1)
-    labels = ClusterTracker(500)._track(x)
+    labels, _ = modes.recluster(jnp.asarray(x), jnp.zeros(500, jnp.int32))
+    labels = np.unique(np.asarray(labels), return_inverse=True)[1]
     k = int(labels.max()) + 1
     assert k >= 2  # the split test does cut the ridge
     touching = []

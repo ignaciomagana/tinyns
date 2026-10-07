@@ -14,14 +14,15 @@ Grid (plan, "Bake-off"):
 - controls: correlated Gaussians ``gauss_d{18,32}``, ``rosen_d4``,
   ``funnel_d10``;
 - every arm at nlive 500 and 2000 with ``k = nlive / 10``, plus ``k = 1`` at
-  nlive 500 for ``N`` and ``C`` on ``sepW_d18``; seeds 0-39.
+  nlive 500 for ``N`` and ``B_ell`` on ``sepW_d18``; seeds 0-39 (the v1
+  bake-off ran five arms, 152 cells; ``B_ell`` won and the others are gone).
 
 **Estimate.** A cell runs ``10 T`` steps (``T`` e-folds to convergence, ``k =
 m / 10``) of ``walks`` sequential chain steps, whatever ``m``. The model:
 55 us per chain step (the PR 1 H100 speed run: gauss_d32, m 500, k 50,
 walks 192, 952 steps in 10 s, one run, float32), times 1.5 for 40 batched
 lanes at m 500 and 3 at m 2000, plus one recluster every ``recluster_every``
-steps at 20 ms (m 500) or 60 ms (m 2000) for the tracking arms, plus 60 s of
+steps at 20 ms (m 500) or 60 ms (m 2000) (both arms cluster), plus 60 s of
 compilation per cell. ``k = 1`` cells run ``m T`` steps. ``T`` per target is
 the information plus a few e-folds (from the prototype geometry and the
 Gaussian truths). Treat the result as good to a factor of 2-3; the CPU
@@ -34,7 +35,7 @@ import argparse
 import os
 import sys
 
-ARMS = ("N", "B_ell", "B_t", "C", "BC")
+ARMS = ("N", "B_ell")
 MIXTURES = (
     [f"sepW_d{d}" for d in (4, 10, 18, 32)]
     + [f"sepM_d{d}" for d in (10, 18, 32)]
@@ -43,7 +44,7 @@ MIXTURES = (
 CONTROLS = ["gauss_d18", "gauss_d32", "rosen_d4", "funnel_d10"]
 NLIVE = (500, 2000)
 SEEDS = "0-39"
-K1_CELLS = [("sepW_d18", "N"), ("sepW_d18", "C")]
+K1_CELLS = [("sepW_d18", "N"), ("sepW_d18", "B_ell")]
 # e-folds to convergence (information plus a few e-folds)
 EFOLDS = {
     "sepW_d4": 20,
@@ -84,7 +85,7 @@ def estimate_s(target, arm, nlive, k):
     steps = nlive * EFOLDS[target] / k
     chain = steps * walks(d) * STEP_US * 1e-6 * (LANE_FACTOR[nlive] if k > 1 else 1.0)
     every = max(1, int(nlive / (4 * k) + 0.5))
-    clustering = 0.0 if arm == "N" else steps / every * RECLUSTER_S[nlive]
+    clustering = steps / every * RECLUSTER_S[nlive]
     return COMPILE_S + chain + clustering
 
 
