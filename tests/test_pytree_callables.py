@@ -13,7 +13,7 @@ import pytest
 from jax import random
 
 import tinyns.callables as callables_mod
-from tinyns import Config, NestedSampler, core, modes
+from tinyns import Config, NestedSampler, core
 from tinyns.callables import (
     _callable_leaves,
     _callable_specs,

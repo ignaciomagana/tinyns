@@ -538,7 +538,9 @@ class NestedSamplingResult:
         label = compact(np.where(light[label], np.argmax(mass), label))
         k = int(label.max()) + 1
         # 2. Labels with at most ndim distinct live points at their posterior
-        # median join the nearest other label.
+        # median join the nearest other label (the Mahalanobis distance to
+        # its live points at its own median: at the small label's median it
+        # may be down to a few points, which span no covariance).
         when = [median(label == c) for c in range(k)]
         tiny = [
             len(np.unique(u[alive(when[c]) & (label == c)], axis=0)) <= ndim
@@ -552,7 +554,9 @@ class NestedSamplingResult:
             mine = u[live & (label == c)]
             centre = mine.mean(0) if len(mine) else u[label == c].mean(0)
             dist = [
-                math.inf if tiny[b] else _mahalanobis2(u[live & (label == b)], centre)
+                math.inf
+                if tiny[b]
+                else _mahalanobis2(u[alive(when[b]) & (label == b)], centre)
                 for b in range(k)
             ]
             heaviest = max((b for b in range(k) if not tiny[b]), key=lambda b: mass[b])

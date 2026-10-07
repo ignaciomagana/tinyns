@@ -373,17 +373,23 @@ def _chain(
     ``frames`` and ``chol`` are those of the chain's kernel, or with ``fold``
     (the chain's fold, under ``vmap``) those of every fold, with a leading
     fold axis. The chain carries the whitened offsets ``L_c^-1 (x - mu_c)``
-    of its point to the frames of its fold, so a step whitens one point, the
-    proposal: against the frames of every fold in one product (the frames
-    are shared by the chains; gathering each chain's ``C_MAX`` factors would
-    move ``C_MAX d^2`` numbers per chain and step), keeping its fold's.
+    of its point to the frames of its fold (and their squared lengths), so a
+    step whitens one point, the proposal: against the frames of every fold
+    in one product (the frames are shared by the chains; gathering each
+    chain's own factors would move ``C_MAX d^2`` numbers per chain and step),
+    keeping its fold's. The label, the Hastings ratio and the hop's count of
+    ellipsoids are read from the two sets of offsets.
 
+    ``near``: the frames in use alone (:func:`_few`), which the chain then
+    looks up instead of ``frames``; the labels are positions in ``near``.
     ``plain``: the frames hold fewer than two walk clusters and fewer than
     two eligible ones, in every fold. The chain is then the symmetric walk
-    in ``chol`` at every step, and nothing of the frames is computed. It
-    makes the same draws from the same keys as the general chain does in
-    that case, so the two agree (a batch of runs is ``plain`` only when all
-    its lanes are).
+    in ``chol`` at every step, and nothing of the frames is computed. The
+    three kernels make the same draws from the same keys and return the same
+    chain (to roundoff) when the frames allow the cheaper one.
+
+    ``draws``: the chain's :func:`_step_keys` and :func:`_hop_draws`; made
+    from ``key`` when not given (``key`` is not read otherwise).
 
     Returns ``(u, logl, moves, ncall, ncall_valid, hops, hop_tries)``.
     """
@@ -428,7 +434,10 @@ def _chain(
 
     if draws is None:
         keys, hop_keys = _step_keys(key, walks, hop)
-        draws = (keys, *(_hop_draws(hop_keys, frames, fold) if tracked and n_hops else (None, None)))
+        hops = (None, None)
+        if tracked and n_hops > 0:
+            hops = _hop_draws(hop_keys, frames, fold)
+        draws = (keys, *hops)
     keys, hop_points, hop_uniforms = draws
     at_hop = _hop_steps(walks, n_hops)
     hop_index = np.cumsum(at_hop) - at_hop  # the number of the hop at a hop step
@@ -455,7 +464,9 @@ def _chain(
     def step(carry, xs):
         (k_z, k_u), is_hop, index = xs
         u, logl, c, y, r2, moves, nev, nvalid, hops, tries = carry
-        z = random.normal(k_z, u.shape, u.dtype)
+        # The barrier keeps XLA from fusing the generator into each consumer
+        # of z (its sums below): on a GPU that drew z again per consumer.
+        z = lax.optimization_barrier(random.normal(k_z, u.shape, u.dtype))
         move = live_step(z)
         if local:
             move = jnp.where(use_local, frame_chol(c) @ z, move)
@@ -643,12 +654,15 @@ def _maybe_recluster(state: State, cfg: Config, batched: bool = False) -> State:
 def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     """The seed of each new point: a distinct live point above ``L*`` of the
     fold of the dead slot it fills (Gumbel top-k within the fold), drawn with
-    replacement only when that fold has too few, and from the whole live set
-    only when it has none. A live point and its descendants thus stay in one
-    fold."""
+    replacement only when that fold has too few (one uniform per new point:
+    the rank of its seed among the fold's points above ``L*``), and from the
+    whole live set only when it has none. A live point and its descendants
+    thus stay in one fold."""
     m, k = above.shape[0], worst.shape[0]
     fold = _fold(m, folds)
-    score = jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
+    score = lax.optimization_barrier(
+        jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
+    )
     dead_fold = fold[worst]
     rank = jnp.cumsum(jax.nn.one_hot(dead_fold, folds, dtype=jnp.int32), 0) - 1
     rank = jnp.take_along_axis(rank, dead_fold[:, None], 1)[:, 0]
@@ -657,12 +671,12 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     ])
     n_fold = jnp.stack([jnp.sum(above & (fold == j)) for j in range(folds)])
     mine = above[None, :] & (fold[None, :] == dead_fold[:, None])
-    logits = jnp.where(
-        (n_fold[dead_fold] > 0)[:, None],
-        jnp.where(mine, 0.0, -jnp.inf),
-        jnp.where(above, 0.0, -jnp.inf)[None, :],
-    )
-    fill = random.categorical(key_fill, logits, axis=-1)
+    mine = jnp.where((n_fold[dead_fold] > 0)[:, None], mine, above[None, :])
+    count = jnp.sum(mine, axis=1)
+    pick = (random.uniform(key_fill, (k,), dtype) * count).astype(jnp.int32)
+    pick = jnp.minimum(pick, count - 1)
+    order = jnp.cumsum(mine, axis=1) - 1  # a row's rank among its candidates
+    fill = jnp.argmax(mine & (order == pick[:, None]), axis=1)
     return jnp.where(rank < n_fold[dead_fold], tops[dead_fold, rank], fill)
 
 
@@ -752,7 +766,10 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
             lambda: jax.vmap(lambda keys, j: _hop_draws(keys, frames, j))(
                 hop_keys, chain_fold
             ),
-            lambda: (jnp.zeros((k, n_hops, cfg.ndim), dtype), jnp.zeros((k, n_hops), dtype)),
+            lambda: (
+                jnp.zeros((k, n_hops, cfg.ndim), dtype),
+                jnp.zeros((k, n_hops), dtype),
+            ),
         )
 
     def chains(kernel):
@@ -1123,7 +1140,7 @@ def finalise(
 
 
 # Rows per call of the compiled prior transform of :func:`finalise`.
-_TRANSFORM_BLOCK = 8192
+_TRANSFORM_BLOCK = 65536
 
 
 @_kernel_cache
@@ -1147,13 +1164,16 @@ def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
         lambda: jax.ShapeDtypeStruct((d,), dtype),
     )
     kernel = _transform_kernel(spec)
-    pad = -n % _TRANSFORM_BLOCK
-    padded = np.concatenate([u, np.full((pad, d), 0.5, u.dtype)]).astype(dtype)
-    out = [
-        np.asarray(kernel(padded[start : start + _TRANSFORM_BLOCK], *leaves))
-        for start in range(0, n + pad, _TRANSFORM_BLOCK)
-    ]
-    return np.concatenate(out).reshape(n + pad, -1)[:n]
+    u = np.asarray(u, dtype)
+    out = []
+    for start in range(0, n, _TRANSFORM_BLOCK):
+        block = u[start : start + _TRANSFORM_BLOCK]
+        rows = len(block)
+        if rows < _TRANSFORM_BLOCK:  # the last block, padded
+            pad = np.full((_TRANSFORM_BLOCK - rows, d), 0.5, dtype)
+            block = np.concatenate([block, pad])
+        out.append(np.asarray(kernel(block, *leaves))[:rows].reshape(rows, -1))
+    return np.concatenate(out) if out else np.zeros((0, d), dtype)
 
 
 def _mode_info(dead: Dead, k: int, hops, hop_tries) -> dict:

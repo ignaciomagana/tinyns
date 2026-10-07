@@ -41,8 +41,9 @@ d`` live points (``m V_c / sum V >= 2 d``) and it has more than ``d``
 members; the most populated cluster always is. A frame *walks*
 (:func:`walk_frames`) if it has at least ``WALK_MIN_POINTS = 3`` members (a
 small mode keeps its own covariance, shrunk toward the pooled one, until it
-is nearly gone). New live points take the label of the nearest frame of each
-clustering until the next recluster. The labels are also the record that
+is nearly gone). The frames are factorized once, at the recluster, and kept
+in the state until the next one; new live points take the label of the
+nearest frame of each clustering until then. The labels are also the record that
 :meth:`tinyns.NestedSamplingResult.modes` reads: a point's slot in the
 clustering of the next fold (which contains it), as ``j * C_MAX + slot``;
 ``modes()`` merges the labels of different clusterings that cover one mode.
@@ -55,8 +56,10 @@ uniformly in its ellipsoid, so the proposal density ``q(x)`` is proportional
 to the number of ellipsoids containing ``x``. The proposal ``x'`` is accepted
 iff it is in the cube, above ``L*`` and ``U < q(x) / q(x')``; a start outside
 every ellipsoid (``q(x) = 0``) never moves. With fewer than two eligible
-frames the hop step is a walk step. The private ``Config._hop=False`` turns
-the hop off (the clustering still runs), for comparisons.
+frames the hop step is a walk step. The proposal does not depend on the
+chain's point, so a chain draws those of all its hop steps before it runs
+(:func:`hop_proposal`). The private ``Config._hop=False`` turns the hop off
+(the clustering still runs), for comparisons.
 
 **The local walk.** The other steps propose ``y = x + s L_c(x) z``, with
 ``c(x)`` the nearest walking frame (Mahalanobis distance) and ``L_c`` its
@@ -66,6 +69,18 @@ accepted iff it is in the cube, above ``L*`` and ``U < N(x | y, s^2 S_c(y)) /
 N(y | x, s^2 S_c(x))``. With fewer than two walking frames the walk uses the
 live covariance of the points outside the fold (symmetric). The private
 ``Config._local=False`` always uses that covariance, for comparisons.
+
+**Cost.** A chain carries the whitened offsets ``L_c^-1 (x - mu_c)`` of its
+point to the frames, so a step whitens one point, the proposal, and reads the
+label, the Hastings ratio and the hop's count of ellipsoids from the two sets
+of offsets. A step of the sampler picks the cheapest of three chain kernels
+that its frames allow (:func:`tinyns.core._kernel_level`; they return the
+same chains): plain symmetric walks while no clustering has two walk clusters
+or two eligible ones (every unimodal run), a kernel that looks up the two
+frames in use when no clustering has more, and one that looks up all
+``C_MAX``. The split search of a recluster runs in rounds, one cluster of
+every clustering per round, as many as the clustering with the most clusters
+needs.
 
 **Why the chains are exact.** For independent live points, given the points
 outside fold ``j`` (and the dead points), a seed drawn from the points of fold
@@ -306,14 +321,16 @@ def hop_proposal(key, eligible, logdet, frame):
     """
     k_dir, k_uni = random.split(key)
     dtype = logdet.dtype
-    uni = random.uniform(k_uni, (3,), dtype)
+    uni = lax.optimization_barrier(random.uniform(k_uni, (3,), dtype))
     logv = jnp.where(eligible, logdet, -jnp.inf)
     cdf = jnp.cumsum(jnp.where(eligible, jnp.exp(logv - jnp.max(logv)), 0.0))
     c = jnp.sum(cdf <= uni[0] * cdf[-1])  # the first frame with cdf above
     last = eligible.shape[0] - 1 - jnp.argmax(eligible[::-1])
     mu, chol = frame(jnp.minimum(c, last))
     d = mu.shape[0]
-    z = random.normal(k_dir, (d,), dtype)
+    # The barrier keeps XLA from fusing the generator into the norm: on a
+    # GPU that fusion compiled for 40 to 90 s at d = 32 and 64.
+    z = lax.optimization_barrier(random.normal(k_dir, (d,), dtype))
     ball = z / jnp.linalg.norm(z) * uni[1] ** (1.0 / d)
     point = mu + math.sqrt(ELL_R2_PER_DIM * (d + 2.0)) * (chol @ ball)
     return point, uni[2]

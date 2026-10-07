@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from jax import random
 
-from tinyns import Config, NestedSampler, core, finalise, init, modes, step
+from tinyns import Config, NestedSampler, core, finalise, init, step
 
 FLOAT = jnp.result_type(float)
 
