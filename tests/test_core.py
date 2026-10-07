@@ -79,9 +79,7 @@ def fake_run(dead_logl, live_logl, m, k):
         ncall_valid=np.int32(0),
         status=np.int32(core.CONVERGED),
         label=np.zeros((FOLDS, m), np.int32),
-        mode_mu=np.zeros((FOLDS, modes.C_MAX, 1)),
-        mode_scat=np.zeros((FOLDS, modes.C_MAX, 1, 1)),
-        mode_count=np.zeros((FOLDS, modes.C_MAX)),
+        **core._empty_frames(1, FOLDS, np.float64),
     )
     zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(

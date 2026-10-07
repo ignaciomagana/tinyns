@@ -247,6 +247,14 @@ def frames(st: Stats, nlive: int | None = None) -> Frames:
     return Frames(mu, chol, ichol, logdet, count, active, eligible)
 
 
+def empty_frames(ndim: int, dtype) -> Frames:
+    """Frames of ``C_MAX`` empty slots (none active)."""
+    eye = jnp.broadcast_to(jnp.eye(ndim, dtype=dtype), (C_MAX, ndim, ndim))
+    zero = jnp.zeros((C_MAX,), dtype)
+    off = jnp.zeros((C_MAX,), bool)
+    return Frames(jnp.zeros((C_MAX, ndim), dtype), eye, eye, zero, zero, off, off)
+
+
 def _eligible(logdet, count, active, nlive, d):
     """Volume share predicts ``2 d`` live points, more than ``d`` members; the
     most populated cluster always takes part."""
@@ -291,6 +299,32 @@ def _unit_ball(key, d, dtype):
     return z / jnp.linalg.norm(z) * random.uniform(k_rad, (), dtype) ** (1.0 / d)
 
 
+def hop_frame(key, eligible, logdet):
+    """An eligible frame drawn in proportion to its volume."""
+    return random.categorical(key, jnp.where(eligible, logdet, -jnp.inf))
+
+
+def hop_point(key, mu, chol):
+    """A uniform draw in the hop ellipsoid of the frame ``(mu, chol)``."""
+    d = mu.shape[0]
+    r = math.sqrt(ELL_R2_PER_DIM * (d + 2.0))
+    return mu + r * (chol @ _unit_ball(key, d, mu.dtype))
+
+
+def hop_test(key, eligible, r2_new, r2_old, d: int):
+    """The hop's Metropolis-Hastings test ``U q(new) < q(old)``.
+
+    ``q`` is the number of eligible ellipsoids that hold a point, read from
+    its squared Mahalanobis distances ``r2`` to the ``C_MAX`` frames; a
+    proposal in no ellipsoid (it cannot be drawn) is refused.
+    """
+    r2max = ELL_R2_PER_DIM * (d + 2.0)
+    n_new = jnp.sum(eligible & (r2_new <= r2max))
+    n_old = jnp.sum(eligible & (r2_old <= r2max))
+    accept = random.uniform(key, (), r2_new.dtype) * n_new < n_old
+    return accept & (n_new >= 1)
+
+
 def propose_hop(key, u, fr: Frames):
     """Propose the hop from ``u``; return ``(u_new, ok)``.
 
@@ -298,20 +332,14 @@ def propose_hop(key, u, fr: Frames):
     proportion to its volume. ``ok`` is the Metropolis-Hastings test ``U
     q(u_new) < q(u)``, with ``q`` the number of eligible ellipsoids that
     contain a point; the caller also requires ``u_new`` in the cube and above
-    ``L*``.
+    ``L*``. :func:`tinyns.core._chain` makes the same three draws from the
+    same keys, with the whitened offsets it already holds.
     """
-    d = u.shape[0]
-    r2max = ELL_R2_PER_DIM * (d + 2.0)
     k_c, k_x, k_acc = random.split(key, 3)
-    c = random.categorical(k_c, jnp.where(fr.eligible, fr.logdet, -jnp.inf))
-    new = fr.mu[c] + math.sqrt(r2max) * (fr.chol[c] @ _unit_ball(k_x, d, u.dtype))
-
-    def n_in(x):
-        return jnp.sum(fr.eligible & (mahalanobis(fr, x)[0] <= r2max))
-
-    n_new, n_old = n_in(new), n_in(u)
-    accept = random.uniform(k_acc, (), u.dtype) * n_new < n_old
-    return new, accept & (n_new >= 1)
+    c = hop_frame(k_c, fr.eligible, fr.logdet)
+    new = hop_point(k_x, fr.mu[c], fr.chol[c])
+    r2_new, r2_old = mahalanobis(fr, new)[0], mahalanobis(fr, u)[0]
+    return new, hop_test(k_acc, fr.eligible, r2_new, r2_old, u.shape[0])
 
 
 # ------------------------------------------------------------ clustering
