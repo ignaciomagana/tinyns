@@ -121,6 +121,8 @@ class Config:
     num_delete: int | None = None
     walks: int | None = None
     _hop: bool = True
+    _local: bool = False
+    _xfit: bool = False
 
     def __post_init__(self):
         ndim = _check_int("ndim", self.ndim, 1)
@@ -131,8 +133,9 @@ class Config:
             raise ValueError(f"num_delete must be at most nlive // 2 = {nlive // 2}")
         walks = default_walks(ndim) if self.walks is None else self.walks
         walks = _check_int("walks", walks, 1)
-        if not isinstance(self._hop, bool):
-            raise TypeError("_hop must be a bool")
+        for name in ("_hop", "_local", "_xfit"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
@@ -277,7 +280,7 @@ def _proposal_mask(above, seeds, ndim):
 
 def _chain(
     key, u, logl, lstar, chol, scale, loglike, prior_transform, walks, skip,
-    frames, hop=True,
+    frames, hop=True, local=False,
 ):
     """A fixed-length constrained Metropolis chain from ``(u, logl)``.
 
@@ -286,11 +289,18 @@ def _chain(
     proposal that fails the likelihood-free tests skips the likelihood
     (``lax.cond``); otherwise the clipped proposal is evaluated and masked.
 
-    The steps are the live-covariance random walk ``u + s L z``, except that
-    with ``hop`` every ``HOP_EVERY``-th step is the inter-mode hop from the
-    chain's ``frames`` (:mod:`tinyns.modes`): a schedule fixed in advance, so
-    the chain composes invariant kernels in a state-independent order. A hop
-    step random-walks when the frames hold fewer than two eligible clusters.
+    The steps are the random walk ``u + s L z``, except that with ``hop``
+    every ``HOP_EVERY``-th step is the inter-mode hop from the chain's
+    ``frames`` (:mod:`tinyns.modes`): a schedule fixed in advance, so the
+    chain composes invariant kernels in a state-independent order. A hop step
+    random-walks when the frames hold fewer than two eligible clusters.
+
+    ``L`` is ``chol`` (the live covariance), or with ``local`` the Cholesky
+    factor of the cluster of the current point when the frames hold at least
+    two walk clusters (:func:`tinyns.modes.walk_frames`): the label ``c(x)``
+    is the nearest walk frame and the proposal ``N(y | x, s^2 S_c(x))`` is not
+    symmetric, so ``y`` is accepted with the Hastings ratio
+    ``N(x | y, s^2 S_c(y)) / N(y | x, s^2 S_c(x))`` (exact for fixed frames).
     Returns ``(u, logl, moves, ncall, ncall_valid, hops, hop_tries)``.
     """
     dtype = logl.dtype
@@ -298,11 +308,41 @@ def _chain(
     def evaluate(v):
         return _loglike_u(loglike, prior_transform, v, dtype)
 
-    def walk(key, u):
-        return u + scale * (chol @ random.normal(key, u.shape, u.dtype))
+    if local:
+        walkable = _modes.walk_frames(frames)
+        use_local = jnp.sum(walkable) >= 2
 
-    def update(carry, prop, pre, hop):
-        u, logl, moves, nev, nvalid, hops, tries = carry
+        def locate(v):
+            r2, y = _modes.mahalanobis(frames, v)
+            return jnp.argmin(jnp.where(walkable, r2, jnp.inf)), y
+
+    else:
+
+        def locate(v):
+            return jnp.zeros((), jnp.int32), jnp.zeros((), dtype)
+
+    def walk(key, u, c, y):
+        """A walk proposal from ``u`` (label ``c``, whitened offsets ``y``):
+        ``(prop, its label, its offsets, Hastings test)``."""
+        if not local:
+            prop = u + scale * (chol @ random.normal(key, u.shape, u.dtype))
+            return prop, c, y, jnp.asarray(True)
+        k_z, k_u = random.split(key)
+        z = random.normal(k_z, u.shape, u.dtype)
+        factor = jnp.where(use_local, frames.chol[c], chol)
+        prop = u + scale * (factor @ z)
+        c_new, y_new = locate(prop)
+        back = (y[c_new] - y_new[c_new]) / scale  # L_c(y)^-1 (x - y) / s
+        log_ratio = (
+            0.5 * (jnp.sum(z * z) - jnp.sum(back * back))
+            + frames.logdet[c] - frames.logdet[c_new]
+        )
+        log_ratio = jnp.where(use_local, log_ratio, 0.0)
+        ok = jnp.log(random.uniform(k_u, (), dtype)) < log_ratio
+        return prop, c_new, y_new, ok
+
+    def update(carry, prop, pre, hop, c_new, y_new):
+        u, logl, c, y, moves, nev, nvalid, hops, tries = carry
         hop = jnp.asarray(hop)
         inside = jnp.all((prop >= 0.0) & (prop <= 1.0))
         call = inside & pre
@@ -318,36 +358,51 @@ def _chain(
         accept = call & (new > lstar)
         u = jnp.where(accept, prop, u)
         logl = jnp.where(accept, new, logl)
+        c = jnp.where(accept, c_new, c)
+        y = jnp.where(accept, y_new, y)
         moves = moves + accept.astype(jnp.int32)
         hops = hops + (accept & hop).astype(jnp.int32)
         tries = tries + hop.astype(jnp.int32)
-        return u, logl, moves, nev, nvalid + call.astype(jnp.int32), hops, tries
+        nvalid = nvalid + call.astype(jnp.int32)
+        return u, logl, c, y, moves, nev, nvalid, hops, tries
 
     def walk_step(carry, key):
-        return update(carry, walk(key, carry[0]), True, False), None
+        prop, c_new, y_new, ok = walk(key, *carry[0:1], *carry[2:4])
+        return update(carry, prop, ok, False, c_new, y_new), None
 
     zero = jnp.zeros((), jnp.int32)
-    carry = (u, logl, zero, zero, zero, zero, zero)
+    carry = (u, logl, *locate(u), zero, zero, zero, zero, zero)
+
+    def result(carry):
+        u, logl, _, _, *counts = carry
+        return (u, logl, *counts)
+
     keys = random.split(key, walks)
     n_hops = walks // _modes.HOP_EVERY if hop else 0
     if n_hops == 0:
         carry, _ = lax.scan(walk_step, carry, keys)
-        return carry
+        return result(carry)
 
     enabled = _modes.hop_enabled(frames)
 
     def cycle(carry, keys):
         carry, _ = lax.scan(walk_step, carry, keys[:-1])
         k_walk, k_hop = random.split(keys[-1])
-        prop, ok = _modes.propose_hop(k_hop, carry[0], frames)
-        prop = jnp.where(enabled, prop, walk(k_walk, carry[0]))
-        return update(carry, prop, ok | ~enabled, enabled), None
+        u, _, c, y = carry[:4]
+        prop, ok = _modes.propose_hop(k_hop, u, frames)
+        c_hop, y_hop = locate(prop)
+        w_prop, w_c, w_y, w_ok = walk(k_walk, u, c, y)
+        prop = jnp.where(enabled, prop, w_prop)
+        ok = jnp.where(enabled, ok, w_ok)
+        c_new = jnp.where(enabled, c_hop, w_c)
+        y_new = jnp.where(enabled, y_hop, w_y)
+        return update(carry, prop, ok, enabled, c_new, y_new), None
 
     head = n_hops * _modes.HOP_EVERY
     cycles = keys[:head].reshape((n_hops, _modes.HOP_EVERY) + keys.shape[1:])
     carry, _ = lax.scan(cycle, carry, cycles)
     carry, _ = lax.scan(walk_step, carry, keys[head:])
-    return carry
+    return result(carry)
 
 
 def _init(key, loglike, prior_transform, cfg: Config) -> State:
@@ -360,6 +415,8 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
     )
     i32 = jnp.int32
     mu, scat, count = _modes.empty_stats(d, dtype)
+    if cfg._xfit:  # one set of cluster statistics per half
+        mu, scat, count = (jnp.stack([x, x]) for x in (mu, scat, count))
     return State(
         key=key,
         u=u,
@@ -383,14 +440,40 @@ def _stats(state: State) -> _modes.Stats:
     return _modes.Stats(state.mode_mu, state.mode_scat, state.mode_count)
 
 
-def _recluster(state: State, batched: bool = False) -> State:
+def _halves(m: int):
+    """The two halves of the live slots (even and odd indices) and the size
+    of the larger one: halves are fixed by slot, so they never change size."""
+    return (m + 1) // 2
+
+
+def _recluster(state: State, batched: bool = False, xfit: bool = False) -> State:
     """Recluster the live points (:func:`tinyns.modes.recluster_lanes`): every
     live point gets a fresh label and enters the cluster statistics.
-    ``batched``: the state has a leading lane axis."""
+    ``batched``: the state has a leading lane axis. ``xfit``: each half of
+    the slots is clustered on its own (two lanes per run)."""
     u, label = state.u, state.label
     if not batched:
         u, label = u[None], label[None]
-    label, (mu, scat, count) = _modes.recluster_lanes(u, label)
+    if not xfit:
+        label, (mu, scat, count) = _modes.recluster_lanes(u, label)
+    else:
+        lanes, m, d = u.shape
+        h = _halves(m)
+        pad = 2 * h - m
+
+        def halves(x, fill):
+            ev, od = x[:, 0::2], x[:, 1::2]
+            if pad:
+                od = jnp.concatenate(
+                    [od, jnp.full((lanes, pad, *od.shape[2:]), fill, od.dtype)], 1
+                )
+            return jnp.stack([ev, od], 1).reshape(lanes * 2, h, *x.shape[2:])
+
+        lab2, st2 = _modes.recluster_lanes(halves(u, 0.5), halves(label, -1))
+        lab2 = lab2.reshape(lanes, 2, h)
+        label = jnp.zeros((lanes, m), jnp.int32)
+        label = label.at[:, 0::2].set(lab2[:, 0]).at[:, 1::2].set(lab2[:, 1, : m // 2])
+        mu, scat, count = (x.reshape(lanes, 2, *x.shape[1:]) for x in st2)
     if not batched:
         label, mu, scat, count = label[0], mu[0], scat[0], count[0]
     return state._replace(
@@ -416,11 +499,16 @@ def _maybe_recluster(state: State, cfg: Config, batched: bool = False) -> State:
     reclusters exactly when it would alone.
     """
     if not batched:
-        return lax.cond(_recluster_due(state, cfg), _recluster, lambda s: s, state)
+        return lax.cond(
+            _recluster_due(state, cfg),
+            lambda s: _recluster(s, xfit=cfg._xfit),
+            lambda s: s,
+            state,
+        )
     due = _recluster_due(state, cfg) & (state.status == RUNNING)
     return lax.cond(
         jnp.any(due),
-        lambda s: _select(due, _recluster(s, batched=True), s),
+        lambda s: _select(due, _recluster(s, batched=True, xfit=cfg._xfit), s),
         lambda s: s,
         state,
     )
@@ -436,27 +524,67 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
     survivor = jnp.ones((m,), bool).at[worst].set(False)
     above = state.logl > lstar
     n_above = jnp.sum(above, dtype=jnp.int32)
-
-    # Seeds: distinct live points above L* (Gumbel top-k), with replacement
-    # only when fewer than k exist.
     key, k_seed, k_fill, k_chain = random.split(state.key, 4)
     score = jnp.where(above, random.gumbel(k_seed, (m,), dtype), -jnp.inf)
-    _, top = lax.top_k(score, k)
-    fill = random.categorical(k_fill, jnp.where(above, 0.0, -jnp.inf), shape=(k,))
-    seeds = jnp.where(jnp.arange(k) < n_above, top, fill)
+    half = jnp.arange(m, dtype=jnp.int32) % 2  # the slot halves (cross-fitting)
 
-    chol = _live_chol(state.u, _proposal_mask(above, seeds, cfg.ndim))
+    if not cfg._xfit:
+        # Seeds: distinct live points above L* (Gumbel top-k), with replacement
+        # only when fewer than k exist.
+        _, top = lax.top_k(score, k)
+        fill = random.categorical(k_fill, jnp.where(above, 0.0, -jnp.inf), shape=(k,))
+        seeds = jnp.where(jnp.arange(k) < n_above, top, fill)
+        chol = _live_chol(state.u, _proposal_mask(above, seeds, cfg.ndim))
+        chols = jnp.stack([chol, chol])
+    else:
+        # Each new point replaces a dead slot of one half and is seeded from a
+        # distinct live point above L* of the same half (with replacement
+        # only when that half has too few); its chain's kernel is built from
+        # the other half alone.
+        dead_half = half[worst]
+        rank = jnp.cumsum(jax.nn.one_hot(dead_half, 2, dtype=jnp.int32), 0) - 1
+        rank = jnp.take_along_axis(rank, dead_half[:, None], 1)[:, 0]
+        tops = jnp.stack([
+            lax.top_k(jnp.where(half == h, score, -jnp.inf), k)[1] for h in (0, 1)
+        ])
+        n_half = jnp.stack([jnp.sum(above & (half == h)) for h in (0, 1)])
+        fill_logits = jnp.where(
+            (n_half[dead_half] > 0)[:, None],
+            jnp.where(above[None, :] & (half[None, :] == dead_half[:, None]), 0.0, -jnp.inf),
+            jnp.where(above, 0.0, -jnp.inf)[None, :],
+        )
+        fill = random.categorical(k_fill, fill_logits, axis=-1)
+        seeds = jnp.where(rank < n_half[dead_half], tops[dead_half, rank], fill)
+
+        def other_chol(h):
+            mask = above & (half != h)
+            mask = jnp.where(jnp.sum(mask) >= cfg.ndim + 1, mask,
+                             _proposal_mask(above, seeds, cfg.ndim))
+            return _live_chol(state.u, mask)
+
+        chols = jnp.stack([other_chol(0), other_chol(1)])
     scale = jnp.exp(state.log_scale)
-    chain_args = (lstar, chol, scale, loglike, prior_transform, walks)
+
+    if cfg._xfit:  # frames[h]: the frames of the chains seeded in half h
+        stats_h = [_modes.Stats(*(x[1 - h] for x in _stats(state))) for h in (0, 1)]
+        frames2 = jax.tree_util.tree_map(
+            lambda a, b: jnp.stack([a, b]), *(_modes.frames(st, m) for st in stats_h)
+        )
 
     def chain(key, i, skip):
-        # The chain's frames are refit without its own seed (if the seed is in
-        # the statistics), so its kernel does not depend on its start.
-        frames = _modes.chain_frames(
-            _stats(state), state.u[i], state.label[i], state.fitted[i], m
-        )
-        return _chain(key, state.u[i], state.logl[i], *chain_args, skip, frames,
-                      cfg._hop)
+        if cfg._xfit:
+            h = half[i]
+            frames = jax.tree_util.tree_map(lambda a: a[h], frames2)
+        else:
+            h = 0
+            # The chain's frames are refit without its own seed (if the seed is
+            # in the statistics), so its kernel does not depend on its start.
+            frames = _modes.chain_frames(
+                _stats(state), state.u[i], state.label[i], state.fitted[i], m
+            )
+        return _chain(key, state.u[i], state.logl[i], lstar, chols[h], scale,
+                      loglike, prior_transform, walks, skip, frames, cfg._hop,
+                      cfg._local)
 
     if k == 1:  # no vmap: the cond really skips out-of-cube proposals
         out = chain(k_chain, seeds[0], True)
@@ -494,12 +622,25 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
         ncall_valid=ncall_valid,
         status=state.status,
     )
-    # New points take the label of their nearest frame; they are not in the
-    # cluster statistics until the next recluster.
-    fr = _modes.frames(_stats(state), m)
+    # New points take the label of their nearest frame (of their own half);
+    # they are not in the cluster statistics until the next recluster.
     i32 = jnp.int32
+    if cfg._xfit:
+        own = [_modes.frames(_modes.Stats(*(x[h] for x in _stats(state))), m)
+               for h in (0, 1)]
+        dead_half = half[worst]
+        new_label = jnp.where(dead_half == 0, _modes.nearest(own[0], new_u),
+                              _modes.nearest(own[1], new_u))
+        dead_label = state.label[worst] + _modes.C_MAX * dead_half
+        n_clusters = jnp.maximum(jnp.sum(own[0].active), jnp.sum(own[1].active))
+        n_eligible = jnp.minimum(jnp.sum(frames2.eligible[0]), jnp.sum(frames2.eligible[1]))
+    else:
+        fr = _modes.frames(_stats(state), m)
+        new_label = _modes.nearest(fr, new_u)
+        dead_label = state.label[worst]
+        n_clusters, n_eligible = jnp.sum(fr.active), jnp.sum(fr.eligible)
     new = new._replace(
-        label=state.label.at[worst].set(_modes.nearest(fr, new_u)),
+        label=state.label.at[worst].set(new_label),
         fitted=state.fitted.at[worst].set(False),
     )
     dead = Dead(
@@ -508,11 +649,11 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
         state.logl_birth[worst],
         insertion,
         moves,
-        label=state.label[worst],
+        label=dead_label,
         hops=hops,
         hop_tries=hop_tries,
-        nclusters=jnp.full((k,), jnp.sum(fr.active), i32),
-        neligible=jnp.full((k,), jnp.sum(fr.eligible), i32),
+        nclusters=jnp.full((k,), n_clusters, i32),
+        neligible=jnp.full((k,), n_eligible, i32),
     )
     # A plateau (nothing above L*) leaves the live set as it was.
     stuck = state._replace(status=jnp.asarray(PLATEAU, jnp.int32))
@@ -730,8 +871,11 @@ def finalise(
         np.asarray(dead.logl_birth, np.float64).reshape(-1),
         np.asarray(state.logl_birth, np.float64)[order],
     ])
+    live_label = np.asarray(state.label)
+    if cfg._xfit:  # the halves have their own slots
+        live_label = live_label + _modes.C_MAX * (np.arange(m) % 2)
     labels = np.concatenate([
-        np.asarray(dead.label).reshape(-1), np.asarray(state.label)[order]
+        np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)
     nlive_i = np.concatenate([np.tile(m - np.arange(k), niter // k), m - np.arange(m)])
     logwt, logz, logzerr = _evidence(logl, nlive_i)

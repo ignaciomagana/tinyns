@@ -258,6 +258,12 @@ def nearest(fr: Frames, x):
 # ----------------------------------------------------------------- the hop
 
 
+def walk_frames(fr: Frames):
+    """The frames that give the random walk its covariance: active, with more
+    than ``d`` members (a full-rank scatter)."""
+    return fr.active & (fr.count > fr.mu.shape[-1])
+
+
 def hop_enabled(fr: Frames):
     """The hop needs two eligible frames; otherwise its steps random-walk."""
     return jnp.sum(fr.eligible) >= 2
@@ -540,7 +546,7 @@ def recluster_lanes(u, labels):
     Call it with the lane axis explicit (not under ``vmap``): the split search
     then skips the slots that no lane occupies.
     """
-    labels = jnp.clip(labels, 0, C_MAX - 1).astype(jnp.int32)
+    labels = jnp.where(labels < 0, -1, jnp.clip(labels, 0, C_MAX - 1)).astype(jnp.int32)
     labels = jax.vmap(lambda u, lab: _refine(u, lab, C_MAX, REFINE_ITERS))(u, labels)
     labels = jax.vmap(_merge)(u, labels)
     js, parts = _split_slots(u, labels)
