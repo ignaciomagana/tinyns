@@ -1,11 +1,15 @@
-"""The inter-mode hop (:mod:`tinyns.modes`): exactness and integration.
+"""The inter-mode hop and the local walk (:mod:`tinyns.modes`): exactness
+and integration.
 
-The invariance test is the gate of the hop: on a fixed two-mode live set,
-chains started from seeds drawn uniformly in the constrained region must end
-in each mode in proportion to its volume. The seed is one of the points the
-frames were fitted to, so the test fails unless the leave-one-out refit
-removes it (the control without it is biased). ``pytest -m slow`` runs it
-with 10^5 chains.
+The invariance tests are the gate: on a fixed two-mode set of "other half"
+points, chains started from seeds drawn uniformly in the constrained region,
+with frames fitted to the other half only (cross-fitting), must end in each
+mode in proportion to its volume. A control fits the frames to a set that
+includes the seed (no cross-fitting) and must fail, so the test has the power
+to see a seed in its own kernel. ``pytest -m slow`` runs it with 10^6 chains,
+which resolves 0.5% of the minor fraction. The local walk has its own test on
+one region cut into two frames of different shapes, where its proposal is not
+symmetric; a walk without the Hastings ratio fails it.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ D = 3
 CENTERS = np.array([[0.30, 0.35, 0.40], [0.72, 0.62, 0.55]])
 RADII = np.array([0.16, 0.11])
 MINOR_FRACTION = RADII[1] ** D / np.sum(RADII**D)  # 0.2453
-NFIT = 40  # live points the frames are fitted to (the seed is one of them)
+NFIT = 60  # points of the other half, the frames are fitted to
 WALKS = 40  # four hop steps per chain
 SCALE = 0.3
 
@@ -43,36 +47,41 @@ def uniform_region(rng, n):
     return CENTERS[ball] + RADII[ball][:, None] * z
 
 
-def invariance(nchains: int, loo: bool = True, seed: int = 0):
-    """Fraction of chain end points in the minor ball, and the hop counts."""
+def invariance(nchains: int, cross_fit: bool = True, seed: int = 0, local=True):
+    """Fraction of chain end points in the minor ball, and the hop counts.
+
+    The frames are fitted to ``NFIT`` other points (``cross_fit``) or to
+    ``NFIT - 1`` other points and the seed (the control)."""
     dtype = jnp.result_type(float)
     rng = np.random.default_rng(seed)
-    others = jnp.asarray(uniform_region(rng, NFIT - 1), dtype)
-    labels, st = modes.recluster(others, jnp.zeros(NFIT - 1, jnp.int32))
+    nother = NFIT if cross_fit else NFIT - 1
+    others = jnp.asarray(uniform_region(rng, nother), dtype)
+    labels, st = modes.recluster(others, jnp.zeros(nother, jnp.int32))
     assert int(jnp.sum(st.count > 0)) == 2, "the fixed live set must split"
-    fit_others = modes.frames(st, NFIT)
-    chol = core._live_chol(others, jnp.ones(NFIT - 1, bool))
+    fit_others = modes.frames(st, 2 * NFIT)
+    chol = core._live_chol(others, jnp.ones(nother, bool))
 
     def one(key, s):
-        label = modes.nearest(fit_others, s[None])[0]
-        all_stats = modes.stats(
-            jnp.concatenate([others, s[None]]),
-            jnp.concatenate([labels, label[None]]),
-            modes.C_MAX,
-        )
-        fr = modes.chain_frames(all_stats, s, label, loo, NFIT)
+        fr = fit_others
+        if not cross_fit:
+            label = modes.nearest(fit_others, s[None])[0]
+            fr = modes.frames(modes.stats(
+                jnp.concatenate([others, s[None]]),
+                jnp.concatenate([labels, label[None]]),
+                modes.C_MAX,
+            ), 2 * NFIT)
         u, _, _, _, _, hops, tries = core._chain(
             key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), chol,
             jnp.asarray(SCALE, dtype), region_loglike, lambda v: v, WALKS, False,
-            fr,
+            fr, True, local,
         )
         return jnp.sum((u - CENTERS[1]) ** 2) <= RADII[1] ** 2, hops, tries
 
     batch = jax.jit(jax.vmap(one))
     minor = hops = tries = 0
     key = random.PRNGKey(seed)
-    for start in range(0, nchains, 10_000):
-        n = min(10_000, nchains - start)
+    for start in range(0, nchains, 50_000):
+        n = min(50_000, nchains - start)
         key, sub = random.split(key)
         seeds = jnp.asarray(uniform_region(rng, n), dtype)
         m, h, t = batch(random.split(sub, n), seeds)
@@ -90,48 +99,82 @@ def z_score(fraction, n):
 
 def test_hop_keeps_the_constrained_prior() -> None:
     n = 20_000
-    fraction, hops, tries = invariance(n)
+    fraction, hops, tries = invariance(n, seed=2)
     assert tries == n * (WALKS // modes.HOP_EVERY)  # two eligible frames
     assert hops > 0.02 * tries
     assert abs(z_score(fraction, n)) < 4.0
 
 
 @pytest.mark.slow
-def test_hop_keeps_the_constrained_prior_1e5() -> None:
-    """The gate: 10^5 chains, within 3 sigma of the volume fraction."""
-    n = 100_000
-    fraction, hops, tries = invariance(n, seed=1)
+@pytest.mark.parametrize("local", [True, False])
+def test_hop_keeps_the_constrained_prior_1e6(local) -> None:
+    """The gate: 10^6 chains (the minor fraction to 0.5% at 3 sigma), within
+    3 sigma of the volume fraction, with the local walk and without."""
+    n = 1_000_000
+    fraction, hops, tries = invariance(n, seed=1, local=local)
     z = z_score(fraction, n)
-    print(f"minor fraction {fraction:.4f} (volume {MINOR_FRACTION:.4f}) "
+    print(f"minor fraction {fraction:.5f} (volume {MINOR_FRACTION:.5f}) "
           f"z={z:+.2f} hop acceptance {hops / tries:.3f}")
     assert abs(z) < 3.0
 
 
 @pytest.mark.slow
-def test_without_leave_one_out_the_hop_is_biased() -> None:
+def test_frames_fitted_to_the_seed_bias_the_hop() -> None:
     """The control: frames that contain the seed bias the mode fractions, so
-    the invariance test has the power to see a missing downdate."""
-    n = 100_000
-    fraction, _, _ = invariance(n, loo=False, seed=1)
+    the invariance test has the power to see a seed in its own kernel."""
+    n = 200_000
+    fraction, _, _ = invariance(n, cross_fit=False, seed=1)
     z = z_score(fraction, n)
-    print(f"without LOO: minor fraction {fraction:.4f} z={z:+.2f}")
+    print(f"seed in the frames: minor fraction {fraction:.4f} z={z:+.2f}")
     assert abs(z) > 3.0
 
 
-def test_downdate_matches_a_refit() -> None:
-    rng = np.random.default_rng(3)
-    x = jnp.asarray(rng.uniform(size=(30, 4)))
-    labels = jnp.asarray(rng.integers(0, 3, 30), jnp.int32)
-    full = modes.stats(x, labels, modes.C_MAX)
-    i = 7
-    down = modes.downdate(full, x[i], labels[i], True)
-    refit = modes.stats(x, labels.at[i].set(-1), modes.C_MAX)
-    tol = 1e-4 if x.dtype == jnp.float32 else 1e-10
-    for a, b in zip(down, refit, strict=True):
-        np.testing.assert_allclose(a, b, atol=tol)
-    same = modes.downdate(full, x[i], labels[i], False)
-    for a, b in zip(same, full, strict=True):
-        np.testing.assert_array_equal(a, b)
+def test_local_walk_keeps_the_constrained_prior() -> None:
+    """One box cut into two frames of different shapes: a walk step from the
+    narrow frame is small and one from the wide frame large, so the proposal
+    is not symmetric across the cut. With the Hastings ratio the chains keep
+    the uniform law (half of the box on each side of the cut); without it
+    they pile up on the narrow side."""
+    lo, hi = 0.2, 0.8
+    dtype = jnp.result_type(float)
+
+    def box(u):
+        return jnp.where(jnp.all((u > lo) & (u < hi)), 0.0, -1.0)
+
+    rng = np.random.default_rng(0)
+    x = rng.uniform(lo, hi, (200, D))
+    lab = (x[:, 0] > 0.5).astype(np.int32)
+    narrow = lab == 0
+    x[narrow] = x[narrow].mean(0) + 0.3 * (x[narrow] - x[narrow].mean(0))
+    fr = modes.frames(modes.stats(jnp.asarray(x, dtype), jnp.asarray(lab),
+                                  modes.C_MAX), 200)
+    assert int(jnp.sum(modes.walk_frames(fr))) == 2
+    chol = core._live_chol(jnp.asarray(x, dtype), jnp.ones(200, bool))
+    n, walks = 20_000, 40
+    seeds = jnp.asarray(rng.uniform(lo, hi, (n, D)), dtype)
+    keys = random.split(random.PRNGKey(1), n)
+
+    def chain(key, s):
+        return core._chain(key, s, box(s), jnp.asarray(-0.5, dtype), chol,
+                           jnp.asarray(1.0, dtype), box, lambda v: v, walks,
+                           False, fr, False, True)[0]
+
+    walkable = modes.walk_frames(fr)
+
+    def naive(key, s):  # the same walk without the Hastings ratio
+        def step(u, key):
+            c = jnp.argmin(jnp.where(walkable, modes.mahalanobis(fr, u)[0], jnp.inf))
+            prop = u + fr.chol[c] @ random.normal(key, (D,), dtype)
+            return jnp.where(box(prop) > -0.5, prop, u), None
+
+        return jax.lax.scan(step, s, random.split(key, walks))[0]
+
+    def z(u):
+        f = float(jnp.mean(u[:, 0] < 0.5))
+        return (f - 0.5) / math.sqrt(0.25 / n)
+
+    assert abs(z(jax.jit(jax.vmap(chain))(keys, seeds))) < 4.0
+    assert z(jax.jit(jax.vmap(naive))(keys, seeds)) > 6.0
 
 
 def two_gaussians(theta):
@@ -182,8 +225,10 @@ def test_step_reclusters_on_schedule() -> None:
     cfg = Config(D, 40, 4, 10)
     state = core.init(1, two_gaussians, lambda u: u, cfg)
     state, _ = core.step(state, two_gaussians, lambda u: u, cfg)
-    assert bool(jnp.all(state.mode_count[1:] == 0)) and state.mode_count[0] == 40
-    assert int(jnp.sum(state.fitted)) == 40 - 4  # the new points are not fitted
+    # The points outside each fold are clustered: one cluster each.
+    assert bool(jnp.all(state.mode_count[:, 1:] == 0))
+    sizes = [40 - len(range(j, 40, cfg._folds)) for j in range(cfg._folds)]
+    np.testing.assert_array_equal(state.mode_count[:, 0], sizes)
 
 
 def test_batched_run_matches_single_runs_with_the_hop() -> None:

@@ -79,14 +79,19 @@ the mode weights scatter from seed to seed. tinyns clusters the live points on
 the device every quarter e-fold (`tinyns/modes.py`: hard EM, merges and Fisher
 splits in 8 cluster slots) and makes every 10th chain step an inter-mode
 *hop*: an independence Metropolis-Hastings step from the union of the
-clusters' moment-matched ellipsoids. It is exact for the constrained prior
-(each chain's ellipsoids are refit without its own seed), and in the v1
-bake-off it cut the seed-to-seed scatter of minor-mode weights about 7x at the
-same number of likelihood calls. `result.modes()` reports each mode's mass,
-an urn error bar and its smallest live count (a mode that held fewer than
-`3 * ndim` live points is flagged unresolved: raise `nlive`). See the
-CHANGELOG for the known open issues (a 1-2% underweighting of minor modes at
-10 to 18 dimensions, and biased weights at 32).
+clusters' moment-matched ellipsoids. The other steps walk in the covariance of
+the current point's cluster, with the exact Metropolis-Hastings correction for
+the change of covariance between clusters, so a mode shaped unlike the
+largest one still mixes. Both moves are exact for the constrained prior: the
+live slots form three folds, each new point is seeded from its own fold, and
+its chain's clusters and covariances are fitted to the other two folds only
+(as emcee moves each half of its walkers with the other half). In the v1
+bake-off the hop cut the seed-to-seed scatter of minor-mode weights about 7x
+at the same number of likelihood calls. `result.modes()` reports each mode's
+mass, an urn error bar and its smallest live count (a mode that held fewer
+than `3 * ndim` live points is flagged unresolved: raise `nlive`). A mode
+needs about `5 * ndim` live points for its own walk to mix: below that its
+weight keeps a bias of a few percent (see the CHANGELOG).
 
 ### Choosing `walks`
 

@@ -195,4 +195,4 @@ def test_bakeoff_runner_and_summary(tmp_path) -> None:
     summarize.main([str(out), "--out", str(report)])
     text = report.read_text()
     assert "## Decision" in text and "| sepW_d4 | 100 | 10 | B_ell |" in text
-    assert len(list(emit.cells())) == 62
+    assert len(list(emit.cells())) == 66

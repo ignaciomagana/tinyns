@@ -44,7 +44,15 @@ recomputes the cached quadrature values.
     per offset dim at d >= 10.
   - `conn`: an offset of 4 sigmas, so the two modes touch.
   - `W`/`M`: the minor-mode volume ratio, 0.21 or 0.03.
-  - d = 32 reuses the d = 18 shapes.
+  - d = 32 reuses the d = 18 shapes: the minor mode is narrowed by the same
+    factor in 15 of the 32 dims, so its volume ratio (0.21 or 0.03) is the
+    d = 18 one, and it is oriented unlike the main mode (in the main mode's
+    whitened frame its variances span 0.02 to 33). The targets are well
+    posed (the cube truncates a mass below 3e-15), but the minor mode holds
+    6% of the live points through its posterior bulk: 30 (about `d`) at
+    nlive 500 and 120 (4 `d`) at 2000, fewer than a covariance-adapted walk
+    needs (about 5 `d`), so the d = 32 cells measure a sampler's
+    small-population limit.
 - **Mode masses**: for every sampler, the mass of mode k is the
   weighted mean of the oracle responsibility `w_k N_k / sum_j w_j N_j` over the
   sampler's samples. Its exact expectation is `w_k`.
@@ -182,7 +190,7 @@ random-walk steps only; the clustering still runs).
 ```bash
 python bench/bakeoff/run.py --target sepW_d18 --arm B_ell --nlive 500 --k 50 \
     --seeds 0-39 --out results.jsonl      # one cell: 40 seeds, one batched run
-python bench/bakeoff/emit.py > jobs.txt   # queue lines of the full grid (62 cells)
+python bench/bakeoff/emit.py > jobs.txt   # queue lines of the full grid (66 cells)
 python bench/bakeoff/emit.py --estimate   # its H100 time estimate
 python bench/bakeoff/summarize.py results.jsonl --out report.md
 ```

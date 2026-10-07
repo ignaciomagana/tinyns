@@ -46,7 +46,8 @@ if str(ROOT) not in sys.path:
 from bench.run import append_jsonl, cpu_model, git_sha, parse_seeds  # noqa: E402
 
 SCHEMA = "tinyns-bakeoff-1"
-# B_ell is tinyns's always-on hop; N turns it off (the private Config._hop).
+# B_ell is tinyns's always-on hop; N turns it off (the private Config._hop),
+# keeping the rest (the folds, the clustering and the local walk).
 ARMS = ("N", "B_ell")
 
 
