@@ -59,6 +59,9 @@ def reference_evidence(logl, nlive_i):
     return np.array(logwts), float(logz), math.sqrt(max(var, 0.0))
 
 
+FOLDS = Config(1)._folds
+
+
 def fake_run(dead_logl, live_logl, m, k):
     """A final State and Dead rows (numpy) with the given likelihoods."""
     dead_logl = np.asarray(dead_logl, np.float64).reshape(-1, k)
@@ -75,10 +78,10 @@ def fake_run(dead_logl, live_logl, m, k):
         ncall=np.int32(0),
         ncall_valid=np.int32(0),
         status=np.int32(core.CONVERGED),
-        label=np.zeros(m, np.int32),
-        mode_mu=np.zeros((2, modes.C_MAX, 1)),
-        mode_scat=np.zeros((2, modes.C_MAX, 1, 1)),
-        mode_count=np.zeros((2, modes.C_MAX)),
+        label=np.zeros((FOLDS, m), np.int32),
+        mode_mu=np.zeros((FOLDS, modes.C_MAX, 1)),
+        mode_scat=np.zeros((FOLDS, modes.C_MAX, 1, 1)),
+        mode_count=np.zeros((FOLDS, modes.C_MAX)),
     )
     zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(
@@ -206,8 +209,8 @@ def test_init_and_step_shapes_dtypes_and_order() -> None:
 
 def test_seeds_are_distinct_when_possible() -> None:
     """With an impossible walk (scale ~ 0) every chain returns its seed, so the
-    new points are the seeds: live points above L* of the half of the slot
-    they fill, distinct unless that half has too few."""
+    new points are the seeds: live points above L* of the fold of the slot
+    they fill, distinct unless that fold has too few."""
     cfg = Config(2, 30, num_delete=10, walks=3)
     loglike = gauss(0.5, 0.2)
     state = init(1, loglike, identity, cfg)
@@ -219,19 +222,19 @@ def test_seeds_are_distinct_when_possible() -> None:
     seeds = np.array([int(np.flatnonzero((u == v).all(axis=1))[0])
                       for v in np.asarray(new.u)[filled]])
     assert np.all(above[seeds])
-    half = np.arange(30) % 2
-    for h in (0, 1):
-        mine = seeds[half[filled] == h]
-        assert np.all(half[mine] == h)
-        assert len(set(mine.tolist())) == min(len(mine), int(above[half == h].sum()))
+    fold = np.arange(30) % cfg._folds
+    for j in range(cfg._folds):
+        mine = seeds[fold[filled] == j]
+        assert np.all(fold[mine] == j)
+        assert len(set(mine.tolist())) == min(len(mine), int(above[fold == j].sum()))
 
 
 @pytest.mark.parametrize("k", [1, 6])
 def test_seeds_and_walk_covariance_are_cross_fitted(monkeypatch, k) -> None:
-    """Each new point is seeded from a live point of its own half (the parity
-    of the dead slot it fills), and the walk covariance of the chains seeded
-    in half h comes from the points of the other half above L*. With an
-    impossible walk the new points are the seeds."""
+    """Each new point is seeded from a live point of its own fold (the fold of
+    the dead slot it fills), and the walk covariance of the chains seeded in
+    fold j comes from the points outside fold j above L*. With an impossible
+    walk the new points are the seeds."""
     masks = []
     live_chol = core._live_chol
 
@@ -247,29 +250,30 @@ def test_seeds_and_walk_covariance_are_cross_fitted(monkeypatch, k) -> None:
     new, dead = core._step(state, loglike, identity, cfg)  # eager: the spy runs
     u = np.asarray(state.u)
     above = np.asarray(state.logl) > float(dead.logl[-1])
-    half = np.arange(30) % 2
-    for h, mask in enumerate(masks):
-        np.testing.assert_array_equal(mask, above & (half != h))
+    fold = np.arange(30) % cfg._folds
+    assert len(masks) == cfg._folds
+    for j, mask in enumerate(masks):
+        np.testing.assert_array_equal(mask, above & (fold != j))
     filled = np.flatnonzero(np.asarray(new.logl_birth) > -np.inf)
     seeds = [int(np.flatnonzero((u == v).all(axis=1))[0])
              for v in np.asarray(new.u)[filled]]
     assert len(set(seeds)) == k and all(above[seeds])
-    np.testing.assert_array_equal(half[seeds], half[filled])
+    np.testing.assert_array_equal(fold[seeds], fold[filled])
 
 
-def test_seeds_fall_back_when_a_half_runs_short() -> None:
-    """A half with too few points above L* reuses them; a half with none
-    borrows from the other half."""
+def test_seeds_fall_back_when_a_fold_runs_short() -> None:
+    """A fold with too few points above L* reuses them; a fold with none
+    borrows from the others (two folds: the parity of the slot)."""
     above = jnp.asarray([True, False, True, False, False, False, True, False])
     worst = jnp.asarray([1, 3, 5, 4])  # three odd slots, one even
     seeds = np.asarray(core._seeds(
-        random.PRNGKey(0), random.PRNGKey(1), above, worst, FLOAT
+        random.PRNGKey(0), random.PRNGKey(1), above, worst, 2, FLOAT
     ))
     assert seeds[3] in (0, 2, 6)  # the even slot: an even point above L*
-    assert all(above[np.asarray(seeds)])  # odd slots: none above, any half
+    assert all(above[np.asarray(seeds)])  # odd slots: none above, any fold
     above = jnp.asarray([True, True, True, False, False, False, True, False])
     seeds = np.asarray(core._seeds(
-        random.PRNGKey(0), random.PRNGKey(1), above, worst, FLOAT
+        random.PRNGKey(0), random.PRNGKey(1), above, worst, 2, FLOAT
     ))
     assert set(seeds[:3].tolist()) == {1}  # the only odd point, reused
 

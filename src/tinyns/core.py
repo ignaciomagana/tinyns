@@ -109,15 +109,16 @@ class Config:
     ``walks`` steps per replacement chain, default :func:`default_walks`
     (``max(25, 6 ndim, ndim^2 // 6)``).
 
-    The live slots form two fixed halves (even and odd indices); each half is
-    clustered every :attr:`recluster_every` steps, and a replacement chain
-    seeded in one half is driven by the other half alone (cross-fitting,
-    :mod:`tinyns.modes`). Every ``HOP_EVERY``-th chain step is the inter-mode
-    hop; the other steps are a random walk in the covariance of the cluster
-    of the current point. Private switches, for comparisons such as
-    ``bench/bakeoff/``: ``_hop=False`` replaces the hop by walk steps (the
-    clustering still runs) and ``_local=False`` makes the walk use the live
-    covariance of the other half everywhere.
+    The live slots form ``K = _folds`` fixed folds (slot index mod ``K``);
+    every :attr:`recluster_every` steps the points outside each fold are
+    clustered, and a replacement chain seeded in a fold is driven by the
+    points outside it alone (cross-fitting, :mod:`tinyns.modes`). Every
+    ``HOP_EVERY``-th chain step is the inter-mode hop; the other steps are a
+    random walk in the covariance of the cluster of the current point.
+    Private switches, for comparisons such as ``bench/bakeoff/``:
+    ``_hop=False`` replaces the hop by walk steps (the clustering still
+    runs), ``_local=False`` makes the walk use the live covariance (of the
+    points outside the fold) everywhere, and ``_folds`` sets ``K``.
     """
 
     ndim: int
@@ -126,6 +127,7 @@ class Config:
     walks: int | None = None
     _hop: bool = True
     _local: bool = True
+    _folds: int = 4
 
     def __post_init__(self):
         ndim = _check_int("ndim", self.ndim, 1)
@@ -139,6 +141,7 @@ class Config:
         for name in ("_hop", "_local"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
+        _check_int("_folds", self._folds, 2)
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
@@ -189,13 +192,14 @@ class State(NamedTuple):
     ncall: Any  # int32 likelihood evaluations
     ncall_valid: Any  # int32 in-cube likelihood evaluations
     status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL or PLATEAU
-    # Mode tracking (tinyns.modes): the cluster label of each live point in
-    # the slots of its own half, and the statistics of the C_MAX cluster
-    # slots of each half (axis 0: half 0, the even slots; half 1, the odd).
-    label: Any  # (m,) int32
-    mode_mu: Any  # (2, C, d)
-    mode_scat: Any  # (2, C, d, d)
-    mode_count: Any  # (2, C)
+    # Mode tracking (tinyns.modes). The live slots form K folds (slot index
+    # mod K); clustering j is of the points outside fold j. label[j, i] is
+    # point i's cluster slot in clustering j (-1 when i is in fold j), and
+    # the statistics are those of the C_MAX slots of each clustering.
+    label: Any  # (K, m) int32
+    mode_mu: Any  # (K, C, d)
+    mode_scat: Any  # (K, C, d, d)
+    mode_count: Any  # (K, C)
 
 
 class Dead(NamedTuple):
@@ -206,10 +210,11 @@ class Dead(NamedTuple):
     ``m - k`` surviving live points (uniform on ``0..m-k`` for a correct
     constrained sampler), the accepted moves of its chain (0: the chain
     returned its seed), and the accepted and attempted hops among them.
-    ``label`` is each dead point's cluster label when it died (its slot in
-    its half, plus ``C_MAX`` for half 1), and ``nclusters`` / ``neligible``
-    the step's number of clusters (the larger of the two halves) and of
-    frames taking part in the hop (the smaller), the same in every row.
+    ``label`` is each dead point's cluster label when it died (its slot ``s``
+    in clustering ``j``, the next fold's, as ``j * C_MAX + s``), and
+    ``nclusters`` / ``neligible`` the step's number of clusters (the largest
+    over the clusterings) and of frames taking part in the hop (the
+    smallest), the same in every row.
     """
 
     u: Any  # (k, d)
@@ -262,11 +267,11 @@ def _live_chol(u, mask):
 
 def _walk_mask(above, other, seeds, ndim):
     """The live points whose covariance shapes the walk of the chains seeded
-    in one half: the points of the ``other`` half above ``L*``.
+    in one fold: the points ``other`` (outside the fold) above ``L*``.
 
     None of them is a chain's seed or (by the seeding rule of :func:`_step`)
-    an ancestor of one, so the proposal depends only on the other half, and
-    (for independent live points) given that half a seed is a uniform draw
+    an ancestor of one, so the proposal depends only on the other folds, and
+    (for independent live points) given them a seed is a uniform draw
     inside the contour. A Metropolis walk with a proposal fixed in advance
     leaves that uniform distribution invariant, so the chain's end point is
     exactly uniform inside the contour for any number of steps. A seed that
@@ -420,7 +425,10 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         lambda v: _loglike_u(loglike, prior_transform, v, dtype), u, batch_size=k
     )
     i32 = jnp.int32
-    mu, scat, count = (jnp.stack([x, x]) for x in _modes.empty_stats(d, dtype))
+    folds = cfg._folds
+    mu, scat, count = (
+        jnp.stack([x] * folds) for x in _modes.empty_stats(d, dtype)
+    )
     return State(
         key=key,
         u=u,
@@ -432,46 +440,68 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         ncall=jnp.asarray(m, i32),
         ncall_valid=jnp.asarray(m, i32),
         status=jnp.asarray(RUNNING, i32),
-        label=jnp.zeros((m,), i32),
+        label=jnp.where(_fold(m, folds)[None, :] == jnp.arange(folds)[:, None], -1, 0)
+        .astype(i32),
         mode_mu=mu,
         mode_scat=scat,
         mode_count=count,
     )
 
 
-def _half(m: int):
-    """The half of each live slot: 0 for even indices, 1 for odd ones."""
-    return jnp.arange(m, dtype=jnp.int32) % 2
+def _fold(m: int, folds: int):
+    """The fold of each live slot: its index mod ``folds``."""
+    return jnp.arange(m, dtype=jnp.int32) % folds
 
 
-def _stats(state: State, h) -> _modes.Stats:
-    """The cluster statistics of half ``h``."""
-    return _modes.Stats(state.mode_mu[h], state.mode_scat[h], state.mode_count[h])
+def _complements(m: int, folds: int) -> np.ndarray:
+    """``(folds, n)`` slot indices outside each fold (static), padded with -1."""
+    idx = [np.flatnonzero(np.arange(m) % folds != j) for j in range(folds)]
+    n = max(len(i) for i in idx)
+    return np.stack([np.concatenate([i, np.full(n - len(i), -1)]) for i in idx])
+
+
+def _stats(state: State, j) -> _modes.Stats:
+    """The cluster statistics of clustering ``j`` (the points outside fold j)."""
+    return _modes.Stats(state.mode_mu[j], state.mode_scat[j], state.mode_count[j])
+
+
+def _reported_label(label, slot_fold, folds: int):
+    """The label recorded for :meth:`~tinyns.NestedSamplingResult.modes`: a
+    point's slot in the clustering of the next fold, ``j = (fold + 1) mod
+    folds`` (one that contains the point), as ``j * C_MAX + slot``;
+    ``modes()`` merges the labels of different clusterings that cover one
+    mode."""
+    j = (slot_fold + 1) % folds
+    return jnp.take_along_axis(label, j[None, :], 0)[0] + _modes.C_MAX * j
 
 
 def _recluster(state: State, batched: bool = False) -> State:
-    """Recluster each half of the live points on its own
-    (:func:`tinyns.modes.recluster_lanes`, two lanes per run): every live
-    point gets a fresh label in the slots of its half, and the statistics of
-    each half are refitted. ``batched``: the state has a leading lane axis.
+    """Recluster the points outside each fold (one lane per fold,
+    :func:`tinyns.modes.recluster_lanes`): every live point gets a fresh label
+    in every clustering but its own fold's, and the statistics are refitted.
+    ``batched``: the state has a leading lane axis.
     """
     u, label = state.u, state.label
     if not batched:
         u, label = u[None], label[None]
-    lanes, m, _ = u.shape
-    h = (m + 1) // 2  # the odd half is padded to this length (label -1)
-
-    def halves(x, fill):
-        even, odd = x[:, 0::2], x[:, 1::2]
-        if odd.shape[1] < h:
-            pad = jnp.full((lanes, 1, *odd.shape[2:]), fill, odd.dtype)
-            odd = jnp.concatenate([odd, pad], 1)
-        return jnp.stack([even, odd], 1).reshape(lanes * 2, h, *x.shape[2:])
-
-    lab2, st2 = _modes.recluster_lanes(halves(u, 0.5), halves(label, -1))
-    lab2 = lab2.reshape(lanes, 2, h)
-    label = label.at[:, 0::2].set(lab2[:, 0]).at[:, 1::2].set(lab2[:, 1, : m // 2])
-    mu, scat, count = (x.reshape(lanes, 2, *x.shape[1:]) for x in st2)
+    lanes, m, d = u.shape
+    folds = label.shape[1]
+    comp = _complements(m, folds)  # (folds, n)
+    valid = jnp.asarray(comp >= 0)
+    at = jnp.asarray(np.maximum(comp, 0))
+    sub_u = u[:, at]  # (lanes, folds, n, d)
+    sub_lab = jnp.take_along_axis(label, at[None], 2)  # (lanes, folds, n)
+    sub_lab = jnp.where(valid[None], sub_lab, -1)
+    n = comp.shape[1]
+    lab, st = _modes.recluster_lanes(
+        sub_u.reshape(lanes * folds, n, d), sub_lab.reshape(lanes * folds, n)
+    )
+    lab = jnp.where(valid[None], lab.reshape(lanes, folds, n), -1)
+    # Scatter back (padding goes to a dummy column m, dropped).
+    cols = jnp.where(valid, at, m)
+    label = jnp.full((lanes, folds, m + 1), -1, jnp.int32)
+    label = label.at[:, jnp.arange(folds)[:, None], cols].set(lab)[..., :m]
+    mu, scat, count = (x.reshape(lanes, folds, *x.shape[1:]) for x in st)
     if not batched:
         label, mu, scat, count = label[0], mu[0], scat[0], count[0]
     return state._replace(label=label, mode_mu=mu, mode_scat=scat, mode_count=count)
@@ -501,30 +531,30 @@ def _maybe_recluster(state: State, cfg: Config, batched: bool = False) -> State:
     )
 
 
-def _seeds(key_seed, key_fill, above, worst, dtype):
+def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     """The seed of each new point: a distinct live point above ``L*`` of the
-    half of the dead slot it fills (Gumbel top-k within the half), drawn with
-    replacement only when that half has too few, and from the whole live set
+    fold of the dead slot it fills (Gumbel top-k within the fold), drawn with
+    replacement only when that fold has too few, and from the whole live set
     only when it has none. A live point and its descendants thus stay in one
-    half."""
+    fold."""
     m, k = above.shape[0], worst.shape[0]
-    half = _half(m)
+    fold = _fold(m, folds)
     score = jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
-    dead_half = half[worst]
-    rank = jnp.cumsum(jax.nn.one_hot(dead_half, 2, dtype=jnp.int32), 0) - 1
-    rank = jnp.take_along_axis(rank, dead_half[:, None], 1)[:, 0]
+    dead_fold = fold[worst]
+    rank = jnp.cumsum(jax.nn.one_hot(dead_fold, folds, dtype=jnp.int32), 0) - 1
+    rank = jnp.take_along_axis(rank, dead_fold[:, None], 1)[:, 0]
     tops = jnp.stack([
-        lax.top_k(jnp.where(half == h, score, -jnp.inf), k)[1] for h in (0, 1)
+        lax.top_k(jnp.where(fold == j, score, -jnp.inf), k)[1] for j in range(folds)
     ])
-    n_half = jnp.stack([jnp.sum(above & (half == h)) for h in (0, 1)])
-    mine = above[None, :] & (half[None, :] == dead_half[:, None])
+    n_fold = jnp.stack([jnp.sum(above & (fold == j)) for j in range(folds)])
+    mine = above[None, :] & (fold[None, :] == dead_fold[:, None])
     logits = jnp.where(
-        (n_half[dead_half] > 0)[:, None],
+        (n_fold[dead_fold] > 0)[:, None],
         jnp.where(mine, 0.0, -jnp.inf),
         jnp.where(above, 0.0, -jnp.inf)[None, :],
     )
     fill = random.categorical(key_fill, logits, axis=-1)
-    return jnp.where(rank < n_half[dead_half], tops[dead_half, rank], fill)
+    return jnp.where(rank < n_fold[dead_fold], tops[dead_fold, rank], fill)
 
 
 def _step(state: State, loglike, prior_transform, cfg: Config):
@@ -537,28 +567,29 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
     survivor = jnp.ones((m,), bool).at[worst].set(False)
     above = state.logl > lstar
     n_above = jnp.sum(above, dtype=jnp.int32)
-    half = _half(m)
+    folds = cfg._folds
+    fold = _fold(m, folds)
     key, k_seed, k_fill, k_chain = random.split(state.key, 4)
-    seeds = _seeds(k_seed, k_fill, above, worst, dtype)
+    seeds = _seeds(k_seed, k_fill, above, worst, folds, dtype)
 
-    # Cross-fitting: the kernel of a chain seeded in half h (the walk
+    # Cross-fitting: the kernel of a chain seeded in fold j (the walk
     # covariance, the cluster frames of the hop and of the local walk) is
-    # built from half 1 - h alone.
+    # built from the points outside fold j alone.
     chols = jnp.stack([
-        _live_chol(state.u, _walk_mask(above, half != h, seeds, cfg.ndim))
-        for h in (0, 1)
+        _live_chol(state.u, _walk_mask(above, fold != j, seeds, cfg.ndim))
+        for j in range(folds)
     ])
-    frames = jax.tree_util.tree_map(  # frames[h]: fitted to half h
-        lambda a, b: jnp.stack([a, b]), *(_modes.frames(_stats(state, h), m) for h in (0, 1))
+    frames = jax.tree_util.tree_map(  # frames[j]: fitted outside fold j
+        lambda *a: jnp.stack(a), *(_modes.frames(_stats(state, j), m) for j in range(folds))
     )
     scale = jnp.exp(state.log_scale)
 
     def chain(key, i, skip):
-        h = half[i]
+        j = fold[i]
         return _chain(
-            key, state.u[i], state.logl[i], lstar, chols[h], scale, loglike,
+            key, state.u[i], state.logl[i], lstar, chols[j], scale, loglike,
             prior_transform, walks, skip,
-            jax.tree_util.tree_map(lambda a: a[1 - h], frames), cfg._hop, cfg._local,
+            jax.tree_util.tree_map(lambda a: a[j], frames), cfg._hop, cfg._local,
         )
 
     if k == 1:  # no vmap: the cond really skips out-of-cube proposals
@@ -597,14 +628,16 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
         ncall_valid=ncall_valid,
         status=state.status,
     )
-    # A new point takes the label of the nearest frame of its own half; it is
-    # not in the cluster statistics until the next recluster.
+    # A new point takes the label of the nearest frame of every clustering
+    # but its own fold's; it is not in the cluster statistics until the next
+    # recluster.
     i32 = jnp.int32
-    dead_half = half[worst]
-    nearest = jax.vmap(lambda h, x: _modes.nearest(
-        jax.tree_util.tree_map(lambda a: a[h], frames), x[None]
-    )[0])
-    new = new._replace(label=state.label.at[worst].set(nearest(dead_half, new_u)))
+    dead_fold = fold[worst]
+    nearest = jax.vmap(  # over clusterings j: (folds, k)
+        lambda fr: _modes.nearest(fr, new_u)
+    )(frames)
+    nearest = jnp.where(jnp.arange(folds)[:, None] == dead_fold[None, :], -1, nearest)
+    new = new._replace(label=state.label.at[:, worst].set(nearest))
     n_clusters = jnp.max(jnp.sum(frames.active, axis=1))
     n_eligible = jnp.min(jnp.sum(frames.eligible, axis=1))
     dead = Dead(
@@ -613,7 +646,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config):
         state.logl_birth[worst],
         insertion,
         moves,
-        label=state.label[worst] + _modes.C_MAX * dead_half,
+        label=_reported_label(state.label[:, worst], dead_fold, folds),
         hops=hops,
         hop_tries=hop_tries,
         nclusters=jnp.full((k,), n_clusters, i32),
@@ -835,7 +868,9 @@ def finalise(
         np.asarray(dead.logl_birth, np.float64).reshape(-1),
         np.asarray(state.logl_birth, np.float64)[order],
     ])
-    live_label = np.asarray(state.label) + _modes.C_MAX * (np.arange(m) % 2)
+    live_label = np.asarray(_reported_label(
+        jnp.asarray(state.label), _fold(m, cfg._folds), cfg._folds
+    ))
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)

@@ -21,7 +21,8 @@ for p in sys.argv[1:]:
             p_ = np.array([r["mass"][j] for r in rs]); kept = p_ > 1e-3 * tm[j]
             lg = np.log(p_[kept] / (1 - p_[kept])) - math.log(tm[j] / (1 - tm[j]))
             b, se, sd = ms(lg)
-            line += f" | mode{j} logit {b:+.4f}+-{se:.4f} sd {sd:.3f} lost {1-kept.mean():.2f}"
+            rel = p_ / tm[j] - 1
+            line += f" | mode{j} mass/truth-1 {rel.mean():+.4f}+-{rel.std(ddof=1)/math.sqrt(n):.4f} logit {b:+.4f}+-{se:.4f} (jensen {-0.5*sd**2:+.4f}) sd {sd:.3f} lost {1-kept.mean():.2f}"
             ins = [r["ins"][j]["mean2"] for r in rs if r["ins"][j]["mean2"] is not None]
             i0 = [r["ins"][0]["mean2"] for r in rs if r["ins"][0]["mean2"] is not None]
             if ins: line += f" ins2 minor {np.mean(ins):.4f}+-{np.std(ins)/math.sqrt(len(ins)):.4f} main {np.mean(i0):.4f}+-{np.std(i0)/math.sqrt(len(i0)):.4f}"

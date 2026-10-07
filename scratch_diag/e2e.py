@@ -8,6 +8,25 @@ import jax, jax.numpy as jnp
 from tinyns import core, modes
 if os.environ.get("TINYNS_WALK_MIN"):  # experiments: the walk-frame size
     modes.WALK_MIN_POINTS = int(os.environ["TINYNS_WALK_MIN"])
+if os.environ.get("TINYNS_HOP_CYCLE"):  # experiments: hops packed early in a chain
+    modes.HOP_CYCLE = int(os.environ["TINYNS_HOP_CYCLE"])
+if os.environ.get("TINYNS_SHRINK"):  # experiments: prior weight (x d points)
+    modes.SHRINK = float(os.environ["TINYNS_SHRINK"])
+if os.environ.get("TINYNS_ELIG", "").startswith("kd:"):  # experiments: count >= c d
+    _c = float(os.environ["TINYNS_ELIG"][3:])
+    from jax.scipy.special import logsumexp as _lse
+    import jax.numpy as _jnp
+    def _elig_kd(logdet, count, active, nlive, d):
+        logv = _jnp.where(active, logdet, -_jnp.inf)
+        share = _jnp.exp(logv - _lse(logv))
+        el = active & (nlive * share >= modes.ELIGIBLE_PER_DIM * d) & (count >= _c * d)
+        largest = _jnp.argmax(_jnp.where(active, count, -1.0))
+        return el.at[largest].set(active[largest])
+    modes._eligible = _elig_kd
+if os.environ.get("TINYNS_ELIG") == "all":  # experiments: no population-dependent eligibility
+    def _elig_all(logdet, count, active, nlive, d):
+        return active & (count >= 3)
+    modes._eligible = _elig_all
 from bench.targets import get_target, mixture_spec
 name, m, lo, hi, B, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
 extra = json.loads(sys.argv[7]) if len(sys.argv) > 7 else {}
@@ -59,7 +78,7 @@ for s0 in range(lo, hi, B):
     with open(out, "a") as f:
         for s, r in zip(seeds, res):
             md = r.metadata
-            rec = dict(target=name, nlive=m, seed=s, cfg=extra, walk_min=os.environ.get("TINYNS_WALK_MIN"), logz=float(r.logz), logzerr=float(r.logzerr),
+            rec = dict(target=name, nlive=m, seed=s, cfg=extra, walk_min=os.environ.get("TINYNS_WALK_MIN"), elig=os.environ.get("TINYNS_ELIG"), hop_cycle=os.environ.get("TINYNS_HOP_CYCLE"), shrink=os.environ.get("TINYNS_SHRINK"), logz=float(r.logz), logzerr=float(r.logzerr),
                        truth=tg.logz, ncall=int(r.ncall), niter=int(r.niter), hop_acc=md.get("hop_acceptance"),
                        acc=md.get("acceptance"), unmoved=md.get("unmoved_fraction"), hist=md.get("mode_history"),
                        wall=wall / len(seeds))
