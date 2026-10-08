@@ -121,7 +121,7 @@ any covariance-adapted walk: on one Gaussian with the shape of sepW_d18's
 minor mode, nlive 30, 60 and 120 give logZ 4.35 +- 0.07, 0.21 +- 0.05 and
 0.03 +- 0.04 too high. A minor mode that small (sepW_d18 at nlive 500: 30 to
 70 points; the d = 32 targets) keeps a bias of a few percent whatever the
-moves; see the CHANGELOG.
+moves; see the known limitations in the CHANGELOG.
 """
 
 from __future__ import annotations

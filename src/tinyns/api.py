@@ -10,6 +10,11 @@ from tinyns.result import NestedSamplingResult
 class NestedSampler:
     """Nested sampler with ``num_delete`` replacements per step, all in JAX.
 
+    Each step deletes the ``num_delete`` lowest live points and replaces them
+    with the ends of that many parallel Metropolis chains of ``walks`` steps:
+    a random walk in the covariance of the current point's cluster, with an
+    inter-mode hop every 10th step (:mod:`tinyns.modes`).
+
     Parameters
     ----------
     loglike:
@@ -89,8 +94,10 @@ class NestedSampler:
 
         ``key`` may be a batch of keys (``jax.random.split(key, B)``): the
         ``B`` runs go through one compiled program (the step is vmapped over
-        the runs) and a list of ``B`` results is returned. Each equals the
-        run of its key alone. With ``batched_data=True`` every array leaf of
+        the runs) and a list of ``B`` results is returned. Each is a draw from
+        the same distribution as the run of its key alone but is not
+        bit-identical to it (vmap changes the summation order; in float64 the
+        two agree to roundoff). With ``batched_data=True`` every array leaf of
         a pytree ``loglike`` or ``prior_transform`` (e.g.
         ``jax.tree_util.Partial(fn, data)`` with ``data`` stacked over runs)
         carries the same leading axis of ``B``: run ``i`` sees slice ``i``.

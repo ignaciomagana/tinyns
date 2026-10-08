@@ -1,9 +1,4 @@
-"""Small numerical helpers used by the sampler implementation.
-
-These helpers are deliberately minimal for the initial scaffold. They provide
-stable log-space operations that are useful for nested-sampling bookkeeping and
-are easy to validate independently before the sampler itself is implemented.
-"""
+"""Small log-space helpers for the result object: weights, ESS, resampling."""
 
 from __future__ import annotations
 
