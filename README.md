@@ -87,11 +87,14 @@ live slots form three folds, each new point is seeded from its own fold, and
 its chain's clusters and covariances are fitted to the other two folds only
 (as emcee moves each half of its walkers with the other half). In the v1
 bake-off the hop cut the seed-to-seed scatter of minor-mode weights about 7x
-at the same number of likelihood calls. `result.modes()` reports each mode's
-mass, an urn error bar and its smallest live count (a mode that held fewer
-than `3 * ndim` live points is flagged unresolved: raise `nlive`). A mode
-needs about `5 * ndim` live points for its own walk to mix: below that its
-weight keeps a bias of a few percent (see the CHANGELOG).
+at the same number of likelihood calls. The mode tracking adds about 6% to
+the run time at 1 ms per likelihood call (H100, 40 batched runs; at most 18%
+over the bake-off cells), and nothing per chain step while a run holds one
+cluster. `result.modes()` reports each mode's
+mass, an urn error bar and its smallest live count. A mode needs about
+`5 * ndim` live points for its own walk to mix; below that its weight keeps a
+bias of a few percent (see the CHANGELOG), and `modes()` flags it unresolved:
+raise `nlive`.
 
 ### Choosing `walks`
 

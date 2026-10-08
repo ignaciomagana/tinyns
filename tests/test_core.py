@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from jax import random
 
-from tinyns import Config, NestedSampler, core, finalise, init, modes, step
+from tinyns import Config, NestedSampler, core, finalise, init, step
 
 FLOAT = jnp.result_type(float)
 
@@ -79,9 +79,7 @@ def fake_run(dead_logl, live_logl, m, k):
         ncall_valid=np.int32(0),
         status=np.int32(core.CONVERGED),
         label=np.zeros((FOLDS, m), np.int32),
-        mode_mu=np.zeros((FOLDS, modes.C_MAX, 1)),
-        mode_scat=np.zeros((FOLDS, modes.C_MAX, 1, 1)),
-        mode_count=np.zeros((FOLDS, modes.C_MAX)),
+        **core._empty_frames(1, FOLDS, FLOAT),
     )
     zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(
@@ -276,6 +274,16 @@ def test_seeds_fall_back_when_a_fold_runs_short() -> None:
         random.PRNGKey(0), random.PRNGKey(1), above, worst, 2, FLOAT
     ))
     assert set(seeds[:3].tolist()) == {1}  # the only odd point, reused
+    # Seeds drawn with replacement are uniform on the fold's points above L*
+    # (here the borrowed ones: slots 0, 2 and 6 for the three odd deaths).
+    above = jnp.asarray([True, False, True, False, False, False, True, False])
+    draw = jax.jit(jax.vmap(
+        lambda key: core._seeds(random.PRNGKey(0), key, above, worst, 2, FLOAT)
+    ))
+    seeds = np.asarray(draw(random.split(random.PRNGKey(2), 3000)))[:, :3]
+    counts = np.array([(seeds == slot).sum() for slot in (0, 2, 6)])
+    assert counts.sum() == seeds.size
+    assert np.all(np.abs(counts - 3000) < 4 * np.sqrt(9000 * (1 / 3) * (2 / 3)))
 
 
 def test_walk_mask_falls_back_when_too_few_points_remain() -> None:

@@ -1,4 +1,4 @@
-"""Checkpoints (``tinyns-ckpt-4``): kill and resume, refusals, atomic writes,
+"""Checkpoints (``tinyns-ckpt-5``): kill and resume, refusals, atomic writes,
 progress lines and the accumulated wall time."""
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import pytest
 from tinyns import NestedSampler, core
 from tinyns import checkpoint as ckpt
 
-TIMING = {"wall_time_s", "compile_s", "chunks", "resumed"}
+TIMING = {"wall_time_s", "compile_s", "sampling_s", "chunks", "resumed"}
 
 
 def gauss(x):
@@ -139,7 +139,7 @@ def test_mismatches_are_refused(tmp_path) -> None:
     for field, value, match in (
         ("x64", not x64, "x64 flag"),
         ("dtype", "float16", "float dtype"),
-        ("format", "tinyns-ckpt-3", "not a tinyns-ckpt-4"),
+        ("format", "tinyns-ckpt-4", "not a tinyns-ckpt-5"),
     ):
         with np.load(path) as data:
             arrays = dict(data)
@@ -153,7 +153,7 @@ def test_mismatches_are_refused(tmp_path) -> None:
 
     junk = tmp_path / "junk.npz"
     junk.write_bytes(b"not a checkpoint")
-    with pytest.raises(ValueError, match="not a tinyns-ckpt-4"):
+    with pytest.raises(ValueError, match="not a tinyns-ckpt-5"):
         sampler.run(0, checkpoint=junk)
 
 

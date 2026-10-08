@@ -36,9 +36,13 @@ _RESULT_NPZ_SCALARS = {
     "message": str,
 }
 # A mode whose live count falls below this many points per dimension between
-# its isolation and its posterior bulk is flagged unresolved (raise nlive):
-# modes above it are weighed reliably, modes below it are not.
-UNRESOLVED_PER_DIM = 3.0
+# its isolation and its posterior bulk is flagged unresolved (raise nlive). A
+# covariance-adapted walk needs about that many points to learn a mode's
+# shape: on one Gaussian with the shape of the minor mode of the 18-D
+# bake-off target, 1.7, 3.3 and 6.7 points per dimension left logZ 4.35,
+# 0.21 and 0.03 too high, and the bake-off cells whose minor mode held fewer
+# than 5 per dimension kept a weight bias or a large scatter.
+UNRESOLVED_PER_DIM = 5.0
 # Two clusters are one mode unless, at each of their posterior medians, their
 # live points leave a gap of this many within-cluster standard deviations
 # along the discriminant direction. The split test also cuts one curved mode
@@ -534,7 +538,9 @@ class NestedSamplingResult:
         label = compact(np.where(light[label], np.argmax(mass), label))
         k = int(label.max()) + 1
         # 2. Labels with at most ndim distinct live points at their posterior
-        # median join the nearest other label.
+        # median join the nearest other label (the Mahalanobis distance to
+        # its live points at its own median: at the small label's median it
+        # may be down to a few points, which span no covariance).
         when = [median(label == c) for c in range(k)]
         tiny = [
             len(np.unique(u[alive(when[c]) & (label == c)], axis=0)) <= ndim
@@ -548,7 +554,9 @@ class NestedSamplingResult:
             mine = u[live & (label == c)]
             centre = mine.mean(0) if len(mine) else u[label == c].mean(0)
             dist = [
-                math.inf if tiny[b] else _mahalanobis2(u[live & (label == b)], centre)
+                math.inf
+                if tiny[b]
+                else _mahalanobis2(u[alive(when[b]) & (label == b)], centre)
                 for b in range(k)
             ]
             heaviest = max((b for b in range(k) if not tiny[b]), key=lambda b: mass[b])

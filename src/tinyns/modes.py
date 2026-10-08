@@ -41,8 +41,9 @@ d`` live points (``m V_c / sum V >= 2 d``) and it has more than ``d``
 members; the most populated cluster always is. A frame *walks*
 (:func:`walk_frames`) if it has at least ``WALK_MIN_POINTS = 3`` members (a
 small mode keeps its own covariance, shrunk toward the pooled one, until it
-is nearly gone). New live points take the label of the nearest frame of each
-clustering until the next recluster. The labels are also the record that
+is nearly gone). The frames are factorized once, at the recluster, and kept
+in the state until the next one; new live points take the label of the
+nearest frame of each clustering until then. The labels are also the record that
 :meth:`tinyns.NestedSamplingResult.modes` reads: a point's slot in the
 clustering of the next fold (which contains it), as ``j * C_MAX + slot``;
 ``modes()`` merges the labels of different clusterings that cover one mode.
@@ -55,8 +56,10 @@ uniformly in its ellipsoid, so the proposal density ``q(x)`` is proportional
 to the number of ellipsoids containing ``x``. The proposal ``x'`` is accepted
 iff it is in the cube, above ``L*`` and ``U < q(x) / q(x')``; a start outside
 every ellipsoid (``q(x) = 0``) never moves. With fewer than two eligible
-frames the hop step is a walk step. The private ``Config._hop=False`` turns
-the hop off (the clustering still runs), for comparisons.
+frames the hop step is a walk step. The proposal does not depend on the
+chain's point, so a chain draws those of all its hop steps before it runs
+(:func:`hop_proposal`). The private ``Config._hop=False`` turns the hop off
+(the clustering still runs), for comparisons.
 
 **The local walk.** The other steps propose ``y = x + s L_c(x) z``, with
 ``c(x)`` the nearest walking frame (Mahalanobis distance) and ``L_c`` its
@@ -66,6 +69,18 @@ accepted iff it is in the cube, above ``L*`` and ``U < N(x | y, s^2 S_c(y)) /
 N(y | x, s^2 S_c(x))``. With fewer than two walking frames the walk uses the
 live covariance of the points outside the fold (symmetric). The private
 ``Config._local=False`` always uses that covariance, for comparisons.
+
+**Cost.** A chain carries the whitened offsets ``L_c^-1 (x - mu_c)`` of its
+point to the frames, so a step whitens one point, the proposal, and reads the
+label, the Hastings ratio and the hop's count of ellipsoids from the two sets
+of offsets. A step of the sampler picks the cheapest of three chain kernels
+that its frames allow (:func:`tinyns.core._kernel_level`; they return the
+same chains): plain symmetric walks while no clustering has two walk clusters
+or two eligible ones (every unimodal run), a kernel that looks up the two
+frames in use when no clustering has more, and one that looks up all
+``C_MAX``. The split search of a recluster runs in rounds, one cluster of
+every clustering per round, as many as the clustering with the most clusters
+needs.
 
 **Why the chains are exact.** For independent live points, given the points
 outside fold ``j`` (and the dead points), a seed drawn from the points of fold
@@ -247,6 +262,14 @@ def frames(st: Stats, nlive: int | None = None) -> Frames:
     return Frames(mu, chol, ichol, logdet, count, active, eligible)
 
 
+def empty_frames(ndim: int, dtype) -> Frames:
+    """Frames of ``C_MAX`` empty slots (none active)."""
+    eye = jnp.broadcast_to(jnp.eye(ndim, dtype=dtype), (C_MAX, ndim, ndim))
+    zero = jnp.zeros((C_MAX,), dtype)
+    off = jnp.zeros((C_MAX,), bool)
+    return Frames(jnp.zeros((C_MAX, ndim), dtype), eye, eye, zero, zero, off, off)
+
+
 def _eligible(logdet, count, active, nlive, d):
     """Volume share predicts ``2 d`` live points, more than ``d`` members; the
     most populated cluster always takes part."""
@@ -285,49 +308,72 @@ def hop_enabled(fr: Frames):
     return jnp.sum(fr.eligible) >= 2
 
 
-def _unit_ball(key, d, dtype):
-    k_dir, k_rad = random.split(key)
-    z = random.normal(k_dir, (d,), dtype)
-    return z / jnp.linalg.norm(z) * random.uniform(k_rad, (), dtype) ** (1.0 / d)
+def hop_proposal(key, eligible, logdet, frame):
+    """Draw a hop proposal: ``(point, uniform)``.
 
-
-def propose_hop(key, u, fr: Frames):
-    """Propose the hop from ``u``; return ``(u_new, ok)``.
-
-    ``u_new`` is uniform in the ellipsoid of an eligible frame chosen in
-    proportion to its volume. ``ok`` is the Metropolis-Hastings test ``U
-    q(u_new) < q(u)``, with ``q`` the number of eligible ellipsoids that
-    contain a point; the caller also requires ``u_new`` in the cube and above
-    ``L*``.
+    ``point`` is uniform in the ellipsoid ``|L^-1 (x - mu)|^2 <= d + 2`` of an
+    eligible frame chosen in proportion to its volume (``eligible`` and
+    ``logdet`` of the ``C_MAX`` frames; ``frame(c)`` returns ``(mu, L)`` of
+    frame ``c``), and ``uniform`` is the draw of its Metropolis-Hastings test
+    (:func:`hop_accept`). The proposal does not depend on the chain's point.
+    One normal vector and three uniforms: the frame by inversion of the
+    volumes' distribution, the radius ``U^(1/d)`` and the test.
     """
-    d = u.shape[0]
+    k_dir, k_uni = random.split(key)
+    dtype = logdet.dtype
+    uni = lax.optimization_barrier(random.uniform(k_uni, (3,), dtype))
+    logv = jnp.where(eligible, logdet, -jnp.inf)
+    cdf = jnp.cumsum(jnp.where(eligible, jnp.exp(logv - jnp.max(logv)), 0.0))
+    c = jnp.sum(cdf <= uni[0] * cdf[-1])  # the first frame with cdf above
+    last = eligible.shape[0] - 1 - jnp.argmax(eligible[::-1])
+    mu, chol = frame(jnp.minimum(c, last))
+    d = mu.shape[0]
+    # The barrier keeps XLA from fusing the generator into the norm: on a
+    # GPU that fusion compiled for 40 to 90 s at d = 32 and 64.
+    z = lax.optimization_barrier(random.normal(k_dir, (d,), dtype))
+    ball = z / jnp.linalg.norm(z) * uni[1] ** (1.0 / d)
+    point = mu + math.sqrt(ELL_R2_PER_DIM * (d + 2.0)) * (chol @ ball)
+    return point, uni[2]
+
+
+def hop_accept(uniform, eligible, r2_new, r2_old, d: int):
+    """The hop's Metropolis-Hastings test ``U q(new) < q(old)`` for the
+    uniform draw ``U``.
+
+    The proposal density ``q`` is proportional to the number of eligible
+    ellipsoids that hold a point, read from its squared Mahalanobis
+    distances ``r2`` to the frames; a proposal in no ellipsoid (it cannot be
+    drawn) is refused. The caller also requires the proposal in the cube and
+    above ``L*``.
+    """
     r2max = ELL_R2_PER_DIM * (d + 2.0)
-    k_c, k_x, k_acc = random.split(key, 3)
-    c = random.categorical(k_c, jnp.where(fr.eligible, fr.logdet, -jnp.inf))
-    new = fr.mu[c] + math.sqrt(r2max) * (fr.chol[c] @ _unit_ball(k_x, d, u.dtype))
-
-    def n_in(x):
-        return jnp.sum(fr.eligible & (mahalanobis(fr, x)[0] <= r2max))
-
-    n_new, n_old = n_in(new), n_in(u)
-    accept = random.uniform(k_acc, (), u.dtype) * n_new < n_old
-    return new, accept & (n_new >= 1)
+    n_new = jnp.sum(eligible & (r2_new <= r2max))
+    n_old = jnp.sum(eligible & (r2_old <= r2max))
+    return (uniform * n_new < n_old) & (n_new >= 1)
 
 
 # ------------------------------------------------------------ clustering
 
 
-def _assign(fr: Frames, x, keep):
+def _assign(fr: Frames, x, keep, whitened: bool = False):
     """Hard-EM classification: ``argmin r^2 + 2 log det L - 2 log weight``.
 
-    Rows with ``keep`` false get label -1.
+    Rows with ``keep`` false get label -1. ``whitened``: ``x`` is of order one
+    (the whitened coordinates of a cluster), and ``L^-1 (x - mu)`` is taken
+    as ``L^-1 x - L^-1 mu``, one product with ``x`` for all the clusters. (In
+    the unit cube a late cluster is a tiny box far from the origin, and that
+    difference would lose its digits in float32.)
     """
     total = jnp.maximum(jnp.sum(fr.count), 1.0)
     log_weight = jnp.log(jnp.maximum(fr.count, 1e-30) / total)
     offset = 2.0 * fr.logdet - 2.0 * log_weight  # (C,)
-    dev = x[None, :, :] - fr.mu[:, None, :]  # (K, m, d)
-    z = solve_triangular(fr.chol, jnp.swapaxes(dev, 1, 2), lower=True)  # (K, d, m)
-    score = jnp.sum(z * z, axis=1) + offset[:, None]
+    if whitened:
+        z = jnp.einsum("kij,mj->kmi", fr.ichol, x)
+        z = z - jnp.einsum("kij,kj->ki", fr.ichol, fr.mu)[:, None, :]
+    else:
+        dev = x[None, :, :] - fr.mu[:, None, :]  # (K, m, d)
+        z = jnp.einsum("kij,kmj->kmi", fr.ichol, dev)
+    score = jnp.sum(z * z, axis=2) + offset[:, None]
     score = jnp.where(fr.active[:, None], score, jnp.inf)
     return jnp.where(keep, jnp.argmin(score, axis=0), -1).astype(jnp.int32)
 
@@ -348,16 +394,17 @@ def _until_fixed(step, state, iters: int):
     return lax.while_loop(cond, body, (0, state, jnp.asarray(True)))[1]
 
 
-def _refine(x, labels, nslots: int, iters: int):
+def _refine(x, labels, nslots: int, iters: int, whitened: bool = False):
     """Hard EM over ``nslots`` clusters: refit and reassign, up to ``iters``
     times (until the labels repeat).
 
-    Rows labelled -1 stay out. Slots that empty out stay empty.
+    Rows labelled -1 stay out. Slots that empty out stay empty. ``whitened``:
+    see :func:`_assign`.
     """
     keep = labels >= 0
 
     def step(labels):
-        return _assign(frames(stats(x, labels, nslots)), x, keep)
+        return _assign(frames(stats(x, labels, nslots)), x, keep, whitened)
 
     return _until_fixed(step, labels, iters)
 
@@ -420,13 +467,17 @@ def _split(x, mask):
     mean = (w @ x) / jnp.maximum(n, 1.0)
     xc = (x - mean) * w[:, None]
     chol, _ = _cholesky(_ridge(xc.T @ xc / jnp.maximum(n - 1.0, 1.0)))
-    y = solve_triangular(chol, xc.T, lower=True).T  # whitened; 0 outside
+    ichol = solve_triangular(chol, jnp.eye(d, dtype=dtype), lower=True)
+    y = xc @ ichol.T  # whitened; 0 outside
     r2 = jnp.sum(y * y, axis=1)
     far = y[jnp.argmax(jnp.where(mask, r2, -jnp.inf))]
     far2 = y[jnp.argmax(jnp.where(mask, jnp.sum((y - far) ** 2, axis=1), -jnp.inf))]
+    total = w @ y
 
     def nearer(c0, c1):
-        return jnp.sum((y - c1) ** 2, axis=1) < jnp.sum((y - c0) ** 2, axis=1)
+        """The rows nearer to ``c1`` than to ``c0``: ``|y - c1|^2 < |y -
+        c0|^2``, as one product with ``y``."""
+        return 2.0 * (y @ (c0 - c1)) < jnp.sum(c0 * c0) - jnp.sum(c1 * c1)
 
     kurt = (y * (w * r2)[:, None]).T @ y / jnp.maximum(n, 1.0)
     _, vecs = jnp.linalg.eigh(kurt)
@@ -448,13 +499,14 @@ def _split(x, mask):
         def lloyd(part):
             weight = part.astype(dtype)
             n1 = jnp.sum(weight)
-            c1 = (weight @ y) / jnp.maximum(n1, 1.0)
-            c0 = ((w - weight) @ y) / jnp.maximum(n - n1, 1.0)
+            sum1 = weight @ y
+            c1 = sum1 / jnp.maximum(n1, 1.0)
+            c0 = (total - sum1) / jnp.maximum(n - n1, 1.0)
             return nearer(c0, c1) & mask
 
         part = _until_fixed(lloyd, part, LLOYD_ITERS)
         labels = jnp.where(mask, part.astype(jnp.int32), -1)
-        labels = _refine(y, labels, 2, SPLIT_EM_ITERS)
+        labels = _refine(y, labels, 2, SPLIT_EM_ITERS, whitened=True)
         part = (labels == 1).astype(dtype)
         n1 = jnp.sum(part)
         ok = (jnp.minimum(n1, n - n1) >= MIN_SPLIT_POINTS) & big
@@ -503,62 +555,85 @@ def _merge(u, labels):
     return lax.while_loop(cond, body, (labels, j0))[0]
 
 
-def _split_slots(u, labels):
-    """The best split of every slot of every lane: ``(J, part)``, shapes
-    ``(B, C)`` and ``(B, C, m)``.
+def _split_all(u, labels):
+    """Split every lane's clusters top-down: ``u`` ``(B, m, d)``, ``labels``
+    ``(B, m)``; returns the labels.
 
-    The slots run in sequence, and a slot that no lane could split (fewer
-    than ``max(6, 4 d)`` members in every lane, e.g. an empty slot) is
-    skipped by a ``lax.cond`` whose predicate is unbatched: the search costs
-    the occupied slots only, also for a batch of runs.
+    In each lane: the best split of every cluster that can split (at least
+    ``max(6, 4 d)`` members) is searched; while the best of them passes the
+    threshold and a slot is free it is applied, and the two clusters it made
+    are searched in turn.
+
+    One loop serves all lanes. An iteration applies the due split of every
+    lane that has no search pending, then searches one cluster in every lane
+    that has one pending (:func:`_split`, vmapped over the lanes). The loop's
+    predicate and the ``lax.cond`` around the search are unbatched, so the
+    search runs as many times as the busiest lane needs: the number of
+    clusters of the lane with the most, plus two per split. (Searching two
+    clusters of a lane at once was no faster on a GPU and compiled slower.)
     """
     lanes, m, d = u.shape
-    size = jnp.sum(labels[:, None, :] == jnp.arange(C_MAX)[None, :, None], axis=-1)
-    need = jnp.any(size >= max(2 * MIN_SPLIT_POINTS, 4 * d), axis=0)  # (C,)
+    threshold = split_threshold(d)
+    min_size = max(2 * MIN_SPLIT_POINTS, 4 * d)
+    slots = jnp.arange(C_MAX)
+    lane = jnp.arange(lanes)
 
-    def slot(xs):
-        c, go = xs
+    def sizes(labels):
+        return jnp.sum(labels[:, None, :] == slots[None, :, None], axis=-1)
+
+    def due(labels, js, todo):
+        """Lanes whose best split passes, with a free slot and no search
+        pending."""
+        full = jnp.all(sizes(labels) > 0, axis=1)
+        return (jnp.max(js, axis=1) >= threshold) & ~full & ~jnp.any(todo, axis=1)
+
+    def cond(carry):
+        labels, js, _, todo = carry
+        return jnp.any(todo) | jnp.any(due(labels, js, todo))
+
+    def body(carry):
+        labels, js, parts, todo = carry
+        # Apply the best split where it is due. The part that moves to the
+        # first free slot is the one without the cluster's first row, so the
+        # slots do not depend on the orientation of the cut (the sign of an
+        # eigenvector, which batched and single solvers can choose apart).
+        go = due(labels, js, todo)
+        c = jnp.argmax(js, axis=1)
+        free = jnp.argmin(sizes(labels) > 0, axis=1)
+        member = labels == c[:, None]
+        part = parts[lane, c]
+        first = jnp.take_along_axis(part, jnp.argmax(member, axis=1)[:, None], 1)
+        part = jnp.where(first, member & ~part, part) & go[:, None]
+        labels = jnp.where(part, free[:, None], labels).astype(jnp.int32)
+        changed = go[:, None] & (
+            (slots[None, :] == c[:, None]) | (slots[None, :] == free[:, None])
+        )
+        js = jnp.where(changed, 0.0, js)
+        todo = todo | (changed & (sizes(labels) >= min_size))
+        # Search the first pending cluster of every lane that has one.
+        has = jnp.any(todo, axis=1)
+        pick = jnp.argmax(todo, axis=1)
+        target = jnp.where(has, pick, C_MAX)  # C_MAX: no row has this label
 
         def search(_):
-            return jax.vmap(lambda u, lab: _split(u, lab == c))(u, labels)
+            return jax.vmap(lambda u, lab, c: _split(u, lab == c))(u, labels, target)
 
         def skip(_):
             return jnp.zeros((lanes,), u.dtype), jnp.zeros((lanes, m), bool)
 
-        return lax.cond(go, search, skip, None)
+        j, p = lax.cond(jnp.any(has), search, skip, None)
+        done = has[:, None] & (slots[None, :] == pick[:, None])
+        js = jnp.where(done, j[:, None], js)
+        parts = jnp.where(done[:, :, None], p[:, None, :], parts)
+        return labels, js, parts, todo & ~done
 
-    js, parts = lax.map(slot, (jnp.arange(C_MAX), need))
-    return jnp.swapaxes(js, 0, 1), jnp.swapaxes(parts, 0, 1)
-
-
-def _split_loop(u, labels, js, parts):
-    """Apply the best split while one passes the threshold and a slot is free;
-    the two clusters a split changes are searched again."""
-    threshold = split_threshold(u.shape[1])
-
-    def occupied(labels):
-        return jnp.any(labels[None, :] == jnp.arange(C_MAX)[:, None], axis=1)
-
-    def cond(carry):
-        labels, js, _ = carry
-        return (jnp.max(js) >= threshold) & ~jnp.all(occupied(labels))
-
-    def body(carry):
-        labels, js, parts = carry
-        c = jnp.argmax(js)
-        slot = jnp.argmin(occupied(labels))  # the first free slot
-        # The part that moves is the one without the cluster's first row, so
-        # the slots do not depend on the orientation of the cut (the sign of
-        # an eigenvector, which batched and single solvers can choose apart).
-        member = labels == c
-        part = parts[c]
-        part = jnp.where(part[jnp.argmax(member)], member & ~part, part)
-        labels = jnp.where(part, slot, labels).astype(jnp.int32)
-        pair = jnp.stack([c, slot])
-        new_j, new_parts = jax.vmap(lambda s: _split(u, labels == s))(pair)
-        return labels, js.at[pair].set(new_j), parts.at[pair].set(new_parts)
-
-    return lax.while_loop(cond, body, (labels, js, parts))[0]
+    carry = (
+        labels,
+        jnp.zeros((lanes, C_MAX), u.dtype),
+        jnp.zeros((lanes, C_MAX, m), bool),
+        sizes(labels) >= min_size,
+    )
+    return lax.while_loop(cond, body, carry)[0]
 
 
 def recluster_lanes(u, labels):
@@ -572,9 +647,14 @@ def recluster_lanes(u, labels):
     labels = jnp.where(labels < 0, -1, jnp.clip(labels, 0, C_MAX - 1))
     labels = labels.astype(jnp.int32)
     labels = jax.vmap(lambda u, lab: _refine(u, lab, C_MAX, REFINE_ITERS))(u, labels)
-    labels = jax.vmap(_merge)(u, labels)
-    js, parts = _split_slots(u, labels)
-    labels = jax.vmap(_split_loop)(u, labels, js, parts)
+    occupied = jnp.any(labels[:, None, :] == jnp.arange(C_MAX)[None, :, None], axis=-1)
+    labels = lax.cond(  # nothing to merge unless a lane holds two clusters
+        jnp.any(jnp.sum(occupied, axis=1) >= 2),
+        lambda labels: jax.vmap(_merge)(u, labels),
+        lambda labels: labels,
+        labels,
+    )
+    labels = _split_all(u, labels)
     return labels, jax.vmap(lambda u, lab: stats(u, lab, C_MAX))(u, labels)
 
 

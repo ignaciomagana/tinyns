@@ -13,7 +13,7 @@ import pytest
 from jax import random
 
 import tinyns.callables as callables_mod
-from tinyns import Config, NestedSampler, core, modes
+from tinyns import Config, NestedSampler, core
 from tinyns.callables import (
     _callable_leaves,
     _callable_specs,
@@ -154,9 +154,7 @@ def _lower_block_kernel_text(loglike, prior):
         ncall_valid=i32(0),
         status=i32(0),
         label=jnp.zeros((CFG._folds, m), i32),
-        mode_mu=jnp.zeros((CFG._folds, modes.C_MAX, NDIM), f),
-        mode_scat=jnp.zeros((CFG._folds, modes.C_MAX, NDIM, NDIM), f),
-        mode_count=jnp.zeros((CFG._folds, modes.C_MAX), f),
+        **core._empty_frames(NDIM, CFG._folds, f),
     )
     lowered = kernel.lower(
         state, i32(4), jnp.asarray(0.1, f), i32(100), i32(10**6),

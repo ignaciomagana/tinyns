@@ -28,8 +28,11 @@ def two_modes(theta):
 
 
 def test_two_mode_runs_find_both_modes() -> None:
-    """Both modes in every run (96 of 96 runs of this target at nlive 400, x64
-    off and on, minor mass 0.217-0.283; the v0.3 heuristic missed 11)."""
+    """Both modes in every run (96 of 96 batched runs of this target at nlive
+    400, x64 off and on, minor mass 0.25 +- 0.012; the v0.3 heuristic missed
+    11). Before modes() measured a small label's distance to the others at
+    their own posterior medians, 3 of the 192 reported one mode: the
+    clustering had cut three points off the minor mode in its last steps."""
     for seed in range(5):
         result = NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(seed)
         weights = np.asarray(result.weights())
@@ -43,6 +46,24 @@ def test_two_mode_runs_find_both_modes() -> None:
         assert modes[1]["mass"] == pytest.approx(mass, abs=0.005)
         assert all(0 < m["urn_sd"] < 1 for m in modes)
         assert not any(m["unresolved"] for m in modes)
+
+
+def test_unresolved_flags_a_mode_below_five_points_per_dimension() -> None:
+    """``unresolved`` is ``min_live < 5 ndim``: at nlive 60 the 25% mode of
+    the 3-D target holds about 15 live points, on either side of the
+    threshold from seed to seed; at nlive 400 it holds about 100."""
+    from tinyns import result as result_module
+
+    assert result_module.UNRESOLVED_PER_DIM == 5.0
+    flags = []
+    for seed in range(6):
+        result = NestedSampler(two_modes, lambda u: u, 3, nlive=60).run(seed)
+        for mode in result.modes():
+            assert mode["unresolved"] == (mode["min_live"] < 15)
+            flags.append(mode["unresolved"])
+        warned = sum("unresolved" in w for w in result.diagnostics()["warnings"])
+        assert warned == sum(m["unresolved"] for m in result.modes())
+    assert any(flags)
 
 
 def banana5(theta):
