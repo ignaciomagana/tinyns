@@ -14,8 +14,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from tinyns import Config, finalise, init, step
-from tinyns.core import CONVERGED, delta_logz
+from tinyns import STATUS, Config, delta_logz, finalise, init, step
 
 NDIM = 3
 DLOGZ = 0.1
@@ -45,22 +44,30 @@ def main():
 
         return jax.lax.scan(body, state, None, length=STEPS_PER_CHUNK)
 
-    state = init(jax.random.key(0), loglike, prior_transform, cfg)
+    state = init(0, loglike, prior_transform, cfg)  # a PRNG key or an int seed
     chunks = []
+    # State.ncall is an int32, which wraps after 2**31 likelihood calls: add up
+    # its increments on the host (a difference stays right across a wrap).
+    ncall = int(state.ncall)
     # delta_logz is the evidence the live points could still add, in log
-    # units. A likelihood plateau would need a check of state.status too.
-    while float(delta_logz(state, cfg)) >= DLOGZ:
+    # units. step sets the status only on a likelihood plateau; the rows of a
+    # chunk that hits one are not valid, and this loop would stop there.
+    while delta_logz(state, cfg) >= DLOGZ and STATUS[int(state.status)] == "running":
+        before = state.ncall
         state, dead = chunk(state)  # leaves of shape (STEPS_PER_CHUNK, k, ...)
         chunks.append(dead)
+        ncall += int(state.ncall - before)
         print(
             f"steps {int(state.it):4d}  running logz {float(state.logz):8.4f}  "
             f"remaining {float(delta_logz(state, cfg)):.3g}"
         )
 
     dead = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs), *chunks)
-    # The status is the driver's business: step never sets "converged".
-    state = state._replace(status=jnp.asarray(CONVERGED, jnp.int32))
-    result = finalise(state, dead, cfg, prior_transform=prior_transform)
+    # With the loop's dlogz, finalise applies the driver's stopping rule and
+    # reports "converged"; without it the result would say "running".
+    result = finalise(
+        state, dead, cfg, prior_transform=prior_transform, dlogz=DLOGZ, ncall=ncall
+    )
 
     print(result.summary())
     print(f"true logZ: {TRUE_LOGZ:.4f}")

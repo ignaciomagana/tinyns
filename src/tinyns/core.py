@@ -45,9 +45,10 @@ from tinyns.callables import (
     _split_callable,
     _split_callables,
 )
+from tinyns.math import as_key
 from tinyns.result import NestedSamplingResult, _evidence
 
-# Run status codes (State.status).
+# Run status codes (State.status): ``STATUS[code]`` is the name of ``code``.
 RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU = range(5)
 STATUS = ("running", "converged", "maxiter", "maxcall", "plateau")
 _MESSAGES = (
@@ -184,8 +185,11 @@ class State(NamedTuple):
     ``ncall`` counts the likelihood evaluations (out-of-cube proposals of a
     vmapped step are evaluated, clipped, and counted) and ``ncall_valid`` the
     in-cube ones; both are int32, and :func:`run` drains them into host
-    integers after every chunk. ``logz`` is the running evidence of the dead
-    points, used only to stop; :func:`finalise` recomputes it.
+    integers after every chunk. A hand-written loop that may exceed ``2**31``
+    calls must count on the host too (``ncall += int(new.ncall - old.ncall)``
+    stays right when the counter wraps) and pass the total to
+    :func:`finalise`. ``logz`` is the running evidence of the dead points,
+    used only to stop; :func:`finalise` recomputes it.
     """
 
     key: Any  # PRNG key
@@ -238,12 +242,6 @@ class Dead(NamedTuple):
     hop_tries: Any  # (k,) int32
     nclusters: Any  # (k,) int32
     neligible: Any  # (k,) int32
-
-
-def _as_key(key):
-    if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
-        return random.PRNGKey(int(key))
-    return key
 
 
 def _loglike_u(loglike, prior_transform, u, dtype):
@@ -868,7 +866,11 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
 
 
 def delta_logz(state: State, cfg: Config):
-    """``log(Z + X max L_live) - log Z`` of ``state`` (``inf`` before any death)."""
+    """``log(Z + X max L_live) - log Z`` of ``state`` (``inf`` before any death).
+
+    The evidence the live points could still add, in log units: the driver
+    stops when it falls below ``dlogz``.
+    """
     dtype = state.logl.dtype
     log_x = -state.it.astype(dtype) * jnp.asarray(cfg.log_shrink, dtype)
     finite = jnp.isfinite(state.logz)
@@ -1023,7 +1025,7 @@ def init(key, loglike, prior_transform, cfg: Config) -> State:
         loglike, prior_transform, cfg.ndim
     )
     return _init_kernel(ll_spec, pt_spec, cfg, None)(
-        _as_key(key), *ll_dyn, *pt_dyn
+        as_key(key), *ll_dyn, *pt_dyn
     )
 
 
@@ -1031,9 +1033,11 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     """Delete the ``k`` lowest live points and replace them; return the new
     state and the step's :class:`Dead` rows.
 
-    It does not test termination (see :func:`delta_logz`). On a plateau (no
-    live point above the deleted ones) the live set is unchanged, the rows are
-    not valid and ``status`` becomes ``PLATEAU``; otherwise ``status`` is left
+    It does not test termination: loop while :func:`delta_logz` is above
+    your ``dlogz`` and pass that ``dlogz`` to :func:`finalise`. On a plateau
+    (no live point above the deleted ones) the live set is unchanged, the rows
+    are not valid and ``status`` becomes ``PLATEAU``
+    (``STATUS[int(state.status)] == "plateau"``); otherwise ``status`` is left
     as it is (``RUNNING`` after :func:`init`). Before the step, the live
     points are reclustered if a recluster is due (``cfg.recluster_every``).
     """
@@ -1049,6 +1053,7 @@ def finalise(
     cfg: Config,
     *,
     prior_transform=None,
+    dlogz: float | None = None,
     ncall: int | None = None,
     metadata: dict | None = None,
 ) -> NestedSamplingResult:
@@ -1062,14 +1067,24 @@ def finalise(
     sample's cluster label when it died (the final live points: their last
     labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads.
     ``prior_transform`` maps the samples to parameter space (without it
-    ``samples`` are the unit-cube points); ``ncall`` overrides
-    ``state.ncall`` (the driver drains it). ``result.success`` and
-    ``result.message`` are read from ``state.status``, which only a driver
-    sets to ``CONVERGED``, ``MAXITER`` or ``MAXCALL``: a hand-written loop
-    over :func:`step` that does not set it gets ``success=False`` and the
-    message ``"running"``.
+    ``samples`` are the unit-cube points).
+
+    ``result.success`` and ``result.message`` are read from ``state.status``.
+    :func:`step` leaves it ``RUNNING`` (or sets ``PLATEAU``), so after a
+    hand-written loop pass the ``dlogz`` the loop stopped at: a running state
+    with ``delta_logz(state, cfg) < dlogz`` (the driver's rule) is reported as
+    converged. Without ``dlogz``, or above it, the result has
+    ``success=False`` and the message ``"running"``.
+
+    ``ncall`` overrides ``state.ncall``, an int32 that wraps after ``2**31``
+    calls: the driver drains it, and a long hand-written loop passes its own
+    host count (see :class:`State`).
     """
     state, dead = jax.device_get((state, dead))
+    if dlogz is not None:
+        dlogz = float(dlogz)
+        if not dlogz >= 0.0:
+            raise ValueError("dlogz must be non-negative")
     m, d, k = cfg.nlive, cfg.ndim, cfg.num_delete
     dead_logl = np.asarray(dead.logl, np.float64).reshape(-1)
     niter = dead_logl.size
@@ -1103,6 +1118,8 @@ def finalise(
     hop_tries = np.asarray(dead.hop_tries).reshape(-1)
     walk_tries = niter * cfg.walks - int(hop_tries.sum())
     status = int(state.status)
+    if status == RUNNING and dlogz is not None and delta_logz(state, cfg) < dlogz:
+        status = CONVERGED
     samples = u
     if prior_transform is not None:
         samples = _transform(prior_transform, u, state.u.dtype)
@@ -1118,6 +1135,7 @@ def finalise(
         "scale": float(np.exp(state.log_scale)),
         "ncall_valid": int(state.ncall_valid),
         "x64": bool(jax.config.jax_enable_x64),
+        **({} if dlogz is None else {"dlogz": dlogz}),
         **_mode_info(dead, k, hops, hop_tries),
     }
     return NestedSamplingResult(
@@ -1207,7 +1225,7 @@ def _key_batch(key):
     ``batch`` is ``None`` for one key (an int seed, a raw ``uint32`` key or a
     typed key) and ``B`` for a batch of ``B`` keys (a leading axis).
     """
-    key = _as_key(key)
+    key = as_key(key)
     if isinstance(key, np.ndarray):
         key = jnp.asarray(key)
     if not isinstance(key, jax.Array):

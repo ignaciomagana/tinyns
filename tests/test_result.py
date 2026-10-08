@@ -74,6 +74,7 @@ def test_to_dict_contains_expected_keys() -> None:
         "logwt",
         "logl_birth",
         "nlive_i",
+        "labels",
         "logz",
         "logzerr",
         "ncall",
@@ -87,6 +88,37 @@ def test_to_dict_contains_expected_keys() -> None:
     }
     assert data["metadata"] == {"status": "complete"}
     assert data["metadata"] is not result.metadata
+    assert data["labels"] is result.labels
+
+
+def test_to_dict_and_to_numpy_hold_every_saved_field(tmp_path) -> None:
+    """to_dict / to_numpy carry what save_npz writes, labels included."""
+    result = make_result()
+    result.labels = jnp.array([0, 1, 0, 1], jnp.int32)
+    path = tmp_path / "result.npz"
+    result.save_npz(path)
+    with np.load(path) as saved:
+        stored = set(saved.files) - {"metadata_json", "format_version"}
+    numpy_data = result.to_numpy()
+    assert stored | {"metadata"} == set(numpy_data) == set(result.to_dict())
+    assert isinstance(numpy_data["labels"], np.ndarray)
+    np.testing.assert_array_equal(numpy_data["labels"], [0, 1, 0, 1])
+
+    result.labels = None  # a result without labels
+    assert result.to_dict()["labels"] is None
+    assert result.to_numpy()["labels"] is None
+
+
+def test_resample_equal_accepts_an_int_seed() -> None:
+    result = make_result()
+    for seed in (0, 3, np.int64(3)):
+        np.testing.assert_array_equal(
+            result.resample_equal(seed, n=5),
+            result.resample_equal(random.PRNGKey(int(seed)), n=5),
+        )
+    typed = result.resample_equal(random.key(3), n=5)
+    np.testing.assert_array_equal(typed, result.resample_equal(3, n=5))
+    assert result.resample_equal(0).shape[1] == result.ndim
 
 
 def test_to_numpy_converts_arrays_and_preserves_to_dict_behavior() -> None:
