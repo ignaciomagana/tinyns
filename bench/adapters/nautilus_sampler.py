@@ -5,7 +5,10 @@ Variants: ``default`` (``Sampler`` and ``run`` defaults: ``n_live=2000``,
 which drops the exploration-phase points for an unbiased posterior/evidence).
 Nautilus has its own live-set size and ignores ``--nlive`` unless
 ``--opt n_live=...`` is given. Vectorised likelihood (jit+vmap on CPU),
-``seed=seed``.
+``seed=seed``. ``--opt pool=N`` passes ``pool=(None, N)``: N worker processes
+for the sampler's own calculations (it trains its ``n_networks = 4`` networks
+in parallel), none for the likelihood, which is already a vectorised call.
+Without it Nautilus trains the networks one after the other.
 
 Nautilus reports no evidence uncertainty; ``logzerr`` is None. (Its paper uses
 ``1 / sqrt(n_eff)`` as a rough scale; ``ess`` is in the record.)
@@ -32,6 +35,8 @@ def run(target, seed, cfg):
     kw = {}
     if "n_live" in opts:
         kw["n_live"] = int(opts["n_live"])
+    if "pool" in opts:
+        kw["pool"] = (None, int(opts["pool"]))
     discard = cfg["variant"] == "discard"
     with Timer() as t:
         sampler = Sampler(
@@ -57,6 +62,7 @@ def run(target, seed, cfg):
         sampler_version=f"nautilus-sampler {version_of('nautilus-sampler')}",
         config=dict(
             n_live=int(sampler.n_live),
+            pool=opts.get("pool"),
             discard_exploration=discard,
             n_eff=float(sampler.n_eff),
         ),

@@ -8,7 +8,7 @@
 #   bench/h100_plan.sh smoke        # 1 seed of each sampler on gauss_d2 (~5 min)
 #   bench/h100_plan.sh emit-jobs    # writes $JOBDIR/bench_{gpu,cpu}_jobs.txt
 #   bench/h100_plan.sh cpu-pool [SLOTS] [CORES_PER_SLOT]   # runs the CPU lines
-#   bench/h100_plan.sh summarize    # table.md from $OUT/results_{gpu,cpu}.jsonl
+#   bench/h100_plan.sh summarize    # report.md + cells.csv from $OUT/results_{gpu,cpu}.jsonl
 #
 # The existing env/core and src/tinyns (3c768e5, used by the reference runs)
 # are left alone. Two new trees are created:
@@ -217,6 +217,6 @@ case ${1:-} in
   summarize)
     cd "$P"
     $BENCH_PY src/tinyns-bench/bench/summarize.py $OUT/results_gpu.jsonl $OUT/results_cpu.jsonl \
-      --out $OUT/table.md && echo "$P/$OUT/table.md" ;;
+      --out $OUT/report.md --csv $OUT/cells.csv && echo "$P/$OUT/report.md" ;;
   *) sed -n '2,12p' "$0"; exit 1 ;;
 esac
