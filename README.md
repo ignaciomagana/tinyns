@@ -186,10 +186,11 @@ cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
   weight was lost or off by more than 0.4 in the logit, all of them at 18 and
   32 dimensions. If a small mode matters, run again at twice the `nlive` and
   compare the modes.
-- *the posterior has many modes.* The eggbox (18 peaks) kept every peak in
-  every run from `nlive=2000`, about 100 live points per peak; at 500 it lost
-  a peak in 4 of 10 runs. Its logZ was right at every `nlive`, and its peak
-  weights scatter as `1 / sqrt(nlive)` (see Limitations).
+- *the posterior has many modes.* Each of the eggbox's two smallest peaks (2%
+  of the posterior) fell below a tenth of its weight in 32% of the runs at
+  `nlive=500`, 15% at 1000, 4% at 2000 and none at 4000; its 8% peaks were
+  kept from 1000. Its logZ was right at every `nlive`, and its peak weights
+  scatter as `1 / sqrt(nlive)` (see Limitations).
 - *the target is curved.* The logZ of the 10-D Rosenbrock was 0.16 too low at
   500, 0.05 at 1000 and unbiased from 2000 (at the default `walks`).
 - *`ndim` is above about `nlive / 10`.* At `nlive=250` logZ was 0.2 to 0.4 too
@@ -308,8 +309,8 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
   not separate more modes than that, or modes on a lattice (an eggbox). The
   evidence is still right, but the hop does not balance those modes: their
   weights scatter from seed to seed (logit sd 0.4 for the eggbox's 8% modes
-  at nlive 1000, 0.6 for its 4% modes) and a 2% mode was lost in 15% of the
-  runs. `modes()` marks such modes `tracked: False`, and counts only the ones
+  at nlive 1000, 0.6 for its 4% modes) and a 2% mode was lost (below a tenth of its
+  weight) in 15% of the runs. `modes()` marks such modes `tracked: False`, and counts only the ones
   that planes across the axes of the unit cube separate.
 - **Curved targets.** A 10-D Rosenbrock is biased low below `nlive=1000` (see
   Choosing `walks`).
