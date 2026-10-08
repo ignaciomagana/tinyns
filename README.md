@@ -128,9 +128,10 @@ A mode needs about `5 * ndim` live points for its own walk to mix. In the
 validation cells where every mode held that many, the weights showed no bias
 within the measurement error. Below it a mode's weight is biased or scatters
 widely, and the mode can be lost; `result.modes()` (and `summary()`) flag it
-`unresolved: raise nlive`. The mode tracking added about 6% to the run time at
-1 ms per likelihood call, and adds nothing per chain step while a run has one
-cluster.
+`unresolved: raise nlive`. The mode tracking is a fixed cost per step: about 6%
+of the run time at 1 ms per likelihood call. For likelihoods that take
+microseconds it is a larger share (15 to 21% more per call on a 10-D two-mode
+target than on a 10-D Gaussian; see Speed).
 
 ## Choosing `walks`
 

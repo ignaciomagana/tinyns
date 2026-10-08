@@ -63,7 +63,7 @@ git history of this file (up to commit eb4631c).
 - **More than 8 separated modes** (an eggbox). The clustering has 8 slots; mode weights are not validated beyond that.
 - **Curved targets need longer chains.** A 10-D Rosenbrock valley needs `walks` of 12 to 25 `* ndim`; at the default, logZ scatters 2.3 times more than `logzerr` says.
 - **Expensive likelihoods.** Parallel chains do not reduce the number of likelihood calls, and with `num_delete > 1` out-of-cube proposals are evaluated (`ncall` against `metadata["ncall_valid"]`). Use `num_delete=1` when one call already fills the device.
-- **Cost of the mode tracking.** About 6% of the run time at 1 ms per likelihood call (H100, 40 batched runs; at most 18% over the validation cells), and nothing per chain step while a run has one cluster. Compilation takes about 10 s on a GPU.
+- **Cost of the mode tracking.** About 6% of the run time at 1 ms per likelihood call (H100, 40 batched runs; at most 18% over the validation cells). It is a fixed cost per step, so for likelihoods that take microseconds it is a larger share: 15 to 21% more per call on a 10-D two-mode target than on a 10-D Gaussian. Compilation takes about 10 s on a GPU.
 - **float32.** Likelihood differences below about `1e-7 * |loglike|` are lost; enable x64 for large `|loglike|` or very narrow posteriors.
 - **Insertion test.** With `num_delete > 1` the ranks of one step share their survivors, so the p-values are mildly anti-conservative (5 to 12% of correct 2-D Gaussian runs fall below 0.05 at `num_delete=50`).
 - **Compile cache.** A process keeps up to 8 compiled configurations per kernel; a loop over more configurations than that recompiles.
