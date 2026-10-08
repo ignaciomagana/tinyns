@@ -18,7 +18,7 @@ from tinyns.math import (
     normalize_log_weights,
     systematic_resample,
 )
-from tinyns.modes import split_threshold
+from tinyns.modes import C_MAX, split_threshold
 
 ArrayLike = Any
 
@@ -43,15 +43,26 @@ _RESULT_NPZ_SCALARS = {
 # 0.21 and 0.03 too high, and the bake-off cells whose minor mode held fewer
 # than 5 per dimension kept a weight bias or a large scatter.
 UNRESOLVED_PER_DIM = 5.0
-# Two clusters are one mode unless, at each of their posterior medians, their
-# live points leave a gap of this many within-cluster standard deviations
-# along the discriminant direction. The split test also cuts one curved mode
-# (a banana) into linear pieces, which touch: gaps of -0.5 to 1.1 there,
-# against 22 to 32 between the separated modes of the validation targets.
+# Two clusters are one mode unless their live points leave a gap of this many
+# within-cluster standard deviations along the discriminant direction at each
+# of their posterior medians. The split test also cuts one curved mode (a
+# banana) into linear pieces, which touch: gaps of -0.5 to 1.1 there, against
+# 22 to 32 between the separated modes of the Gaussian validation mixtures
+# and 5 to 20 between those of LogGamma (10-D, 500 to 1000 live points).
 # Before that, a cluster with at most ndim distinct live points at its own
-# posterior median is dropped: it spans no volume, and the stuck chains of a
-# banana's tip leave such clumps of near-copies 7 to 50 deviations out.
+# posterior median is set aside: it spans no volume.
 SEPARATION_SIGMA = 3.0
+# A mode is cut where its live points leave a slab across a coordinate axis
+# of the unit cube empty (:func:`_empty_slab`): the width of the slab times
+# the density of the SLAB_NEIGHBOURS (at least ndim + 1) live points on its
+# sparser side must reach SLAB_SCORE. Live points are uniform in the cube
+# above the likelihood contour, so a connected region leaves no such slab:
+# the largest score was 21.5 over 768 runs (64 each of Gaussians in 2-D and
+# 10-D, bananas in 5-D and 10-D, the 4-D Rosenbrock and the 10-D funnel, at
+# nlive 500 and 1000), against at least 56 between the modes of 12 Gaussians
+# in 3-D, 250 for the 2-D LogGamma target and 1600 for the eggbox.
+SLAB_SCORE = 30.0
+SLAB_NEIGHBOURS = 8
 
 
 def _jsonable(value):
@@ -146,22 +157,81 @@ def _nearest_mode(u, weights, label, k):
     return np.argmin(np.asarray(score), axis=0)
 
 
-def _gap(x, side) -> float:
-    """Empty stretch between ``x[~side]`` and ``x[side]`` along the Fisher
-    discriminant, in within-set standard deviations (negative if they overlap).
+def _discriminant(x, side):
+    """The Fisher discriminant ``w`` of ``x[~side]`` and ``x[side]``, scaled to
+    a unit within-set standard deviation, and the ends ``(lo, hi)`` of the
+    empty stretch between the two sets along it: ``lo = max x[~side] @ w``
+    and ``hi = min x[side] @ w`` (``hi < lo`` if they overlap; ``w = 0`` and
+    no stretch for sets without any spread).
 
     Repeated rows count once: an unmoved chain returns a copy of its seed, and
     copies would shrink the within-set scatter without adding information."""
     x, first = np.unique(x, axis=0, return_index=True)  # copies of a seed: once
     side = np.asarray(side)[first]
     a, b = x[~side], x[side]
-    if not len(a) or not len(b):
-        return math.inf
     dev = np.concatenate([a - a.mean(0), b - b.mean(0)])
     within = _ridge(dev.T @ dev / max(len(x) - 2, 1))
-    w = np.linalg.solve(within, b.mean(0) - a.mean(0))
-    p = x @ w / math.sqrt(max(w @ within @ w, 1e-300))
-    return float(p[side].min() - p[~side].max())
+    with np.errstate(all="ignore"):
+        w = np.linalg.solve(within, b.mean(0) - a.mean(0))
+        w = w / math.sqrt(max(w @ within @ w, 1e-300))
+    if not np.all(np.isfinite(w)):  # no spread within the sets: no scale
+        return np.zeros(x.shape[1]), 0.0, 0.0
+    p = x @ w
+    return w, float(p[~side].max()), float(p[side].min())
+
+
+def _gap(x, side) -> float:
+    """Empty stretch between ``x[~side]`` and ``x[side]`` along the Fisher
+    discriminant, in within-set standard deviations (negative if they
+    overlap; see :func:`_discriminant`)."""
+    side = np.asarray(side)
+    if side.all() or not side.any():
+        return math.inf
+    _, lo, hi = _discriminant(x, side)
+    return hi - lo
+
+
+def _empty_slab(x, m: int) -> tuple[float, int, float]:
+    """The emptiest slab across a coordinate axis among the rows ``x``:
+    ``(score, axis, cut)``.
+
+    Along each axis, every stretch between two neighbouring rows with at
+    least ``m`` rows on either side is scored by its width times ``(m - 1) /
+    span``, the density of the ``m`` rows next to it on its sparser side
+    (``span``: the stretch they cover). For rows drawn from a density without
+    holes the score is of order ``log(len(x))``; ``cut`` is the middle of the
+    best stretch. The score is 0 for fewer than ``2 m`` rows."""
+    n, ndim = x.shape
+    best = (0.0, -1, 0.0)
+    if n < 2 * m:
+        return best
+    i = np.arange(m - 1, n - m)
+    for axis in range(ndim):
+        p = np.sort(x[:, axis])
+        span = np.maximum(p[i] - p[i - m + 1], p[i + m] - p[i + 1])
+        score = (p[i + 1] - p[i]) * (m - 1) / np.maximum(span, 1e-300)
+        j = int(np.argmax(score))
+        if score[j] > best[0]:
+            best = (float(score[j]), axis, 0.5 * float(p[i[j]] + p[i[j] + 1]))
+    return best
+
+
+def _slab_parts(live, x, m: int):
+    """Cut the rows ``x`` wherever the rows ``live`` leave an empty slab
+    (:func:`_empty_slab` with a score of ``SLAB_SCORE``), again and again;
+    returns the part of every row of ``x`` (0, 1, ...)."""
+    part = np.zeros(len(x), dtype=int)
+    todo, count = [(live, np.arange(len(x)))], 0
+    while todo:
+        points, rows = todo.pop()
+        score, axis, cut = _empty_slab(points, m)
+        if score < SLAB_SCORE:
+            part[rows] = count
+            count += 1
+            continue
+        low, below = points[:, axis] <= cut, x[rows, axis] <= cut
+        todo += [(points[low], rows[below]), (points[~low], rows[~below])]
+    return part
 
 
 def _ks_uniform(ranks, nslots: int) -> tuple[float, float]:
@@ -457,59 +527,86 @@ class NestedSamplingResult:
     def modes(self) -> list[dict[str, Any]]:
         """Return the posterior modes, heaviest first, with their urn error bar.
 
-        Pure post-processing of the cluster labels the run recorded
-        (:attr:`labels`: each sample's cluster when it died, from the
-        on-device clustering that drives the inter-mode hop), so it runs no
-        clustering and compiles nothing, and its modes are the clusters the
-        sampler balanced. The clustering's split test also cuts a curved mode
-        into touching pieces, its slots are reused over a run, and a slot
-        holds different points at different times, so the labels become modes
-        in four passes:
+        Post-processing of the run's samples: it reads the cluster labels the
+        run recorded (:attr:`labels`: the id of each sample's cluster when it
+        died, in one of the cross-fitted clusterings that drive the
+        inter-mode hop), runs no likelihood and compiles nothing. A label is
+        not a mode: the clustering's split test also cuts a curved mode into
+        touching pieces, each clustering covers every mode with labels of its
+        own, a cluster that is split later held several modes until then, and
+        a lattice of many modes is never split at all. The modes are found in
+        five passes:
 
-        1. a label carrying less than one effective posterior sample (mass
-           times the posterior ESS below 1, e.g. a piece split off early in
-           the run and merged back) joins the heaviest label;
-        2. a label with at most ``ndim`` distinct live points at its own
-           posterior median joins the label nearest to it then (Mahalanobis
-           distance of its mean to the other labels' live points): so few
-           points span no volume, and the gap next to them cannot tell a
-           separate mode from a thinly sampled tail, such as the clump of
-           near-copies that stuck chains leave in the tip of a banana. A real
-           mode that small would be ``unresolved`` anyway;
-        3. two labels count as separate modes only if their live points leave
-           a gap of ``SEPARATION_SIGMA`` within-cluster standard deviations
-           along the discriminant direction at each of the two posterior
-           medians (where both have live points); touching labels are merged,
-           one pair at a time, until every pair is separated. Pieces of a
-           curved mode that look apart at one time touch at the other;
-        4. every sample is relabelled by its nearest mode (hard-EM
+        1. a label carrying less than one effective posterior sample, or with
+           at most ``ndim`` distinct live points at its own posterior median
+           (they span no volume, so no gap next to them can be measured), is
+           set aside;
+        2. two labels *touch* if both have live points at the later of their
+           two posterior medians and these leave a gap of less than
+           ``SEPARATION_SIGMA`` within-cluster standard deviations along
+           their discriminant direction, there or at the earlier median; they
+           are *apart* if they leave a gap wherever both have live points.
+           Touching labels are merged, with three exceptions. A cluster is
+           left out if it touches two labels that are apart and its own live
+           points leave a gap between the two (a cluster of another
+           clustering that never split them), or if the clusters it was split
+           into ended up apart (``metadata["mode_tree"]`` records what was
+           split into what). And a label that does not live to see the
+           other's median only *leans* on it: modes that are separate in the
+           posterior bulk are still connected at a low likelihood contour,
+           so an early label joins the one mode it leans on, and none if it
+           leans on several;
+        3. a mode with fewer than ``UNRESOLVED_PER_DIM * ndim`` live points
+           at its posterior median joins another if the live points of the
+           labels left out fill the gap between the two, and a mode found by
+           one clustering only is left out if no live point of another fold
+           has one of its points as nearest neighbour (the descendants of a
+           stuck chain stay in one fold);
+        4. a mode is cut wherever its live points, at its posterior median,
+           leave a slab across a coordinate axis of the unit cube empty
+           (``SLAB_SCORE``): this finds the modes the sampler's clustering
+           did not separate, such as the 18 of an eggbox, when planes across
+           the axes of the cube separate them;
+        5. every sample is relabelled by its nearest mode (hard-EM
            classification with each mode's posterior-weighted mean and
-           covariance), so that a mode keeps its points where the run's
-           clustering had them in another slot (before it split the mode
-           off, or after a merge near the end of the run).
+           covariance), so that a mode has its points from before it was
+           split off and those of the labels left out.
 
         Each mode's live count ``n(t)`` is rebuilt from the birth and death
         iterations. The mode is isolated from the first iteration at which
-        its live points and the others pass the split test's threshold
-        (:func:`tinyns.modes.split_threshold`; if they never do before the
-        earlier of the two posterior medians, there is no drift term and
-        ``isolation_iteration`` is that median). From then on random-walk
-        chains cannot leave it, so without the hop ``n`` does a random walk
-        (the urn) and the mode's mass scatters from seed to seed by
-        ``urn_sd`` in ``logit(mass)``: ``1/n + 1/(N - n)`` at isolation,
+        its live points and those of every other mode pass the split test's
+        threshold (:func:`tinyns.modes.split_threshold`; if they never do
+        before the earlier of the two posterior medians, there is no drift
+        term and ``isolation_iteration`` is that median). From then on
+        random-walk chains cannot leave it, so without the hop ``n`` does a
+        random walk (the urn) and the mode's mass scatters from seed to seed
+        by ``urn_sd`` in ``logit(mass)``: ``1/n + 1/(N - n)`` at isolation,
         plus ``2 (1 - g) / (N^2 g)`` per iteration up to the mode's posterior
         median and ``2 g / (N^2 (1 - g))`` up to the rest's, with ``g = n /
         N``. The hop removes most of that drift (about 7x less scatter in the
-        v1 bake-off), so ``urn_sd`` is an upper bound. ``min_live`` is the
-        smallest ``n`` between isolation and the mode's median; below
-        ``UNRESOLVED_PER_DIM * ndim`` the mode is ``unresolved`` and its mass
-        is not reliable: raise ``nlive``. A mode lost before the end leaves no
-        trace in its own run. A unimodal run (or a result without
-        :attr:`labels`) gives one mode of mass 1.
+        v1 bake-off), so ``urn_sd`` is an upper bound for a mode the sampler
+        tracked.
+
+        Per mode: ``mass``, ``urn_sd``, ``isolation_iteration``,
+        ``min_live`` (the smallest ``n`` between isolation and the mode's
+        median), ``unresolved`` (``min_live`` below ``UNRESOLVED_PER_DIM *
+        ndim``: the mass is not reliable, raise ``nlive``) and ``tracked``:
+        False for a mode that pass 4 cut out of a larger one. The sampler's
+        clustering did not separate such a mode from its neighbours, so the
+        hop did not balance it, its mass scatters by about ``urn_sd``, and
+        the count of such modes is a lower bound (modes with fewer than
+        ``SLAB_NEIGHBOURS`` live points, or that no axis-aligned plane
+        separates, stay merged). :meth:`diagnostics` also reports for how
+        much of the run the clustering's slots were full
+        (``mode_slots_full``); then too there may be more modes than are
+        returned. A mode lost before the end leaves no trace in its own run,
+        and neither does one that never held more than about ``ndim`` live
+        points per fold. A unimodal run (or a result without :attr:`labels`)
+        gives one mode of mass 1.
         """
 
         one = [{"mass": 1.0, "urn_sd": 0.0, "min_live": int(self.nlive),
-                "isolation_iteration": 0, "unresolved": False}]
+                "isolation_iteration": 0, "unresolved": False, "tracked": True}]
         if int(self.niter) == 0 or self.labels is None:
             return one
         try:
@@ -521,10 +618,7 @@ class NestedSamplingResult:
         nlive, niter, ndim = int(self.nlive), int(self.niter), int(self.ndim)
         weights = np.asarray(self.weights(), dtype=float)
         u = np.asarray(self.samples_u, dtype=float)
-        label = np.unique(np.asarray(self.labels), return_inverse=True)[1]
-        k = int(label.max()) + 1 if label.size else 0
-        if k < 2:
-            return one
+        ids, label = np.unique(np.asarray(self.labels), return_inverse=True)
         cumulative = np.cumsum(weights)
         born, index = self._births[0], np.arange(len(u))
 
@@ -535,78 +629,52 @@ class NestedSamplingResult:
         def alive(t):
             return (born < t) & (index >= t)
 
-        def compact(label):
-            return np.unique(label, return_inverse=True)[1]
-
-        # 1. Labels without posterior mass join the heaviest.
-        mass = np.bincount(label, weights, minlength=k)
-        light = mass * self.posterior_ess() < cumulative[-1]
-        label = compact(np.where(light[label], np.argmax(mass), label))
-        k = int(label.max()) + 1
-        # 2. Labels with at most ndim distinct live points at their posterior
-        # median join the nearest other label (the Mahalanobis distance to
-        # its live points at its own median: at the small label's median it
-        # may be down to a few points, which span no covariance).
-        when = [median(label == c) for c in range(k)]
-        tiny = [
-            len(np.unique(u[alive(when[c]) & (label == c)], axis=0)) <= ndim
-            for c in range(k)
-        ]
-        if k - sum(tiny) < 2:
+        # 1. Labels without posterior mass, or with at most ndim distinct
+        # live points at their posterior median, are set aside (-1).
+        small = np.bincount(label, weights) * self.posterior_ess() < cumulative[-1]
+        for c in np.flatnonzero(~small):
+            mine = label == c
+            small[c] = len(np.unique(u[alive(median(mine)) & mine], axis=0)) <= ndim
+        label = np.where(small[label], -1, label)
+        # 2, 3. Labels that cover one mode are merged.
+        label = self._merge_labels(label, ids, u, median, alive)
+        if label.max() < 0:
+            label = np.zeros_like(label)
+        # 4. A mode is cut where its live points leave an empty slab.
+        cut, tracked = np.full(len(label), -1), []
+        for c in range(int(label.max()) + 1):
+            mine = label == c
+            live = np.unique(u[alive(median(mine)) & mine], axis=0)
+            part = _slab_parts(live, u[mine], max(SLAB_NEIGHBOURS, ndim + 1))
+            cut[mine] = len(tracked) + part
+            tracked += [part.max() == 0] * (int(part.max()) + 1)
+        if len(tracked) < 2:
             return one
-        root = np.arange(k)
-        for c in np.flatnonzero(tiny):
-            live = alive(when[c])
-            mine = u[live & (label == c)]
-            centre = mine.mean(0) if len(mine) else u[label == c].mean(0)
-            dist = [
-                math.inf
-                if tiny[b]
-                else _mahalanobis2(u[alive(when[b]) & (label == b)], centre)
-                for b in range(k)
-            ]
-            heaviest = max((b for b in range(k) if not tiny[b]), key=lambda b: mass[b])
-            root[c] = int(np.argmin(dist)) if math.isfinite(min(dist)) else heaviest
-        label = compact(root[label])
-        k = int(label.max()) + 1
-        # 3. Merge labels that touch (pieces of one mode), one pair at a time,
-        # until every pair is separated.
-        def separated(a, b, label):
-            gaps = []
-            for t in sorted({median(label == a), median(label == b)}):
-                pair = alive(t) & ((label == a) | (label == b))
-                side = label[pair] == b
-                if side.any() and not side.all():
-                    gaps.append(_gap(u[pair], side))
-            return bool(gaps) and min(gaps) > SEPARATION_SIGMA
-
-        merged = True
-        while merged and k > 1:
-            merged = False
-            for a, b in itertools.combinations(range(k), 2):
-                if not separated(a, b, label):
-                    label = compact(np.where(label == b, a, label))
-                    k, merged = k - 1, True
-                    break
-        if k < 2:
-            return one
-        # 4. Relabel every sample by its nearest mode, so that n(t) counts the
+        # 5. Relabel every sample by its nearest mode, so that n(t) counts the
         # points of a mode also where the run's clustering had merged it.
-        label = compact(_nearest_mode(u, weights, label, k))
-        k = int(label.max()) + 1
-        if k < 2:
+        kept, label = np.unique(
+            _nearest_mode(u, weights, cut, len(tracked)), return_inverse=True
+        )
+        masks = [label == c for c in range(len(kept))]
+        if len(masks) < 2:
             return one
         threshold = split_threshold(ndim)
         out = []
-        for mine in (label == c for c in range(k)):
+        for c, mine in enumerate(masks):
             net = np.bincount(born[mine & (born >= 0)], minlength=niter) - mine[:niter]
             n = np.sum(mine & (born < 0)) + np.concatenate([[0], np.cumsum(net)[:-1]])
 
-            def isolated(t, mine=mine):
+            def isolated(t, c=c, mine=mine):
+                """Every other mode with live points passes the split test."""
                 live = alive(t)
-                side = mine[live]
-                return 0 < side.sum() < side.size and (
-                    _fisher(u[live], side) >= threshold
+                others = [
+                    live & other
+                    for b, other in enumerate(masks)
+                    if b != c and np.any(live & other)
+                ]
+                return bool(others) and np.any(live & mine) and all(
+                    _fisher(u[pair], mine[pair]) >= threshold
+                    for pair in (other | (live & mine) for other in others)
                 )
 
             stop, stop_rest = median(mine), median(~mine)
@@ -631,8 +699,241 @@ class NestedSamplingResult:
                 "min_live": min_live,
                 "isolation_iteration": int(lo),
                 "unresolved": bool(min_live < UNRESOLVED_PER_DIM * ndim),
+                "tracked": bool(tracked[kept[c]]),
             })
         return sorted(out, key=lambda mode: -mode["mass"])
+
+    def _merge_labels(self, label, ids, u, median, alive):
+        """Passes 2 and 3 of :meth:`modes`: the mode of every sample (-1:
+        none).
+
+        ``label`` holds the labels ``0..len(ids)-1`` (-1: set aside) and
+        ``ids`` the recorded label each stands for; ``median(mask)`` is the
+        posterior median iteration of the samples ``mask`` and ``alive(t)``
+        the samples that are live at iteration ``t``.
+        """
+        k = len(ids)
+        metadata = self.metadata or {}
+        rows = [np.flatnonzero(label == c) for c in range(k)]
+        kept = [c for c in range(k) if len(rows[c])]
+        born = self._births[0]
+        when = {c: median(label == c) for c in kept}
+
+        def points(c, t):
+            i = rows[c]
+            return u[i[(born[i] < t) & (i >= t)]]
+
+        def gap(a, b, t):
+            xa, xb = points(a, t), points(b, t)
+            if not len(xa) or not len(xb):
+                return None
+            side = np.arange(len(xa) + len(xb)) >= len(xa)
+            return _gap(np.concatenate([xa, xb]), side)
+
+        # touch[a, b]: both labels have live points at the later of their two
+        # medians, and leave no gap there or at the earlier one. leans[a]:
+        # the labels b of a later median that a does not live to see and
+        # touches at its own. apart[a, b]: a gap wherever both have live
+        # points.
+        touch = np.zeros((k, k), bool)
+        apart = np.zeros((k, k), bool)
+        leans: dict[int, list[int]] = {c: [] for c in kept}
+        for a, b in itertools.combinations(kept, 2):
+            early, late = (a, b) if when[a] <= when[b] else (b, a)
+            first, last = gap(a, b, when[early]), gap(a, b, when[late])
+            gaps = [g for g in (first, last) if g is not None]
+            if not gaps:
+                continue
+            if min(gaps) > SEPARATION_SIGMA:
+                apart[a, b] = apart[b, a] = True
+            elif last is None:
+                leans[early].append(late)
+            else:
+                touch[a, b] = touch[b, a] = True
+
+        slot = {int(raw): c for c, raw in enumerate(ids)}
+        children: dict[int, list[int]] = {}
+        for child, parent in metadata.get("mode_tree") or []:
+            children.setdefault(int(parent), []).append(int(child))
+        composite = np.zeros(k, bool)
+        group = np.arange(k)
+
+        def find(c):
+            while group[c] != c:
+                group[c] = group[group[c]]
+                c = group[c]
+            return c
+
+        def heirs(raw):
+            """The label ``raw`` if it stands for part of a mode, else the
+            nearest descendants that do."""
+            c = slot.get(raw)
+            if c is not None and len(rows[c]) and not composite[c]:
+                return [c]
+            return [h for child in children.get(raw, []) for h in heirs(child)]
+
+        def tainted(raw):
+            """Whether the label ``raw`` or one of its descendants belongs to
+            no mode."""
+            c = slot.get(raw)
+            if c is not None and composite[c]:
+                return True
+            return any(tainted(child) for child in children.get(raw, []))
+
+        def spans(q, a, b):
+            """Whether the live points of ``q`` lie on both sides of the gap
+            between ``a`` and ``b`` (more than ``ndim`` on either) and leave
+            a gap themselves."""
+            for t in {when[q], when[a], when[b]}:
+                xa, xb, xq = points(a, t), points(b, t), points(q, t)
+                if not (len(xa) and len(xb) and len(xq)):
+                    continue
+                side = np.arange(len(xa) + len(xb)) >= len(xa)
+                w, lo, hi = _discriminant(np.concatenate([xa, xb]), side)
+                xq = np.unique(xq, axis=0)
+                over = xq @ w > 0.5 * (lo + hi)
+                if (
+                    min(over.sum(), len(over) - over.sum()) > xq.shape[1]
+                    and _gap(xq, over) > SEPARATION_SIGMA
+                ):
+                    return True
+            return False
+
+        # A cluster belongs to no mode if it touches (or leans on) two
+        # labels that are apart and its own live points leave a gap between
+        # the two: a cluster of another clustering that covers both.
+        for q in kept:
+            near = [c for c in kept if touch[q, c] or c in leans[q] or q in leans[c]]
+            composite[q] = any(
+                apart[a, b] and spans(q, a, b)
+                for a, b in itertools.combinations(near, 2)
+            )
+        # Nor does it if the clusters it was split into ended in separate
+        # modes. Touching labels are merged from the last cluster made to
+        # the first, so that the parts of a cluster are merged before it.
+        whole: list[int] = []
+        for q in sorted(kept, key=lambda c: -rows[c][0]):
+            below = children.get(int(ids[q]), [])
+            parts = [h for child in below for h in heirs(child)]
+            composite[q] |= any(tainted(child) for child in below) or any(
+                apart[a, b] and find(a) != find(b)
+                for a, b in itertools.combinations(parts, 2)
+            )
+            if not composite[q]:
+                for c in whole:
+                    if touch[q, c]:
+                        group[find(c)] = find(q)
+                whole.append(q)
+        # A group of labels is a mode, or the early part of the one mode its
+        # labels lean on; it belongs to none if they lean on several. The
+        # groups are taken by decreasing time of their last median.
+        last: dict[int, int] = {}
+        for c in whole:
+            last[find(c)] = max(last.get(find(c), -1), when[c])
+        mode: dict[int, int] = {}
+        for r in sorted(last, key=lambda r: -last[r]):
+            targets = {
+                mode[find(b)]
+                for c in whole
+                if find(c) == r
+                for b in leans[c]
+                if not composite[b] and find(b) in mode and find(b) != r
+            }
+            if not targets:
+                mode[r] = len(mode)
+            else:
+                targets -= {-1}
+                mode[r] = targets.pop() if len(targets) == 1 else -1
+        of_label = np.full(k + 1, -1)
+        for c in whole:
+            of_label[c] = mode[find(c)]
+
+        # 3. A mode with fewer than UNRESOLVED_PER_DIM * ndim live points at
+        # its posterior median is part of another if the live points of the
+        # labels that belong to no mode fill the gap between the two.
+        def live_points(m):
+            """The distinct live points at the median of mode ``m``, the mode
+            of each (-1: none) and its row among the samples."""
+            mine = of_label[label] == m
+            live = alive(median(mine))
+            x, first = np.unique(u[live], axis=0, return_index=True)
+            return x, of_label[label][live][first], np.flatnonzero(live)[first]
+
+        found = sorted(set(of_label[:k]) - {-1})
+        joint = {m: m for m in found}
+        for m in found:
+            x, owner, _ = live_points(m)
+            small = np.sum(owner == m) < UNRESOLVED_PER_DIM * u.shape[1]
+            for rival in found if small else []:
+                pair = (owner == m) | (owner == rival)
+                if rival != m and np.any(owner == rival):
+                    w, lo, hi = _discriminant(x[pair], owner[pair] == rival)
+                    p, mid = x[owner < 0] @ w, 0.5 * (lo + hi)
+                    lo, hi = max([lo, *p[p <= mid]]), min([hi, *p[p > mid]])
+                    if hi - lo <= SEPARATION_SIGMA:
+                        low, high = sorted((joint[m], joint[rival]))
+                        joint = {a: low if b == high else b for a, b in joint.items()}
+        of_label = np.array([joint.get(m, -1) for m in of_label])
+        # A mode whose labels are all of one clustering holds points of one
+        # fold only. It is left out if no live point of another fold has one
+        # of them as nearest neighbour: a point and its descendants stay in
+        # one fold, so these are the descendants of a stuck chain.
+        folds = metadata.get("folds")
+        for m in sorted(set(joint.values())) if folds else []:
+            members = np.flatnonzero(of_label[:k] == m)
+            if len({int(ids[c]) % folds for c in members}) > 1:
+                continue
+            x, owner, at = live_points(m)
+            other = np.asarray(self.labels)[at] % folds != int(ids[members[0]]) % folds
+            dev = x - x.mean(0)
+            chol = np.linalg.cholesky(_ridge(dev.T @ dev / max(len(x) - 1, 1)))
+            z = np.linalg.solve(chol, dev.T).T
+            dist = np.sum((z[other][:, None, :] - z[None, :, :]) ** 2, axis=-1)
+            dist[np.arange(other.sum()), np.flatnonzero(other)] = np.inf
+            if not (other.any() and np.any(owner[np.argmin(dist, axis=1)] == m)):
+                of_label[members] = -1
+        return np.unique(of_label, return_inverse=True)[1][label] - 1
+
+    def _mode_slots(self) -> tuple[int | None, float | None]:
+        """The most clusters one of the run's clusterings held at a time, and
+        the fraction of the iterations at which all ``C_MAX`` slots were in
+        use (``metadata["mode_history"]``; ``(None, None)`` without it)."""
+        history = (self.metadata or {}).get("mode_history")
+        if not history or int(self.niter) == 0:
+            return None, None
+        starts = [int(row[0]) for row in history] + [int(self.niter)]
+        full = sum(
+            stop - start
+            for row, start, stop in zip(history, starts, starts[1:], strict=False)
+            if row[1] >= C_MAX
+        )
+        return max(int(row[1]) for row in history), full / int(self.niter)
+
+    def _mode_warnings(self, modes) -> list[str]:
+        """The warnings of :meth:`diagnostics` about ``modes``."""
+        warnings = [
+            f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
+            f"{mode['min_live']} live points; raise nlive"
+            for i, mode in enumerate(modes)
+            if mode["unresolved"]
+        ]
+        most, full = self._mode_slots()
+        loose = sum(not mode["tracked"] for mode in modes)
+        if loose:
+            held = "" if most is None else f" (it held at most {most} clusters)"
+            warnings.append(
+                f"{loose} of the {len(modes)} modes were not separated by the "
+                f"sampler's clustering{held}: the inter-mode hop did not balance "
+                "them, so their masses scatter from run to run by about urn_sd, "
+                "and there may be more modes than were found"
+            )
+        if full and len(modes) > 1:
+            warnings.append(
+                f"the {C_MAX} cluster slots were full for {100 * full:.0f}% of "
+                f"the run: there may be more modes than the {len(modes)} found, "
+                "and the mode masses are not reliable"
+            )
+        return warnings
 
     def information(self) -> float:
         """Return the nested-sampling information from posterior weights."""
@@ -691,7 +992,13 @@ class NestedSamplingResult:
 
         Besides the weight statistics it holds the pooled insertion-test
         p-value (``insertion_pvalue``; :meth:`insertion_test` has the
-        windows) and the posterior ``modes`` (:meth:`modes`).
+        windows), the posterior ``modes`` (:meth:`modes`) and
+        ``mode_slots_full``, the fraction of the run during which every
+        cluster slot of the sampler's clustering was in use (``None`` for a
+        result without that record). The warnings name each unresolved mode,
+        the modes the clustering did not separate, and a run of several
+        modes whose slots were full: in the last two cases the number of
+        modes is a lower bound.
         """
 
         metadata = {} if self.metadata is None else self.metadata
@@ -742,12 +1049,7 @@ class NestedSamplingResult:
                 "insertion indices look non-uniform; constrained sampler may be "
                 "biased or poorly mixed"
             )
-        for i, mode in enumerate(modes):
-            if mode["unresolved"]:
-                warnings.append(
-                    f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
-                    f"{mode['min_live']} live points; raise nlive"
-                )
+        warnings.extend(self._mode_warnings(modes))
         if nposterior < self.nlive + 10:
             warnings.append("very few dead points")
 
@@ -772,6 +1074,7 @@ class NestedSamplingResult:
             "acceptance": acceptance,
             "insertion_pvalue": insertion["pvalue"],
             "modes": modes,
+            "mode_slots_full": self._mode_slots()[1],
             "warnings": warnings,
         }
 
@@ -794,7 +1097,7 @@ class NestedSamplingResult:
         """Return a human-readable multi-line summary of the result.
 
         With more than one posterior mode it ends with a per-mode table
-        (:meth:`modes`).
+        (:meth:`modes`) and the warnings about the mode count.
         """
 
         insertion = self.insertion_test()
@@ -814,10 +1117,16 @@ class NestedSamplingResult:
             lines.append("mode      mass  logit sd  min live")
             for i, mode in enumerate(modes):
                 flag = "  unresolved: raise nlive" if mode["unresolved"] else ""
+                flag += "" if mode["tracked"] else "  not tracked"
                 lines.append(
                     f"{i:4d}  {mode['mass']:8.4f}  {mode['urn_sd']:8.2f}  "
                     f"{mode['min_live']:8d}{flag}"
                 )
+            lines += [
+                "warning: " + text
+                for text in self._mode_warnings(modes)
+                if "is unresolved" not in text
+            ]
         return "\n".join(lines)
 
     def __str__(self) -> str:

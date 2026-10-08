@@ -26,7 +26,7 @@ from tinyns import modes
 def cluster_twice(u):
     """Cluster a batch of snapshots ``(B, m, d)`` from scratch, then again
     from the first labels."""
-    labels, _ = modes.recluster_lanes(u, jnp.zeros(u.shape[:2], jnp.int32))
+    labels, *_ = modes.recluster_lanes(u, jnp.zeros(u.shape[:2], jnp.int32))
     return modes.recluster_lanes(u, labels)[0]
 
 
@@ -118,6 +118,26 @@ def test_far_tail_point_does_not_hide_a_comparable_mode() -> None:
     labels = cluster_twice(jnp.asarray(np.vstack([bulk, minor])[None]))[0]
     truth = np.r_[np.zeros(375, bool), np.ones(125, bool)]
     assert detected(labels, truth, tolerance=0.03)
+
+
+def test_recluster_reports_the_slots_a_split_wrote() -> None:
+    """``fresh`` marks both parts of every split and ``origin`` the slot the
+    cluster was in, so that the sampler can give the parts new ids with the
+    split cluster as their parent; a later call that splits nothing marks
+    nothing."""
+    rng = np.random.default_rng(3)
+    centres = np.array([[0.2, 0.2, 0.2], [0.8, 0.2, 0.5], [0.5, 0.8, 0.8]])
+    x = np.concatenate([c + 0.01 * rng.normal(size=(60, 3)) for c in centres])
+    u = jnp.asarray(x[None])
+    labels, _, fresh, origin = modes.recluster_lanes(u, jnp.zeros((1, 180), jnp.int32))
+    assert sorted(np.unique(labels).tolist()) == [0, 1, 2]
+    np.testing.assert_array_equal(fresh[0], np.arange(modes.C_MAX) < 3)
+    np.testing.assert_array_equal(origin[0, :3], [0, 0, 0])  # all from slot 0
+    np.testing.assert_array_equal(origin[0, 3:], np.arange(3, modes.C_MAX))
+    again, _, fresh, origin = modes.recluster_lanes(u, labels)
+    np.testing.assert_array_equal(again, labels)
+    assert not fresh.any()
+    np.testing.assert_array_equal(origin[0], np.arange(modes.C_MAX))
 
 
 def test_labels_and_statistics_agree() -> None:
