@@ -141,13 +141,59 @@ targets need longer chains: a 10-D Rosenbrock valley needs 12 to 25 `* ndim`.
 If in doubt, rerun with twice the walks and check that logZ moves by less than
 `logzerr`.
 
-## Choosing nlive / num_delete
+## Choosing `nlive` and `num_delete`
 
-<!-- PLACEHOLDER: the defaults-sweep PR replaces this section. -->
-The current defaults are `nlive=1000` and `num_delete = nlive // 10` (at most
-`nlive // 2`). Guidance from the defaults sweep will go here. Until then:
-`logzerr` falls as `1 / sqrt(nlive)`, every mode needs `5 * ndim` live points,
-and `num_delete=1` suits expensive likelihoods (see Limitations).
+The defaults are `nlive=1000` and `num_delete = nlive // 10`. They come from a
+sweep of 362 cells of 40 runs each on an H100: `nlive` from 250 to 4000,
+`num_delete / nlive` from 0.05 to 0.5, on Gaussians (2 to 64 dimensions),
+two- and three-mode mixtures (10 to 32), a 10-D Rosenbrock, a 10-D funnel and
+the eggbox.
+
+**`nlive`.** `logzerr` falls as `1 / sqrt(nlive)` and the likelihood calls
+grow in proportion to it: at 1000, `logzerr` is 0.17, 0.31 and 0.44 on 10-,
+32- and 64-D Gaussians after 2, 18 and 125 million calls. On a GPU with a
+cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
+0.85 s at 4000 on a 10-D Gaussian), so raise it freely there. Raise it when:
+
+- *a small mode matters.* A mode needs `5 * ndim` live points to be weighted
+  correctly, twice that if it is much thinner than the main mode. For a mode
+  holding a fraction `f` of the posterior that is `nlive` of about
+  `5 * ndim / f` to `10 * ndim / f`. A 6% mode was weighted without bias and
+  never lost from `nlive` 500, 1000 and 2000 at 10, 18 and 32 dimensions
+  (1000, 2000 and 4000 for a thin one, still lost in 1 run of 40 at 32). At
+  half of that the thin mode was lost in 5 to 40% of the runs.
+- *`modes()` flags a mode unresolved.* The flag is a reason to raise `nlive`,
+  but its absence is not proof: it caught one in five of the runs with a
+  wrong weight, because a mode lost early leaves no trace. If a small mode
+  matters, compare with a run at twice the `nlive`.
+- *the posterior has many modes.* The eggbox (18 peaks) kept every peak in
+  every run from `nlive=2000`, about 100 live points per peak; at 500 it lost
+  a peak in 4 of 10 runs. Its logZ was right at every `nlive`.
+- *the target is curved.* The logZ of the 10-D Rosenbrock was 0.16 too low at
+  500, 0.05 at 1000 and unbiased from 2000 (at the default `walks`).
+- *`ndim` is above about `nlive / 10`.* At `nlive=250` logZ was 0.2 to 0.4 too
+  high at 32 and 64 dimensions; 1000 was unbiased up to 64.
+
+**`num_delete`.** For a given number of likelihood calls the accuracy of logZ
+does not depend on it: a larger share shrinks the volume faster per death and
+loses as much in effective live points. It sets the run time instead (a 10-D
+Gaussian at `nlive=1000`, compiled: 1.1, 0.7, 0.5 and 0.3 s at a share of 0.05,
+0.1, 0.25 and 0.5; 27 s at `num_delete=1`). Stay at `nlive // 10` unless you
+have a reason:
+
+- Above it the diagnostics degrade. On the eggbox logZ scattered 1.5 to 2.5
+  times `logzerr` at shares of 0.25 and 0.5 (0.9 to 1.2 at 0.1), a mode near
+  the `5 * ndim` limit was lost more often, and the insertion test rejected
+  13% and 30% of correct runs at the 5% level (6% at 0.1 and below).
+- `num_delete=1` is for a likelihood that already fills the device in one
+  call. It evaluates no out-of-cube proposal, which saved 8 to 17% of the
+  calls, and its `logzerr` is 2% smaller. If the device can evaluate several
+  likelihoods at once, the default is faster by the batch size.
+
+**Memory** was no constraint: 40 batched runs at 64 dimensions peaked at 4 GiB
+of GPU memory with `nlive=4000` (7 GiB at a share of 0.5), and one run holds
+`niter * ndim` samples on the host (740 thousand dead points at 64-D,
+`nlive=4000`).
 
 ## GPU notes
 
@@ -237,16 +283,18 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
 
 - **Small modes.** A mode with fewer than about `5 * ndim` live points is not
   sampled reliably. `modes()` flags it; raise `nlive`.
-- **Many modes.** The clustering has 8 slots. Mode weights are not validated
-  for more separated modes than that (an eggbox).
+- **Many modes.** The clustering has 8 slots and rarely split the eggbox's 18
+  peaks: logZ is right, but `modes()` reports one mode, and the peak
+  weights scatter as without the hop (0.7 in the log at `nlive=1000`, 0.26 at
+  4000).
 - **Curved targets** need more `walks` than the default.
 - **Expensive likelihoods.** Parallel chains do not reduce the number of
   likelihood calls, and with `num_delete > 1` out-of-cube proposals are
   evaluated too. When one call already fills the device, use `num_delete=1`.
 - **float32.** Likelihood differences below about `1e-7 * |loglike|` are lost;
   enable x64.
-- **Insertion test.** With `num_delete > 1` its p-values are mildly
-  anti-conservative.
+- **Insertion test.** Its p-values are honest up to `num_delete = nlive // 10`
+  and anti-conservative above (see Choosing `nlive` and `num_delete`).
 - **Compile cache.** A process keeps up to 8 compiled configurations.
 
 ## Benchmarks
