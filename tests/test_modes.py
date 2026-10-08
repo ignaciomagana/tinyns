@@ -263,7 +263,14 @@ def test_more_modes_than_the_clustering_separates_are_flagged() -> None:
     assert 14 <= len(modes) <= 18
     assert not any(m["tracked"] for m in modes)
     assert sum(m["mass"] for m in modes) == pytest.approx(1.0)
-    assert 0.04 < modes[0]["mass"] < 0.2 and all(m["urn_sd"] > 0.2 for m in modes)
+    # The run is not the same on every CPU in float32, so the bounds hold for
+    # any seed. The heaviest mode is one 8% peak with its scatter, or two that
+    # stayed merged: 0.10 to 0.20 over 21 runs. The typical urn_sd is that of
+    # a mode of 20 to 70 live points left unbalanced (median 0.33 to 0.55 over
+    # those runs); a single mode cut late has only its 1 / n term (0.10 and up).
+    assert 0.04 < modes[0]["mass"] < 0.3
+    urn_sd = sorted(m["urn_sd"] for m in modes)
+    assert urn_sd[0] > 0.05 and urn_sd[len(urn_sd) // 2] > 0.25
     warnings = result.diagnostics()["warnings"]
     assert sum("were not separated by the sampler's" in w for w in warnings) == 1
     assert "not tracked" in result.summary() and "warning: " in result.summary()
