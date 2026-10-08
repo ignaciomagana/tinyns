@@ -1,19 +1,76 @@
 # Competitor benchmark harness
 
-Runs tinyns and the other nested samplers on standard targets with a known
-evidence, and records one JSONL line per run. It is not part of the package.
+Standard targets with a known evidence and known mode masses, and three tools
+built on them. It is not part of the package.
+
+- `validate.py` is the **release gate**: tinyns alone, PASS or FAIL.
+- `run.py` runs tinyns or a competitor and records one JSONL line per run.
+- `summarize.py` merges those records into the **head-to-head report**.
 
 ```
 bench/
   targets.py           targets: JAX loglike, box prior, true logZ, oracle mode masses
   adapters/            one module per sampler: run(target, seed, cfg) -> dict
+  validate.py          the release gate: tinyns on the standard targets -> PASS/FAIL
   run.py               CLI: one sampler x one target x seeds -> results.jsonl
-  summarize.py         JSONL -> Markdown table per sampler x target
+  summarize.py         JSONL files -> head-to-head report (Markdown, CSV, JSON)
   h100_plan.sh         env build + sweep job lines for js2h100 (review before use)
   slurm_cpu.sh         the CPU sampler lines as a Slurm array (Hilda)
   requirements-*.txt   pins for the two envs
   tests/               pytest (collected by the repo's CI)
 ```
+
+## Validation gate
+
+Run it before a release, and after any change to the sampler:
+
+```bash
+python bench/validate.py                 # quick tier: about 6 min on 4 CPU cores
+python bench/validate.py --tier full     # every case: a GPU, or a Slurm node
+python bench/validate.py --no-x64        # the same in float32
+```
+
+It prints a PASS/FAIL table and exits with code 1 if a case fails. Each case
+is `--seeds` independent runs of one target, run as one batch of keys.
+
+| case | quick nlive | full nlive | walks |
+|---|---|---|---|
+| `gauss_d2`, `gauss_d10` | 500 | 1000 | default |
+| `gauss_d32` | - | 1000 | default |
+| `rosen_d4` | 500 | 1000 | 100 |
+| `rosen_d10` | - | 1000 | 250 |
+| `funnel_d10`, `loggamma_d10`, `eggbox_d2` | 500 | 1000 | default |
+| `sepW_d10` | 2000 | 2000 | default |
+| `sepW_d18` | - | 4000 | default |
+
+- The quick tier runs 16 seeds, the full tier 64 at the default `nlive`.
+- Rosenbrock runs at `walks = 25 * ndim`: the default is calibrated on
+  Gaussians and is too short for a curved valley.
+- The mixtures run at an `nlive` that gives the 6% minor mode more than
+  `5 * ndim` live points, which is what it takes to resolve it.
+
+A case passes when all of these hold (se is the standard error over seeds):
+
+| criterion | rule |
+|---|---|
+| `bias` | \|mean logZ - truth\| < 3 se |
+| `scatter` | sd(logZ) / mean(logzerr) in [0.75, 1.3] |
+| `modes` | mixtures: logit bias of each minor mode weight < 3 se, its sd <= 0.4, no seed lost a mode |
+| `flags` | every run converged, and `result.modes()` flags no mode `unresolved` |
+
+- **The scatter ratio is noisy.** Measured on N seeds it has a relative error
+  of `1 / sqrt(2 (N - 1))`: 18% at 16 seeds, 9% at 64. A case fails only when
+  the ratio is outside the band by more than 3 of those; the table prints that
+  interval. So the quick tier catches an error bar that is off by a factor of
+  about 2, and the full tier one that is off by 40%.
+- **Mode weights are oracle masses**: the target's exact responsibility
+  averaged over the posterior samples, not `result.modes()`.
+- **Expect a false FAIL now and then.** Each criterion is a 3-sigma test, and
+  the full tier runs about 25 of them. Rerun a failed case with another key
+  (`--cases NAME --seed 1`) and more seeds before believing it.
+- `--json FILE` keeps every seed's logZ, logzerr and mode masses.
+- `--cases`, `--seeds` and `--nlive` override the tier, for a closer look at
+  one case.
 
 ## Targets
 
@@ -66,7 +123,7 @@ recomputes the cached quadrature values.
 | `blackjax_nss` | gpu | `blackjax.nss`, `num_delete = nlive/10`, `num_inner_steps = max(5, 2d)` |
 | `dynesty[:rwalk100]` | cpu | `bound='multi', sample='auto'`, or `sample='rwalk', walks=100` |
 | `ultranest[:slice]` | cpu | MLFriends, or `SliceSampler(nsteps=2d, mixture directions)` |
-| `nautilus[:discard]` | cpu | defaults (`n_live=2000`), or `discard_exploration=True` |
+| `nautilus[:discard]` | cpu | defaults (`n_live=2000`), or `discard_exploration=True`; `--opt pool=N` |
 | `jaxns[:nlive]` | gpu | JAXNS 3 defaults, or `root_allocation_degree = nlive` (own env) |
 
 Each adapter's docstring gives its exact settings. These differences matter
@@ -166,17 +223,55 @@ How `run.py` works:
 - `status (ok/timeout/error), error, wall_s, compile_s, ncall, ncall_valid`
 - `logz, logzerr, mode_mass, n_samples, ess (Kish), ts`
 
-**Summary columns**:
+## Head-to-head report
 
-- `dlogZ`: mean ± standard error.
-- `scat/err`: sd(dlogZ) / mean(logzerr).
-- `z_rms`: rms of dlogZ / logzerr.
-- `logit sd [95% CI]`: for the worst minor mode, with a bootstrap over seeds.
-  Seeds that lost the mode are left out.
-- `logit bias`.
-- `lost`: the fraction of seeds where some minor mode has under 10% of its
-  true mass.
-- Medians of `ncall`, `wall s` and `compile s`.
+```bash
+python bench/summarize.py results_gpu.jsonl results_cpu.jsonl \
+    --out report.md --csv cells.csv --json cells.json
+```
+
+It merges any number of JSONL files. A cell is one (sampler, target, nlive);
+runs with `--opt` settings form their own sampler, labelled
+`name [key=value]`, so a matched-settings rerun sits next to the default one.
+
+The report has three parts:
+
+1. **Headline**: for each target family, the reference sampler's rank, and
+   each competitor's calls, wall time, logZ rms and mode-weight sd relative to
+   it. `--reference` picks the sampler (default `tinyns_v1`); without records
+   of it the report says so and carries on.
+2. **Accurate cells**: per sampler and family, how many cells are accurate.
+3. **Cells**: one row per cell. The module docstring describes the columns.
+
+The same rows go to `--csv` (flat) and `--json`.
+
+**Accurate** is the report's meaning of "comparable accuracy". A cell is
+accurate when:
+
+- at least 90% of its runs finished;
+- its logZ bias is within 3 se or within 0.1 nats (the `dlogz` the runs stop
+  at);
+- for a mixture, at most 10% of its seeds lost a mode, and the logit bias of
+  the mode weight is within 3 se or 0.1.
+
+The headline's ratios are geometric means over the targets where both samplers
+are accurate.
+
+**Read the costs with these in mind:**
+
+- **Hardware.** Wall times compare only within one hardware label. The GPU
+  samplers ran on one H100; the CPU samplers ran on 4 cores of a Xeon
+  E5-2695 v3 each, and call the likelihood from Python. One such call costs
+  35 us through the jitted JAX function, against 0.3 us per point in a batch.
+- **Precision differs.** The samplers do not stop at the same accuracy, so
+  compare `rms` before `ncall`:
+  - Nautilus runs 2000 live points to an effective sample size of 10000.
+  - JAXNS's default is `30 * ndim` live points: 60 at d = 2, 1920 at d = 64.
+  - UltraNest stops at `dlogz = 0.5` and may add live points.
+- **Timeouts.** A run stops at 1 h on the GPU and at 4 h on a CPU. `ncall` is
+  the median of the finished runs only; `wall s` counts the timeouts too.
+- **Seeds.** 20 per target (40 for the mixtures); the CPU samplers have 10 at
+  d >= 32.
 
 ## Multimodality bake-off (`bench/bakeoff/`)
 
@@ -212,12 +307,16 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
 
 ## Tests
 
-`pytest bench/tests` covers four things:
+`pytest bench/tests` covers:
 
 - the target truths: 2-D grid integrals, the cached quadratures, and the exact
   mode masses checked with direct draws from each mixture;
 - every installed adapter, on `gauss_d2` with nlive 100;
-- `run.py` and `summarize.py` end to end, including a timeout record.
+- `run.py` and `summarize.py` end to end, including a timeout record;
+- the report on synthetic records: merging, the accuracy flags, the headline
+  ratios and ranks, a missing reference;
+- the gate: its criteria on synthetic rows, and one run of its code path on
+  tiny settings.
 
 Adapters whose package is missing are skipped. CI has only tinyns installed,
 so there it runs the tinyns adapter that matches the installed version.
