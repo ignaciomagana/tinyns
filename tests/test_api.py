@@ -23,8 +23,11 @@ def identity(u):
 
 def test_public_exports() -> None:
     for name in ("NestedSampler", "Config", "init", "step", "finalise",
-                 "NestedSamplingResult"):
+                 "delta_logz", "STATUS", "NestedSamplingResult"):
         assert name in tinyns.__all__ and hasattr(tinyns, name)
+    assert tinyns.delta_logz is tinyns.core.delta_logz
+    assert tinyns.STATUS == ("running", "converged", "maxiter", "maxcall", "plateau")
+    assert tinyns.STATUS[tinyns.core.PLATEAU] == "plateau"
 
 
 def test_signatures() -> None:

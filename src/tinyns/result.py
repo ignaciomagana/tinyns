@@ -778,7 +778,7 @@ class NestedSamplingResult:
     def resample_equal(self, key, n: int | None = None):
         """Return ``n`` equally weighted posterior samples (systematic resampling).
 
-        ``key`` is a JAX PRNG key (not an int seed); ``n`` defaults to the
+        ``key`` is a JAX PRNG key or an int seed; ``n`` defaults to the
         posterior effective sample size.
         """
 
@@ -869,9 +869,11 @@ class NestedSamplingResult:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a plain Python dictionary representation of the result."""
+        """Return a plain Python dictionary representation of the result
+        (the fields :meth:`save_npz` writes; ``labels`` may be ``None``)."""
 
         out = {name: getattr(self, name) for name in _RESULT_NPZ_ARRAYS}
+        out["labels"] = self.labels
         out.update({name: getattr(self, name) for name in _RESULT_NPZ_SCALARS})
         out["metadata"] = None if self.metadata is None else dict(self.metadata)
         return out
@@ -880,6 +882,7 @@ class NestedSamplingResult:
         """Return a plain dictionary with array fields converted to NumPy arrays."""
 
         out = {name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS}
+        out["labels"] = None if self.labels is None else np.asarray(self.labels)
         out.update(
             {
                 name: kind(getattr(self, name))

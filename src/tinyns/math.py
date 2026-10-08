@@ -5,9 +5,17 @@ from __future__ import annotations
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 from jax import random
 
 ArrayLike = Any
+
+
+def as_key(key):
+    """Return ``key`` as a JAX PRNG key: an int seed becomes ``PRNGKey(seed)``."""
+    if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+        return random.PRNGKey(int(key))
+    return key
 
 
 def logsumexp(values: ArrayLike) -> float:
@@ -84,12 +92,15 @@ def effective_sample_size_from_log_weights(logw: ArrayLike):
 
 
 def systematic_resample(key, logw: ArrayLike, n: int):
-    """Draw ``n`` systematic-resampling indices from log weights."""
+    """Draw ``n`` systematic-resampling indices from log weights.
+
+    ``key`` is a PRNG key or an int seed.
+    """
 
     normalized = normalize_log_weights(logw)
     weights = jnp.exp(normalized)
     cdf = jnp.cumsum(weights)
-    start = random.uniform(key, shape=()) / n
+    start = random.uniform(as_key(key), shape=()) / n
     positions = start + jnp.arange(n) / n
     return jnp.searchsorted(cdf, positions, side="left")
 

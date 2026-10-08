@@ -42,10 +42,10 @@ print(result.summary())  # logz is -log(400) = -5.99 within logzerr
 (tinyns vmaps them); a NaN likelihood counts as `-inf`. The whole API is
 `NestedSampler(loglike, prior_transform, ndim, nlive, *, num_delete, walks)`
 and `sampler.run(key, *, dlogz=0.1, maxiter, maxcall, progress, checkpoint,
-batched_data)`. `key` is a PRNG key or an int seed. The run stops when the
-live points hold less than `dlogz` of the evidence, at `maxiter` dead points
-or `maxcall` likelihood calls, or on a likelihood plateau. `progress=True`
-prints one line per chunk of steps.
+batched_data)`. `key` is a PRNG key or an int seed, here and wherever tinyns
+takes a key. The run stops when the live points hold less than `dlogz` of the
+evidence, at `maxiter` dead points or `maxcall` likelihood calls, or on a
+likelihood plateau. `progress=True` prints one line per chunk of steps.
 
 ## The result
 
@@ -54,7 +54,7 @@ from tinyns import NestedSamplingResult
 
 print(result.logz, result.logzerr)  # log evidence and its error
 samples, weights = result.samples, result.weights()  # weighted posterior
-equal = result.resample_equal(jax.random.key(1), n=2000)  # equal weights
+equal = result.resample_equal(1, n=2000)  # equal weights; key or int seed
 print(result.modes())  # posterior modes: mass, smallest live count, flags
 print(result.insertion_test()["pvalue"])  # insertion-rank uniformity test
 print(result.diagnostics()["warnings"])  # the checks, as a list of warnings
@@ -64,8 +64,8 @@ result = NestedSamplingResult.load_npz("result.npz")
 
 The arrays (`samples`, `samples_u`, `logl`, `logwt`, `logl_birth`, `nlive_i`,
 `labels`) hold the dead points in order, then the final live points.
-`metadata` has the settings and timings, and `to_dynesty_dict()` gives
-dynesty-style keys.
+`metadata` has the settings and timings; `to_dict()` and `to_numpy()` return
+every field, and `to_dynesty_dict()` gives dynesty-style keys.
 
 ## How it works
 
@@ -98,12 +98,23 @@ chain length. What remains is common to every MCMC-driven nested sampler: a
 new point is correlated with its seed (hence `walks`), and the step scale
 adapts on past chains.
 
-**Speed.** On an H100, a 13-D Gaussian with 1000 live points ran in 0.56 s
-once compiled, against 51 s for tinyns v0.2.5 (about 90x; measured on the
-first v1 core, before the mode tracking was added). With `num_delete`
+**Speed.** Measured on one NVIDIA H100 in float32, on a 13-D correlated
+Gaussian run to `dlogz = 0.1` with the default settings of each version:
+
+| live points | v1, compiled | v1, first run | v0.2.5, compiled | v0.2.5, first run |
+|---|---|---|---|---|
+| 1000 | 0.93 s | 9.8 s | 47 s | 53 s |
+| 4000 | 1.15 s | 10.3 s | 227 s | 233 s |
+
+"Compiled" is a second run in the same process; "first run" includes the
+compilation (about 8 s for v1). v1 is 50x faster at 1000 live points and 200x
+at 4000 once compiled, and 5x and 23x on a first run. With `num_delete`
 proportional to `nlive` the number of steps does not depend on `nlive`, so for
-a cheap likelihood the run time on a GPU is nearly flat in `nlive`.
-Compilation takes about 10 s on a GPU.
+a cheap likelihood the run time on a GPU is nearly flat in `nlive`. With
+`num_delete=1` the chains run one at a time and the gain is small: 35 s and
+136 s compiled, 1.3x and 1.7x faster than v0.2.5. A two-mode target in 10
+dimensions took 0.91 s compiled against 0.66 s for a 10-D Gaussian; with
+clustering and hops active, the time per likelihood call was 15 to 20% higher.
 
 ## Multimodal posteriors
 
@@ -117,9 +128,10 @@ A mode needs about `5 * ndim` live points for its own walk to mix. In the
 validation cells where every mode held that many, the weights showed no bias
 within the measurement error. Below it a mode's weight is biased or scatters
 widely, and the mode can be lost; `result.modes()` (and `summary()`) flag it
-`unresolved: raise nlive`. The mode tracking added about 6% to the run time at
-1 ms per likelihood call, and adds nothing per chain step while a run has one
-cluster.
+`unresolved: raise nlive`. The mode tracking is a fixed cost per step: about 6%
+of the run time at 1 ms per likelihood call. For likelihoods that take
+microseconds it is a larger share (15 to 21% more per call on a 10-D two-mode
+target than on a 10-D Gaussian; see Speed).
 
 ## Choosing `walks`
 
@@ -196,22 +208,26 @@ share one compilation.
 ## The functional core
 
 ```python
-from tinyns import Config, finalise, init, step
-from tinyns.core import delta_logz
+from tinyns import Config, delta_logz, finalise, init, step
 
 cfg = Config(ndim=2, nlive=200)
-state = init(jax.random.key(0), loglike, prior_transform, cfg)
+state = init(0, loglike, prior_transform, cfg)
 rows = []
-while delta_logz(state, cfg) > 0.1:  # evidence left in the live points
+while delta_logz(state, cfg) >= 0.1:  # evidence left in the live points
     state, dead = step(state, loglike, prior_transform, cfg)
     rows.append(dead)
 dead = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *rows)
-result = finalise(state, dead, cfg, prior_transform=prior_transform)
+result = finalise(state, dead, cfg, prior_transform=prior_transform, dlogz=0.1)
 ```
 
 `State` and `Dead` are pytrees of arrays, so `step` works under `jax.jit`,
-`lax.scan` and `jax.vmap`. `step` does not test termination: the loop owns
-`state.status` (the result above reports `running`).
+`lax.scan` and `jax.vmap`. `step` does not test termination; the loop does.
+Given the loop's `dlogz`, `finalise` applies the stopping rule of `run` and
+reports `converged` (without it: `success=False`, `running`).
+`tinyns.STATUS[int(state.status)]` names the status, which `step` changes only
+on a likelihood plateau (`"plateau"`: stop there). `state.ncall` is an int32:
+a loop that may pass `2**31` likelihood calls counts them on the host and
+gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
 
 `examples/` has five scripts, each under a minute on a CPU: `quickstart.py`,
 `multimodal.py`, `checkpoint_resume.py`, `sbc_batched.py` and

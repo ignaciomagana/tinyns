@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from jax import random
 
+import tinyns
 from tinyns import Config, NestedSampler, core, finalise, init, step
 
 FLOAT = jnp.result_type(float)
@@ -451,6 +452,75 @@ def test_functional_loop_matches_the_insertion_replay() -> None:
         np.sort(replay, axis=1), np.sort(np.asarray(dead.insertion), axis=1)
     )
     assert abs(result.logz) < 4 * result.logzerr + 0.05
+
+
+def test_finalise_reports_convergence_of_a_hand_written_loop() -> None:
+    cfg = Config(2, 40, num_delete=5, walks=15)
+    loglike = gauss(0.5, 0.1)
+    state = init(7, loglike, identity, cfg)
+    rows = []
+    ncall = int(state.ncall)
+    while tinyns.delta_logz(state, cfg) >= 0.1:
+        before = state.ncall
+        state, dead = step(state, loglike, identity, cfg)
+        rows.append(dead)
+        ncall += int(state.ncall - before)
+    assert tinyns.STATUS[int(state.status)] == "running"  # step leaves it
+    dead = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *rows)
+
+    plain = finalise(state, dead, cfg)
+    assert not plain.success and plain.message == "running"
+    assert "dlogz" not in plain.metadata
+
+    done = finalise(state, dead, cfg, dlogz=0.1, ncall=ncall)
+    assert done.success and done.message.startswith("converged")
+    assert done.metadata["status"] == "converged" and done.metadata["dlogz"] == 0.1
+    assert done.ncall == ncall == plain.ncall
+    assert done.logz == plain.logz
+
+    # Stopped early (the dlogz was not reached): still "running".
+    early = finalise(state, dead, cfg, dlogz=1e-6)
+    assert not early.success and early.metadata["status"] == "running"
+    with pytest.raises(ValueError, match="dlogz"):
+        finalise(state, dead, cfg, dlogz=-1.0)
+
+    # A status the loop or the driver set is kept: dlogz never overrides it.
+    for code in (core.MAXITER, core.MAXCALL, core.PLATEAU):
+        forced = state._replace(status=jnp.asarray(code, jnp.int32))
+        result = finalise(forced, dead, cfg, dlogz=0.1)
+        assert result.metadata["status"] == tinyns.STATUS[code]
+        assert result.success == (code == core.PLATEAU)
+
+    # The driver's result agrees with the hand-written loop's.
+    driver = core.run(7, loglike, identity, cfg, dlogz=0.1)
+    assert driver.niter == done.niter and driver.ncall == done.ncall
+    np.testing.assert_allclose(driver.logz, done.logz, rtol=1e-6)
+
+
+def test_host_call_count_survives_int32_wraparound() -> None:
+    """The documented pattern: differences of State.ncall stay right when the
+    int32 counter wraps."""
+    before = jnp.asarray(2**31 - 10, jnp.int32)
+    after = before + jnp.asarray(25, jnp.int32)  # wraps
+    assert int(after) < 0 and int(after - before) == 25
+
+
+def test_public_key_arguments_accept_int_seeds() -> None:
+    cfg = Config(2, 20, num_delete=2, walks=5)
+    loglike = gauss(0.5, 0.1)
+    a = init(3, loglike, identity, cfg)
+    b = init(np.int64(3), loglike, identity, cfg)
+    c = init(jax.random.PRNGKey(3), loglike, identity, cfg)
+    np.testing.assert_array_equal(a.u, b.u)
+    np.testing.assert_array_equal(a.u, c.u)
+    r1 = core.run(3, loglike, identity, cfg, maxiter=40)
+    r2 = core.run(jax.random.PRNGKey(3), loglike, identity, cfg, maxiter=40)
+    np.testing.assert_array_equal(r1.samples_u, r2.samples_u)
+    np.testing.assert_array_equal(
+        r1.resample_equal(5, n=7), r1.resample_equal(jax.random.PRNGKey(5), n=7)
+    )
+    with pytest.raises(TypeError):
+        init(True, loglike, identity, cfg)  # a bool is not a seed
 
 
 def test_chunk_length_and_limits_are_traced() -> None:
