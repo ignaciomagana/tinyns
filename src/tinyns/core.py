@@ -1,12 +1,14 @@
 """The full-JAX core of :mod:`tinyns`: ``Config``, ``State``, ``init``, ``step``.
 
 One :func:`step` deletes the ``k = cfg.num_delete`` lowest live points and
-replaces them with the ends of ``k`` fixed-length constrained random walks,
-seeded from distinct live points above the new contour ``L*`` (the highest
-deleted likelihood). The evidence bookkeeping treats the ``k`` deaths of a
-step as consecutive deaths at live counts ``m, m-1, ..., m-k+1`` (the
-birth/death contours of Fowlie, Handley and Su), so the expected log prior
-volume after ``it`` steps is ``-it * S`` with ``S = sum_j 1 / (m - j)``.
+replaces them with the ends of ``k`` fixed-length Metropolis chains (a random
+walk in the covariance of the current point's cluster, with an inter-mode hop
+every 10th step; :mod:`tinyns.modes`), seeded from live points above the new
+contour ``L*`` (the highest deleted likelihood). The evidence bookkeeping
+treats the ``k`` deaths of a step as consecutive deaths at live counts
+``m, m-1, ..., m-k+1`` (the birth/death contours of Fowlie, Handley and Su),
+so the expected log prior volume after ``it`` steps is ``-it * S`` with
+``S = sum_j 1 / (m - j)``.
 :func:`finalise` recomputes the weights, the evidence and its error on the
 host in float64.
 
@@ -1031,7 +1033,9 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
 
     It does not test termination (see :func:`delta_logz`). On a plateau (no
     live point above the deleted ones) the live set is unchanged, the rows are
-    not valid and ``status`` becomes ``PLATEAU``.
+    not valid and ``status`` becomes ``PLATEAU``; otherwise ``status`` is left
+    as it is (``RUNNING`` after :func:`init`). Before the step, the live
+    points are reclustered if a recluster is due (``cfg.recluster_every``).
     """
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
@@ -1059,7 +1063,11 @@ def finalise(
     labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads.
     ``prior_transform`` maps the samples to parameter space (without it
     ``samples`` are the unit-cube points); ``ncall`` overrides
-    ``state.ncall`` (the driver drains it).
+    ``state.ncall`` (the driver drains it). ``result.success`` and
+    ``result.message`` are read from ``state.status``, which only a driver
+    sets to ``CONVERGED``, ``MAXITER`` or ``MAXCALL``: a hand-written loop
+    over :func:`step` that does not set it gets ``success=False`` and the
+    message ``"running"``.
     """
     state, dead = jax.device_get((state, dead))
     m, d, k = cfg.nlive, cfg.ndim, cfg.num_delete

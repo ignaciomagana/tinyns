@@ -185,9 +185,10 @@ class LogZBootstrap:
     """Simulated-weights (jittered) log-evidence realizations.
 
     Produced by :meth:`NestedSamplingResult.logz_bootstrap`. ``logzerr`` is the
-    sample standard deviation of the log-evidence realizations and is the honest
-    single-run evidence uncertainty; the percentiles capture the (typically
-    left-skewed) shape that a single Gaussian ``sqrt(H/nlive)`` cannot.
+    sample standard deviation of the log-evidence realizations: the
+    prior-volume-path uncertainty of a single run, not any sampling bias. The
+    percentiles capture the (typically left-skewed) shape that a single
+    Gaussian ``sqrt(H/nlive)`` cannot.
     """
 
     logz_mean: float
@@ -312,13 +313,18 @@ class NestedSamplingResult:
     """Number of sampled dimensions."""
 
     success: bool = True
-    """Whether the sampler completed successfully."""
+    """True if the run converged (``dlogz``) or ended on a likelihood plateau;
+    False if it stopped at ``maxiter`` or ``maxcall``."""
 
     message: str = ""
-    """Optional human-readable sampler status message."""
+    """Human-readable status of the run."""
 
     metadata: dict[str, Any] | None = None
-    """Run configuration and telemetry (see the CHANGELOG for the keys)."""
+    """Run settings and telemetry: ``status``, ``walks``, ``dlogz``,
+    ``final_delta_logz``, ``acceptance`` (of the walk steps), ``scale``,
+    ``ncall_valid`` (in-cube likelihood calls), ``x64``, the hop counters,
+    ``wall_time_s``, ``compile_s``, ``sampling_s``, ``resumed`` and more (the
+    CHANGELOG lists the keys)."""
 
     def log_weights(self):
         """Return posterior weights normalized in log space."""
@@ -770,7 +776,11 @@ class NestedSamplingResult:
         }
 
     def resample_equal(self, key, n: int | None = None):
-        """Return equally weighted posterior samples using systematic resampling."""
+        """Return ``n`` equally weighted posterior samples (systematic resampling).
+
+        ``key`` is a JAX PRNG key (not an int seed); ``n`` defaults to the
+        posterior effective sample size.
+        """
 
         if n is None:
             n = max(1, int(self.posterior_ess()))

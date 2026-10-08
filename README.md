@@ -1,173 +1,249 @@
 # tinyns
 
-`tinyns` is a tiny nested sampler written entirely in JAX, in the spirit of
-`emcee` and `tinygp`: give it a log likelihood, a prior transform and the
-number of dimensions, and it returns the evidence and weighted posterior
-samples. Every step runs on the device; the host syncs once per chunk of steps.
-
-This is the v1 development branch: the API below is a hard break from v0.x
-(no compatibility shims, no old-checkpoint readers).
+`tinyns` is a tiny, general-purpose nested sampler written entirely in JAX, in
+the spirit of `emcee` and `tinygp`. Give it a log likelihood, a prior transform
+and the number of dimensions; it returns the evidence and weighted posterior
+samples. The whole run executes on the device (GPU or CPU), it handles
+multimodal posteriors inside the sampler, and it is not tied to any application.
 
 ## Install
 
+`tinyns` needs Python 3.10+ and JAX 0.4.31+. It is not on PyPI yet:
+
 ```bash
-git clone <repo-url>
-cd tinyns
-python -m pip install -e '.[dev]'
+python -m pip install git+https://github.com/ignaciomagana/tinyns.git
 ```
 
-## Example
+For a GPU, install the matching JAX build first (see the JAX install guide).
+For development: clone, `python -m pip install -e '.[dev]'`, then `make test`.
+
+## Quickstart
 
 ```python
+import jax
 import jax.numpy as jnp
 from tinyns import NestedSampler
 
 
-def prior_transform(u):
+def prior_transform(u):  # unit cube -> parameters: uniform on [-10, 10]^2
     return -10.0 + 20.0 * u
 
 
-def loglike(theta):
+def loglike(theta):  # one point -> log likelihood
     return -0.5 * jnp.sum(theta**2) - jnp.log(2 * jnp.pi)
 
 
-result = NestedSampler(loglike, prior_transform, ndim=2).run(0)
-print(result.summary())
+sampler = NestedSampler(loglike, prior_transform, ndim=2)
+result = sampler.run(jax.random.key(0))
+print(result.summary())  # logz is -log(400) = -5.99 within logzerr
 ```
 
-`loglike` and `prior_transform` are JAX-traceable functions of one point. A
-NaN likelihood counts as `-inf`.
+`loglike` and `prior_transform` are JAX-traceable functions of one point
+(tinyns vmaps them); a NaN likelihood counts as `-inf`. The whole API is
+`NestedSampler(loglike, prior_transform, ndim, nlive, *, num_delete, walks)`
+and `sampler.run(key, *, dlogz=0.1, maxiter, maxcall, progress, checkpoint,
+batched_data)`. `key` is a PRNG key or an int seed. The run stops when the
+live points hold less than `dlogz` of the evidence, at `maxiter` dead points
+or `maxcall` likelihood calls, or on a likelihood plateau. `progress=True`
+prints one line per chunk of steps.
 
-## API
+## The result
 
 ```python
-NestedSampler(loglike, prior_transform, ndim, nlive=1000, *,
-              num_delete=None,  # None -> max(1, nlive // 10), at most nlive // 2
-              walks=None)       # None -> max(25, 6 * ndim, ndim**2 // 6)
-sampler.run(key, *, dlogz=0.1, maxiter=None, maxcall=None, progress=False,
-            checkpoint=None, batched_data=False)
+from tinyns import NestedSamplingResult
+
+print(result.logz, result.logzerr)  # log evidence and its error
+samples, weights = result.samples, result.weights()  # weighted posterior
+equal = result.resample_equal(jax.random.key(1), n=2000)  # equal weights
+print(result.modes())  # posterior modes: mass, smallest live count, flags
+print(result.insertion_test()["pvalue"])  # insertion-rank uniformity test
+print(result.diagnostics()["warnings"])  # the checks, as a list of warnings
+result.save_npz("result.npz")
+result = NestedSamplingResult.load_npz("result.npz")
 ```
 
-Any other keyword raises `TypeError`. `key` is a PRNG key or an int seed. The
-run stops when the live points hold less than `dlogz` of the evidence, before
-more than `maxiter` dead points, once `maxcall` likelihood calls are reached,
-or on a likelihood plateau (no live point above the deleted ones).
-`progress=True` prints one line per chunk of steps.
-
-The functional core is exported too: `Config`, `init(key, loglike,
-prior_transform, cfg)`, `step(state, loglike, prior_transform, cfg) -> (state,
-dead)` and `finalise(state, dead, cfg, prior_transform=...)`. `State` and
-`Dead` are pytrees of arrays, so a loop over `step` can be jitted or vmapped.
+The arrays (`samples`, `samples_u`, `logl`, `logwt`, `logl_birth`, `nlive_i`,
+`labels`) hold the dead points in order, then the final live points.
+`metadata` has the settings and timings, and `to_dynesty_dict()` gives
+dynesty-style keys.
 
 ## How it works
 
 Each step deletes the `k = num_delete` lowest live points and replaces them
-with the ends of `k` fixed-length constrained random walks (vmapped), seeded
-from distinct live points above the new contour `L*`. A walk step is
-`u + s L z`, with `L` the Cholesky factor of the live-point covariance; steps
-that leave the unit cube or fall to `L*` or below are rejected, and a chain
-that never moves returns its seed. The step multiplier `s` adapts toward 25%
-acceptance inside every step. With `num_delete=1` the single chain is not
-vmapped, so an out-of-cube proposal skips the likelihood: use it for expensive
-likelihoods.
+with the end points of `k` Metropolis chains of fixed length `walks`, run in
+parallel (vmapped). Each chain starts from a live point above the new
+likelihood contour `L*`; proposals that leave the unit cube or fall to `L*` or
+below are rejected, and a chain that never moves returns its seed.
 
-### Multimodal posteriors
+- **Local random walk.** The live points are clustered on the device every
+  quarter e-fold of prior volume. A walk step is `x + s L z`, with `L` the
+  Cholesky factor of the covariance of the cluster of `x`, and the exact
+  Hastings correction when the proposal lands in another cluster.
+- **Hop.** Every 10th chain step is an independence Metropolis-Hastings
+  proposal from the union of ellipsoids fitted to the clusters. It moves
+  points between modes and keeps the mode weights right.
+- **Cross-fitting.** The live slots form three folds. A chain seeded in one
+  fold uses clusters and covariances fitted to the other two only (as emcee
+  moves each half of its walkers with the other half).
+- **Evidence.** The `k` deaths of a step are counted at live counts
+  `m, ..., m-k+1` (birth/death contours; Fowlie, Handley & Su); `logz` and
+  `logzerr` are recomputed on the host in float64.
+- **Driver.** A compiled `while_loop` runs chunks of steps on the device; the
+  host syncs once per chunk (progress, checkpoints, stopping).
 
-A random-walk chain cannot cross between separated modes, so without help the
-number of live points in each mode drifts from step to step (a Polya urn) and
-the mode weights scatter from seed to seed. tinyns clusters the live points on
-the device every quarter e-fold (`tinyns/modes.py`: hard EM, merges and Fisher
-splits in 8 cluster slots) and makes every 10th chain step an inter-mode
-*hop*: an independence Metropolis-Hastings step from the union of the
-clusters' moment-matched ellipsoids. The other steps walk in the covariance of
-the current point's cluster, with the exact Metropolis-Hastings correction for
-the change of covariance between clusters, so a mode shaped unlike the
-largest one still mixes. Both moves are exact for the constrained prior: the
-live slots form three folds, each new point is seeded from its own fold, and
-its chain's clusters and covariances are fitted to the other two folds only
-(as emcee moves each half of its walkers with the other half). In the v1
-bake-off the hop cut the seed-to-seed scatter of minor-mode weights about 7x
-at the same number of likelihood calls. The mode tracking adds about 6% to
-the run time at 1 ms per likelihood call (H100, 40 batched runs; at most 18%
-over the bake-off cells), and nothing per chain step while a run holds one
-cluster. `result.modes()` reports each mode's
-mass, an urn error bar and its smallest live count. A mode needs about
-`5 * ndim` live points for its own walk to mix; below that its weight keeps a
-bias of a few percent (see the CHANGELOG), and `modes()` flags it unresolved:
-raise `nlive`.
+**Exactness.** A chain's kernel is built without its own fold, so it does not
+depend on the chain's seed or its ancestors, and both moves leave the uniform
+law on `{L > L*}` invariant. The end point therefore has that law for any
+chain length. What remains is common to every MCMC-driven nested sampler: a
+new point is correlated with its seed (hence `walks`), and the step scale
+adapts on past chains.
 
-### Choosing `walks`
+**Speed.** On an H100, a 13-D Gaussian with 1000 live points ran in 0.56 s
+once compiled, against 51 s for tinyns v0.2.5 (about 90x; measured on the
+first v1 core, before the mode tracking was added). With `num_delete`
+proportional to `nlive` the number of steps does not depend on `nlive`, so for
+a cheap likelihood the run time on a GPU is nearly flat in `nlive`.
+Compilation takes about 10 s on a GPU.
 
-The default is `walks = max(25, 6 * ndim, ndim**2 // 6)`
-(`tinyns.core.default_walks`): 6 steps per dimension up to 36 dimensions, then
-`ndim / 6` per dimension (384 steps at 48, 682 at 64). The proposal covariance
-of a step is built from the live points above `L*` other than the chains'
-seeds, so a chain's proposals do not depend on where it starts and its end
-point is uniform inside the contour however short the walk. (With the seed
-included, its pull on the covariance biased logZ upward by an amount that grew
-with `ndim` and shrank with `nlive`.) What remains is mixing: early in a run,
-while the prior box still cuts the likelihood contours, the likelihood rank
-along a chain takes 2 to 3 `ndim` steps to decorrelate (about 9 steps later
-on). Above about 48 dimensions `6 * ndim` steps are too few for that phase:
-they left +0.36 nats at 64 dimensions. The default keeps the logZ bias below
-its scatter on correlated Gaussians from 2 to 64 dimensions with 250 to 2000
-live points.
+## Multimodal posteriors
 
-Strongly curved targets need longer walks than their dimension suggests. A
-10-D Rosenbrock valley needs 12 to 25 `* ndim`: at the default (60) logZ
-scatters 2.3 times more than `logzerr` says. Neal's funnel in 10-D is fine
-at the default. If in doubt, rerun with twice the walks and check that logZ
-moves by less than `logzerr`.
+A random walk cannot cross between separated modes, so without help the number
+of live points in each mode drifts and the mode weights scatter from seed to
+seed. With the hop, that scatter was about 7x smaller than with chains seeded
+from live points alone, at the same number of likelihood calls (Gaussian
+mixtures of two and three modes in 4 to 32 dimensions).
 
-The `k` deaths of a step are counted at live counts `m, m-1, ..., m-k+1`
-(Fowlie, Handley & Su), so the expected log prior volume after `it` steps is
-`-it * sum_j 1/(m - j)`; the final live points die at counts `m, ..., 1`. The
-weights, `logz` and `logzerr = sqrt(sum_i dH_i / n_i)` are recomputed on the
-host in float64. `result.nlive_i` holds the live count at every death.
+A mode needs about `5 * ndim` live points for its own walk to mix. In the
+validation cells where every mode held that many, the weights showed no bias
+within the measurement error. Below it a mode's weight is biased or scatters
+widely, and the mode can be lost; `result.modes()` (and `summary()`) flag it
+`unresolved: raise nlive`. The mode tracking added about 6% to the run time at
+1 ms per likelihood call, and adds nothing per chain step while a run has one
+cluster.
 
-## The result
+## Choosing `walks`
 
-`NestedSamplingResult` holds `samples`, `samples_u`, `logl`, `logwt`,
-`logl_birth`, `nlive_i`, `labels` (each sample's cluster when it died),
-`logz`, `logzerr`, `ncall`, `niter`, `nlive`,
-`num_delete` and `metadata`. Methods: `summary()`, `diagnostics()`,
-`insertion_test()` (ranks of the new points among the `nlive - num_delete`
-survivors of their step), `modes()`, `logz_bootstrap()`, `resample_equal()`,
-`save_npz()`/`load_npz()`, `to_numpy()` and `to_dynesty_dict()`.
+The default, `max(25, 6 * ndim, ndim**2 // 6)`, keeps the logZ bias below its
+scatter on correlated Gaussians from 2 to 64 dimensions. Strongly curved
+targets need longer chains: a 10-D Rosenbrock valley needs 12 to 25 `* ndim`.
+If in doubt, rerun with twice the walks and check that logZ moves by less than
+`logzerr`.
+
+## Choosing nlive / num_delete
+
+<!-- PLACEHOLDER: the defaults-sweep PR replaces this section. -->
+The current defaults are `nlive=1000` and `num_delete = nlive // 10` (at most
+`nlive // 2`). Guidance from the defaults sweep will go here. Until then:
+`logzerr` falls as `1 / sqrt(nlive)`, every mode needs `5 * ndim` live points,
+and `num_delete=1` suits expensive likelihoods (see Limitations).
+
+## GPU notes
+
+- **Precision.** tinyns runs in JAX's default precision, float32. Set
+  `JAX_ENABLE_X64=1` when `|loglike|` is large (float32 resolves about 7
+  digits) or the posterior is very narrow in the unit cube.
+- **Compile cache.** `jax.config.update("jax_compilation_cache_dir", path)`
+  lets separate processes reuse compiled programs.
+- **Memory.** A step evaluates `num_delete` likelihoods at once (times the
+  batch size of a batched run). If that does not fit, lower `num_delete`.
 
 ## Checkpoints
 
-`run(key, checkpoint="run.npz")` writes one `.npz` file atomically at most
-every 10 minutes and at the end. If the file exists, the run resumes from it,
-and the result is bit-identical to an uninterrupted run (each step splits the
-PRNG key it carries, so the random stream depends on the step count only, not
-on where the chunks end). A checkpoint written with a different config, key,
-x64 flag or float dtype is refused. A run stopped by `maxiter` or `maxcall`
-continues when called again with a larger limit; `metadata["wall_time_s"]`
-adds up every session.
+```python
+result = sampler.run(jax.random.key(0), checkpoint="run.npz")
+```
 
-## Batches of runs
+The run writes `run.npz` atomically at most every 10 minutes and at the end.
+If the file exists, the run resumes from it, and the result is bit-identical
+to an uninterrupted run (tested on CPU). A checkpoint of a different
+configuration, key or precision is refused. A run stopped by `maxiter` or
+`maxcall` continues when called again with a larger limit.
 
-`run(jax.random.split(key, B))` runs `B` independent runs in one compiled
-program and returns a list of `B` results; with `batched_data=True` the
-arrays of a `Partial` likelihood carry a leading axis of `B`, one dataset per
-run (simulation-based calibration, mock campaigns). The step is vmapped over
-the runs inside the loop, and a finished run waits, frozen, for the others.
-Each run is a draw from the same distribution as its separate run but is not
-bit-identical to it, since vmap changes XLA's summation order: in float64 the
-two agree to roundoff, in float32 they can part late in the run.
+## Batched runs and SBC
 
-## Data in the likelihood
+```python
+from jax.tree_util import Partial
 
-Pass data as a pytree callable, `jax.tree_util.Partial(loglike_fn, data)`:
-its arrays become arguments of the compiled kernels, and datasets of one
-shape share one compiled program, which suits mock-data campaigns. A closure's
-captured arrays of at least 4096 elements are hoisted to arguments as well.
-Use `jax.config.update("jax_compilation_cache_dir", path)` to share compiles
-across processes.
 
-## float32 and float64
+def loglike_data(data, theta):  # the data are the first argument
+    return -0.5 * jnp.sum((data - theta[0]) ** 2)
 
-tinyns runs in the default JAX precision. Enable `JAX_ENABLE_X64` when the
-log likelihood is large in magnitude (float32 resolves about 7 digits) or
-the posterior is very narrow in the unit cube.
+
+data = jax.random.normal(jax.random.key(2), (16, 20))  # 16 datasets
+like = Partial(loglike_data, data)
+sampler = NestedSampler(like, prior_transform, ndim=1, nlive=200)
+results = sampler.run(jax.random.split(jax.random.key(3), 16), batched_data=True)
+```
+
+A batch of keys runs that many independent runs in one compiled program and
+returns a list of results. With `batched_data=True` every array of a pytree
+callable carries a leading batch axis: one dataset per run, for
+simulation-based calibration and mock campaigns. A batched run agrees with the
+run of its key alone in distribution, not bit for bit.
+
+## Pytree callables
+
+```python
+for one in data[:2]:  # same shapes: compiled once
+    like = Partial(loglike_data, one)
+    print(NestedSampler(like, prior_transform, ndim=1, nlive=200).run(0).logz)
+```
+
+Pass data as `jax.tree_util.Partial(fn, data)` or any pytree callable. Its
+arrays become arguments of the compiled program, so datasets of one shape
+share one compilation.
+
+## The functional core
+
+```python
+from tinyns import Config, finalise, init, step
+from tinyns.core import delta_logz
+
+cfg = Config(ndim=2, nlive=200)
+state = init(jax.random.key(0), loglike, prior_transform, cfg)
+rows = []
+while delta_logz(state, cfg) > 0.1:  # evidence left in the live points
+    state, dead = step(state, loglike, prior_transform, cfg)
+    rows.append(dead)
+dead = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *rows)
+result = finalise(state, dead, cfg, prior_transform=prior_transform)
+```
+
+`State` and `Dead` are pytrees of arrays, so `step` works under `jax.jit`,
+`lax.scan` and `jax.vmap`. `step` does not test termination: the loop owns
+`state.status` (the result above reports `running`).
+
+`examples/` has five scripts, each under a minute on a CPU: `quickstart.py`,
+`multimodal.py`, `checkpoint_resume.py`, `sbc_batched.py` and
+`functional_core.py`. The test suite runs them and the snippets above.
+
+## Limitations
+
+- **Small modes.** A mode with fewer than about `5 * ndim` live points is not
+  sampled reliably. `modes()` flags it; raise `nlive`.
+- **Many modes.** The clustering has 8 slots. Mode weights are not validated
+  for more separated modes than that (an eggbox).
+- **Curved targets** need more `walks` than the default.
+- **Expensive likelihoods.** Parallel chains do not reduce the number of
+  likelihood calls, and with `num_delete > 1` out-of-cube proposals are
+  evaluated too. When one call already fills the device, use `num_delete=1`.
+- **float32.** Likelihood differences below about `1e-7 * |loglike|` are lost;
+  enable x64.
+- **Insertion test.** With `num_delete > 1` its p-values are mildly
+  anti-conservative.
+- **Compile cache.** A process keeps up to 8 compiled configurations.
+
+## Benchmarks
+
+`bench/README.md` describes the harness that runs tinyns, dynesty, UltraNest,
+Nautilus, BlackJAX and JAXNS on targets with known evidence.
+
+<!-- PLACEHOLDER: head-to-head table, to be filled at release. -->
+The head-to-head table will be added here at release.
+
+## References and license
+
+tinyns builds on nested sampling (Skilling 2006), the evidence bookkeeping
+and insertion-rank test of Fowlie, Handley & Su, and the split-ensemble idea
+of emcee (Foreman-Mackey et al. 2013). `CHANGELOG.md` lists the v1 changes and
+what was removed from v0.x. MIT license (`LICENSE`).

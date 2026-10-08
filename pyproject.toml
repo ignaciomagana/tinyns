@@ -5,8 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "tinyns"
 version = "1.0.0.dev0"
-description = "A tiny dynesty-style nested sampler for JAX likelihoods."
-keywords = ["nested-sampling", "jax", "bayesian-inference", "monte-carlo"]
+description = "A tiny, fast, general-purpose nested sampler in JAX."
+keywords = ["nested-sampling", "jax", "gpu", "bayesian-inference", "evidence", "monte-carlo"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
@@ -15,6 +15,9 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Astronomy",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Physics",
 ]
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +30,12 @@ dependencies = [
   "jaxlib",
   "numpy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ignaciomagana/tinyns"
+Repository = "https://github.com/ignaciomagana/tinyns"
+Issues = "https://github.com/ignaciomagana/tinyns/issues"
+Changelog = "https://github.com/ignaciomagana/tinyns/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
