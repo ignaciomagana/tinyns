@@ -138,6 +138,8 @@ from jax import lax, random
 from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import logsumexp
 
+from tinyns._compat import optimization_barrier
+
 C_MAX = 8  # cluster slots (static shapes)
 TREE_SIZE = 512  # cluster ids of a clustering whose parent is recorded
 HOP_EVERY = 10  # every 10th chain step is the hop: P_HOP = 0.1
@@ -325,7 +327,7 @@ def hop_proposal(key, eligible, logdet, frame):
     """
     k_dir, k_uni = random.split(key)
     dtype = logdet.dtype
-    uni = lax.optimization_barrier(random.uniform(k_uni, (3,), dtype))
+    uni = optimization_barrier(random.uniform(k_uni, (3,), dtype))
     logv = jnp.where(eligible, logdet, -jnp.inf)
     cdf = jnp.cumsum(jnp.where(eligible, jnp.exp(logv - jnp.max(logv)), 0.0))
     c = jnp.sum(cdf <= uni[0] * cdf[-1])  # the first frame with cdf above
@@ -334,7 +336,7 @@ def hop_proposal(key, eligible, logdet, frame):
     d = mu.shape[0]
     # The barrier keeps XLA from fusing the generator into the norm: on a
     # GPU that fusion compiled for 40 to 90 s at d = 32 and 64.
-    z = lax.optimization_barrier(random.normal(k_dir, (d,), dtype))
+    z = optimization_barrier(random.normal(k_dir, (d,), dtype))
     ball = z / jnp.linalg.norm(z) * uni[1] ** (1.0 / d)
     point = mu + math.sqrt(ELL_R2_PER_DIM * (d + 2.0)) * (chol @ ball)
     return point, uni[2]

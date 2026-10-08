@@ -38,6 +38,7 @@ from jax.scipy.special import logsumexp
 
 from tinyns import checkpoint as _checkpoint
 from tinyns import modes as _modes
+from tinyns._compat import optimization_barrier
 from tinyns.callables import (
     _device_leaves,
     _kernel_cache,
@@ -473,7 +474,7 @@ def _chain(
         u, logl, c, y, r2, moves, nev, nvalid, hops, tries = carry
         # The barrier keeps XLA from fusing the generator into each consumer
         # of z (its sums below): on a GPU that drew z again per consumer.
-        z = lax.optimization_barrier(random.normal(k_z, u.shape, u.dtype))
+        z = optimization_barrier(random.normal(k_z, u.shape, u.dtype))
         move = live_step(z)
         if local:
             move = jnp.where(use_local, frame_chol(c) @ z, move)
@@ -689,7 +690,7 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     thus stay in one fold."""
     m, k = above.shape[0], worst.shape[0]
     fold = _fold(m, folds)
-    score = lax.optimization_barrier(
+    score = optimization_barrier(
         jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
     )
     dead_fold = fold[worst]
