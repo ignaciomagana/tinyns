@@ -359,6 +359,8 @@ def test_batched_run_matches_single_runs_with_the_hop() -> None:
             assert (alone.niter, alone.ncall) == (result.niter, result.ncall)
             np.testing.assert_allclose(alone.samples_u, result.samples_u, atol=1e-9)
             assert alone.metadata["mode_history"] == result.metadata["mode_history"]
+            assert alone.metadata["mode_tree"] == result.metadata["mode_tree"]
+            np.testing.assert_array_equal(alone.labels, result.labels)
         else:
             np.testing.assert_allclose(
                 alone.logl[:120], result.logl[:120], rtol=1e-4, atol=1e-4
@@ -378,6 +380,10 @@ def test_checkpoint_round_trip_with_cluster_state(tmp_path, monkeypatch) -> None
     assert resumed.metadata["resumed"]
     np.testing.assert_array_equal(resumed.logl, whole.logl)
     assert resumed.metadata["mode_history"] == whole.metadata["mode_history"]
+    # the cluster ids and their parents are part of the checkpointed state
+    np.testing.assert_array_equal(resumed.labels, whole.labels)
+    assert resumed.metadata["mode_tree"] == whole.metadata["mode_tree"]
+    assert len(whole.metadata["mode_tree"]) >= 2 * whole.metadata["folds"]
     other = Config(D, 60, 6, 10, _hop=False)
     with pytest.raises(ValueError, match="_hop"):
         core.run(4, two_gaussians, lambda u: u, other, checkpoint=path)

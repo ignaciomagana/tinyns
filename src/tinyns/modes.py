@@ -44,9 +44,12 @@ small mode keeps its own covariance, shrunk toward the pooled one, until it
 is nearly gone). The frames are factorized once, at the recluster, and kept
 in the state until the next one; new live points take the label of the
 nearest frame of each clustering until then. The labels are also the record that
-:meth:`tinyns.NestedSamplingResult.modes` reads: a point's slot in the
-clustering of the next fold (which contains it), as ``j * C_MAX + slot``;
-``modes()`` merges the labels of different clusterings that cover one mode.
+:meth:`tinyns.NestedSamplingResult.modes` reads: the id of a point's cluster
+in the clustering of the next fold (which contains it) when the point died.
+A slot's cluster takes a new id when a split writes it (both parts of a
+split do; a merge keeps the id of the slot that absorbs the other), so an id
+never names a cluster and, later, one part of it; ``modes()`` merges the
+labels of different clusterings and times that cover one mode.
 
 **The hop.** Every ``HOP_EVERY``-th step of a chain (``P_HOP = 1 /
 HOP_EVERY``) is an independence Metropolis-Hastings step from the uniform law
@@ -136,6 +139,7 @@ from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import logsumexp
 
 C_MAX = 8  # cluster slots (static shapes)
+TREE_SIZE = 512  # cluster ids of a clustering whose parent is recorded
 HOP_EVERY = 10  # every 10th chain step is the hop: P_HOP = 0.1
 SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
@@ -557,7 +561,9 @@ def _merge(u, labels):
 
 def _split_all(u, labels):
     """Split every lane's clusters top-down: ``u`` ``(B, m, d)``, ``labels``
-    ``(B, m)``; returns the labels.
+    ``(B, m)``; returns the labels, ``fresh`` ``(B, C_MAX)``, the slots a
+    split wrote (both parts of every split applied), and ``origin`` ``(B,
+    C_MAX)``, the slot that held each slot's points before the splits.
 
     In each lane: the best split of every cluster that can split (at least
     ``max(6, 4 d)`` members) is searched; while the best of them passes the
@@ -588,11 +594,11 @@ def _split_all(u, labels):
         return (jnp.max(js, axis=1) >= threshold) & ~full & ~jnp.any(todo, axis=1)
 
     def cond(carry):
-        labels, js, _, todo = carry
+        labels, js, _, todo, _, _ = carry
         return jnp.any(todo) | jnp.any(due(labels, js, todo))
 
     def body(carry):
-        labels, js, parts, todo = carry
+        labels, js, parts, todo, fresh, origin = carry
         # Apply the best split where it is due. The part that moves to the
         # first free slot is the one without the cluster's first row, so the
         # slots do not depend on the orientation of the cut (the sign of an
@@ -609,6 +615,9 @@ def _split_all(u, labels):
             (slots[None, :] == c[:, None]) | (slots[None, :] == free[:, None])
         )
         js = jnp.where(changed, 0.0, js)
+        fresh = fresh | changed
+        moved = go[:, None] & (slots[None, :] == free[:, None])
+        origin = jnp.where(moved, origin[lane, c][:, None], origin)
         todo = todo | (changed & (sizes(labels) >= min_size))
         # Search the first pending cluster of every lane that has one.
         has = jnp.any(todo, axis=1)
@@ -625,21 +634,29 @@ def _split_all(u, labels):
         done = has[:, None] & (slots[None, :] == pick[:, None])
         js = jnp.where(done, j[:, None], js)
         parts = jnp.where(done[:, :, None], p[:, None, :], parts)
-        return labels, js, parts, todo & ~done
+        return labels, js, parts, todo & ~done, fresh, origin
 
     carry = (
         labels,
         jnp.zeros((lanes, C_MAX), u.dtype),
         jnp.zeros((lanes, C_MAX, m), bool),
         sizes(labels) >= min_size,
+        jnp.zeros((lanes, C_MAX), bool),
+        jnp.broadcast_to(slots, (lanes, C_MAX)),
     )
-    return lax.while_loop(cond, body, carry)[0]
+    out = lax.while_loop(cond, body, carry)
+    return out[0], out[4], out[5]
 
 
 def recluster_lanes(u, labels):
     """:func:`recluster` for a batch of independent live sets: ``u`` of shape
-    ``(B, m, d)`` and ``labels`` ``(B, m)``; returns batched labels and stats.
-    Rows labelled ``-1`` (padding) stay out of every cluster.
+    ``(B, m, d)`` and ``labels`` ``(B, m)``; returns batched labels, stats,
+    ``fresh`` ``(B, C_MAX)``, the slots that hold a part of a cluster this
+    call split, and ``origin`` ``(B, C_MAX)``, the slot that held that
+    cluster. (The caller gives the fresh slots new cluster ids, with the id of
+    ``origin`` as their parent; a merge leaves the id of the slot that
+    absorbs the other.) Rows labelled ``-1`` (padding) stay out of every
+    cluster.
 
     Call it with the lane axis explicit (not under ``vmap``): the split search
     then skips the slots that no lane occupies.
@@ -654,8 +671,9 @@ def recluster_lanes(u, labels):
         lambda labels: labels,
         labels,
     )
-    labels = _split_all(u, labels)
-    return labels, jax.vmap(lambda u, lab: stats(u, lab, C_MAX))(u, labels)
+    labels, fresh, origin = _split_all(u, labels)
+    st = jax.vmap(lambda u, lab: stats(u, lab, C_MAX))(u, labels)
+    return labels, st, fresh, origin
 
 
 def recluster(u, labels):
@@ -667,5 +685,5 @@ def recluster(u, labels):
     while it is below half the split threshold), then splits (the best split
     of any cluster, while one passes the threshold and a slot is free).
     """
-    labels, st = recluster_lanes(u[None], labels[None])
+    labels, st, _, _ = recluster_lanes(u[None], labels[None])
     return labels[0], Stats(*(x[0] for x in st))

@@ -56,6 +56,7 @@ A case passes when all of these hold (se is the standard error over seeds):
 | `bias` | \|mean logZ - truth\| < 3 se |
 | `scatter` | sd(logZ) / mean(logzerr) in [0.75, 1.3] |
 | `modes` | mixtures: logit bias of each minor mode weight < 3 se, its sd <= 0.4, no seed lost a mode |
+| `count` | `result.modes()` reports the true number of modes in at least 90% of the runs |
 | `flags` | every run converged, and `result.modes()` flags no mode `unresolved` |
 
 - **The scatter ratio is noisy.** Measured on N seeds it has a relative error
@@ -65,6 +66,20 @@ A case passes when all of these hold (se is the standard error over seeds):
   about 2, and the full tier one that is off by 40%.
 - **Mode weights are oracle masses**: the target's exact responsibility
   averaged over the posterior samples, not `result.modes()`.
+- **The mode count** is that of `result.modes()`. The truth is 1 for the
+  Gaussians, `rosen_d4` and the funnel, 4 for LogGamma and 2 for the
+  mixtures. Two cases have a range, and may flag `unresolved`:
+  - `rosen_d10` has a second lobe at `x_1 = -1` with 2.52% of the mass
+    (`P(x_1 < 0)` by the quadrature that gives its evidence), joined to the
+    main mode by a bridge of 0.8% (`|x_1| < 0.3`). One mode or two are both
+    right. At nlive 1000 the lobe holds about 25 live points, fewer than
+    `5 * ndim`, so a run that reports it flags it.
+  - `eggbox_d2` has 18 modes that the sampler's clustering does not separate
+    (a lattice has no two-way split). `modes()` counts the ones the live
+    points still hold apart: 15 to 18 at nlive 1000, 7 to 18 at 500. The case
+    passes with 8 to 18 modes, and a run that reports fewer than 18 must say
+    that its count is a lower bound (a mode that is not `tracked`, or the
+    full-slots warning). Its 2% modes hold about 10 live points at nlive 500.
 - **Expect a false FAIL now and then.** Each criterion is a 3-sigma test, and
   the full tier runs about 25 of them. Rerun a failed case with another key
   (`--cases NAME --seed 1`) and more seeds before believing it.
@@ -80,7 +95,7 @@ recomputes the cached quadrature values.
 | name | d | logZ truth | modes |
 |---|---|---|---|
 | `gauss_d{2,8,16,32,64}` | 2-64 | analytic, `-d log 20` | - |
-| `rosen_d{2,10}` | 2, 10 | 1-D transfer-operator quadrature | - |
+| `rosen_d{2,10}` | 2, 10 | 1-D transfer-operator quadrature | - (d = 10: a 2.5% lobe at `x_1 = -1`) |
 | `funnel_d10` | 10 | 1-D quadrature over v | - |
 | `loggamma_d{2,10,30}` | 2-30 | analytic (CDFs), ~ -2.3e-5 | 4 x 0.25 |
 | `eggbox_d2` | 2 | 2-D quadrature, 235.856 | not scored (18) |
@@ -323,8 +338,9 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
 - `run.py` and `summarize.py` end to end, including a timeout record;
 - the report on synthetic records: merging, the accuracy flags, the headline
   ratios and ranks, a missing reference;
-- the gate: its criteria on synthetic rows, and one run of its code path on
-  tiny settings.
+- the gate: its criteria on synthetic rows (the mode count and its
+  lower-bound flag among them), and one run of its code path on tiny
+  settings.
 
 Adapters whose package is missing are skipped. CI has only tinyns installed,
 so there it runs the tinyns adapter that matches the installed version.

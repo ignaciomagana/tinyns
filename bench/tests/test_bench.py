@@ -60,6 +60,19 @@ def test_cached_quadratures():
     assert abs(eggbox_logz_quadrature(1001) - EGG_LOGZ) < 1e-5
 
 
+def test_rosenbrock_lobe_mass():
+    """The 10-D Rosenbrock target has a second lobe at x_1 = -1 behind a thin
+    bridge (the gate accepts one mode or two); at d = 4 and 2 the arm at
+    x_1 < 0 is part of the one mode."""
+    from bench.targets import rosenbrock_x1_mass
+
+    assert rosenbrock_x1_mass(10, -5.0, 0.0, n=4001) == pytest.approx(0.0252, abs=2e-4)
+    assert rosenbrock_x1_mass(10, -0.3, 0.3, n=4001) == pytest.approx(0.0083, abs=2e-4)
+    assert rosenbrock_x1_mass(4, -5.0, 0.0, n=4001) == pytest.approx(0.0626, abs=2e-4)
+    assert rosenbrock_x1_mass(4, -0.3, 0.3, n=4001) == pytest.approx(0.0676, abs=2e-4)
+    assert rosenbrock_x1_mass(2, -5.0, 5.0, n=2001) == pytest.approx(1.0, abs=1e-9)
+
+
 @pytest.mark.parametrize("name", ["sepW_d4", "connW_d10", "mix3_d10"])
 def test_mixture_mode_masses_are_exact(name):
     """E_post[responsibility] = mixture weights, by exact draws from the mixture."""
@@ -301,10 +314,27 @@ def test_validation_gate_criteria():
     assert validate.judge(modes) == []
     for bad in (dict(lost=0.1), dict(logit_z=3.5), dict(logit_sd=0.5)):
         assert validate.judge(dict(modes, **bad)) == ["modes"]
+    # the mode count: at most 10% of the runs may be wrong
+    counted = dict(good, modes_min=4, modes_max=4, nmodes=[4] * 15 + [3],
+                   lower_bound=[False] * 16)
+    assert validate.judge(counted) == []
+    assert validate.judge(dict(counted, nmodes=[4] * 14 + [3, 5])) == ["count"]
+    # fewer modes than the truth pass only with the lower-bound flag
+    egg = dict(good, modes_min=8, modes_max=18, nmodes=[18] * 8 + [15] * 8,
+               lower_bound=[False] * 8 + [True] * 8, small_mode=True, unresolved=9)
+    assert validate.judge(egg) == []
+    assert validate.judge(dict(egg, lower_bound=[False] * 16)) == ["count"]
+    assert validate.judge(dict(egg, nmodes=[18] * 8 + [19] * 8)) == ["count"]
+    # one mode or two are both right for rosen_d10, with no flag needed
+    lobe = dict(good, modes_min=1, modes_max=2, nmodes=[1] * 12 + [2] * 4,
+                lower_bound=[False] * 16, small_mode=True, unresolved=4)
+    assert validate.judge(lobe) == []
+    assert validate.judge(dict(lobe, small_mode=False)) == ["flags"]
     # every case names a target, and the quick tier is a subset of the full one
-    for name, (quick, full, _) in validate.CASES.items():
+    for name, (quick, full, _, modes) in validate.CASES.items():
         assert get_target(name).logz is not None and full is not None
         assert quick is None or quick <= full
+        assert 1 <= modes[0] <= modes[1]
 
 
 def test_validation_gate_runs_on_tiny_settings(tmp_path, capsys):
@@ -324,6 +354,7 @@ def test_validation_gate_runs_on_tiny_settings(tmp_path, capsys):
     assert len(case["logz"]) == 3 and case["nlive"] == 100 and case["walks"] == 25
     assert "| gauss_d2 | 100 | 25 | 3 |" in table and "cases pass" in table
     assert abs(case["dz_mean"]) < 1.0 and case["unresolved"] == 0
+    assert case["nmodes"] == [1, 1, 1] and "| 1 (3/3 ok) |" in table
 
     row = validate.run_case("sepW_d4", 200, seeds=3)  # a mixture: the mode columns
     assert len(row["mode_mass"]) == 3 and 0.0 <= row["lost"] <= 1.0

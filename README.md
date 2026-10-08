@@ -133,6 +133,21 @@ of the run time at 1 ms per likelihood call. For likelihoods that take
 microseconds it is a larger share (15 to 21% more per call on a 10-D two-mode
 target than on a 10-D Gaussian; see Speed).
 
+`result.modes()` counts the modes from the clusters the run recorded, and
+gives each mode's mass, the seed-to-seed scatter to expect (`urn_sd`) and two
+flags.
+
+- `unresolved`: the mode held fewer than `5 * ndim` live points.
+- `tracked`: `False` if the sampler's clustering never separated the mode from
+  its neighbours. The hop then did not balance it, its mass scatters by about
+  `urn_sd`, and the number of such modes is a lower bound. An eggbox is the
+  example: its 18 modes sit on a lattice that no two-way split separates, and
+  `modes()` finds 15 to 18 of them from the gaps between their live points
+  (nlive 1000), none tracked.
+
+`diagnostics()` and `summary()` turn both flags into warnings, and warn when
+the clustering's 8 slots were full during a run with several modes.
+
 ## Choosing `walks`
 
 The default, `max(25, 6 * ndim, ndim**2 // 6)`, keeps the logZ bias below its
@@ -237,8 +252,13 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
 
 - **Small modes.** A mode with fewer than about `5 * ndim` live points is not
   sampled reliably. `modes()` flags it; raise `nlive`.
-- **Many modes.** The clustering has 8 slots. Mode weights are not validated
-  for more separated modes than that (an eggbox).
+- **Many modes.** The clustering has 8 slots and splits two ways, so it does
+  not separate more modes than that, or modes on a lattice (an eggbox). The
+  evidence is still right, but the hop does not balance those modes: their
+  weights scatter from seed to seed (logit sd 0.4 for the eggbox's 8% modes
+  at nlive 1000, 0.6 for its 4% modes) and a 2% mode was lost in 15% of the
+  runs. `modes()` marks such modes `tracked: False`, and counts only the ones
+  that planes across the axes of the unit cube separate.
 - **Curved targets** need more `walks` than the default.
 - **Expensive likelihoods.** Parallel chains do not reduce the number of
   likelihood calls, and with `num_delete > 1` out-of-cube proposals are
