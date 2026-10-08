@@ -133,13 +133,30 @@ of the run time at 1 ms per likelihood call. For likelihoods that take
 microseconds it is a larger share (15 to 21% more per call on a 10-D two-mode
 target than on a 10-D Gaussian; see Speed).
 
+`result.modes()` counts the modes from the clusters the run recorded, and
+gives each mode's mass, the seed-to-seed scatter to expect (`urn_sd`) and two
+flags.
+
+- `unresolved`: the mode held fewer than `5 * ndim` live points.
+- `tracked`: `False` if the sampler's clustering never separated the mode from
+  its neighbours. The hop then did not balance it, its mass scatters by about
+  `urn_sd`, and the number of such modes is a lower bound. An eggbox is the
+  example: its 18 modes sit on a lattice that no two-way split separates, and
+  `modes()` finds 15 to 18 of them from the gaps between their live points
+  (nlive 1000), none tracked.
+
+`diagnostics()` and `summary()` turn both flags into warnings, and warn when
+the clustering's 8 slots were full during a run with several modes.
+
 ## Choosing `walks`
 
 The default, `max(25, 6 * ndim, ndim**2 // 6)`, keeps the logZ bias below its
-scatter on correlated Gaussians from 2 to 64 dimensions. Strongly curved
-targets need longer chains: a 10-D Rosenbrock valley needs 12 to 25 `* ndim`.
-If in doubt, rerun with twice the walks and check that logZ moves by less than
-`logzerr`.
+scatter on correlated Gaussians from 2 to 64 dimensions. It was also enough
+for a curved target once there were enough live points: with the default
+`walks` (60) and `num_delete = nlive // 10`, the logZ of a 10-D Rosenbrock was
+0.16 +- 0.05 low at `nlive=500` and within 0.05 +- 0.04 from 1000, with a
+scatter of 1.0 to 1.1 times `logzerr` (40 runs each). If in doubt, rerun with
+twice the walks and check that logZ moves by less than `logzerr`.
 
 ## Choosing `nlive` and `num_delete`
 
@@ -163,12 +180,16 @@ cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
   (1000, 2000 and 4000 for a thin one, still lost in 1 run of 40 at 32). At
   half of that the thin mode was lost in 5 to 40% of the runs.
 - *`modes()` flags a mode unresolved.* The flag is a reason to raise `nlive`,
-  but its absence is not proof: it caught one in five of the runs with a
-  wrong weight, because a mode lost early leaves no trace. If a small mode
-  matters, compare with a run at twice the `nlive`.
+  but its absence is not proof. A mode that is lost leaves no trace in its own
+  run: every run that lost the 6% mode reported one mode and no warning. At
+  `nlive=1000` the flag was raised in 7 of the 57 runs (of 360) whose minor
+  weight was lost or off by more than 0.4 in the logit, all of them at 18 and
+  32 dimensions. If a small mode matters, run again at twice the `nlive` and
+  compare the modes.
 - *the posterior has many modes.* The eggbox (18 peaks) kept every peak in
   every run from `nlive=2000`, about 100 live points per peak; at 500 it lost
-  a peak in 4 of 10 runs. Its logZ was right at every `nlive`.
+  a peak in 4 of 10 runs. Its logZ was right at every `nlive`, and its peak
+  weights scatter as `1 / sqrt(nlive)` (see Limitations).
 - *the target is curved.* The logZ of the 10-D Rosenbrock was 0.16 too low at
   500, 0.05 at 1000 and unbiased from 2000 (at the default `walks`).
 - *`ndim` is above about `nlive / 10`.* At `nlive=250` logZ was 0.2 to 0.4 too
@@ -283,11 +304,15 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
 
 - **Small modes.** A mode with fewer than about `5 * ndim` live points is not
   sampled reliably. `modes()` flags it; raise `nlive`.
-- **Many modes.** The clustering has 8 slots and rarely split the eggbox's 18
-  peaks: logZ is right, but `modes()` reports one mode, and the peak
-  weights scatter as without the hop (0.7 in the log at `nlive=1000`, 0.26 at
-  4000).
-- **Curved targets** need more `walks` than the default.
+- **Many modes.** The clustering has 8 slots and splits two ways, so it does
+  not separate more modes than that, or modes on a lattice (an eggbox). The
+  evidence is still right, but the hop does not balance those modes: their
+  weights scatter from seed to seed (logit sd 0.4 for the eggbox's 8% modes
+  at nlive 1000, 0.6 for its 4% modes) and a 2% mode was lost in 15% of the
+  runs. `modes()` marks such modes `tracked: False`, and counts only the ones
+  that planes across the axes of the unit cube separate.
+- **Curved targets.** A 10-D Rosenbrock is biased low below `nlive=1000` (see
+  Choosing `walks`).
 - **Expensive likelihoods.** Parallel chains do not reduce the number of
   likelihood calls, and with `num_delete > 1` out-of-cube proposals are
   evaluated too. When one call already fills the device, use `num_delete=1`.

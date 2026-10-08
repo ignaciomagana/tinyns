@@ -19,8 +19,15 @@ Criteria (``judge``), with se the standard error over the seeds:
               its sd over seeds <= 0.4, and no seed lost a mode (weight below
               10% of the truth). The weights are oracle masses: the target's
               exact responsibility averaged over the posterior samples.
+``count``     the number of modes ``result.modes()`` reports is the true
+              one in at least 90% of the runs. Where the truth has more
+              modes than the sampler's clustering can separate (the eggbox),
+              a run may report fewer, but then it must say so: a mode that
+              is not ``tracked``, or a full-slots warning.
 ``flags``     no run ended without converging, and no mode of
-              ``result.modes()`` is flagged ``unresolved``
+              ``result.modes()`` is flagged ``unresolved`` (but for the
+              cases whose smallest mode holds too few live points to be
+              resolved: see ``CASES``)
 """
 
 from __future__ import annotations
@@ -41,31 +48,49 @@ SCATTER_BAND = (0.75, 1.3)
 MAX_LOGIT_SD = 0.4
 NSIGMA = 3.0
 
-# target: (nlive in the quick tier, nlive in the full tier, walks). A tier
-# skips the cases whose nlive is None; walks None is the sampler default.
+MAX_MISCOUNT = 0.1
+
+# target: (nlive in the quick tier, nlive in the full tier, walks, modes). A
+# tier skips the cases whose nlive is None; walks None is the sampler default.
 # - quick keeps to d <= 10 and nlive 500; full runs the default nlive (1000).
 # - Rosenbrock needs more steps per chain than the default (25 * ndim; see the
 #   NestedSampler docstring).
 # - The 6% minor mode of sepW needs 5 * ndim live points through its bulk to be
 #   resolved (tinyns.result.UNRESOLVED_PER_DIM): 0.06 * nlive is 120 against
 #   50 at d = 10, and 240 against 90 at d = 18.
+# - modes: the smallest and the largest number of modes a run may report, and
+#   "small" if the smallest mode is too small for ``unresolved`` to count as a
+#   failure.
+#   - rosen_d10 has a second lobe at x_1 = -1 with 2.52% of the mass (by the
+#     quadrature of ``bench.targets``, P(x_1 < 0)), joined to the main mode by
+#     a bridge of 0.8% of the mass (|x_1| < 0.3): one mode or two are both
+#     right, and at nlive 1000 the lobe holds about 25 live points, under
+#     5 * ndim. At d = 4 the two arms are one mode (6.3% and 6.8%).
+#   - eggbox has 18 modes of mass 0.08 (8), 0.04 (8) and 0.02 (2), which the
+#     clustering does not separate, so the hop does not balance them: a run
+#     reports the ones its live points still hold apart (15 to 18 at nlive
+#     1000, 8 to 18 at 500), not tracked, and the 0.02 modes hold about 10
+#     live points at nlive 500.
 CASES = {
-    "gauss_d2": (500, 1000, None),
-    "gauss_d10": (500, 1000, None),
-    "gauss_d32": (None, 1000, None),
-    "rosen_d4": (500, 1000, 100),
-    "rosen_d10": (None, 1000, 250),
-    "funnel_d10": (500, 1000, None),
-    "loggamma_d10": (500, 1000, None),
-    "eggbox_d2": (500, 1000, None),
-    "sepW_d10": (2000, 2000, None),
-    "sepW_d18": (None, 4000, None),
+    "gauss_d2": (500, 1000, None, (1, 1)),
+    "gauss_d10": (500, 1000, None, (1, 1)),
+    "gauss_d32": (None, 1000, None, (1, 1)),
+    "rosen_d4": (500, 1000, 100, (1, 1)),
+    "rosen_d10": (None, 1000, 250, (1, 2, "small")),
+    "funnel_d10": (500, 1000, None, (1, 1)),
+    "loggamma_d10": (500, 1000, None, (4, 4)),
+    "eggbox_d2": (500, 1000, None, (8, 18, "small")),
+    "sepW_d10": (2000, 2000, None, (2, 2)),
+    "sepW_d18": (None, 4000, None, (2, 2)),
 }
 TIERS = {"quick": dict(column=0, seeds=16), "full": dict(column=1, seeds=64)}
 
 
-def run_case(target_name, nlive, walks=None, seeds=16, seed=0) -> dict:
-    """Run ``seeds`` batched tinyns runs of one target; return its statistics."""
+def run_case(target_name, nlive, walks=None, seeds=16, seed=0, modes=None) -> dict:
+    """Run ``seeds`` batched tinyns runs of one target; return its statistics.
+
+    ``modes``: the mode counts a run may report, as in ``CASES`` (default: no
+    ``count`` criterion)."""
     import jax
     import numpy as np
 
@@ -82,6 +107,13 @@ def run_case(target_name, nlive, walks=None, seeds=16, seed=0) -> dict:
     t0 = time.perf_counter()
     results = sampler.run(keys)
     wall = time.perf_counter() - t0
+    checks = [r.diagnostics() for r in results]
+    found = [d["modes"] for d in checks]
+    bound = [  # the run says that its mode count is a lower bound
+        any(not m["tracked"] for m in d["modes"])
+        or bool(len(d["modes"]) > 1 and d["mode_slots_full"])
+        for d in checks
+    ]
     row = dict(
         case=target_name,
         ndim=target.ndim,
@@ -93,9 +125,12 @@ def run_case(target_name, nlive, walks=None, seeds=16, seed=0) -> dict:
         logz=[float(r.logz) for r in results],
         logzerr=[float(r.logzerr) for r in results],
         not_converged=sum(not r.success for r in results),
-        unresolved=sum(any(m["unresolved"] for m in r.modes()) for r in results),
-        nmodes=[len(r.modes()) for r in results],
+        unresolved=sum(any(m["unresolved"] for m in ms) for ms in found),
+        nmodes=[len(ms) for ms in found],
+        lower_bound=bound,
     )
+    if modes is not None:
+        row.update(modes_min=modes[0], modes_max=modes[1], small_mode=len(modes) > 2)
     row.update(logz_stats(np.array(row["logz"]) - target.logz, row["logzerr"]))
     if target.mode_mass is not None:
         masses = [weighted_summary(target, r.samples, r.logwt)[0] for r in results]
@@ -128,15 +163,30 @@ def judge(row: dict) -> list[str]:
         row["lost"] == 0 and row["logit_z"] < NSIGMA and row["logit_sd"] <= MAX_LOGIT_SD
     ):
         failed.append("modes")
-    if row["not_converged"] or row["unresolved"]:
+    if "modes_min" in row and miscounted(row) > MAX_MISCOUNT * row["seeds"]:
+        failed.append("count")
+    if row["not_converged"] or (row["unresolved"] and not row.get("small_mode")):
         failed.append("flags")
     return failed
+
+
+def miscounted(row: dict) -> int:
+    """The runs whose mode count is wrong: outside ``modes_min..modes_max``,
+    or, where the two differ, below ``modes_max`` without saying that the
+    count is a lower bound (``lower_bound``; one mode needs no such flag when
+    one mode is right)."""
+    lo, hi = row["modes_min"], row["modes_max"]
+    return sum(
+        not lo <= n <= hi or (lo > 1 and n < hi and not flagged)
+        for n, flagged in zip(row["nmodes"], row["lower_bound"], strict=True)
+    )
 
 
 def to_markdown(rows) -> str:
     head = (
         "| case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] "
-        "| logit bias ± se | logit sd | lost | unres | ncall | wall s | verdict |"
+        "| logit bias ± se | logit sd | lost | modes | unres | ncall | wall s "
+        "| verdict |"
     )
     out = [head, "|" + "---|" * (head.count("|") - 1)]
     for r in rows:
@@ -148,6 +198,10 @@ def to_markdown(rows) -> str:
             )
         else:
             modes = "- | - | -"
+        low, high = min(r["nmodes"]), max(r["nmodes"])
+        count = str(low) if low == high else f"{low}-{high}"
+        if "modes_min" in r:
+            count += f" ({r['seeds'] - miscounted(r)}/{r['seeds']} ok)"
         flags = f"{r['unresolved']}/{r['seeds']}"
         if r["not_converged"]:
             flags += f" ({r['not_converged']} not converged)"
@@ -156,7 +210,8 @@ def to_markdown(rows) -> str:
             f"| {r['case']} | {r['nlive']} | {r['walks']} | {r['seeds']} "
             f"| {r['dz_mean']:+.3f} ± {r['dz_se']:.3f} "
             f"| {r['dz_mean'] / r['dz_se']:+.1f} "
-            f"| {r['scat_over_err']:.2f} [{lo:.2f}, {hi:.2f}] | {modes} | {flags} "
+            f"| {r['scat_over_err']:.2f} [{lo:.2f}, {hi:.2f}] | {modes} | {count} "
+            f"| {flags} "
             f"| {r['ncall']:.3g} | {r['wall_s']:.0f} | {verdict} |"
         )
     return "\n".join(out) + "\n"
@@ -194,7 +249,7 @@ def main(argv=None) -> int:
             if args.cases:
                 print(f"{name} is not in the {args.tier} tier", file=sys.stderr)
             continue
-        row = run_case(name, nlive, CASES[name][2], seeds, args.seed)
+        row = run_case(name, nlive, CASES[name][2], seeds, args.seed, CASES[name][3])
         rows.append(row)
         verdict = "FAIL: " + ", ".join(row["failed"]) if row["failed"] else "PASS"
         print(f"{name}: {verdict} ({row['wall_s']:.0f} s)", file=sys.stderr, flush=True)

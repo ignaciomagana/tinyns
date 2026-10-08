@@ -126,7 +126,9 @@ def gaussian(d: int) -> Target:
 ROSEN_HALF_WIDTH = 5.0
 
 
-def rosenbrock_logz_quadrature(d: int, n: int = 20001, chunk: int = 512) -> float:
+def rosenbrock_logz_quadrature(
+    d: int, n: int = 20001, chunk: int = 512, x1_range=None
+) -> float:
     """Evidence of the chained Rosenbrock target by 1-D transfer-operator quadrature.
 
     The integrand is ``prod_i exp(-(1-x_i)^2) exp(-100 (x_{i+1} - x_i^2)^2)``,
@@ -136,12 +138,18 @@ def rosenbrock_logz_quadrature(d: int, n: int = 20001, chunk: int = 512) -> floa
     (spacing 5e-4 for n = 20001, against the narrowest kernel width 0.07).
     Converged to < 1e-9 in log Z (n = 10001 vs 20001 at d = 10; d = 2 also
     agrees with a brute-force 2-D grid to 4e-9).
+
+    ``x1_range = (lo, hi)`` restricts the first coordinate to ``lo < x_1 <
+    hi``: the log of the evidence times the posterior mass there
+    (:func:`rosenbrock_x1_mass`).
     """
     x = np.linspace(-ROSEN_HALF_WIDTH, ROSEN_HALF_WIDTH, n)
     h = x[1] - x[0]
     tw = np.full(n, h)
     tw[0] = tw[-1] = 0.5 * h
     v = np.ones(n)
+    if x1_range is not None:
+        v = ((x > x1_range[0]) & (x < x1_range[1])).astype(float)
     logscale = 0.0
     a = np.exp(-((1.0 - x) ** 2)) * tw  # quadrature weight in x times the x factor
     x2 = x**2
@@ -155,6 +163,18 @@ def rosenbrock_logz_quadrature(d: int, n: int = 20001, chunk: int = 512) -> floa
         logscale += math.log(m)
         v = new / m
     return logscale + math.log(np.sum(v * tw)) - d * math.log(2 * ROSEN_HALF_WIDTH)
+
+
+def rosenbrock_x1_mass(d: int, lo: float, hi: float, n: int = 10001) -> float:
+    """Posterior mass of ``lo < x_1 < hi`` for the chained Rosenbrock target.
+
+    At d = 10 the target has a second lobe at ``x_1 = -1`` (and ``x_i = 1``
+    for the rest): ``P(x_1 < 0)`` is 0.0252, and the bridge to the main mode,
+    ``|x_1| < 0.3``, holds 0.0083. At d = 4 the two arms are one mode (0.0626
+    and 0.0676), and at d = 2 the valley is a parabola (0.0818 and 0.1337).
+    """
+    part = rosenbrock_logz_quadrature(d, n, x1_range=(lo, hi))
+    return math.exp(part - rosenbrock_logz_quadrature(d, n))
 
 
 # rosenbrock_logz_quadrature(d) with n = 20001 (see --check).

@@ -101,8 +101,8 @@ def default_walks(ndim: int) -> int:
     9 later on), and in high dimensions ``6 ndim`` steps leave a small upward
     logZ bias from that phase. This default keeps the bias below the logZ
     scatter on correlated Gaussians from 2 to 64 dimensions with 250 to 2000
-    live points. Curved targets need more (a 10-D Rosenbrock valley 12 to 25
-    ``ndim``).
+    live points. It is also enough for a 10-D Rosenbrock from
+    ``nlive=1000``.
     """
     return max(25, 6 * ndim, ndim * ndim // 6)
 
@@ -215,6 +215,14 @@ class State(NamedTuple):
     mode_count: Any  # (K, C)
     mode_active: Any  # (K, C) bool
     mode_eligible: Any  # (K, C) bool
+    # The cluster id of each slot, the next free id of each clustering, and
+    # the parent of every id (-1: none; the first TREE_SIZE ids). The two
+    # parts of a split take new ids, with the id of the cluster they split as
+    # parent, so an id names one cluster between the split that made it and
+    # the split that ends it.
+    mode_uid: Any  # (K, C) int32
+    mode_next: Any  # (K,) int32
+    mode_tree: Any  # (K, TREE_SIZE) int32
 
 
 class Dead(NamedTuple):
@@ -225,8 +233,8 @@ class Dead(NamedTuple):
     ``m - k`` surviving live points (uniform on ``0..m-k`` for a correct
     constrained sampler), the accepted moves of its chain (0: the chain
     returned its seed), and the accepted and attempted hops among them.
-    ``label`` is each dead point's cluster label when it died (its slot ``s``
-    in clustering ``j``, the next fold's, as ``j * C_MAX + s``), and
+    ``label`` is each dead point's cluster label when it died (the id of its
+    cluster in clustering ``j``, the next fold's; :func:`_reported_label`), and
     ``nclusters`` / ``neligible`` the step's number of clusters (the largest
     over the clusterings) and of frames taking part in the hop (the
     smallest), the same in every row.
@@ -551,10 +559,14 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
 def _empty_frames(ndim: int, folds: int, dtype) -> dict:
     """The ``mode_*`` fields of a :class:`State` before the first recluster."""
     empty = _modes.empty_frames(ndim, dtype)
-    return {
+    out = {
         "mode_" + name: jnp.stack([x] * folds)
         for name, x in empty._asdict().items()
     }
+    out["mode_uid"] = jnp.zeros((folds, _modes.C_MAX), jnp.int32)
+    out["mode_next"] = jnp.ones((folds,), jnp.int32)
+    out["mode_tree"] = jnp.full((folds, _modes.TREE_SIZE), -1, jnp.int32)
+    return out
 
 
 def _fold(m: int, folds: int):
@@ -577,15 +589,17 @@ def _frames(state: State) -> _modes.Frames:
     ))
 
 
-def _reported_label(label, slot_fold, folds: int):
-    """The label recorded for :meth:`~tinyns.NestedSamplingResult.modes`: a
-    point's slot in the clustering of the next fold, ``j = (fold + 1) mod
-    folds`` (one that contains the point), as ``j * C_MAX + slot``;
-    ``modes()`` merges the labels of different clusterings that cover one
-    mode."""
+def _reported_label(label, uid, slot_fold, folds: int):
+    """The label recorded for :meth:`~tinyns.NestedSamplingResult.modes`: the
+    id of a point's cluster in the clustering of the next fold, ``j = (fold +
+    1) mod folds`` (one that contains the point), as ``id * folds + j``
+    (``uid``: the ids of the slots, :attr:`State.mode_uid`). A cluster's id
+    ends when it is split, so a label never names a cluster and, later, a
+    part of it; ``modes()`` merges the labels that cover one mode."""
     j = (slot_fold + 1) % folds
     xp = np if isinstance(label, np.ndarray) else jnp
-    return xp.take_along_axis(label, j[None, :], 0)[0] + _modes.C_MAX * j
+    slot = xp.take_along_axis(label, j[None, :], 0)[0]
+    return uid[j, slot] * folds + j
 
 
 def _recluster(state: State, batched: bool = False) -> State:
@@ -607,8 +621,24 @@ def _recluster(state: State, batched: bool = False) -> State:
     sub_lab = jnp.take_along_axis(label, at[None], 2)  # (lanes, folds, n)
     sub_lab = jnp.where(valid[None], sub_lab, -1)
     n = comp.shape[1]
-    lab, st = _modes.recluster_lanes(
+    lab, st, fresh, origin = _modes.recluster_lanes(
         sub_u.reshape(lanes * folds, n, d), sub_lab.reshape(lanes * folds, n)
+    )
+    # The parts of the clusters split in this call take new ids, and the id
+    # of the cluster they were split from is recorded as their parent (ids
+    # past TREE_SIZE are dropped).
+    old, nxt, tree = state.mode_uid, state.mode_next, state.mode_tree
+    if not batched:
+        old, nxt, tree = old[None], nxt[None], tree[None]
+    shape = (lanes, folds, _modes.C_MAX)
+    fresh, origin = fresh.reshape(shape), origin.reshape(shape)
+    rank = jnp.cumsum(fresh, axis=-1, dtype=jnp.int32) - 1
+    uid = jnp.where(fresh, nxt[..., None] + rank, old)
+    nxt = nxt + jnp.sum(fresh, axis=-1, dtype=jnp.int32)
+    parent = jnp.take_along_axis(old, origin, axis=-1)
+    entry = jnp.where(fresh, uid, _modes.TREE_SIZE)  # out of range: dropped
+    tree = jax.vmap(jax.vmap(lambda t, i, p: t.at[i].set(p, mode="drop")))(
+        tree, entry, parent
     )
     lab = jnp.where(valid[None], lab.reshape(lanes, folds, n), -1)
     # Scatter back (padding goes to a dummy column m, dropped).
@@ -620,7 +650,7 @@ def _recluster(state: State, batched: bool = False) -> State:
         "mode_" + name: x.reshape(lanes, folds, *x.shape[1:])
         for name, x in frames._asdict().items()
     }
-    new["label"] = label
+    new.update(label=label, mode_uid=uid, mode_next=nxt, mode_tree=tree)
     if not batched:
         new = {name: x[0] for name, x in new.items()}
     return state._replace(**new)
@@ -849,7 +879,9 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         state.logl_birth[worst],
         insertion,
         moves,
-        label=_reported_label(state.label[:, worst], dead_fold, folds),
+        label=_reported_label(
+            state.label[:, worst], state.mode_uid, dead_fold, folds
+        ),
         hops=hops,
         hop_tries=hop_tries,
         nclusters=jnp.full((k,), n_clusters, i32),
@@ -1098,7 +1130,8 @@ def finalise(
         np.asarray(state.logl_birth, np.float64)[order],
     ])
     live_label = _reported_label(
-        np.asarray(state.label), np.arange(m) % cfg._folds, cfg._folds
+        np.asarray(state.label), np.asarray(state.mode_uid),
+        np.arange(m) % cfg._folds, cfg._folds,
     )
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
@@ -1137,6 +1170,8 @@ def finalise(
         "x64": bool(jax.config.jax_enable_x64),
         **({} if dlogz is None else {"dlogz": dlogz}),
         **_mode_info(dead, k, hops, hop_tries),
+        "mode_tree": _mode_tree(state),
+        "folds": cfg._folds,
     }
     return NestedSamplingResult(
         samples_u=u,
@@ -1194,6 +1229,18 @@ def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
             block = np.concatenate([block, pad])
         out.append(np.asarray(kernel(block, *leaves))[:rows].reshape(rows, -1))
     return np.concatenate(out) if out else np.zeros((0, d), dtype)
+
+
+def _mode_tree(state: State) -> list:
+    """``[label, parent label]`` of every cluster made by a split (labels as
+    :func:`_reported_label` records them), for ``result.metadata``."""
+    tree, nxt = np.asarray(state.mode_tree), np.asarray(state.mode_next)
+    folds = tree.shape[0]
+    return [
+        [int(uid * folds + j), int(tree[j, uid] * folds + j)]
+        for j in range(folds)
+        for uid in range(1, min(int(nxt[j]), tree.shape[1]))
+    ]
 
 
 def _mode_info(dead: Dead, k: int, hops, hop_tries) -> dict:
