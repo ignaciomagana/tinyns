@@ -32,8 +32,8 @@ record. The report has three parts.
 
 **Headline** (only when ``--reference``, default ``tinyns_v1``, has records):
 per family, each competitor's calls, wall time, rms and logit sd relative to the
-reference (geometric means over the targets where both are accurate), and the
-reference's rank.
+reference (geometric means over the targets where both are accurate), the same
+costs at equal rms, and the reference's rank by those (``headline``).
 """
 
 from __future__ import annotations
@@ -359,36 +359,62 @@ def _geomean(ratios):
     return math.exp(sum(math.log(x) for x in ratios) / len(ratios)) if ratios else None
 
 
+def _pair(a, cells):
+    """The cell of ``cells`` (one sampler, one target) closest in nlive to ``a``."""
+
+    def distance(b):
+        return abs(math.log((b["nlive"] or 1) / (a["nlive"] or 1)))
+
+    return min(cells, key=distance)
+
+
 def headline(rows, reference: str):
     """Per (family, competitor): costs relative to ``reference``.
 
-    Cells pair up by (target, nlive). ``common`` counts the targets where both
-    samplers are accurate, out of those both ran; the ratios (competitor /
-    reference; above 1 means the reference is cheaper, or more precise for
-    ``rms`` and ``logit_sd``) are geometric means over the common targets.
-    Returns the ratio rows and, per family, the reference's rank among the
-    samplers with a common target (1 = fewest calls, or shortest wall time).
+    A reference cell pairs with the competitor's cell of the same target (of
+    the nearest ``nlive`` when there are several). ``common`` counts the
+    targets where both are accurate, out of those both ran. The ratios are
+    competitor / reference, as geometric means over the common targets:
+
+    ``ncall``, ``wall_s``   as run. Above 1: the reference is cheaper.
+    ``rms``, ``logit_sd``   above 1: the reference is more precise.
+    ``ncall_eq``, ``wall_eq``  the cost ratio times the squared rms ratio: the
+        cost at equal logZ rms, if each sampler's cost goes as 1 / rms^2 (as
+        when nlive is raised). This is the comparison at comparable accuracy
+        when the two ran at different precision.
+
+    Returns the ratio rows and, per family, the reference's rank by
+    ``ncall_eq`` and by ``wall_eq`` among the samplers with a common target
+    (1 is the cheapest).
     """
-    cell = {(r["sampler"], r["target"], r["nlive"]): r for r in rows}
+    by = defaultdict(list)
+    for r in rows:
+        by[(r["sampler"], r["target"])].append(r)
     ratios = []
     for fam in _families(rows):
         ref = [r for r in rows if r["sampler"] == reference and r["family"] == fam]
         for s in sorted({r["sampler"] for r in rows} - {reference}):
-            pairs = [(a, cell.get((s, a["target"], a["nlive"]))) for a in ref]
-            pairs = [(a, b) for a, b in pairs if b is not None]
+            pairs = [(a, by[(s, a["target"])]) for a in ref if (s, a["target"]) in by]
+            pairs = [(a, _pair(a, cells)) for a, cells in pairs]
             if not pairs:
                 continue
             both = [(a, b) for a, b in pairs if a["accurate"] and b["accurate"]]
+
+            def ratio(k, k2=None, both=both):
+                vals = [
+                    b[k] / a[k] * ((b[k2] / a[k2]) ** 2 if k2 else 1.0)
+                    for a, b in both
+                    if all(x.get(key) for x in (a, b) for key in (k, k2) if key)
+                ]
+                return _geomean(vals)
+
             ratios.append(
                 dict(
                     family=fam, sampler=s, common=len(both), ran=len(pairs),
                     hw=pairs[0][1]["hw"],
-                    **{
-                        k: _geomean(
-                            [b[k] / a[k] for a, b in both if a.get(k) and b.get(k)]
-                        )
-                        for k in ("ncall", "wall_s", "rms", "logit_sd")
-                    },
+                    ncall=ratio("ncall"), wall_s=ratio("wall_s"), rms=ratio("rms"),
+                    ncall_eq=ratio("ncall", "rms"), wall_eq=ratio("wall_s", "rms"),
+                    logit_sd=ratio("logit_sd"),
                 )
             )
     ranks = []
@@ -407,8 +433,8 @@ def headline(rows, reference: str):
                 accurate=sum(r["accurate"] for r in ref),
                 cells=len(ref),
                 of=len(rs) + 1,
-                rank_ncall=rank("ncall"),
-                rank_wall=rank("wall_s"),
+                rank_ncall=rank("ncall_eq"),
+                rank_wall=rank("wall_eq"),
             )
         )
     return ratios, ranks
@@ -422,8 +448,9 @@ def headline_markdown(rows, reference: str) -> str:
         )
     ratios, ranks = headline(rows, reference)
     out = [
-        f"`{reference}` per target family: accurate cells, and its rank among "
-        "the samplers that are accurate on a common target.\n",
+        f"`{reference}` per target family: its accurate cells, and its rank by "
+        "cost at equal logZ rms among the samplers that are accurate on a "
+        "common target.\n",
         "| family | accurate | rank by calls | rank by wall time |",
         "|---|---|---|---|",
     ]
@@ -434,18 +461,21 @@ def headline_markdown(rows, reference: str) -> str:
         )
     out += [
         "",
-        f"Competitor / `{reference}` (above 1: `{reference}` needs fewer calls, "
-        "less time, or has the smaller rms or logit sd), geometric mean over the "
-        "common accurate targets.\n",
+        f"Competitor / `{reference}`, geometric mean over the common accurate "
+        f"targets. Above 1: `{reference}` needs fewer calls or less time, or has "
+        "the smaller rms or logit sd. `at equal rms` is the cost ratio times "
+        "the squared rms ratio (cost taken to go as 1 / rms^2). Wall times "
+        "compare across hardware labels only as measured.\n",
         "| family | competitor | hw | common / ran | calls | wall time | rms "
-        "| logit sd |",
-        "|---|---|---|---|---|---|---|---|",
+        "| calls at equal rms | wall time at equal rms | logit sd |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     g = "{:.3g}"
     for x in ratios:
         out.append(
             f"| {x['family']} | {x['sampler']} | {x['hw']} | {x['common']}/{x['ran']} "
             f"| {_f(x['ncall'], g)} | {_f(x['wall_s'], g)} | {_f(x['rms'], g)} "
+            f"| {_f(x['ncall_eq'], g)} | {_f(x['wall_eq'], g)} "
             f"| {_f(x['logit_sd'], g)} |"
         )
     return "\n".join(out) + "\n"

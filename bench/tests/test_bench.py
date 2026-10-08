@@ -262,10 +262,13 @@ def test_report_merges_files_and_ranks_the_reference(tmp_path):
     slow = next(x for x in ratios if (x["sampler"], x["family"]) == ("slow", "gauss"))
     assert slow["common"] == 1
     assert slow["ncall"] == pytest.approx(2.0) and slow["wall_s"] == pytest.approx(5.0)
+    a, b = rows[("ref", "gauss_d2")], rows[("slow", "gauss_d2")]
+    assert slow["ncall_eq"] == pytest.approx(2.0 * (b["rms"] / a["rms"]) ** 2)
     lost = next(x for x in ratios if (x["sampler"], x["family"]) == ("slow", "sepW"))
     assert lost["common"] == 0 and lost["ncall"] is None
     gauss = next(r for r in ranks if r["family"] == "gauss")
-    assert gauss["rank_ncall"] == 1 and gauss["accurate"] == 1
+    # only "noerr" (the same calls at a hundredth of the rms) is cheaper at equal rms
+    assert gauss["rank_ncall"] == 2 and gauss["of"] == 4 and gauss["accurate"] == 1
 
     out, csv_path, json_path = (tmp_path / n for n in ("r.md", "c.csv", "c.json"))
     args = [str(f) for f in files] + ["--out", str(out), "--csv", str(csv_path)]

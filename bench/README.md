@@ -240,6 +240,12 @@ The report has three parts:
    each competitor's calls, wall time, logZ rms and mode-weight sd relative to
    it. `--reference` picks the sampler (default `tinyns_v1`); without records
    of it the report says so and carries on.
+   - The samplers do not run at the same precision, so the table also gives
+     the costs **at equal rms**: the cost ratio times the squared rms ratio,
+     which takes each sampler's cost to go as `1 / rms^2` (as it does when
+     nlive is raised). The rank uses these.
+   - A reference cell pairs with the competitor's cell of the same target, of
+     the nearest nlive when the competitor has several.
 2. **Accurate cells**: per sampler and family, how many cells are accurate.
 3. **Cells**: one row per cell. The module docstring describes the columns.
 
@@ -255,7 +261,9 @@ accurate when:
   the mode weight is within 3 se or 0.1.
 
 The headline's ratios are geometric means over the targets where both samplers
-are accurate.
+are accurate. A sampler that is cheap where it is accurate, and accurate on
+few targets, still ranks well there: read the rank next to the accurate-cells
+table.
 
 **Read the costs with these in mind:**
 
