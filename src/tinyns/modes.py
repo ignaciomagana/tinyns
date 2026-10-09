@@ -327,7 +327,7 @@ def hop_proposal(key, eligible, logdet, frame):
     """
     k_dir, k_uni = random.split(key)
     dtype = logdet.dtype
-    uni = optimization_barrier(random.uniform(k_uni, (3,), dtype))
+    uni = random.uniform(k_uni, (3,), dtype)
     logv = jnp.where(eligible, logdet, -jnp.inf)
     cdf = jnp.cumsum(jnp.where(eligible, jnp.exp(logv - jnp.max(logv)), 0.0))
     c = jnp.sum(cdf <= uni[0] * cdf[-1])  # the first frame with cdf above
