@@ -6,6 +6,7 @@ built on them. It is not part of the package.
 - `validate.py` is the **release gate**: tinyns alone, PASS or FAIL.
 - `run.py` runs tinyns or a competitor and records one JSONL line per run.
 - `summarize.py` merges those records into the **head-to-head report**.
+- `RESULTS.md` is that report for v1, with the settings and how to read it.
 
 ```
 bench/
@@ -14,6 +15,7 @@ bench/
   validate.py          the release gate: tinyns on the standard targets -> PASS/FAIL
   run.py               CLI: one sampler x one target x seeds -> results.jsonl
   summarize.py         JSONL files -> head-to-head report (Markdown, CSV, JSON)
+  RESULTS.md           the measured head-to-head and the full gate, for v1
   h100_plan.sh         env build + sweep job lines for js2h100 (review before use)
   slurm_cpu.sh         the CPU sampler lines as a Slurm array (Hilda)
   requirements-*.txt   pins for the two envs
@@ -249,7 +251,13 @@ It merges any number of JSONL files. A cell is one (sampler, target, nlive);
 runs with `--opt` settings form their own sampler, labelled
 `name [key=value]`, so a matched-settings rerun sits next to the default one.
 
-The report has three parts:
+- `--sha tinyns_v1=afa58dd` keeps only the `tinyns_v1` records written at
+  that commit (`git_sha`), and says how many it left out. Use it when a
+  results file holds runs of an older build.
+- `--reference-nlive 500,1000` keeps the headline to the reference's cells at
+  those `nlive`, when it also ran at values no competitor ran at.
+
+The report has four parts:
 
 1. **Headline**: for each target family, the reference sampler's rank, and
    each competitor's calls, wall time, logZ rms and mode-weight sd relative to
@@ -261,8 +269,14 @@ The report has three parts:
      nlive is raised). The rank uses these.
    - A reference cell pairs with the competitor's cell of the same target, of
      the nearest nlive when the competitor has several.
-2. **Accurate cells**: per sampler and family, how many cells are accurate.
-3. **Cells**: one row per cell. The module docstring describes the columns.
+2. **Samplers**: version, commit, hardware, runs, timeouts and errors.
+3. **Accurate cells**: per sampler and family, how many cells are accurate,
+   with one row per `nlive` for a sampler that ran at several.
+4. **Cells**: one row per cell. The module docstring describes the columns.
+   `wall s` is the median over seeds; `run s` is wall minus compile, where
+   the sampler times its compilation apart; `first s` is the cell's first
+   run on a GPU, which is a cold start when the later seeds load their
+   programs from `--jax-cache`.
 
 The same rows go to `--csv` (flat) and `--json`.
 
@@ -337,7 +351,8 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
 - every installed adapter, on `gauss_d2` with nlive 100;
 - `run.py` and `summarize.py` end to end, including a timeout record;
 - the report on synthetic records: merging, the accuracy flags, the headline
-  ratios and ranks, a missing reference;
+  ratios and ranks, a missing reference, the commit filter, the cold-start
+  and compiled times, cells of several `nlive`;
 - the gate: its criteria on synthetic rows (the mode count and its
   lower-bound flag among them), and one run of its code path on tiny
   settings.
