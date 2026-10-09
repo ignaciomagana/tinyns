@@ -5,7 +5,9 @@
 
 A cell is one (sampler, target, nlive); a sampler run with ``--opt`` settings is
 its own sampler, labelled ``name [key=value]``. A repeated seed keeps its last
-record. The report has three parts.
+record. ``--sha SAMPLER=SHA`` keeps only the records of that sampler that were
+written at that commit (``git_sha``), so runs of an older build of the sampler
+do not enter the table. The report has four parts.
 
 **Cells**, one row each:
 
@@ -15,7 +17,9 @@ record. The report has three parts.
 ``ok``          successful runs / all runs, then timeouts (T) and errors (E)
 ``dlogZ``       mean of logz - truth, +- its standard error
 ``rms``         rms of logz - truth, in nats (the accuracy of one run)
-``scat/err``    sd(logz - truth) / mean(logzerr): 1 for honest error bars
+``sd``          sd of logz over the seeds
+``logzerr``     mean of the error bar the sampler reports
+``scat/err``    their ratio, sd / logzerr: 1 for honest error bars
 ``in 3s``       fraction of runs with |logz - truth| < 3 logzerr
 ``logit bias``  mean logit(mass) - logit(true mass) of a minor mode, +- its
                 standard error; the mode is the one with the largest sd
@@ -25,15 +29,29 @@ record. The report has three parts.
                 true mass
 ``ncall``       median likelihood calls of the successful runs
 ``wall s``      median wall time over the successful and the timed-out runs
-                (``>`` when that median is a timeout); ``compile s`` likewise
+                (``>`` when that median is a timeout). Compilation is inside
+                it; with ``run.py --jax-cache`` every seed but the first
+                loads its programs from the cache instead of compiling them
+``compile s``   median compile (or cache load) time, where the sampler times
+                it apart
+``run s``       median of wall - compile over the successful runs: the time
+                of a compiled run (only where ``compile s`` exists)
+``first s``     wall time of the cell's first run (by timestamp) on a GPU: a
+                cold start, compilation included
 ``acc``         ``yes`` when the cell is accurate (``accurate``), else why not
 
+**Samplers**: per sampler, its version, the commit the records were written
+at, the hardware, and its runs, timeouts and errors.
+
 **Accurate cells**: per sampler and target family, how many cells are accurate.
+A sampler that ran at several ``nlive`` has one row for each.
 
 **Headline** (only when ``--reference``, default ``tinyns_v1``, has records):
 per family, each competitor's calls, wall time, rms and logit sd relative to the
 reference (geometric means over the targets where both are accurate), the same
 costs at equal rms, and the reference's rank by those (``headline``).
+``--reference-nlive 500,1000`` keeps the headline to the reference's cells at
+those ``nlive``, when it also ran at values no competitor ran at.
 """
 
 from __future__ import annotations
@@ -70,9 +88,26 @@ def label(rec) -> str:
     return f"{rec['sampler']} [{','.join(f'{k}={opts[k]}' for k in sorted(opts))}]"
 
 
-def load(paths):
-    """{(sampler label, target, cli nlive): [records]} from JSONL files."""
+def parse_sha(items) -> dict:
+    """``["tinyns_v1=afa58dd", ...]`` -> ``{"tinyns_v1": "afa58dd"}``."""
+    out = {}
+    for item in items or []:
+        name, sep, sha = item.partition("=")
+        if not sep or not sha:
+            raise SystemExit(f"--sha expects SAMPLER=SHA, got {item!r}")
+        out[name] = sha
+    return out
+
+
+def load(paths, sha=None, dropped=None):
+    """{(sampler label, target, cli nlive): [records]} from JSONL files.
+
+    ``sha`` maps a sampler name (the spec without its variant) to a commit
+    prefix: a record of that sampler with another ``git_sha`` is left out,
+    and counted in ``dropped`` (a dict, sampler -> records) when one is given.
+    """
     recs = {}
+    sha = sha or {}
     for path in paths:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -81,6 +116,11 @@ def load(paths):
                     continue
                 r = json.loads(line)
                 if r.get("schema") != "tinyns-bench-1":
+                    continue
+                want = sha.get(r["sampler"].split(":")[0])
+                if want and not (r.get("git_sha") or "").startswith(want):
+                    if dropped is not None:
+                        dropped[r["sampler"]] = dropped.get(r["sampler"], 0) + 1
                     continue
                 nlive = (r.get("config") or {}).get("cli", {}).get("nlive")
                 recs[(label(r), r["target"], nlive, r["seed"])] = r
@@ -236,6 +276,15 @@ def _median_wall(recs):
     return wall, pairs[(len(pairs) - 1) // 2][1] or pairs[len(pairs) // 2][1]
 
 
+def _first_wall(recs):
+    """Wall time of the cell's first run by timestamp, if it ran on a GPU and
+    finished: a cold start when the later seeds load a compilation cache."""
+    first = min(recs, key=lambda r: (r.get("ts") or "", r["seed"]))
+    if first["status"] != "ok" or not (first.get("hw") or {}).get("gpu"):
+        return None
+    return first.get("wall_s")
+
+
 def summarize(groups):
     """One row (a flat dict) per cell, sorted by target then sampler."""
     rows = []
@@ -259,6 +308,7 @@ def summarize(groups):
             n_error=sum(r["status"] == "error" for r in recs),
             wall_s=wall,
             wall_is_timeout=censored,
+            first_s=_first_wall(recs),
         )
         if ok:
             truth = ok[0]["truth"]
@@ -277,6 +327,12 @@ def summarize(groups):
             row["ncall"] = float(np.median([r["ncall"] for r in ok]))
             comp = [r["compile_s"] for r in ok if r.get("compile_s") is not None]
             row["compile_s"] = float(np.median(comp)) if comp else None
+            run = [
+                r["wall_s"] - r["compile_s"]
+                for r in ok
+                if r.get("compile_s") is not None and r.get("wall_s") is not None
+            ]
+            row["run_s"] = float(np.median(run)) if run else None
         row["why_not"] = accurate(row)
         row["accurate"] = not row["why_not"]
         rows.append(row)
@@ -288,7 +344,7 @@ CSV_COLUMNS = (
     "n_timeout", "n_error", "dz_mean", "dz_se", "rms", "scatter", "err_mean",
     "scat_over_err", "in3", "logit_bias", "logit_bias_se", "logit_sd", "logit_sd_lo",
     "logit_sd_hi", "lost", "ncall", "wall_s", "wall_is_timeout", "compile_s",
-    "accurate", "why_not",
+    "run_s", "first_s", "accurate", "why_not",
 )
 
 
@@ -304,8 +360,9 @@ def _pm(mean, se, fmt):
 
 def cells_markdown(rows) -> str:
     head = (
-        "| target | sampler | hw | nlive | ok | dlogZ | rms | scat/err | in 3s "
-        "| logit bias | logit sd [95% CI] | lost | ncall | wall s | compile s | acc |"
+        "| target | sampler | hw | nlive | ok | dlogZ | rms | sd | logzerr "
+        "| scat/err | in 3s | logit bias | logit sd [95% CI] | lost | ncall "
+        "| wall s | compile s | run s | first s | acc |"
     )
     out = [head, "|" + "---|" * (head.count("|") - 1)]
     f2 = "{:.2f}"
@@ -324,10 +381,12 @@ def cells_markdown(rows) -> str:
         out.append(
             f"| {r['target']} | {r['sampler']} | {r['hw']} | {r['live_points']} | {ok} "
             f"| {_pm(r.get('dz_mean'), r.get('dz_se'), '{:+.3f}')} "
-            f"| {_f(r.get('rms'))} | {_f(r.get('scat_over_err'), f2)} "
+            f"| {_f(r.get('rms'))} | {_f(r.get('scatter'))} "
+            f"| {_f(r.get('err_mean'))} | {_f(r.get('scat_over_err'), f2)} "
             f"| {_f(r.get('in3'), f2)} | {bias} | {sd} | {lost} "
             f"| {_f(r.get('ncall'), '{:.3g}')} | {wall} "
             f"| {_f(r.get('compile_s'), '{:.1f}')} "
+            f"| {_f(r.get('run_s'), '{:.1f}')} | {_f(r.get('first_s'), '{:.0f}')} "
             f"| {'yes' if r['accurate'] else 'no: ' + r['why_not']} |"
         )
     return "\n".join(out) + "\n"
@@ -339,19 +398,31 @@ def _families(rows):
 
 
 def accurate_markdown(rows) -> str:
-    """Accurate cells / cells per sampler (rows) and target family (columns)."""
+    """Accurate cells / cells per sampler (rows) and target family (columns).
+
+    A sampler with cells at more than one ``nlive`` gets a row per ``nlive``,
+    so cells at different settings are not added up."""
     fams = _families(rows)
+    nlives = defaultdict(set)
+    for r in rows:
+        nlives[r["sampler"]].add(r["nlive"])
+
+    def name(r):
+        if len(nlives[r["sampler"]]) < 2:
+            return (r["sampler"], 0, r["sampler"])
+        return (r["sampler"], r["nlive"] or 0, f"{r['sampler']} (nlive {r['nlive']})")
+
     count = defaultdict(lambda: [0, 0])
     for r in rows:
-        c = count[(r["sampler"], r["family"])]
+        c = count[(name(r), r["family"])]
         c[0] += r["accurate"]
         c[1] += 1
     out = ["| sampler | " + " | ".join(fams) + " |", "|---|" + "---|" * len(fams)]
-    for s in sorted({r["sampler"] for r in rows}):
+    for key in sorted({name(r) for r in rows}):
         cells = [
-            "{}/{}".format(*count[(s, f)]) if (s, f) in count else "-" for f in fams
+            "{}/{}".format(*count[(key, f)]) if (key, f) in count else "-" for f in fams
         ]
-        out.append(f"| {s} | " + " | ".join(cells) + " |")
+        out.append(f"| {key[2]} | " + " | ".join(cells) + " |")
     return "\n".join(out) + "\n"
 
 
@@ -368,8 +439,11 @@ def _pair(a, cells):
     return min(cells, key=distance)
 
 
-def headline(rows, reference: str):
+def headline(rows, reference: str, nlive=None):
     """Per (family, competitor): costs relative to ``reference``.
+
+    ``nlive`` (a collection) keeps only the reference's cells at those
+    ``nlive``; the competitors' cells are never filtered.
 
     A reference cell pairs with the competitor's cell of the same target (of
     the nearest ``nlive`` when there are several). ``common`` counts the
@@ -387,6 +461,8 @@ def headline(rows, reference: str):
     ``ncall_eq`` and by ``wall_eq`` among the samplers with a common target
     (1 is the cheapest).
     """
+    if nlive:
+        rows = [r for r in rows if r["sampler"] != reference or r["nlive"] in nlive]
     by = defaultdict(list)
     for r in rows:
         by[(r["sampler"], r["target"])].append(r)
@@ -440,14 +516,20 @@ def headline(rows, reference: str):
     return ratios, ranks
 
 
-def headline_markdown(rows, reference: str) -> str:
+def headline_markdown(rows, reference: str, nlive=None) -> str:
     if not any(r["sampler"] == reference for r in rows):
         return (
             f"No `{reference}` records in the input, so there is no headline "
             "table yet (`--reference` ranks another sampler).\n"
         )
-    ratios, ranks = headline(rows, reference)
-    out = [
+    ratios, ranks = headline(rows, reference, nlive)
+    out = []
+    if nlive:
+        out.append(
+            f"Only the `{reference}` cells at nlive "
+            f"{', '.join(str(n) for n in sorted(nlive))} enter this section.\n"
+        )
+    out += [
         f"`{reference}` per target family: its accurate cells, and its rank by "
         "cost at equal logZ rms among the samplers that are accurate on a "
         "common target.\n",
@@ -499,15 +581,51 @@ def hardware(groups) -> list[str]:
     return lines
 
 
-def report(groups, reference: str = "tinyns_v1") -> tuple[str, list[dict]]:
+def samplers_markdown(groups) -> str:
+    """Per sampler: version, commit, hardware, and its runs and failures.
+
+    The version is the record's ``sampler_version`` without the import path
+    that the tinyns adapters append. The commit is the checkout ``run.py``
+    was started from, which for ``tinyns_v1`` is the sampler itself.
+    """
+    by = defaultdict(list)
+    for (sampler, _, _), recs in groups.items():
+        by[sampler].extend(recs)
+    out = [
+        "| sampler | version | commit | hw | cells | runs | timeouts | errors |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for s in sorted(by):
+        recs = by[s]
+        vers = {(r.get("sampler_version") or "").split(" (")[0] for r in recs}
+        shas = {(r.get("git_sha") or "?")[:7] for r in recs}
+        cells = sum(k[0] == s for k in groups)
+        out.append(
+            f"| {s} | {', '.join(sorted(vers - {''})) or '-'} "
+            f"| {', '.join(sorted(shas))} "
+            f"| {'; '.join(sorted({hw_label(r) for r in recs}))} | {cells} "
+            f"| {len(recs)} | {sum(r['status'] == 'timeout' for r in recs)} "
+            f"| {sum(r['status'] == 'error' for r in recs)} |"
+        )
+    return "\n".join(out) + "\n"
+
+
+def report(
+    groups, reference: str = "tinyns_v1", dropped=None, reference_nlive=None
+) -> tuple[str, list[dict]]:
     rows = summarize(groups)
     nrec = sum(len(v) for v in groups.values())
+    left_out = [
+        f"Left out by `--sha`: {n} records of `{s}` from another commit."
+        for s, n in sorted((dropped or {}).items())
+    ]
     md = [
         "# Nested-sampler head-to-head",
         "",
         f"{nrec} runs in {len(rows)} cells (sampler x target x nlive). "
         "The columns are described in `bench/summarize.py`; the samplers' "
         "settings and the caveats in `bench/README.md`.",
+        *left_out,
         "",
         "Hardware (wall times compare only within one label):",
         *hardware(groups),
@@ -519,7 +637,10 @@ def report(groups, reference: str = "tinyns_v1") -> tuple[str, list[dict]]:
         "",
         "## Headline",
         "",
-        headline_markdown(rows, reference),
+        headline_markdown(rows, reference, reference_nlive),
+        "## Samplers",
+        "",
+        samplers_markdown(groups),
         "## Accurate cells per sampler and target family",
         "",
         accurate_markdown(rows),
@@ -552,8 +673,26 @@ def main(argv=None):
     p.add_argument(
         "--reference", default="tinyns_v1", help="the sampler the headline ranks"
     )
+    p.add_argument(
+        "--sha",
+        action="append",
+        default=[],
+        metavar="SAMPLER=SHA",
+        help="keep only this sampler's records written at this commit",
+    )
+    p.add_argument(
+        "--reference-nlive",
+        default=None,
+        metavar="N[,N]",
+        help="the headline uses only the reference's cells at these nlive",
+    )
     args = p.parse_args(argv)
-    md, rows = report(load(args.files), args.reference)
+    dropped = {}
+    groups = load(args.files, parse_sha(args.sha), dropped)
+    ref_nlive = args.reference_nlive and {
+        int(n) for n in args.reference_nlive.split(",")
+    }
+    md, rows = report(groups, args.reference, dropped, ref_nlive)
     if args.csv:
         write_csv(args.csv, rows)
     if args.json:

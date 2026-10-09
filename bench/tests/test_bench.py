@@ -296,6 +296,93 @@ def test_report_merges_files_and_ranks_the_reference(tmp_path):
     assert "No `tinyns_v1` records" in md and "## Cells" in md
 
 
+def test_report_times_a_cold_start_and_filters_on_the_commit(tmp_path):
+    from bench import summarize
+
+    new, old = "a" * 40, "b" * 40
+    recs = []
+    for seed in range(6):
+        # the first run compiles (20 s of 30); the others load the cache (1 s of 11)
+        r = _record("tinyns_v1", "gauss_d2", seed, 0.01 * seed, gpu="NVIDIA H100 80GB",
+                    wall=30.0 if seed == 0 else 11.0)
+        r.update(compile_s=20.0 if seed == 0 else 1.0, git_sha=new,
+                 ts=f"2026-01-01T00:00:{seed:02d}",
+                 sampler_version="tinyns 1.0.0 (/some/where/tinyns)")
+        recs.append(r)
+        # the same sampler at an older commit, and its k1 variant: biased by 5
+        for spec in ("tinyns_v1", "tinyns_v1:k1"):
+            stale = _record(spec, "gauss_d8", seed, 5.0, gpu="NVIDIA H100 80GB")
+            recs.append(dict(stale, git_sha=old, ts="2025-01-01T00:00:00"))
+        # another sampler is not filtered, whatever its commit; a CPU cell
+        # has no cold start
+        recs.append(dict(_record("other", "gauss_d2", seed, 0.0), git_sha=old))
+    path = tmp_path / "r.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+
+    rows = summarize.summarize(summarize.load([path]))
+    assert len(rows) == 4
+    dropped = {}
+    groups = summarize.load([path], summarize.parse_sha(["tinyns_v1=aaaaaaa"]), dropped)
+    assert dropped == {"tinyns_v1": 6, "tinyns_v1:k1": 6}
+    rows = {r["sampler"]: r for r in summarize.summarize(groups)}
+    assert set(rows) == {"tinyns_v1", "other"}
+    v1 = rows["tinyns_v1"]
+    assert v1["wall_s"] == 11.0 and v1["compile_s"] == 1.0
+    assert v1["run_s"] == 10.0 and v1["first_s"] == 30.0
+    assert rows["other"]["first_s"] is None and rows["other"]["run_s"] is None
+
+    md, _ = summarize.report(groups, dropped=dropped)
+    assert "Left out by `--sha`: 6 records of `tinyns_v1` from" in md
+    # the samplers table drops the import path from the version
+    assert "| tinyns_v1 | tinyns 1.0.0 | aaaaaaa | GPU H100 | 1 | 6 | 0 | 0 |" in md
+    assert "/some/where" not in md
+    assert "| 11 | 1.0 | 10.0 | 30 | yes |" in md
+    with pytest.raises(SystemExit):
+        summarize.parse_sha(["tinyns_v1"])
+    out = tmp_path / "r.md"
+    summarize.main([str(path), "--sha", "tinyns_v1=" + new[:7], "--out", str(out)])
+    assert "gauss_d8" not in out.read_text()
+
+
+def test_report_keeps_cells_of_different_nlive_apart(tmp_path):
+    from bench import summarize
+
+    rng = np.random.default_rng(1)
+    recs = []
+    for seed in range(20):
+        noise = 0.1 * rng.normal(size=3)
+        recs.append(_record("ref", "gauss_d2", seed, noise[0]))
+        # the reference at a larger nlive: twice the calls, and biased
+        big = _record("ref", "gauss_d2", seed, 1.0 + noise[1], ncall=2000)
+        big["config"]["cli"]["nlive"] = 4000
+        recs.append(big)
+        recs.append(_record("other", "gauss_d2", seed, noise[2], ncall=3000))
+    path = tmp_path / "r.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    rows = summarize.summarize(summarize.load([path]))
+
+    table = summarize.accurate_markdown(rows)
+    assert "| ref (nlive 500) | 1/1 |" in table
+    assert "| ref (nlive 4000) | 0/1 |" in table
+    assert "| other | 1/1 |" in table
+
+    # every reference cell pairs with the competitor: the biased one is not common
+    ratios, ranks = summarize.headline(rows, "ref")
+    assert ranks[0]["cells"] == 2 and ranks[0]["accurate"] == 1
+    assert ratios[0]["ran"] == 2 and ratios[0]["common"] == 1
+    ratios, ranks = summarize.headline(rows, "ref", nlive={500})
+    assert ranks[0]["cells"] == 1 and ratios[0]["ran"] == 1
+    assert ratios[0]["ncall"] == pytest.approx(3.0)
+
+    out = tmp_path / "r.md"
+    args = [str(path), "--reference", "ref", "--out", str(out)]
+    summarize.main(args + ["--reference-nlive", "500"])
+    md = out.read_text()
+    assert "Only the `ref` cells at nlive 500 enter this section." in md
+    assert "| gauss | 1/1 | " in md and "| gauss | 1/2 | " not in md
+    assert "| gauss_d2 | ref | CPU 4c | 4000 | 20/20 |" in md  # still a cell
+
+
 def test_validation_gate_criteria():
     from bench import validate
 
