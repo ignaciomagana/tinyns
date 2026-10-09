@@ -11,11 +11,20 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11"]
         x64: ["0"]
+        jax: ["latest"]
         include:
           # The full suite with 64-bit floats as well.
           - python-version: "3.11"
             x64: "1"
-    name: test (py${{ matrix.python-version }}, x64=${{ matrix.x64 }})
+            jax: "latest"
+          # The minimum supported JAX (pyproject.toml), on the minimum Python.
+          - python-version: "3.10"
+            x64: "0"
+            jax: "0.4.31"
+          - python-version: "3.10"
+            x64: "1"
+            jax: "0.4.31"
+    name: test (py${{ matrix.python-version }}, x64=${{ matrix.x64 }}, jax ${{ matrix.jax }})
     env:
       JAX_ENABLE_X64: ${{ matrix.x64 }}
 
@@ -30,6 +39,10 @@ jobs:
 
       - name: Install package
         run: python -m pip install -e ".[dev]"
+
+      - name: Pin JAX
+        if: matrix.jax != 'latest'
+        run: python -m pip install "jax==${{ matrix.jax }}" "jaxlib==${{ matrix.jax }}"
 
       - name: Run Ruff
         run: ruff check .
