@@ -65,9 +65,9 @@ git history of this file (up to commit eb4631c).
 ### Benchmarks
 
 - **Head-to-head against tinyns 0.x, BlackJAX NSS, JAXNS, dynesty, UltraNest and Nautilus** on the 24 targets of `bench/` (20 or 40 seeds; GPU samplers on one H100, CPU samplers on 4 cores). The README has a compact table and `bench/RESULTS.md` every cell, the settings, the fairness caveats and the full validation gate at afa58dd (10 of 10 cases pass on the H100).
-  - *At the competitors' settings* tinyns v1 is accurate on 18 of 24 targets at nlive 500 and on 22 at the default 1000. It fails on `rosen_d10` at 500 (logZ low by 0.22 ± 0.06), on the 32-D mixtures at 500 (minor mode lost in 25 to 30% of the runs) and on 5 of the 6 `sepM` cells; no competitor is accurate on any `sepM` target at its settings. `sepM_d18` works at nlive 2000.
+  - *At the competitors' settings* tinyns v1 is accurate on 18 of 24 targets at nlive 500 and on 22 at the default 1000. It fails on `rosen_d10` at 500 (logZ low by 0.22 ± 0.06), on the 32-D mixtures at 500 (minor mode lost in 25 to 30% of the runs) and on 5 of the 6 `sepM` cells; no competitor is accurate on any `sepM` target at its settings. With more live points (tinyns only) `sepM_d18` works at nlive 2000 and `sepM_d32` at 4000, where all 12 mixtures are accurate.
   - *Cost.* A compiled run takes 1 to 20 s and a first run 9 to 31 s (BlackJAX NSS: 9 to 77 s compiled; JAXNS: 16 to 360 s). tinyns does not need the fewest likelihood calls: Nautilus needs 1.7 to 24 times fewer, at an rms 2 to 28 times smaller, where it is accurate.
-  - *Not like for like:* GPU and CPU wall times, Nautilus without a pool, UltraNest's MLFriends at d = 10, chain lengths at d >= 30, and tinyns's rows above nlive 500. `bench/RESULTS.md` lists these and the cells that have not run.
+  - *Not like for like:* GPU and CPU wall times, Nautilus without a pool, UltraNest's MLFriends at d = 10, chain lengths at d >= 30, and tinyns's rows above nlive 500. `bench/RESULTS.md` lists these and the competitor cells that have not run. The tinyns rows were measured at afa58dd, one merge before the JAX 0.4.31 change, which differs only in roundoff.
 - **`bench/summarize.py`** gains `--sha SAMPLER=SHA` (only the records written at one commit), `--reference-nlive`, the columns `sd`, `logzerr`, `run s` (wall minus compile) and `first s` (a cold start), a table of sampler versions and failures, and one accurate-cells row per `nlive`.
 
 ### Defaults
@@ -92,6 +92,7 @@ git history of this file (up to commit eb4631c).
 - **Insertion test.** With `num_delete > 1` the ranks of one step share their survivors, so the p-values are anti-conservative above `num_delete = nlive // 10`: 5%, 6%, 13% and 30% of correct runs fall below 0.05 at shares of 0.05, 0.1, 0.25 and 0.5 (see Defaults).
 - **Compile cache.** A process keeps up to 8 compiled configurations per kernel; a loop over more configurations than that recompiles.
 - **Bit-identical resume** is tested on CPU only.
+- **A fixed seed is not bit-reproducible on a GPU in float32.** Five identical runs in separate processes gave four different `logz` (measured on `sepM_d32` on an H100 at afa58dd). On a CPU a fixed seed reproduces to the bit. The results agree in distribution.
 
 ### Benchmarks
 

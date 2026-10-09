@@ -226,6 +226,9 @@ of GPU memory with `nlive=4000` (7 GiB at a share of 0.5), and one run holds
   lets separate processes reuse compiled programs.
 - **Memory.** A step evaluates `num_delete` likelihoods at once (times the
   batch size of a batched run). If that does not fit, lower `num_delete`.
+- **Reproducibility.** On a GPU in float32 a fixed seed is not bit-reproducible
+  between processes: five identical runs of a 32-D mixture gave four different
+  `logz`. On a CPU it is. The results agree in distribution.
 
 ## Checkpoints
 
@@ -352,19 +355,21 @@ Mixtures with a 6% minor mode (`sepM`: a narrow one; `mix3`: three modes of
 weight 0.7, 0.2 and 0.1). Each cell is the sd over seeds of the logit of a
 minor mode's weight; the seeds that lost a mode; calls; time:
 
-| sampler | on | `sepW_d10` | `sepW_d18` | `sepM_d18` | `mix3_d10` |
-|---|---|---|---|---|---|
-| **tinyns v1**, nlive 500 | H100 | 0.14; 0%; 1.2e6; 1.9 s | 0.40; 0%; 3.8e6; 3.5 s | 1.08; 68%; 3.8e6; 3.3 s | 0.06; 0%; 1.2e6; 2.0 s |
-| **tinyns v1**, nlive 1000 (default) | H100 | 0.06; 0%; 2.4e6; 2.0 s | 0.06; 0%; 7.5e6; 3.6 s | 0.40; 20%; 7.5e6; 4.0 s | 0.05; 0%; 2.4e6; 2.1 s |
-| **tinyns v1**, nlive 2000 (*) | H100 | 0.03; 0%; 4.8e6; 2.1 s | 0.04; 0%; 1.5e7; 3.9 s | 0.03; 0%; 1.5e7; 4.1 s | not run |
-| tinyns 0.x | H100 | 0.13; 0%; 9.8e5; 33 s | 0.27; 0%; 3.1e6; 80 s | not run | not run |
-| BlackJAX NSS | H100 | 0.65; 10%; 1.9e6; 12 s | 0.81; 10%; 5.9e6; 17 s | 1.37; 57%; 6.0e6; 17 s | 0.87; 12%; 1.9e6; 12 s |
-| JAXNS | H100 | 0.82; 5%; 7.3e6; 55 s | 0.97; 30%; 2.3e7; 98 s | not run | not run |
-| dynesty | 4 cores | 0.87; 0%; 5.9e5; 91 s | 0.59; 2%; 1.3e6; 204 s | 1.17; 52%; 1.3e6; 200 s | 0.93; 10%; 5.9e5; 91 s |
-| UltraNest | 4 cores | 0.07; 0%; 1.4e7; 1837 s; 5 of 40 timed out | 0.80; 5%; 5.0e6; 738 s | 0.87; 62%; 4.8e6; 724 s | timed out (>14405 s) |
-| Nautilus | 4 cores | 0.03; 0%; 1.4e5; 961 s | 0.08; 0%; 2.6e5; 3481 s | -; 100%; 2.4e5; 1993 s | 0.02; 0%; 1.5e5; 1507 s |
+| sampler | on | `sepW_d10` | `sepW_d18` | `sepM_d18` | `sepM_d32` | `mix3_d10` |
+|---|---|---|---|---|---|---|
+| **tinyns v1**, nlive 500 | H100 | 0.14; 0%; 1.2e6; 1.9 s | 0.40; 0%; 3.8e6; 3.5 s | 1.08; 68%; 3.8e6; 3.3 s | 1.48; 70%; 1.2e7; 6.5 s | 0.06; 0%; 1.2e6; 2.0 s |
+| **tinyns v1**, nlive 1000 (default) | H100 | 0.06; 0%; 2.4e6; 2.0 s | 0.06; 0%; 7.5e6; 3.6 s | 0.40; 20%; 7.5e6; 4.0 s | 0.85; 55%; 2.3e7; 8.1 s | 0.05; 0%; 2.4e6; 2.1 s |
+| **tinyns v1**, nlive 2000 (*) | H100 | 0.03; 0%; 4.8e6; 2.1 s | 0.04; 0%; 1.5e7; 3.9 s | 0.03; 0%; 1.5e7; 4.1 s | 0.34; 28%; 4.6e7; 9.2 s | 0.03; 0%; 4.8e6; 2.3 s |
+| **tinyns v1**, nlive 4000 (*) | H100 | 0.02; 0%; 9.6e6; 2.4 s | 0.02; 0%; 3.0e7; 4.4 s | 0.02; 0%; 3.0e7; 4.4 s | 0.08; 2%; 9.3e7; 10 s | 0.02; 0%; 9.6e6; 2.6 s |
+| tinyns 0.x | H100 | 0.13; 0%; 9.8e5; 33 s | 0.27; 0%; 3.1e6; 80 s | not run | not run | not run |
+| BlackJAX NSS | H100 | 0.65; 10%; 1.9e6; 12 s | 0.81; 10%; 5.9e6; 17 s | 1.37; 57%; 6.0e6; 17 s | 0.58; 60%; 1.8e7; 33 s | 0.87; 12%; 1.9e6; 12 s |
+| JAXNS | H100 | 0.82; 5%; 7.3e6; 55 s | 0.97; 30%; 2.3e7; 98 s | not run | not run | not run |
+| dynesty | 4 cores | 0.87; 0%; 5.9e5; 91 s | 0.59; 2%; 1.3e6; 204 s | 1.17; 52%; 1.3e6; 200 s | 0.53; 40%; 1.1e7; 1372 s | 0.93; 10%; 5.9e5; 91 s |
+| UltraNest | 4 cores | 0.07; 0%; 1.4e7; 1837 s; 5 of 40 timed out | 0.80; 5%; 5.0e6; 738 s | 0.87; 62%; 4.8e6; 724 s | 0.93; 70%; 1.4e7; 2195 s | timed out (>14405 s) |
+| Nautilus | 4 cores | 0.03; 0%; 1.4e5; 961 s | 0.08; 0%; 2.6e5; 3481 s | -; 100%; 2.4e5; 1993 s | -; 100%; 4.8e5; 5671 s | 0.02; 0%; 1.5e5; 1507 s |
 
-(*) More live points than any competitor ran: not a comparison.
+(*) tinyns only, with more live points than any competitor ran: not a
+comparison.
 
 - **Accuracy.** tinyns v1 is accurate on 18 of the 24 targets at nlive 500 and
   on 22 at 1000, and its error bars are honest (sd / logzerr from 0.69 to
@@ -386,16 +391,16 @@ minor mode's weight; the seeds that lost a mode; calls; time:
 - **`sepM`.** At nlive 500 and 1000 tinyns is accurate on 1 of the 6 `sepM`
   cells (`sepM_d10` at 1000), and no competitor is accurate on any at these
   settings. tinyns recovers the mode once it holds about `5 * ndim` live
-  points: `sepM_d18` works at nlive 2000 (25 seeds), for 4 times the calls of
-  nlive 500 (1.5e7) and 0.8 s more time. `sepM_d32` fails at 1000 and has not
-  run above.
+  points: `sepM_d18` works at nlive 2000, for 4 times the calls of nlive 500
+  (1.5e7) and 0.8 s more time, and `sepM_d32` at 4000 (it still loses the
+  mode in 28% of the runs at 2000), for 8 times the calls (9.3e7) and 3.8 s
+  more. At nlive 4000 all 12 mixtures are accurate.
 - **Known gaps.** Deferred reruns would favour the competitors: Nautilus with
   a pool and a larger `n_live` (at 8000 it resolves `sepM_d10`), UltraNest's
   slice sampler at d = 10 (it finishes where MLFriends timed out), chain
   lengths matched to tinyns's at d >= 30 (dynesty's `rwalk` is unbiased on
   `gauss_d32` with 192 steps), and competitor rows at nlive 1000 and above.
-  tinyns 0.x and JAXNS have not run `connW`, `sepM` and `mix3`; a GPU outage
-  cut tinyns's nlive 2000 rows short and its 4000 rows did not run.
+  tinyns 0.x and JAXNS have not run `connW`, `sepM` and `mix3`.
 
 ## References and license
 
