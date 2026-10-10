@@ -73,9 +73,10 @@ def test_rosenbrock_lobe_mass():
     assert rosenbrock_x1_mass(2, -5.0, 5.0, n=2001) == pytest.approx(1.0, abs=1e-9)
 
 
-@pytest.mark.parametrize("name", ["sepW_d4", "connW_d10", "mix3_d10"])
+@pytest.mark.parametrize("name", ["sepW_d4", "connW_d10", "mix3_d10", "needle_d10"])
 def test_mixture_mode_masses_are_exact(name):
-    """E_post[responsibility] = mixture weights, by exact draws from the mixture."""
+    """E_post[responsibility] = mixture weights, by exact draws from the mixture
+    (the needle's modes are two components each)."""
     import jax
     from bench.targets import mixture_spec
 
@@ -92,6 +93,31 @@ def test_mixture_mode_masses_are_exact(name):
     r = np.asarray(jax.vmap(t.responsibility)(x), float)
     mean, se = r.mean(axis=0), r.std(axis=0) / math.sqrt(n)
     assert np.all(np.abs(mean - np.array(t.mode_mass)) < 5 * se + 1e-4)
+
+
+def test_cauchy_evidence_and_mode_masses_are_exact():
+    """Exact draws from the two products of Cauchy and normal factors: the
+    fraction inside the box is the evidence times the box volume, and the
+    responsibilities of the draws inside average to the mode masses."""
+    import jax
+
+    t = get_target("cauchy_d10")
+    d, half = t.ndim, t.hi[0]
+    rng = np.random.default_rng(2)
+    n = 40000
+    minor = rng.random(n) < 0.2
+    scale = np.where(minor, 0.8, 1.0)[:, None]
+    z = np.concatenate(
+        [rng.standard_cauchy((n, 4)), rng.standard_normal((n, d - 4))], axis=1
+    )
+    x = z * scale
+    x[minor, 4:7] += 12.0 / math.sqrt(3)
+    inside = np.all(np.abs(x) < half, axis=1)
+    p = math.exp(t.logz + t.log_prior_volume)
+    assert abs(inside.mean() - p) < 5 * math.sqrt(p * (1 - p) / n)
+    r = np.asarray(jax.vmap(t.responsibility)(x[inside]), float)
+    se = r.std(axis=0) / math.sqrt(len(r))
+    assert np.all(np.abs(r.mean(axis=0) - np.array(t.mode_mass)) < 5 * se + 1e-4)
 
 
 DEFAULT_SPECS = sorted(adapters.REGISTRY)

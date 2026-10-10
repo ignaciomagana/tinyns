@@ -96,6 +96,8 @@ def test_unimodal_run_reports_one_mode() -> None:
         {
             "mass": 1.0,
             "urn_sd": 0.0,
+            "fold_mass": [1.0, 1.0, 1.0],
+            "fold_sd": 0.0,
             "min_live": 100,
             "isolation_iteration": 0,
             "unresolved": False,
@@ -278,7 +280,8 @@ def test_more_modes_than_the_clustering_separates_are_flagged() -> None:
 
 def test_full_cluster_slots_are_reported(two_mode_run) -> None:
     """``mode_slots_full`` is the fraction of the run with every slot in
-    use; with several modes it is a warning that there may be more."""
+    use. With more clusters than modes the slots held pieces of the modes
+    found; only with as many modes as slots may there be more."""
     from tinyns.modes import C_MAX
 
     result = two_mode_run
@@ -289,7 +292,165 @@ def test_full_cluster_slots_are_reported(two_mode_run) -> None:
     diagnostics = full.diagnostics()
     assert diagnostics["mode_slots_full"] == pytest.approx(0.5, abs=0.01)
     text = f"the {C_MAX} cluster slots were full for 50%"
-    assert any(text in w for w in diagnostics["warnings"])
+    slots = [w for w in diagnostics["warnings"] if text in w]
+    assert len(slots) == 1 and f"{C_MAX} clusters for the 2 modes" in slots[0]
+    assert "there may be more modes" not in slots[0]
     assert "cluster slots were full" in full.summary()
+    many = full._mode_warnings([full.modes()[1]] * C_MAX)
+    assert any(text in w and "there may be more modes" in w for w in many)
     bare = dataclasses.replace(result, metadata=None)
     assert bare.diagnostics()["mode_slots_full"] is None and len(bare.modes()) == 2
+    assert bare.modes()[0]["fold_sd"] is None
+
+
+def test_folds_measure_the_scatter_of_the_mode_masses(two_mode_run) -> None:
+    """A point and its descendants stay in one fold (its label names the
+    clustering of the next fold), so each fold's samples give the modes'
+    masses of a run of their own. Where the hop balances the modes the
+    folds agree: ``fold_sd`` was 0.03 to 0.16 over 32 runs of a 10-D
+    two-mode mixture at nlive 300 and 500, and 0.04 on average at 18-D."""
+    result = two_mode_run
+    folds = result.metadata["folds"]
+    fold = (np.asarray(result.labels) % folds - 1) % folds
+    weights = np.asarray(result.weights())
+    minor = np.asarray(result.samples)[:, 0] > 0.55
+    modes = result.modes()
+    assert len(modes) == 2
+    for f in range(folds):
+        own = weights[fold == f].sum()
+        assert modes[1]["fold_mass"][f] == pytest.approx(
+            weights[minor & (fold == f)].sum() / own, abs=0.01
+        )
+        assert sum(m["fold_mass"][f] for m in modes) == pytest.approx(1.0)
+    assert np.mean(modes[1]["fold_mass"]) == pytest.approx(modes[1]["mass"], abs=0.02)
+    assert modes[0]["fold_sd"] == pytest.approx(modes[1]["fold_sd"])
+    assert 0.0 < modes[1]["fold_sd"] < 0.3
+    assert "fold sd" in result.summary()
+
+
+def test_hop_warning_reads_the_recorded_history(two_mode_run) -> None:
+    """The warning that the hop balanced the modes only in part comes from
+    the run's record: the clustering held many clusters per mode (lumps),
+    the hop was off (fewer than two eligible clusters), or it was rarely
+    accepted. It quotes the folds' masses."""
+    from tinyns import result as result_module
+
+    result = two_mode_run
+    diagnostics = result.diagnostics()
+    assert diagnostics["mode_lumps"] < result_module.LUMPS_WARN
+    assert diagnostics["mode_hop_off"] < result_module.HOP_OFF_WARN
+    assert diagnostics["hop_acceptance"] > result_module.HOP_ACCEPT_WARN
+    assert not any("inter-mode hop" in w for w in diagnostics["warnings"])
+    modes = result.modes()
+    late = min(m["isolation_iteration"] for m in modes) + 1
+    cases = {
+        "held 2.5 clusters per mode": ([[0, 1, 1], [late, 5, 3]], 0.5),
+        "was off (fewer than two eligible clusters) for 100%": (
+            [[0, 1, 1], [late, 2, 1]], 0.5
+        ),
+        "accepted 0.1% of its proposals": (result.metadata["mode_history"], 0.001),
+    }
+    for text, (history, acceptance) in cases.items():
+        metadata = {
+            **result.metadata, "mode_history": history, "hop_acceptance": acceptance
+        }
+        warned = dataclasses.replace(result, metadata=metadata).diagnostics()
+        hop = [w for w in warned["warnings"] if "only in part" in w]
+        assert len(hop) == 1 and text in hop[0], text
+        assert "cross-fitted folds gave mode 1 the masses" in hop[0]
+
+
+def test_tracked_when_the_clustering_separated_the_modes(two_mode_run) -> None:
+    """A mode that only the empty-slab pass found is still ``tracked`` when
+    the run's labels separated it: here every sample has a label of its own,
+    so the labels are all set aside, but each holds one mode only."""
+    result = two_mode_run
+    folds = result.metadata["folds"]
+    own = np.arange(len(result.labels)) * folds + np.asarray(result.labels) % folds
+    modes = relabelled(result, own).modes()
+    assert len(modes) == 2 and all(m["tracked"] for m in modes)
+    warnings = relabelled(result, own).diagnostics()["warnings"]
+    assert not any("not separated" in w for w in warnings)
+
+
+def test_saddle_depth_tells_lumps_from_modes() -> None:
+    """Dead points cover every contour, so the likelihood of the samples
+    between two separate modes dips; between a mode and a lump of it, it
+    does not."""
+    from tinyns.result import SADDLE_DEPTH, _saddle_depth
+
+    rng = np.random.default_rng(0)
+    d = 6
+    centre = np.zeros(d)
+    centre[0] = 10.0
+    prior = rng.uniform(-5.0, 15.0, (4000, d))  # early samples: anywhere
+    post = rng.normal(size=(4000, d))
+    post[3000:] += centre  # a second mode of a third of the mass
+    u = np.concatenate([prior, post])
+    r2, r2c = np.sum(u**2, axis=1), np.sum((u - centre) ** 2, axis=1)
+    logl = np.logaddexp(-0.5 * r2, np.log(1 / 3) - 0.5 * r2c)
+    weights = np.where(np.arange(len(u)) < len(prior), 1e-6, 1.0)
+    near = r2 < r2c
+    assert _saddle_depth(u, logl, weights, near, ~near) > 4 * SADDLE_DEPTH
+    one = near & (r2 < 30)  # a single mode, cut in two
+    lump = u[:, 1] >= 1.0
+    assert _saddle_depth(u, logl, weights, one & ~lump, one & lump) < 1.0
+
+
+def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
+    """The needle target of ``bench.targets`` (each mode a core with two
+    thin arms) against the same two modes without arms. The clustering cuts
+    the needle's modes into lumps and the hop balances them only in part,
+    which the warning says; for the plain modes it says nothing."""
+    from bench.targets import build_needle, build_two_mode, mixture_target
+
+    for spec, arms in ((build_needle(10), True), (build_two_mode(10, 0.2), False)):
+        target = mixture_target("needle" if arms else "plain", spec)
+        sampler = NestedSampler(target.loglike, target.prior_transform, 10, nlive=500)
+        for result in [sampler.run(0)]:
+            diagnostics = result.diagnostics()
+            modes = diagnostics["modes"]
+            assert len(modes) >= 2
+            assert sum(m["mass"] for m in modes[1:]) == pytest.approx(0.2, abs=0.1)
+            warned = [w for w in diagnostics["warnings"] if "only in part" in w]
+            slots = any("slots were full" in w for w in diagnostics["warnings"])
+            if arms:
+                assert diagnostics["mode_lumps"] > 1.5 and len(warned) == 1
+                assert "it cut modes into lumps" in warned[0]
+            else:
+                assert diagnostics["mode_lumps"] < 1.2 and not warned and not slots
+                assert modes[1]["fold_sd"] < 0.3
+
+
+@pytest.mark.slow
+def test_modes_that_are_not_convex_18d() -> None:
+    """The gate of the needle and Cauchy targets of ``bench.targets`` against
+    the same two modes without arms (18-D, nlive 1000, 8 batched runs each).
+    Over 16 single runs each: the needle reported 2 modes and the warning
+    every time (minor mass 0.198, logit sd 0.19 over the runs; 0.57 without
+    the hop), the Cauchy target 2 modes in 14 runs and the warning in all 14
+    (0.192, sd 0.32; truth 0.203), the plain modes 2 and no warning (sd
+    0.019). In float32 two of these 8 batched plain runs report one mode,
+    as before this check existed."""
+    from bench.targets import build_two_mode, get_target, mixture_target
+
+    keys = jax.random.split(jax.random.key(0), 8)
+    plain = mixture_target("plain_d18", build_two_mode(18, 0.2))
+    for target in (get_target("needle_d18"), get_target("cauchy_d18"), plain):
+        sampler = NestedSampler(target.loglike, target.prior_transform, 18)
+        found, warned, minor = 0, 0, []
+        for result in sampler.run(keys):
+            diagnostics = result.diagnostics()
+            modes = diagnostics["modes"]
+            if len(modes) == 2:
+                found += 1
+                minor.append(modes[1]["mass"])
+            warned += any("only in part" in w for w in diagnostics["warnings"])
+        logit = np.log(np.array(minor) / (1 - np.array(minor)))
+        print(target.name, found, warned, np.mean(minor), np.std(logit))
+        truth = target.mode_mass[1]
+        assert abs(np.mean(minor) - truth) < 0.05
+        if target is plain:
+            assert found >= 6 and warned == 0 and np.std(logit) < 0.1
+        else:
+            assert found >= 6 and warned >= found

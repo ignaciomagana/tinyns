@@ -80,7 +80,8 @@ below are rejected, and a chain that never moves returns its seed.
   Cholesky factor of the covariance of the cluster of `x`, and the exact
   Hastings correction when the proposal lands in another cluster.
 - **Hop.** Every 10th chain step is an independence Metropolis-Hastings
-  proposal from the union of ellipsoids fitted to the clusters. It moves
+  proposal from the union of ellipsoids fitted to the clusters that are large
+  enough to be eligible (with fewer than two, the hop is off). It moves
   points between modes and keeps the mode weights right.
 - **Cross-fitting.** The live slots form three folds. A chain seeded in one
   fold uses clusters and covariances fitted to the other two only (as emcee
@@ -134,9 +135,16 @@ microseconds it is a larger share (15 to 21% more per call on a 10-D two-mode
 target than on a 10-D Gaussian; see Speed).
 
 `result.modes()` counts the modes from the clusters the run recorded, and
-gives each mode's mass, the seed-to-seed scatter to expect (`urn_sd`) and two
-flags.
+gives each mode's mass, the seed-to-seed scatter to expect without the hop
+(`urn_sd`), the scatter measured within the run (`fold_sd`) and two flags.
 
+- `fold_sd`: the standard deviation, in logit, of the mode's mass over the
+  three cross-fitted folds (`fold_mass`). A point and its descendants stay in
+  one fold, so each fold samples the modes like a run of its own, and the
+  run's mass scatters from run to run by about `fold_sd / sqrt(3)` (within a
+  factor of 2 on the targets of `bench`). Where the hop balances the modes
+  the folds agree: `fold_sd` was 0.04 on average on a two-mode mixture in
+  18-D, 0.1 on `sepW_d10` and `sepW_d18`.
 - `unresolved`: the mode held fewer than `5 * ndim` live points.
 - `tracked`: `False` if the sampler's clustering never separated the mode from
   its neighbours. The hop then did not balance it, its mass scatters by about
@@ -145,8 +153,14 @@ flags.
   `modes()` finds 15 to 18 of them from the gaps between their live points
   (nlive 1000), none tracked.
 
-`diagnostics()` and `summary()` turn both flags into warnings, and warn when
-the clustering's 8 slots were full during a run with several modes.
+`diagnostics()` and `summary()` turn both flags into warnings. They also warn
+when the hop balanced the modes only in part: after the modes separated, the
+clustering held 1.5 clusters per mode or more on average (it cut the modes
+into lumps), the hop was off (fewer than two clusters eligible to propose
+from) for half of the posterior mass or more, or it accepted less than 2% of
+its proposals. That warning quotes each mode's masses in the three folds. And
+they say when the clustering's 8 slots were full during a run with several
+modes: no further mode could be split off then.
 
 ## Choosing `walks`
 
@@ -308,6 +322,24 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
 
 - **Small modes.** A mode with fewer than about `5 * ndim` live points is not
   sampled reliably. `modes()` flags it; raise `nlive`.
+- **Modes with thin arms or a funnel neck.** When a mode's contours are a core
+  with thin arms, or narrow into a neck (a scale parameter pressed against its
+  prior edge and coupled to a location), its live points are heavy-tailed
+  along a few directions. The clustering cuts each mode into lumps, and the
+  hop's ellipsoids cover the modes poorly. On the 18-D `needle_d18` target of
+  `bench` the hop cut the run-to-run logit scatter of the minor mass from 0.57
+  to 0.19 (16 runs at nlive 1000), against 0.37 to 0.019 for the same modes
+  without arms; on `cauchy_d18` from 0.53 to 0.32. On an 18-D posterior with
+  a funnel neck it accepted 0.6% of its proposals and gave no gain: the
+  minor mass scattered by 0.25 over 3 runs, against 0.30 for v0.2.5, and the
+  three folds' masses differed by a logit sd of 1.0 to 1.6 within each run.
+  The mode masses then scatter as for a sampler without the hop; logZ is
+  unaffected (`needle_d18`: +0.03 +- 0.08 from the truth). `diagnostics()`
+  warns, and `fold_sd / sqrt(3)` gives the scatter. `modes()` merges lumps
+  that the likelihood does not dip between, but a lump joined to its mode
+  only along a curved path, such as a funnel neck, can be reported as a small
+  mode of its own (unresolved; 1 of the 3 runs above), and the clustering's
+  labels may also be merged into one mode (2 of 16 `cauchy_d18` runs).
 - **Many modes.** The clustering has 8 slots and splits two ways, so it does
   not separate more modes than that, or modes on a lattice (an eggbox). The
   evidence is still right, but the hop does not balance those modes: their
