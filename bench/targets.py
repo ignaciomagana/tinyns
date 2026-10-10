@@ -20,7 +20,9 @@ same function, applied to its weighted (or equal-weight) samples.
 
 Names: ``gauss_d{d}``, ``rosen_d{d}``, ``funnel_d{d}``, ``loggamma_d{d}``,
 ``eggbox_d2``, ``sepW_d{d}``, ``sepM_d{d}``, ``connW_d{d}`` and ``mix3_d10``;
-``sepWtw_d{d}`` is ``sepW`` with a banana-twisted main mode.
+``sepWtw_d{d}`` is ``sepW`` with a banana-twisted main mode. ``needle_d{d}``
+and ``cauchy_d{d}`` are two-mode targets whose modes are not convex (a core
+with thin arms, and a star), on which the hop gives no gain.
 ``BENCH_TARGETS`` lists the ones in the standard sweep.
 """
 
@@ -497,6 +499,48 @@ def build_three_mode(d=10, weights=(0.7, 0.2, 0.1), seed=0):
     return t
 
 
+# The needle toy: a two-mode mixture whose modes are a core with thin arms.
+NEEDLE_WEIGHT, NEEDLE_EPS, NEEDLE_STRETCH, NEEDLE_NARROW = 0.2, 0.5, 30.0, 1.2
+
+
+def build_needle(d):
+    """``build_two_mode(d, 0.2, 'sep', 'W')`` with every mode a core and a
+    needle through it: the mode's Gaussian (weight ``1 - eps``) plus one with
+    the same mean (weight ``eps = 0.5``) and its covariance stretched 30x
+    along the two narrowest coordinates that the modes are not offset along
+    and narrowed 1.2x along the others.
+
+    Its likelihood contours are a core with two thin arms, not convex, and
+    its live points are heavy-tailed along the arms, as for a scale
+    parameter pressed against its prior edge and coupled to a location (a
+    funnel neck). The sampler's clustering then cuts each mode into lumps and
+    the hop's ellipsoids cover the arms poorly. ``groups`` maps the four
+    components to the two modes; the minor mode has mass 0.2.
+    """
+    t = build_two_mode(d, NEEDLE_WEIGHT, "sep", "W")
+    order = np.argsort(t["sigs"][0])
+    n_off = 2 if d <= 4 else 3  # the coordinates the modes are offset along
+    stretch = np.full(d, 1.0 / NEEDLE_NARROW)
+    stretch[order[n_off : n_off + 2]] = NEEDLE_STRETCH
+    comps = []
+    for m in range(2):
+        cov = t["covs"][m] * np.outer(stretch, stretch)
+        comps += [
+            (t["weights"][m] * (1 - NEEDLE_EPS), t["means"][m], t["covs"][m], m),
+            (t["weights"][m] * NEEDLE_EPS, t["means"][m], cov, m),
+        ]
+    weights, means, covs, groups = (list(x) for x in zip(*comps, strict=True))
+    return dict(
+        d=d,
+        weights=weights,
+        means=means,
+        covs=covs,
+        sigs=[np.sqrt(np.diag(cov)) for cov in covs],
+        groups=groups,
+        variant="needle",
+    )
+
+
 def mixture_target(name: str, t: dict) -> Target:
     import jax.numpy as jnp
     from jax.scipy.special import logsumexp
@@ -530,12 +574,16 @@ def mixture_target(name: str, t: dict) -> Target:
             y = y.at[0, tj].add(-twist * sj * (y[0, ti] / si) ** 2)
         return A - 0.5 * jnp.einsum("ki,kij,kj->k", y, P, y)
 
+    # A mode is a group of components (``t["groups"]``; default one each).
+    groups = np.asarray(t.get("groups", range(len(w))))
+    member = jnp.asarray(groups[None, :] == np.arange(groups.max() + 1)[:, None], float)
+
     def loglike(x):
         return logsumexp(comps(x))
 
     def responsibility(x):
         c = comps(x)
-        return jnp.exp(c - logsumexp(c))
+        return member @ jnp.exp(c - logsumexp(c))
 
     return Target(
         name=name,
@@ -545,7 +593,7 @@ def mixture_target(name: str, t: dict) -> Target:
         hi=np.ones(d),
         logz=0.0,
         logz_source="analytic",
-        mode_mass=tuple(float(x) for x in w),
+        mode_mass=tuple(float(w[groups == g].sum()) for g in range(groups.max() + 1)),
         responsibility=responsibility,
         meta=dict(
             variant=t.get("variant"),
@@ -554,6 +602,73 @@ def mixture_target(name: str, t: dict) -> Target:
             twist=t.get("twist", 0.0),
             truncated_mass_bound=float(trunc),
         ),
+    )
+
+
+# ------------------------------------------------------- product of Cauchy
+CAUCHY_HALF_WIDTH, CAUCHY_K, CAUCHY_WEIGHT = 30.0, 4, 0.2
+CAUCHY_OFF, CAUCHY_NARROW = 12.0, 0.8
+
+
+def cauchy(d: int) -> Target:
+    """Two modes, each a product of independent factors: standard Cauchy in
+    the first 4 coordinates and standard normal in the others, in the box
+    [-30, 30]^d.
+
+    The minor mode (weight 0.2) is narrower by 0.8 in every coordinate and
+    offset by 12 sd in total along the first three normal coordinates. The
+    contours of a mode are stars with an arm along each Cauchy axis, so its
+    live points are heavy-tailed along them. Every factor's mass in the box
+    is a closed form (the Cauchy CDF is ``1/2 + atan(z) / pi``), so logZ and
+    the mode masses are exact, box included.
+    """
+    if d < CAUCHY_K + 3:
+        raise ValueError(f"cauchy needs d >= {CAUCHY_K + 3}")
+    import jax.numpy as jnp
+    from jax.scipy.special import logsumexp
+
+    k, half = CAUCHY_K, CAUCHY_HALF_WIDTH
+    shift = np.zeros(d)
+    shift[k : k + 3] = CAUCHY_OFF / math.sqrt(3)
+    comps = [
+        (1.0 - CAUCHY_WEIGHT, np.zeros(d), 1.0),
+        (CAUCHY_WEIGHT, shift, CAUCHY_NARROW),
+    ]
+
+    def box_mass(mu, sc):
+        hi, lo = (half - mu) / sc, (-half - mu) / sc
+        heavy = [(math.atan(hi[i]) - math.atan(lo[i])) / math.pi for i in range(k)]
+        normal = [_norm_cdf(hi[i]) - _norm_cdf(lo[i]) for i in range(k, d)]
+        return float(np.prod(heavy + normal))
+
+    masses = np.array([w * box_mass(mu, sc) for w, mu, sc in comps])
+    M = jnp.asarray(np.stack([c[1] for c in comps]))
+    S = jnp.asarray([c[2] for c in comps])
+    A = jnp.asarray([math.log(w) - d * math.log(sc) for w, _, sc in comps])
+
+    def components(x):
+        z = (x[None, :] - M) / S[:, None]
+        heavy = jnp.sum(-math.log(math.pi) - jnp.log1p(z[:, :k] ** 2), axis=1)
+        normal = jnp.sum(-0.5 * z[:, k:] ** 2 - 0.5 * LOG_2PI, axis=1)
+        return A + heavy + normal
+
+    def loglike(x):
+        return logsumexp(components(x))
+
+    def responsibility(x):
+        c = components(x)
+        return jnp.exp(c - logsumexp(c))
+
+    return Target(
+        name=f"cauchy_d{d}",
+        ndim=d,
+        loglike=loglike,
+        lo=np.full(d, -half),
+        hi=np.full(d, half),
+        logz=math.log(masses.sum()) - d * math.log(2 * half),
+        logz_source="analytic",
+        mode_mass=tuple(float(m) for m in masses / masses.sum()),
+        responsibility=responsibility,
     )
 
 
@@ -578,6 +693,7 @@ _FAMILIES = {
     "funnel": funnel,
     "loggamma": loggamma,
     "eggbox": eggbox,
+    "cauchy": cauchy,
 }
 
 
@@ -597,6 +713,8 @@ def mixture_spec(name: str) -> dict | None:
         return build_two_mode(d, MINOR_WEIGHT, mm.group(1), mm.group(2), twist=twist)
     if fam == "mix3":
         return build_three_mode(d)
+    if fam == "needle":
+        return build_needle(d)
     return None
 
 

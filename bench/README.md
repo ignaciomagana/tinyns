@@ -85,6 +85,12 @@ A case passes when all of these hold (se is the standard error over seeds):
 - **Expect a false FAIL now and then.** Each criterion is a 3-sigma test, and
   the full tier runs about 25 of them. Rerun a failed case with another key
   (`--cases NAME --seed 1`) and more seeds before believing it.
+- **Pair A/B comparisons.** In float32 a seed's trajectory differs between
+  CPU node types (on Hilda, HENON and SIRIUS nodes) as well as between CPU
+  and GPU. Compare two versions or settings on the same seeds, run on one
+  node type, and compare them seed by seed. An unpaired comparison once
+  showed a fake trend: in the hop-eligibility study, 17 against 26 lost
+  modes in 120 seeds, which vanished when the runs were paired.
 - `--json FILE` keeps every seed's logZ, logzerr and mode masses.
 - `--cases`, `--seeds` and `--nlive` override the tier, for a closer look at
   one case.
@@ -106,6 +112,8 @@ recomputes the cached quadrature values.
 | `sepWtw_d{d}` | any | analytic, 0 | 0.94 / 0.06 (banana-twisted main mode) |
 | `sepM_d{10,18,32}` | 10-32 | analytic, 0 | 0.94 / 0.06 |
 | `mix3_d10` | 10 | analytic, 0 | 0.7 / 0.2 / 0.1 |
+| `needle_d{d}` | 4-32 | analytic, 0 | 0.8 / 0.2 (each mode a core with two thin arms) |
+| `cauchy_d{d}` | >= 7 | analytic (CDFs, box included) | 0.797 / 0.203 (products of Cauchy and normal factors) |
 
 - **Gaussians**: covariance `Q diag(s^2) Q^T`, with `s` log-spaced over
   [0.1, 1] and `Q` a random rotation. The mean is in [-1, 1]^d and the prior
@@ -127,6 +135,11 @@ recomputes the cached quadrature values.
     nlive 500 and 120 (4 `d`) at 2000, fewer than a covariance-adapted walk
     needs (about 5 `d`), so the d = 32 cells measure a sampler's
     small-population limit.
+- **Modes that are not convex** (`needle`, `cauchy`; not in the standard
+  sweep): the contours of each mode have thin arms, so the clustering cuts
+  the modes into lumps and the hop balances them only in part. They test
+  what `result.modes()` and `diagnostics()` report then
+  (`tests/test_modes.py`).
 - **Mode masses**: for every sampler, the mass of mode k is the
   weighted mean of the oracle responsibility `w_k N_k / sum_j w_j N_j` over the
   sampler's samples. Its exact expectation is `w_k`.
