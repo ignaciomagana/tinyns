@@ -95,3 +95,20 @@ def test_scalar_prior_transform_in_one_dimension() -> None:
                            lambda u: u[0], 1, 40).run(1)
     assert result.samples.shape == (result.niter + 40, 1)
     assert math.isfinite(result.logz)
+
+
+def test_out_of_memory_names_num_delete(monkeypatch) -> None:
+    def exhausted(*args, **kwargs):
+        raise RuntimeError("RESOURCE_EXHAUSTED: Out of memory while allocating")
+
+    monkeypatch.setattr(tinyns.core, "run", exhausted)
+    sampler = NestedSampler(loglike, identity, ndim=2, nlive=400)
+    with pytest.raises(MemoryError, match="num_delete=40.*num_delete=10"):
+        sampler.run(0)
+
+    def other(*args, **kwargs):
+        raise RuntimeError("something else")
+
+    monkeypatch.setattr(tinyns.core, "run", other)
+    with pytest.raises(RuntimeError, match="something else"):
+        sampler.run(0)
