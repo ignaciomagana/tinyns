@@ -8,9 +8,11 @@ contour ``L*`` (the highest deleted likelihood). The evidence bookkeeping
 treats the ``k`` deaths of a step as consecutive deaths at live counts
 ``m, m-1, ..., m-k+1`` (the birth/death contours of Fowlie, Handley and Su),
 so the expected log prior volume after ``it`` steps is ``-it * S`` with
-``S = sum_j 1 / (m - j)``.
+``S = sum_j 1 / (m - j)``, less the extra compression of exact likelihood
+ties (plateaus; :func:`_tie_counts`), which :class:`State` carries apart
+(``log_x_ties``). Each dead row records its live count (``Dead.nlive``).
 :func:`finalise` recomputes the weights, the evidence and its error on the
-host in float64.
+host in float64 from those counts.
 
 :func:`run` is the driver: a jitted ``lax.while_loop`` runs up to ``n_steps``
 steps into a preallocated buffer of dead rows, and the host syncs once per
@@ -190,6 +192,14 @@ class State(NamedTuple):
     stays right when the counter wraps) and pass the total to
     :func:`finalise`. ``logz`` is the running evidence of the dead points,
     used only to stop; :func:`finalise` recomputes it.
+
+    The log prior volume after the step is ``-it * S + log_x_ties``
+    (:func:`_log_x`): ``-it * S`` is recomputed from ``it`` (no running sum
+    to lose precision in float32) and ``log_x_ties`` is the extra
+    compression of the deaths tied with an earlier step's contour, exactly 0
+    on a run without ties. ``lstar_prev`` is the contour of the last step
+    (NaN before the first) and ``tie_run`` the number of consecutive steps,
+    ending with the last, whose contour equals it (:func:`_tie_counts`).
     """
 
     key: Any  # PRNG key
@@ -198,6 +208,9 @@ class State(NamedTuple):
     logl_birth: Any  # (m,) contour each live point was born above; -inf at init
     it: Any  # int32 steps done
     logz: Any  # running log evidence of the dead points
+    log_x_ties: Any  # extra log prior volume removed by tied deaths (<= 0)
+    lstar_prev: Any  # contour of the last step; NaN before the first
+    tie_run: Any  # int32 consecutive steps, ending with the last, at lstar_prev
     log_scale: Any  # log of the walk-step multiplier
     ncall: Any  # int32 likelihood evaluations
     ncall_valid: Any  # int32 in-cube likelihood evaluations
@@ -228,11 +241,17 @@ class State(NamedTuple):
 class Dead(NamedTuple):
     """The ``k`` rows of one step: deleted points by increasing likelihood.
 
-    ``insertion[j]``, ``moves[j]``, ``hops[j]`` and ``hop_tries[j]`` belong to
-    the ``j``-th new point (not to dead point ``j``): its rank among the
-    ``m - k`` surviving live points (uniform on ``0..m-k`` for a correct
-    constrained sampler), the accepted moves of its chain (0: the chain
-    returned its seed), and the accepted and attempted hops among them.
+    ``nlive[j]`` is the live count at death ``j`` (:func:`_tie_counts`):
+    ``m - j`` but on a likelihood plateau.
+
+    ``insertion[j]``, ``nslots[j]``, ``moves[j]``, ``hops[j]`` and
+    ``hop_tries[j]`` belong to the ``j``-th new point (not to dead point
+    ``j``): its rank among the surviving live points strictly above ``L*``
+    (survivors with exactly its likelihood in a random order with it;
+    uniform on ``0..nslots[j]-1`` for a correct constrained sampler;
+    ``nslots = m - k + 1`` without ties), the accepted moves of its chain (0:
+    the chain returned its seed), and the accepted and attempted hops among
+    them.
     ``label`` is each dead point's cluster label when it died (the id of its
     cluster in clustering ``j``, the next fold's; :func:`_reported_label`), and
     ``nclusters`` / ``neligible`` the step's number of clusters (the largest
@@ -250,6 +269,8 @@ class Dead(NamedTuple):
     hop_tries: Any  # (k,) int32
     nclusters: Any  # (k,) int32
     neligible: Any  # (k,) int32
+    nlive: Any  # (k,) int32
+    nslots: Any  # (k,) int32
 
 
 def _loglike_u(loglike, prior_transform, u, dtype):
@@ -544,6 +565,9 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         logl_birth=jnp.full((m,), -jnp.inf, dtype),
         it=jnp.zeros((), i32),
         logz=jnp.asarray(-jnp.inf, dtype),
+        log_x_ties=jnp.zeros((), dtype),
+        lstar_prev=jnp.asarray(jnp.nan, dtype),
+        tie_run=jnp.zeros((), i32),
         log_scale=jnp.asarray(math.log(_INITIAL_SCALE), dtype),
         ncall=jnp.asarray(m, i32),
         ncall_valid=jnp.asarray(m, i32),
@@ -744,6 +768,34 @@ def _few(frames: _modes.Frames, cfg: Config) -> _modes.Frames:
     ))
 
 
+def _log_x(state: State, cfg: Config):
+    """Log prior volume after ``state.it`` steps: ``-it * S + log_x_ties``."""
+    dtype = state.logl.dtype
+    log_x = -state.it.astype(dtype) * jnp.asarray(cfg.log_shrink, dtype)
+    return log_x + state.log_x_ties
+
+
+def _tie_counts(dead_logl, state: State, cfg: Config):
+    """The live count at each death of a step, and which deaths are tied.
+
+    New points land strictly above ``L*``, so when live points tie at one
+    likelihood (``L = 0`` or NaN on part of the prior, a finite plateau, a
+    floor) the tied points left behind die in later steps, below every point
+    born since. Following Fowlie, Handley and Su (2021, plateaus), the ``q``
+    deaths of a plateau count at ``m, m-1, ..., m-q+1``: a point born above
+    the tie is not live for the tied deaths still to come. A death equal to
+    the previous step's contour (``lstar_prev``) is tied, and the
+    ``tie_run`` steps at that contour have taken ``k`` deaths each, so death
+    ``j`` counts at ``m - j - k * tie_run``. Any other death counts at
+    ``m - j``.
+    """
+    m, k = cfg.nlive, cfg.num_delete
+    tied = dead_logl == state.lstar_prev
+    base = jnp.arange(m, m - k, -1, dtype=jnp.int32)
+    nlive = jnp.where(tied, base - k * state.tie_run, base)
+    return jnp.maximum(nlive, 1), tied
+
+
 def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     """One step. ``level`` (:func:`_kernel_level`) selects the chains' kernel
     through a ``lax.switch``; a batch of runs passes one unbatched value (the
@@ -754,7 +806,6 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     _, worst = lax.top_k(-state.logl, k)
     dead_logl = state.logl[worst]
     lstar = dead_logl[-1]
-    survivor = jnp.ones((m,), bool).at[worst].set(False)
     above = state.logl > lstar
     n_above = jnp.sum(above, dtype=jnp.int32)
     folds = cfg._folds
@@ -829,11 +880,30 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         out = chains(0)()
     new_u, new_logl, moves, nev, nvalid, hops, hop_tries = out
 
-    insertion = jnp.sum(
-        survivor & (state.logl <= new_logl[:, None]), axis=1, dtype=jnp.int32
+    # A new point's rank among the survivors strictly above L* (points tied
+    # at L* are below every new point), out of n_above + 1 slots. Survivors
+    # with exactly its likelihood (a plateau above L*, the seed of an unmoved
+    # chain) are in a random order with it: the rank takes a uniform place
+    # among them, from a key folded off k_seed (the other draws are as they
+    # were).
+    below = jnp.sum(above & (state.logl < new_logl[:, None]), axis=1, dtype=jnp.int32)
+    same = jnp.sum(above & (state.logl == new_logl[:, None]), axis=1, dtype=jnp.int32)
+    place = random.uniform(random.fold_in(k_seed, 1), (k,), dtype)
+    place = jnp.minimum((place * (same + 1)).astype(jnp.int32), same)
+    insertion = below + place
+    nlive, tied = _tie_counts(dead_logl, state, cfg)
+    log_x = _log_x(state, cfg)
+    # The weights: the constant widths of cfg._log_widths() without ties,
+    # else the widths of the live counts (as finalise computes them).
+    log_t = -1.0 / nlive.astype(dtype)
+    log_prev = log_x + (jnp.cumsum(log_t) - log_t)
+    logwt = jnp.where(
+        jnp.any(tied),
+        dead_logl + log_prev + jnp.log(-jnp.expm1(log_t)),
+        dead_logl + jnp.asarray(cfg._log_widths(), dtype) + log_x,
     )
-    log_x = -state.it.astype(dtype) * jnp.asarray(cfg.log_shrink, dtype)
-    logwt = dead_logl + jnp.asarray(cfg._log_widths(), dtype) + log_x
+    plain_t = jnp.asarray(-1.0 / (m - np.arange(k)), dtype)
+    log_x_ties = state.log_x_ties + jnp.sum(jnp.where(tied, log_t - plain_t, 0.0))
     # The step scale adapts to the random-walk acceptance alone.
     walk_moves = jnp.sum(moves - hops).astype(dtype)
     acceptance = walk_moves / jnp.maximum(k * walks - jnp.sum(hop_tries), 1)
@@ -852,6 +922,11 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         logl_birth=state.logl_birth.at[worst].set(lstar),
         it=state.it + 1,
         logz=jnp.logaddexp(state.logz, logsumexp(logwt)),
+        log_x_ties=log_x_ties,
+        lstar_prev=lstar,
+        tie_run=jnp.where(lstar == state.lstar_prev, state.tie_run + 1, 1).astype(
+            jnp.int32
+        ),
         log_scale=log_scale.astype(dtype),
         ncall=ncall,
         ncall_valid=ncall_valid,
@@ -882,6 +957,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         hop_tries=hop_tries,
         nclusters=jnp.full((k,), n_clusters, i32),
         neligible=jnp.full((k,), n_eligible, i32),
+        nlive=nlive,
+        nslots=jnp.full((k,), n_above + 1, i32),
     )
     # A plateau (nothing above L*) leaves the live set as it was.
     stuck = state._replace(status=jnp.asarray(PLATEAU, jnp.int32))
@@ -899,8 +976,7 @@ def delta_logz(state: State, cfg: Config):
     The evidence the live points could still add, in log units: the driver
     stops when it falls below ``dlogz``.
     """
-    dtype = state.logl.dtype
-    log_x = -state.it.astype(dtype) * jnp.asarray(cfg.log_shrink, dtype)
+    log_x = _log_x(state, cfg)
     finite = jnp.isfinite(state.logz)
     logz = jnp.where(finite, state.logz, 0.0)
     remain = jnp.logaddexp(logz, log_x + jnp.max(state.logl)) - logz
@@ -1088,14 +1164,18 @@ def finalise(
     """Build the :class:`NestedSamplingResult` from the final state and the rows.
 
     ``dead`` holds the valid rows of every step in order, with any leading
-    shape (``(steps, k)`` or flat). The final live points are appended by
+    shape (``(steps, k)`` or flat). Each dead row dies at its recorded live
+    count (``dead.nlive``: ``m - j`` for death ``j`` of a step, fewer on a
+    likelihood plateau) and the final live points are appended by
     increasing likelihood at live counts ``m, m-1, ..., 1``; the weights,
     ``logz`` and ``logzerr = sqrt(sum_i dH_i / n_i)`` are recomputed in
     float64 (:func:`tinyns.result._evidence`). ``result.labels`` holds each
     sample's cluster label when it died (the final live points: their last
-    labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads.
-    ``prior_transform`` maps the samples to parameter space (without it
-    ``samples`` are the unit-cube points).
+    labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads, and
+    ``result.insertion_ranks`` / ``insertion_slots`` the in-sampler insertion
+    ranks (``dead.insertion``, ``dead.nslots``). ``prior_transform`` maps
+    the samples to parameter space (without it ``samples`` are the unit-cube
+    points).
 
     ``result.success`` and ``result.message`` are read from ``state.status``.
     :func:`step` leaves it ``RUNNING`` (or sets ``PLATEAU``), so after a
@@ -1132,10 +1212,12 @@ def finalise(
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)
-    nlive_i = np.concatenate([np.tile(m - np.arange(k), niter // k), m - np.arange(m)])
+    nlive_i = np.concatenate([
+        np.asarray(dead.nlive, np.int64).reshape(-1), m - np.arange(m)
+    ])
     logwt, logz, logzerr = _evidence(logl, nlive_i)
 
-    log_x = -(niter // k) * cfg.log_shrink
+    log_x = -(niter // k) * cfg.log_shrink + float(state.log_x_ties)
     logz_dead = float(np.logaddexp.reduce(logwt[:niter])) if niter else -math.inf
     remain = (
         float(np.logaddexp(logz_dead, log_x + logl[niter:].max()) - logz_dead)
@@ -1177,6 +1259,8 @@ def finalise(
         logl_birth=logl_birth,
         nlive_i=nlive_i,
         labels=labels,
+        insertion_ranks=np.asarray(dead.insertion, np.int64).reshape(-1),
+        insertion_slots=np.asarray(dead.nslots, np.int64).reshape(-1),
         logz=logz,
         logzerr=logzerr,
         ncall=int(state.ncall) if ncall is None else int(ncall),
@@ -1312,7 +1396,7 @@ def _dead_template(cfg: Config, dtype) -> Dead:
         np.zeros((k, d), dtype),
         np.zeros((k,), dtype),
         np.zeros((k,), dtype),
-        *(np.zeros((k,), i32),) * 7,
+        *(np.zeros((k,), i32),) * 9,
     )
 
 

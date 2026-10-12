@@ -22,8 +22,10 @@ from tinyns.modes import C_MAX, split_threshold
 
 ArrayLike = Any
 
-_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v3"
+_RESULT_NPZ_FORMAT_VERSION = "tinyns-result-npz-v4"
 _RESULT_NPZ_ARRAYS = ("samples_u", "samples", "logl", "logwt", "logl_birth", "nlive_i")
+# Optional arrays (``None`` in a result built by hand), saved when present.
+_RESULT_NPZ_OPTIONAL = ("labels", "insertion_ranks", "insertion_slots")
 _RESULT_NPZ_SCALARS = {
     "logz": float,
     "logzerr": float,
@@ -305,20 +307,32 @@ def _saddle_depth(u, logl, weights, a, b) -> float:
     return float(min(profile[0], profile[-1]) - profile.min())
 
 
-def _ks_uniform(ranks, nslots: int) -> tuple[float, float]:
-    """KS distance of ranks from the uniform law on ``0..nslots-1``, p-value.
-
-    The p-value is the asymptotic Kolmogorov tail (Stephens' small-sample
-    correction), conservative for a discrete law.
-    """
-    n = len(ranks)
-    ecdf = np.cumsum(np.bincount(ranks, minlength=nslots)[:nslots]) / n
-    ks = float(np.max(np.abs(ecdf - np.arange(1, nslots + 1) / nslots)))
+def _kolmogorov_pvalue(n: int, ks: float) -> float:
+    """The asymptotic Kolmogorov tail of a KS distance ``ks`` of ``n`` values
+    (Stephens' small-sample correction)."""
     lam = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * ks
     if lam < 0.2:  # the series converges slowly here; the tail is 1 - 1e-11
-        return ks, 1.0
+        return 1.0
     terms = (2 * (-1) ** (k - 1) * math.exp(-2 * (k * lam) ** 2) for k in range(1, 101))
-    return ks, min(max(sum(terms), 0.0), 1.0)
+    return min(max(sum(terms), 0.0), 1.0)
+
+
+def _ks_uniform(values) -> tuple[float, float]:
+    """KS distance of ``values`` from the uniform law on ``[0, 1]``, p-value."""
+    x = np.sort(np.asarray(values, dtype=np.float64))
+    n = len(x)
+    i = np.arange(1, n + 1)
+    ks = float(max(np.max(i / n - x), np.max(x - (i - 1) / n)))
+    return ks, _kolmogorov_pvalue(n, ks)
+
+
+def _rank_pit(ranks, nslots) -> np.ndarray:
+    """``(rank + U) / nslots``: uniform on ``[0, 1)`` when each rank is uniform
+    on ``0..nslots-1`` (a randomized PIT, so rows with different slot counts
+    pool; ``U`` is uniform from a fixed seed, so the test is reproducible)."""
+    ranks = np.asarray(ranks, dtype=np.float64)
+    jitter = np.random.default_rng(0).random(ranks.shape)
+    return (ranks + jitter) / np.asarray(nslots, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -405,7 +419,10 @@ class NestedSamplingResult:
     the final live points by increasing likelihood. ``num_delete`` points die
     per step, so the live counts at the deaths (``nlive_i``) cycle through
     ``nlive, nlive - 1, ..., nlive - num_delete + 1`` and end with
-    ``nlive, ..., 1`` over the final live points.
+    ``nlive, ..., 1`` over the final live points. On a likelihood plateau
+    (live points tied at one likelihood) the tied deaths count at
+    ``nlive, nlive - 1, ...`` across the steps they take (Fowlie, Handley and
+    Su 2021), so ``nlive_i`` is lower there.
     """
 
     samples_u: ArrayLike
@@ -425,12 +442,26 @@ class NestedSamplingResult:
     live points), aligned with ``logl``."""
 
     nlive_i: ArrayLike
-    """Number of live points when each sample died (dynesty's ``samples_n``)."""
+    """Number of live points when each sample died (dynesty's ``samples_n``),
+    counting plateaus as above."""
 
     labels: ArrayLike | None = None
     """Cluster slot of each sample when it died (the final live points: at the
     end of the run), from the on-device clustering (:mod:`tinyns.modes`);
     :meth:`modes` reads it. ``None`` for a result built by hand."""
+
+    insertion_ranks: ArrayLike | None = None
+    """In-sampler insertion rank of every point born during the run (``niter``
+    values; row ``i`` is a new point of the step of dead row ``i``): the
+    number of surviving live points strictly above the step's contour with
+    a likelihood below the new point's, plus a uniform place among those
+    with exactly its likelihood. ``None`` for a result built by hand
+    (:meth:`insertion_indices` then replays the births)."""
+
+    insertion_slots: ArrayLike | None = None
+    """The number of possible ranks of each of :attr:`insertion_ranks`: the
+    survivors strictly above the contour, plus one (``nlive - num_delete +
+    1`` but on a plateau)."""
 
     logz: float
     """Estimated log evidence."""
@@ -552,20 +583,37 @@ class NestedSamplingResult:
     def insertion_indices(self) -> np.ndarray:
         """Return the insertion index of every point born during the run.
 
-        The index is the number of the ``nlive - num_delete`` surviving live
-        points of its step with a likelihood at or below the new point's, so
-        it is uniform on ``0..nlive-num_delete`` for a correct constrained
-        sampler (the new points of one step are ranked against the survivors
-        only, not against each other).
+        The index is the number of the surviving live points of its step
+        strictly above the step's contour (``nlive - num_delete`` of them
+        without ties) with a likelihood below the new point's (ties: a
+        uniform place among them), so it is
+        uniform on ``0..insertion_slots-1`` for a correct constrained sampler
+        (the new points of one step are ranked against the survivors only,
+        not against each other). These are the ranks the sampler recorded
+        (:attr:`insertion_ranks`); a result built without them replays the
+        births from ``logl_birth``, which is ambiguous on a likelihood
+        plateau.
         """
 
+        if self.insertion_ranks is not None:
+            return np.asarray(self.insertion_ranks, dtype=int)
         return self._births[1]
+
+    def _insertion_slots(self) -> np.ndarray:
+        if self.insertion_slots is not None:
+            return np.asarray(self.insertion_slots, dtype=int)
+        nslots = int(self.nlive) - int(self.num_delete) + 1
+        return np.full(int(self.niter), nslots)
 
     def insertion_test(self, windows: int = 3) -> dict[str, Any]:
         """Return a Kolmogorov-Smirnov test of the insertion indices.
 
-        The indices (:meth:`insertion_indices`) are tested against the uniform
-        law on ``0..nlive-num_delete`` over the whole run and in ``windows`` equal
+        Each index (:meth:`insertion_indices`) is mapped to ``(rank + U) /
+        nslots``, with ``nslots`` its number of possible ranks
+        (:attr:`insertion_slots`) and ``U`` uniform (from a fixed seed), which
+        is uniform on ``[0, 1)`` for a correct sampler even when the slot
+        counts differ (a likelihood plateau). These values are tested against
+        the uniform law over the whole run and in ``windows`` equal
         stretches of it, so that a bias confined to part of the run (the
         narrow posterior bulk, say) is not diluted by the rest. Returns the
         pooled ``n``, ``ks`` distance and ``pvalue``, and the same per
@@ -581,12 +629,12 @@ class NestedSamplingResult:
         if int(windows) < 1:
             raise ValueError("windows must be a positive integer")
         ranks = self.insertion_indices()
+        values = _rank_pit(ranks, self._insertion_slots())
 
         def test(start, stop):
             ks, pvalue = math.nan, math.nan
             if stop > start:
-                nslots = int(self.nlive) - int(self.num_delete) + 1
-                ks, pvalue = _ks_uniform(ranks[start:stop], nslots)
+                ks, pvalue = _ks_uniform(values[start:stop])
             return {"start": start, "stop": stop, "n": stop - start, "ks": ks,
                     "pvalue": pvalue}
 
@@ -1418,13 +1466,17 @@ class NestedSamplingResult:
 
     def save_npz(self, path) -> None:
         """Save the final result to a compressed NumPy ``.npz`` file (with
-        :attr:`labels` when present)."""
+        :attr:`labels` and the insertion ranks when present)."""
 
-        labels = {} if self.labels is None else {"labels": np.asarray(self.labels)}
+        optional = {
+            name: np.asarray(getattr(self, name))
+            for name in _RESULT_NPZ_OPTIONAL
+            if getattr(self, name) is not None
+        }
         np.savez_compressed(
             path,
             **{name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS},
-            **labels,
+            **optional,
             **{
                 name: np.asarray(kind(getattr(self, name)))
                 for name, kind in _RESULT_NPZ_SCALARS.items()
@@ -1453,7 +1505,10 @@ class NestedSamplingResult:
                 )
             return cls(
                 **{name: jnp.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
-                labels=np.asarray(data["labels"]) if "labels" in data.files else None,
+                **{
+                    name: np.asarray(data[name]) if name in data.files else None
+                    for name in _RESULT_NPZ_OPTIONAL
+                },
                 **{
                     name: kind(_npz_scalar(data[name]))
                     for name, kind in _RESULT_NPZ_SCALARS.items()
@@ -1463,10 +1518,11 @@ class NestedSamplingResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain Python dictionary representation of the result
-        (the fields :meth:`save_npz` writes; ``labels`` may be ``None``)."""
+        (the fields :meth:`save_npz` writes; ``labels`` and the insertion
+        ranks may be ``None``)."""
 
         out = {name: getattr(self, name) for name in _RESULT_NPZ_ARRAYS}
-        out["labels"] = self.labels
+        out.update({name: getattr(self, name) for name in _RESULT_NPZ_OPTIONAL})
         out.update({name: getattr(self, name) for name in _RESULT_NPZ_SCALARS})
         out["metadata"] = None if self.metadata is None else dict(self.metadata)
         return out
@@ -1475,7 +1531,9 @@ class NestedSamplingResult:
         """Return a plain dictionary with array fields converted to NumPy arrays."""
 
         out = {name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS}
-        out["labels"] = None if self.labels is None else np.asarray(self.labels)
+        for name in _RESULT_NPZ_OPTIONAL:
+            value = getattr(self, name)
+            out[name] = None if value is None else np.asarray(value)
         out.update(
             {
                 name: kind(getattr(self, name))
