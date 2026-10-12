@@ -365,6 +365,15 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
   only along a curved path, such as a funnel neck, can be reported as a small
   mode of its own (unresolved; 1 of the 3 runs above), and the clustering's
   labels may also be merged into one mode (2 of 16 `cauchy_d18` runs).
+- **Small modes in high dimensions go unreported.** At 32 dimensions and the
+  default `nlive`, the clustering did not separate a 6% mode (about 60 live
+  points, below `5 * ndim`) in 32 to 36 of 40 runs of `sepW_d32`. `modes()`
+  then reports one mode and no warning. The samples still carry the mode at
+  its weight (logit scatter 0.14 to 0.17, never lost), so the posterior and
+  logZ are right; only the mode count is wrong. At 18 dimensions the same
+  mode was missed in 0 of 40 runs with x64 and 2 of 40 in float32. If the
+  number of modes matters, raise `nlive` until every mode holds `5 * ndim`
+  live points.
 - **Many modes.** The clustering has 8 slots and splits two ways, so it does
   not separate more modes than that, or modes on a lattice (an eggbox). The
   evidence is still right, but the hop does not balance those modes: their
@@ -378,7 +387,10 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
   likelihood calls, and with `num_delete > 1` out-of-cube proposals are
   evaluated too. When one call already fills the device, use `num_delete=1`.
 - **float32.** Likelihood differences below about `1e-7 * |loglike|` are lost;
-  enable x64.
+  enable x64. On two- and three-mode mixtures from 10 to 32 dimensions (40
+  runs each at the default `nlive`, H100) float32 and x64 gave the same logZ
+  and mode weights, except where a mode held fewer than `5 * ndim` live
+  points (`sepM_d18`: minor-mode logit scatter 0.54 in float32, 0.16 in x64).
 - **Insertion test.** Its p-values are honest up to `num_delete = nlive // 10`
   and anti-conservative above (see Choosing `nlive` and `num_delete`).
 - **Finite plateaus with few points above them.** When a plateau holds nearly
