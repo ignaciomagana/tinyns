@@ -1,0 +1,389 @@
+"""The inter-mode hop and the local walk (:mod:`tinyns.modes`): exactness
+and integration.
+
+The invariance tests are the gate: on a fixed two-mode set of "other half"
+points, chains started from seeds drawn uniformly in the constrained region,
+with frames fitted to the other half only (cross-fitting), must end in each
+mode in proportion to its volume. A control fits the frames to a set that
+includes the seed (no cross-fitting) and must fail, so the test has the power
+to see a seed in its own kernel. ``pytest -m slow`` runs it with 10^6 chains,
+which resolves 0.5% of the minor fraction. The local walk has its own test on
+one region cut into two frames of different shapes, where its proposal is not
+symmetric; a walk without the Hastings ratio fails it.
+"""
+
+from __future__ import annotations
+
+import math
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax import random
+
+from tinyns import core, modes
+from tinyns.core import Config
+
+D = 3
+CENTERS = np.array([[0.30, 0.35, 0.40], [0.72, 0.62, 0.55]])
+RADII = np.array([0.16, 0.11])
+MINOR_FRACTION = RADII[1] ** D / np.sum(RADII**D)  # 0.2453
+NFIT = 60  # points of the other half, the frames are fitted to
+WALKS = 40  # four hop steps per chain
+SCALE = 0.3
+
+
+def region_loglike(u):
+    """0 inside either ball, -1 outside; the contour is L* = -0.5."""
+    r2 = jnp.sum((u[None, :] - jnp.asarray(CENTERS)) ** 2, axis=1)
+    return jnp.where(jnp.any(r2 <= jnp.asarray(RADII) ** 2), 0.0, -1.0)
+
+
+def uniform_region(rng, n):
+    ball = rng.choice(2, size=n, p=[1 - MINOR_FRACTION, MINOR_FRACTION])
+    z = rng.standard_normal((n, D))
+    z *= (rng.uniform(size=(n, 1)) ** (1 / D)) / np.linalg.norm(z, axis=1)[:, None]
+    return CENTERS[ball] + RADII[ball][:, None] * z
+
+
+def invariance(nchains: int, cross_fit: bool = True, seed: int = 0, local=True):
+    """Fraction of chain end points in the minor ball, and the hop counts.
+
+    The frames are fitted to ``NFIT`` other points (``cross_fit``) or to
+    ``NFIT - 1`` other points and the seed (the control)."""
+    dtype = jnp.result_type(float)
+    rng = np.random.default_rng(seed)
+    nother = NFIT if cross_fit else NFIT - 1
+    others = jnp.asarray(uniform_region(rng, nother), dtype)
+    labels, st = modes.recluster(others, jnp.zeros(nother, jnp.int32))
+    assert int(jnp.sum(st.count > 0)) == 2, "the fixed live set must split"
+    fit_others = modes.frames(st, 2 * NFIT)
+    chol = core._live_chol(others, jnp.ones(nother, bool))
+
+    def one(key, s):
+        fr = fit_others
+        if not cross_fit:
+            label = modes.nearest(fit_others, s[None])[0]
+            fr = modes.frames(modes.stats(
+                jnp.concatenate([others, s[None]]),
+                jnp.concatenate([labels, label[None]]),
+                modes.C_MAX,
+            ), 2 * NFIT)
+        u, _, _, _, _, hops, tries = core._chain(
+            key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), chol,
+            jnp.asarray(SCALE, dtype), region_loglike, lambda v: v, WALKS, False,
+            fr, True, local,
+        )
+        return jnp.sum((u - CENTERS[1]) ** 2) <= RADII[1] ** 2, hops, tries
+
+    batch = jax.jit(jax.vmap(one))
+    minor = hops = tries = 0
+    key = random.PRNGKey(seed)
+    for start in range(0, nchains, 50_000):
+        n = min(50_000, nchains - start)
+        key, sub = random.split(key)
+        seeds = jnp.asarray(uniform_region(rng, n), dtype)
+        m, h, t = batch(random.split(sub, n), seeds)
+        minor += int(jnp.sum(m))
+        hops += int(jnp.sum(h))
+        tries += int(jnp.sum(t))
+    return minor / nchains, hops, tries
+
+
+def z_score(fraction, n):
+    return (fraction - MINOR_FRACTION) / math.sqrt(
+        MINOR_FRACTION * (1 - MINOR_FRACTION) / n
+    )
+
+
+def test_chain_reads_its_own_fold_and_the_compact_frames() -> None:
+    """In a step the chains share the frames of every fold and each looks up
+    its own (and, when few are in use, a compact copy of those). Both must
+    return the chain that the fold's frames alone give."""
+    dtype = jnp.result_type(float)
+    rng = np.random.default_rng(3)
+    cfg = Config(D, 2 * NFIT, walks=WALKS)
+
+    def fit(n):
+        others = uniform_region(rng, n)
+        ball = np.argmin(((others[:, None] - CENTERS) ** 2).sum(-1), axis=1)
+        others = jnp.asarray(others, dtype)
+        st = modes.stats(others, jnp.asarray(ball, jnp.int32), modes.C_MAX)
+        return modes.frames(st, n), core._live_chol(others, jnp.ones(n, bool))
+
+    kernels = [fit(n) for n in (2 * NFIT, 3 * NFIT, 4 * NFIT)]  # one per fold
+    assert [int(jnp.sum(fr.eligible)) for fr, _ in kernels] == [2, 2, 2]
+    frames = jax.tree_util.tree_map(lambda *a: jnp.stack(a), *(fr for fr, _ in kernels))
+    chols = jnp.stack([chol for _, chol in kernels])
+    few = core._few(frames, cfg)
+    assert few.mu.shape[1] == core._FEW < modes.C_MAX
+    n = 2000
+    seeds = jnp.asarray(uniform_region(rng, n), dtype)
+    keys = random.split(random.PRNGKey(5), n)
+    folds = jnp.asarray(rng.integers(0, 3, n), jnp.int32)
+
+    def chain(key, s, j, stacked, near):
+        fr, chol = jax.tree_util.tree_map(lambda a: a[j], (frames, chols))
+        args = (chols, frames, j, near) if stacked else (chol, fr, None, None)
+        return core._chain(
+            key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), args[0],
+            jnp.asarray(SCALE, dtype), region_loglike, lambda v: v, WALKS, False,
+            args[1], True, True, args[2], False, args[3],
+        )
+
+    def run(stacked, near=None):
+        return jax.jit(jax.vmap(lambda k, s, j: chain(k, s, j, stacked, near)))(
+            keys, seeds, folds
+        )
+
+    alone = run(False)
+    assert int(jnp.sum(alone[5])) > 0.02 * int(jnp.sum(alone[6])) > 0  # hops
+    for other in (run(True), run(True, few)):
+        if jax.config.jax_enable_x64:
+            np.testing.assert_allclose(other[0], alone[0], atol=1e-9)
+            for a, b in zip(other[2:], alone[2:], strict=True):
+                np.testing.assert_array_equal(a, b)
+        else:  # a roundoff difference can flip a Metropolis decision
+            same = np.all(np.isclose(other[0], alone[0], atol=1e-4), axis=1)
+            assert same.mean() > 0.95
+
+
+def test_hop_proposal_is_uniform_on_the_eligible_ellipsoids() -> None:
+    """A frame in proportion to its volume (never one that is not eligible),
+    a point uniform in its ellipsoid, and a uniform draw for the test."""
+    dtype = jnp.result_type(float)
+    scales = np.array([0.02, 0.03, 0.05, 0.01])
+    mu = jnp.asarray([[0.2] * D, [0.5] * D, [0.8] * D, [0.5, 0.2, 0.8]], dtype)
+    chol = jnp.asarray(scales[:, None, None] * np.eye(D), dtype)
+    logdet = jnp.asarray(D * np.log(scales), dtype)
+    eligible = jnp.asarray([True, True, False, True])
+    n = 40_000
+
+    def draw(key):
+        point, uniform = modes.hop_proposal(
+            key, eligible, logdet, lambda c: (mu[c], chol[c])
+        )
+        r2 = jnp.sum(((point - mu) / jnp.asarray(scales, dtype)[:, None]) ** 2, 1)
+        return jnp.argmin(r2), jnp.min(r2), uniform
+
+    c, r2, uniform = map(np.asarray, jax.jit(jax.vmap(draw))(
+        random.split(random.PRNGKey(0), n)
+    ))
+    share = np.where(eligible, scales**D, 0.0)
+    share /= share.sum()
+    for frame in range(4):
+        sd = math.sqrt(share[frame] * (1 - share[frame]) / n)
+        assert abs(np.mean(c == frame) - share[frame]) <= 4 * sd
+    # In its ellipsoid r^2 <= d + 2, with (r^2 / (d + 2))^(d / 2) uniform.
+    t = (r2 / (D + 2.0)) ** (D / 2)
+    assert t.max() <= 1.0 + 1e-5
+    for x in (t, uniform):
+        assert abs(x.mean() - 0.5) < 4 * math.sqrt(1 / 12 / n)
+        assert abs(np.mean(x < 0.1) - 0.1) < 4 * math.sqrt(0.09 / n)
+    assert 0.0 <= uniform.min() and uniform.max() < 1.0
+
+
+def test_hop_keeps_the_constrained_prior() -> None:
+    n = 20_000
+    fraction, hops, tries = invariance(n, seed=2)
+    assert tries == n * (WALKS // modes.HOP_EVERY)  # two eligible frames
+    assert hops > 0.02 * tries
+    assert abs(z_score(fraction, n)) < 4.0
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("local", [True, False])
+def test_hop_keeps_the_constrained_prior_1e6(local) -> None:
+    """The gate: 10^6 chains (the minor fraction to 0.5% at 3 sigma), within
+    3 sigma of the volume fraction, with the local walk and without."""
+    n = 1_000_000
+    fraction, hops, tries = invariance(n, seed=1, local=local)
+    z = z_score(fraction, n)
+    print(f"minor fraction {fraction:.5f} (volume {MINOR_FRACTION:.5f}) "
+          f"z={z:+.2f} hop acceptance {hops / tries:.3f}")
+    assert abs(z) < 3.0
+
+
+@pytest.mark.slow
+def test_frames_fitted_to_the_seed_bias_the_hop() -> None:
+    """The control: frames that contain the seed bias the mode fractions, so
+    the invariance test has the power to see a seed in its own kernel."""
+    n = 200_000
+    fraction, _, _ = invariance(n, cross_fit=False, seed=1)
+    z = z_score(fraction, n)
+    print(f"seed in the frames: minor fraction {fraction:.4f} z={z:+.2f}")
+    assert abs(z) > 3.0
+
+
+def test_local_walk_keeps_the_constrained_prior() -> None:
+    """One box cut into two frames of different shapes: a walk step from the
+    narrow frame is small and one from the wide frame large, so the proposal
+    is not symmetric across the cut. With the Hastings ratio the chains keep
+    the uniform law (half of the box on each side of the cut); without it
+    they pile up on the narrow side."""
+    lo, hi = 0.2, 0.8
+    dtype = jnp.result_type(float)
+
+    def box(u):
+        return jnp.where(jnp.all((u > lo) & (u < hi)), 0.0, -1.0)
+
+    rng = np.random.default_rng(0)
+    x = rng.uniform(lo, hi, (200, D))
+    lab = (x[:, 0] > 0.5).astype(np.int32)
+    narrow = lab == 0
+    x[narrow] = x[narrow].mean(0) + 0.3 * (x[narrow] - x[narrow].mean(0))
+    fr = modes.frames(modes.stats(jnp.asarray(x, dtype), jnp.asarray(lab),
+                                  modes.C_MAX), 200)
+    assert int(jnp.sum(modes.walk_frames(fr))) == 2
+    chol = core._live_chol(jnp.asarray(x, dtype), jnp.ones(200, bool))
+    n, walks = 20_000, 40
+    seeds = jnp.asarray(rng.uniform(lo, hi, (n, D)), dtype)
+    keys = random.split(random.PRNGKey(1), n)
+
+    def chain(key, s):
+        return core._chain(key, s, box(s), jnp.asarray(-0.5, dtype), chol,
+                           jnp.asarray(1.0, dtype), box, lambda v: v, walks,
+                           False, fr, False, True)[0]
+
+    walkable = modes.walk_frames(fr)
+
+    def naive(key, s):  # the same walk without the Hastings ratio
+        def step(u, key):
+            c = jnp.argmin(jnp.where(walkable, modes.mahalanobis(fr, u)[0], jnp.inf))
+            prop = u + fr.chol[c] @ random.normal(key, (D,), dtype)
+            return jnp.where(box(prop) > -0.5, prop, u), None
+
+        return jax.lax.scan(step, s, random.split(key, walks))[0]
+
+    def z(u):
+        f = float(jnp.mean(u[:, 0] < 0.5))
+        return (f - 0.5) / math.sqrt(0.25 / n)
+
+    assert abs(z(jax.jit(jax.vmap(chain))(keys, seeds))) < 4.0
+    assert z(jax.jit(jax.vmap(naive))(keys, seeds)) > 6.0
+
+
+def two_gaussians(theta):
+    def log_normal(center, sigma):
+        z = (theta - center) / sigma
+        return -0.5 * jnp.sum(z * z) - D * math.log(sigma * math.sqrt(2 * math.pi))
+
+    return jnp.logaddexp(
+        math.log(0.75) + log_normal(jnp.asarray(CENTERS[0]), 0.03),
+        math.log(0.25) + log_normal(jnp.asarray(CENTERS[1]), 0.02),
+    )
+
+
+def test_run_hops_between_modes() -> None:
+    cfg = Config(D, 200, 20, 20)
+    result = core.run(3, two_gaussians, lambda u: u, cfg)
+    assert abs(result.logz) < 5 * result.logzerr + 0.2  # truth 0
+    meta = result.metadata
+    assert meta["hop_tries"] > 0 and meta["hops"] > 0
+    assert max(c for _, c, _ in meta["mode_history"]) >= 2
+    minor = np.asarray(result.samples)[:, 0] > 0.5
+    w = np.asarray(result.weights())
+    assert 0.1 < w[minor].sum() / w.sum() < 0.45  # truth 0.25
+
+
+def test_without_the_hop_the_clustering_still_runs() -> None:
+    """``_hop=False`` (the comparison arm N of the bake-off): random-walk
+    steps only, but the labels are still recorded for modes()."""
+    cfg = Config(D, 200, 20, 20, _hop=False)
+    result = core.run(3, two_gaussians, lambda u: u, cfg)
+    meta = result.metadata
+    assert meta["hop_tries"] == 0 and meta["hop_acceptance"] is None
+    assert max(c for _, c, _ in meta["mode_history"]) >= 2
+    assert len(result.labels) == len(result.logl)
+    assert len(result.modes()) == 2
+    assert Config(D, 40, 4, 10).recluster_every == 3
+    with pytest.raises(TypeError, match="_hop"):
+        Config(D, 40, 4, 10, _hop="N")
+
+
+def test_the_chain_kernels_agree() -> None:
+    """A step picks the cheapest chain kernel its frames allow
+    (``core._kernel_level``): plain walks while no clustering has two
+    clusters, then the frames in use, compacted. Each must return what the
+    general kernel does (to roundoff: in float32 a rare Metropolis decision
+    may flip)."""
+    cfg = Config(D, 200, 20, 20)
+    step = jax.jit(lambda state, level: core._step(
+        state, two_gaussians, lambda u: u, cfg, level
+    )[0])
+    recluster = jax.jit(lambda state: core._maybe_recluster(state, cfg))
+    state = core.init(3, two_gaussians, lambda u: u, cfg)
+    seen = set()
+    for _ in range(80):
+        state = recluster(state)
+        level = int(core._kernel_level(state, cfg))
+        mine = step(state, jnp.int32(level))
+        if level not in seen:
+            seen.add(level)
+            general = step(state, jnp.int32(2))
+            if jax.config.jax_enable_x64:
+                np.testing.assert_allclose(mine.u, general.u, atol=1e-9)
+                np.testing.assert_array_equal(mine.ncall_valid, general.ncall_valid)
+            else:
+                assert np.mean(np.asarray(mine.logl == general.logl)) > 0.95
+        state = mine
+    assert {0, 1} <= seen
+
+
+def test_one_chain_per_step_hops() -> None:
+    cfg = Config(D, 100, 1, 20)
+    result = core.run(5, two_gaussians, lambda u: u, cfg, maxiter=3000)
+    assert result.metadata["hop_tries"] > 0
+
+
+def test_step_reclusters_on_schedule() -> None:
+    cfg = Config(D, 40, 4, 10)
+    state = core.init(1, two_gaussians, lambda u: u, cfg)
+    state, _ = core.step(state, two_gaussians, lambda u: u, cfg)
+    # The points outside each fold are clustered: one cluster each.
+    assert bool(jnp.all(state.mode_count[:, 1:] == 0))
+    sizes = [40 - len(range(j, 40, cfg._folds)) for j in range(cfg._folds)]
+    np.testing.assert_array_equal(state.mode_count[:, 0], sizes)
+
+
+def test_batched_run_matches_single_runs_with_the_hop() -> None:
+    """As in test_batch: equal to roundoff in float64; in float32 a roundoff
+    difference can flip a Metropolis decision, so only the start must agree."""
+    cfg = Config(D, 60, 6, 10)
+    keys = random.split(random.PRNGKey(2), 3)
+    batch = core.run(keys, two_gaussians, lambda u: u, cfg, maxiter=1200)
+    for key, result in zip(keys, batch, strict=True):
+        alone = core.run(key, two_gaussians, lambda u: u, cfg, maxiter=1200)
+        if jax.config.jax_enable_x64:
+            assert (alone.niter, alone.ncall) == (result.niter, result.ncall)
+            np.testing.assert_allclose(alone.samples_u, result.samples_u, atol=1e-9)
+            assert alone.metadata["mode_history"] == result.metadata["mode_history"]
+            assert alone.metadata["mode_tree"] == result.metadata["mode_tree"]
+            np.testing.assert_array_equal(alone.labels, result.labels)
+        else:
+            np.testing.assert_allclose(
+                alone.logl[:120], result.logl[:120], rtol=1e-4, atol=1e-4
+            )
+        assert result.metadata["hop_tries"] > 0
+
+
+def test_checkpoint_round_trip_with_cluster_state(tmp_path, monkeypatch) -> None:
+    cfg = Config(D, 60, 6, 10)
+    path = tmp_path / "run.npz"
+    whole = core.run(4, two_gaussians, lambda u: u, cfg)
+    # Stop after a few steps, then resume from the checkpoint.
+    monkeypatch.setattr(core, "_CHECKPOINT_SECONDS", 0.0)
+    part = core.run(4, two_gaussians, lambda u: u, cfg, maxiter=300, checkpoint=path)
+    assert part.niter == 300
+    resumed = core.run(4, two_gaussians, lambda u: u, cfg, checkpoint=path)
+    assert resumed.metadata["resumed"]
+    np.testing.assert_array_equal(resumed.logl, whole.logl)
+    assert resumed.metadata["mode_history"] == whole.metadata["mode_history"]
+    # the cluster ids and their parents are part of the checkpointed state
+    np.testing.assert_array_equal(resumed.labels, whole.labels)
+    assert resumed.metadata["mode_tree"] == whole.metadata["mode_tree"]
+    assert len(whole.metadata["mode_tree"]) >= 2 * whole.metadata["folds"]
+    other = Config(D, 60, 6, 10, _hop=False)
+    with pytest.raises(ValueError, match="_hop"):
+        core.run(4, two_gaussians, lambda u: u, other, checkpoint=path)

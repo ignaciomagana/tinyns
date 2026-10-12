@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import itertools
 import math
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax import random
 
 from tinyns.result import NestedSamplingResult
@@ -19,11 +19,14 @@ def make_result() -> NestedSamplingResult:
         logl=jnp.array([-3.0, -2.0, -1.0, -0.5]),
         logwt=jnp.array([-4.0, -2.0, -1.0, -0.25]),
         logl_birth=jnp.array([-jnp.inf, -jnp.inf, -3.0, -2.0]),
+        nlive_i=np.array([2, 2, 2, 1]),
+        labels=np.array([0, 0, 0, 0], np.int32),
         logz=-0.1,
         logzerr=0.01,
         ncall=10,
         niter=2,
         nlive=2,
+        num_delete=1,
         ndim=2,
         message="ok",
         metadata={"status": "complete"},
@@ -70,11 +73,16 @@ def test_to_dict_contains_expected_keys() -> None:
         "logl",
         "logwt",
         "logl_birth",
+        "nlive_i",
+        "labels",
+        "insertion_ranks",
+        "insertion_slots",
         "logz",
         "logzerr",
         "ncall",
         "niter",
         "nlive",
+        "num_delete",
         "ndim",
         "success",
         "message",
@@ -82,6 +90,42 @@ def test_to_dict_contains_expected_keys() -> None:
     }
     assert data["metadata"] == {"status": "complete"}
     assert data["metadata"] is not result.metadata
+    assert data["labels"] is result.labels
+
+
+def test_to_dict_and_to_numpy_hold_every_saved_field(tmp_path) -> None:
+    """to_dict / to_numpy carry what save_npz writes, labels and insertion
+    ranks included."""
+    result = make_result()
+    result.labels = jnp.array([0, 1, 0, 1], jnp.int32)
+    result.insertion_ranks = np.array([1, 0])
+    result.insertion_slots = np.array([2, 1])
+    path = tmp_path / "result.npz"
+    result.save_npz(path)
+    with np.load(path) as saved:
+        stored = set(saved.files) - {"metadata_json", "format_version"}
+    numpy_data = result.to_numpy()
+    assert stored | {"metadata"} == set(numpy_data) == set(result.to_dict())
+    assert isinstance(numpy_data["labels"], np.ndarray)
+    np.testing.assert_array_equal(numpy_data["labels"], [0, 1, 0, 1])
+
+    np.testing.assert_array_equal(numpy_data["insertion_slots"], [2, 1])
+
+    result.labels = None  # a result without labels
+    assert result.to_dict()["labels"] is None
+    assert result.to_numpy()["labels"] is None
+
+
+def test_resample_equal_accepts_an_int_seed() -> None:
+    result = make_result()
+    for seed in (0, 3, np.int64(3)):
+        np.testing.assert_array_equal(
+            result.resample_equal(seed, n=5),
+            result.resample_equal(random.PRNGKey(int(seed)), n=5),
+        )
+    typed = result.resample_equal(random.key(3), n=5)
+    np.testing.assert_array_equal(typed, result.resample_equal(3, n=5))
+    assert result.resample_equal(0).shape[1] == result.ndim
 
 
 def test_to_numpy_converts_arrays_and_preserves_to_dict_behavior() -> None:
@@ -144,39 +188,28 @@ def test_information_ignores_zero_weight_nonfinite_likelihood() -> None:
     assert result.information() == 0.0
 
 
-def _small_gaussian_run():
-    from tests.helpers import run_ns
+def _small_gaussian_run(num_delete=None):
+    from tinyns import NestedSampler
 
     def loglike(theta):
         return -0.5 * jnp.sum(theta**2) - math.log(2.0 * math.pi)
 
-    return run_ns(
-        random.PRNGKey(0),
-        loglike,
-        lambda u: 4.0 * u - 2.0,
-        ndim=2,
-        nlive=50,
-        dlogz=0.3,
-        maxiter=200000,
+    sampler = NestedSampler(
+        loglike, lambda u: 4.0 * u - 2.0, 2, 50, num_delete=num_delete
     )
+    return sampler.run(random.PRNGKey(0), dlogz=0.3)
 
 
 def test_logz_bootstrap_reconstruction_matches_sampler() -> None:
-    from tinyns.result import _simulate_logz_realizations
+    from tinyns.result import _log_weights, _np_logsumexp
 
-    result = _small_gaussian_run()
-    ndead = result.niter
-    logl = np.asarray(result.logl, dtype=float)
-    nlive = int(result.nlive)
-
-    # Feeding the deterministic shrinkage log t_i = -1 / nlive must reproduce
-    # the sampler's own logz, confirming the weight convention matches.
-    log_shrinkage = np.full((1, ndead), -1.0 / nlive)
-    reconstructed = _simulate_logz_realizations(
-        logl[:ndead], logl[ndead:], nlive, log_shrinkage
-    )[0]
-
-    assert abs(float(reconstructed) - float(result.logz)) < 1e-5
+    for k in (1, 5):
+        result = _small_gaussian_run(k)
+        # Feeding the expected shrinkage log t_i = -1 / n_i must reproduce the
+        # sampler's own logz, confirming the weight convention matches.
+        log_t = -1.0 / np.asarray(result.nlive_i, dtype=float)[None, :]
+        logwt = _log_weights(result.logl, result.nlive_i, log_t)
+        assert abs(float(_np_logsumexp(logwt, axis=1)[0]) - result.logz) < 1e-12
 
 
 def test_logz_bootstrap_is_deterministic_and_sane() -> None:
@@ -205,7 +238,7 @@ def test_logz_bootstrap_input_validation() -> None:
     with np.testing.assert_raises(ValueError):
         result.logz_bootstrap(n_realizations=0)
 
-    result.nlive = 0
+    result.nlive_i = np.array([2, 2, 0, 1])
     with np.testing.assert_raises(ValueError):
         result.logz_bootstrap(n_realizations=8)
 
@@ -350,11 +383,13 @@ def test_diagnostics_low_ess_triggers_warning() -> None:
         logl=jnp.zeros(101),
         logwt=jnp.concatenate([jnp.array([0.0]), jnp.full(100, -1000.0)]),
         logl_birth=jnp.full(101, -jnp.inf),
+        nlive_i=101 - np.arange(101),
         logz=0.0,
         logzerr=0.1,
         ncall=101,
         niter=0,
         nlive=101,
+        num_delete=1,
         ndim=1,
     )
 
@@ -369,38 +404,84 @@ def test_insertion_indices_are_rebuilt_from_the_birth_contours() -> None:
     assert result.insertion_indices().tolist() == [1, 1]
 
 
-def _replayed_result(ranks, nlive):
-    """A result whose births insert each new point at the given ranks."""
+def test_recorded_insertion_ranks_and_slots_are_used() -> None:
+    """The ranks the sampler recorded win over the replay, and each is tested
+    against its own number of slots (fewer on a plateau)."""
+    result = make_result()
+    result.insertion_ranks = np.array([0, 0])
+    result.insertion_slots = np.array([1, 1])
+    assert result.insertion_indices().tolist() == [0, 0]
+    rng = np.random.default_rng(5)
+    slots = rng.integers(1, 40, 2000)
+    ranks = rng.integers(0, slots)
+    result.niter = len(ranks)
+    result.insertion_ranks, result.insertion_slots = ranks, slots
+    assert result.insertion_test()["pvalue"] > 0.01
+    result.insertion_ranks = slots - 1  # always at the top
+    assert result.insertion_test()["pvalue"] < 1e-6
+    # Against a single slot count (the nlive of the run) the same uniform
+    # ranks would look biased low.
+    result.insertion_ranks, result.insertion_slots = ranks, None
+    result.nlive, result.num_delete = 40, 1
+    assert result.insertion_test()["pvalue"] < 1e-6
+
+
+def _replayed_result(ranks, nlive, k=1):
+    """A result whose births insert each new point at the given ranks among
+    the survivors of its step (``k`` deaths and births per step)."""
     rng = np.random.default_rng(0)
     live = sorted(rng.uniform(0.0, 1.0, nlive).tolist())
-    logl, birth = [], []
+    logl, births = [], {}
     initial = list(live)
-    births = {}
-    for rank in ranks:
-        dead = live.pop(0)
-        logl.append(dead)
-        others = live
-        lo = dead if rank == 0 else others[rank - 1]
-        hi = others[rank] if rank < len(others) else lo + 1.0
-        new = 0.5 * (lo + hi)
-        births[new] = dead
-        live.insert(rank, new)
+    for step in range(len(ranks) // k):
+        dead = live[:k]
+        del live[:k]
+        logl += dead
+        survivors = list(live)
+        for rank in ranks[step * k : (step + 1) * k]:
+            lo = dead[-1] if rank == 0 else survivors[rank - 1]
+            hi = survivors[rank] if rank < len(survivors) else lo + 1.0
+            new = lo + (hi - lo) * rng.uniform(0.01, 0.99)
+            births[new] = dead[-1]
+            live.append(new)
+        live.sort()
     birth = [births.get(x, -np.inf) for x in logl + live]
     assert sum(b == -np.inf for b in birth) == len(initial)
     n = len(logl) + nlive
+    nlive_i = np.concatenate(
+        [np.tile(nlive - np.arange(k), len(logl) // k), nlive - np.arange(nlive)]
+    )
     return NestedSamplingResult(
         samples_u=jnp.asarray(rng.uniform(size=(n, 1))),
         samples=jnp.zeros((n, 1)),
-        logl=jnp.asarray(logl + live),
+        logl=np.asarray(logl + live),  # float64: no ties after many births
         logwt=jnp.zeros(n),
-        logl_birth=jnp.asarray(birth),
+        logl_birth=np.asarray(birth),
+        nlive_i=nlive_i,
         logz=0.0,
         logzerr=0.1,
         ncall=n,
-        niter=len(ranks),
+        niter=len(logl),
         nlive=nlive,
+        num_delete=k,
         ndim=1,
     )
+
+
+def test_insertion_replay_with_several_deaths_per_step() -> None:
+    nlive, k = 12, 4
+    rng = np.random.default_rng(3)
+    ranks = rng.integers(0, nlive - k + 1, 400)
+    result = _replayed_result(ranks, nlive, k)
+    rebuilt = result.insertion_indices().reshape(-1, k)
+    np.testing.assert_array_equal(
+        np.sort(rebuilt, axis=1), np.sort(ranks.reshape(-1, k), axis=1)
+    )
+    born = result._births[0]
+    assert set(born[born >= 0].tolist()) == set(range(k - 1, 400, k))
+    assert result.insertion_test()["pvalue"] > 0.01
+    top = np.full_like(ranks, nlive - k)  # always above every survivor
+    assert _replayed_result(top, nlive, k).insertion_test()["pvalue"] < 1e-6
 
 
 def test_insertion_test_passes_uniform_ranks_and_flags_biased_ones() -> None:
@@ -435,16 +516,18 @@ def test_insertion_test_passes_uniform_ranks_and_flags_biased_ones() -> None:
 
 
 def test_ks_pvalue_matches_the_kolmogorov_law() -> None:
-    from tinyns.result import _ks_uniform
+    from tinyns.result import _kolmogorov_pvalue, _ks_uniform, _rank_pit
 
-    assert _ks_uniform(np.arange(10), 10) == (0.0, 1.0)
-    ks, pvalue = _ks_uniform(np.zeros(100, dtype=int), 10)
-    assert ks == 0.9 and pvalue < 1e-20
-    # 227 of 400 ranks in the lower of two slots: D = 0.0675, at the 5%
-    # critical value 1.358 of the Kolmogorov law.
-    ks, pvalue = _ks_uniform(np.repeat([0, 1], [227, 173]), 2)
-    assert ks == 0.0675
-    assert abs(pvalue - 0.05) < 0.002
+    ks, pvalue = _ks_uniform((np.arange(10) + 0.5) / 10)
+    assert ks == pytest.approx(0.05) and pvalue == 1.0
+    ks, pvalue = _ks_uniform(np.full(100, 0.05))
+    assert ks == pytest.approx(0.95) and pvalue < 1e-20
+    # D = 0.0675 of 400 values is at the 5% critical value 1.358 of the
+    # Kolmogorov law.
+    assert abs(_kolmogorov_pvalue(400, 0.0675) - 0.05) < 0.002
+    # The randomized PIT of a rank is inside its slot.
+    pit = _rank_pit(np.array([0, 3, 9]), np.array([1, 4, 10]))
+    assert np.all((pit >= [0, 0.75, 0.9]) & (pit < [1, 1, 1]))
 
 
 def test_result_npz_round_trip(tmp_path) -> None:
@@ -467,7 +550,11 @@ def test_result_npz_round_trip(tmp_path) -> None:
     assert loaded.ncall == result.ncall
     assert loaded.niter == result.niter
     np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
+    np.testing.assert_array_equal(loaded.nlive_i, result.nlive_i)
+    np.testing.assert_array_equal(loaded.labels, result.labels)
+    assert loaded.insertion_ranks is None and loaded.insertion_slots is None
     assert loaded.nlive == result.nlive
+    assert loaded.num_delete == result.num_delete
     assert loaded.ndim == result.ndim
     assert loaded.success == result.success
     assert loaded.message == result.message
@@ -537,6 +624,8 @@ def test_result_npz_bad_format_version_raises(tmp_path) -> None:
         logl=np.zeros(1),
         logwt=np.zeros(1),
         logl_birth=np.zeros(1),
+        nlive_i=np.ones(1),
+        num_delete=1,
         logz=0.0,
         niter=0,
         logzerr=0.0,
@@ -555,16 +644,15 @@ def test_result_npz_bad_format_version_raises(tmp_path) -> None:
 
 def test_result_npz_missing_required_key_raises(tmp_path) -> None:
     path = tmp_path / "missing.npz"
-    np.savez_compressed(path, format_version="tinyns-result-npz-v2")
+    np.savez_compressed(path, format_version="tinyns-result-npz-v3")
 
     with np.testing.assert_raises(ValueError):
         NestedSamplingResult.load_npz(path)
 
 
-def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> None:
+def test_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> None:
     """The split test cuts one curved mode into pieces; modes() merges them
     because neighbouring pieces leave no gap along their discriminant."""
-    from tinyns.clusters import ClusterTracker
     from tinyns.result import SEPARATION_SIGMA, _gap
 
     rng = np.random.default_rng(2)
@@ -572,19 +660,18 @@ def test_split_pieces_of_a_curved_ridge_touch_and_separate_modes_do_not() -> Non
     for _ in range(4):  # a 5-D Rosenbrock ridge
         ridge.append(0.5 * ridge[-1] ** 2 - 1.0 + 0.5 * rng.normal(size=500))
     x = np.stack(ridge, axis=1)
-    labels = ClusterTracker(500)._track(x)
-    k = int(labels.max()) + 1
-    assert k >= 2  # the split test does cut the ridge
-    touching = []
-    for a, b in itertools.combinations(range(k), 2):
-        pair = (labels == a) | (labels == b)
-        if _gap(x[pair], labels[pair] == b) <= SEPARATION_SIGMA:
-            touching.append((a, b))
-    assert len(touching) >= k - 1
-    assert {c for edge in touching for c in edge} == set(range(k))
+    piece = np.digitize(x[:, 0], np.quantile(x[:, 0], [0.25, 0.5, 0.75]))
+    for a in range(3):  # consecutive pieces along the ridge
+        pair = (piece == a) | (piece == a + 1)
+        assert _gap(x[pair], piece[pair] == a + 1) <= SEPARATION_SIGMA
 
     blobs = np.concatenate(
         [rng.normal(size=(400, 5)), rng.normal(size=(30, 5)) + [12, 0, 0, 0, 0]]
     )
-    assert _gap(blobs, np.arange(430) >= 400) > 2 * SEPARATION_SIGMA
+    side = np.arange(430) >= 400
+    assert _gap(blobs, side) > 2 * SEPARATION_SIGMA
+    # Copies of one point (an unmoved chain returns its seed) count once.
+    copies = np.concatenate([blobs, np.repeat(blobs[400:401], 25, axis=0)])
+    with_copies = _gap(copies, np.concatenate([side, np.ones(25, bool)]))
+    assert with_copies == pytest.approx(_gap(blobs, side))
 

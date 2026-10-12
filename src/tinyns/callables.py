@@ -93,8 +93,8 @@ def _partition_callable(fn):
     (:func:`_split_callable`).
 
     The jit boundaries that use this split are the kernels of
-    :mod:`tinyns.core`: the live-point pass of ``init``, the block of ``step``
-    and the live-cov chain inside it.
+    :mod:`tinyns.core`: the live-point pass of ``init``, ``step`` and the chunk
+    kernel of the driver.
     """
     leaves, treedef = jax.tree_util.tree_flatten(fn)
     mask = tuple(_is_dynamic_leaf(leaf) for leaf in leaves)
@@ -276,13 +276,17 @@ def _callable_specs(loglike, prior_transform, ndim: int):
 
 # The compiled-kernel builders of tinyns.core, cached on the callables' specs
 # and their static arguments. JAX's own jit cache keys the compiled programs on
-# the shapes and dtypes of the array arguments.
+# the shapes and dtypes of the array arguments. The cache is small: on a CPU a
+# compiled run program (with the mode tracking) holds about 2000 memory
+# mappings, and Linux stops a process at 65530 by default
+# (vm.max_map_count), so 32 configs per kernel aborted the compiler.
+_KERNEL_CACHE_SIZE = 8
 _KERNEL_CACHES: list = []
 
 
 def _kernel_cache(build):
     """Cache a kernel builder ``build(loglike_spec, prior_spec, *static)``."""
-    cached = functools.lru_cache(maxsize=32)(build)
+    cached = functools.lru_cache(maxsize=_KERNEL_CACHE_SIZE)(build)
     _KERNEL_CACHES.append(cached)
     return cached
 
@@ -297,8 +301,8 @@ def _clear_caches() -> None:
 def _device_leaves(fn):
     """Return ``fn`` with its numpy array leaves placed on the device.
 
-    The host loop calls this once per run, so that the compiled kernels are
-    not handed a host array (and a transfer) at every block.
+    The driver calls this once per run, so that the compiled kernels are
+    not handed a host array (and a transfer) at every chunk.
     """
     leaves, treedef = jax.tree_util.tree_flatten(fn)
     if not any(isinstance(leaf, np.ndarray) for leaf in leaves):

@@ -2,162 +2,127 @@
 
 from __future__ import annotations
 
-import difflib
-from typing import Any
-
-from tinyns import checkpoint, loop
+from tinyns import core
 from tinyns.core import Config
 from tinyns.result import NestedSamplingResult
-from tinyns.types import LogLikelihood, PriorTransform, PRNGKeyLike
-
-_KNOWN_KWARGS = frozenset(("walks", "replacement_chains", "block_size", "cluster_swap"))
 
 
 class NestedSampler:
-    """Static nested sampler with a live-cov random walk in jitted blocks.
+    """Nested sampler with ``num_delete`` replacements per step, all in JAX.
+
+    Each step deletes the ``num_delete`` lowest live points and replaces them
+    with the ends of that many parallel Metropolis chains of ``walks`` steps:
+    a random walk in the covariance of the current point's cluster, with an
+    inter-mode hop every 10th step (:mod:`tinyns.modes`).
 
     Parameters
     ----------
     loglike:
-        JAX-traceable function of one point in parameter space that returns
-        its log likelihood (it is ``jax.vmap``-ped where needed). It may be a
-        JAX pytree callable such as ``jax.tree_util.Partial(loglike_fn,
-        data)``: its array leaves are passed to the compiled kernels as
-        arguments rather than embedded as constants, which helps when
-        ``data`` is large.
+        JAX-traceable function of one point in parameter space returning its
+        log likelihood (NaN counts as ``-inf``). It may be a JAX pytree
+        callable such as ``jax.tree_util.Partial(loglike_fn, data)``: its array
+        leaves are passed to the compiled kernels as arguments, so datasets of
+        one shape share one compiled program.
     prior_transform:
         JAX-traceable function mapping one unit-cube point to parameter space.
         May be a pytree callable, like ``loglike``.
     ndim:
-        Number of model dimensions. Must be positive.
+        Number of dimensions.
     nlive:
-        Number of live points to use. Must be positive.
+        Number of live points (at least 2).
+    num_delete:
+        Live points deleted and replaced per step, default
+        ``max(1, nlive // 10)``, at most ``nlive // 2``. Its replacement chains
+        run in parallel (vmapped); ``num_delete=1`` runs one unbatched chain
+        that skips the likelihood of out-of-cube proposals, for expensive
+        likelihoods.
     walks:
-        rwalk steps per replacement chain. ``None`` resolves to
-        ``max(25, 6 * ndim)`` (12 for ``ndim=1``).
-    replacement_chains:
-        Chains run in parallel per replacement (one is kept).
-    block_size:
-        Nested-sampling iterations per jitted block.
-    cluster_swap:
-        Let the chains swap between tracked clusters of the live points, which
-        keeps the weights of separated modes from drifting. ``None`` turns it
-        on with one replacement chain, the only configuration that supports
-        it. Any other keyword raises ``TypeError``.
+        Steps per replacement chain, default ``max(25, 6 * ndim, ndim**2 // 6)``
+        (:func:`tinyns.core.default_walks`): 6 steps per dimension up to 36
+        dimensions, ``ndim / 6`` per dimension beyond. Calibrated on correlated
+        Gaussians up to 64 dimensions, and enough for a 10-D Rosenbrock from
+        ``nlive=1000``. If in doubt, rerun with twice the walks and compare.
     """
 
     def __init__(
         self,
-        loglike: LogLikelihood,
-        prior_transform: PriorTransform,
+        loglike,
+        prior_transform,
         ndim: int,
-        nlive: int = 500,
+        nlive: int = 1000,
         *,
+        num_delete: int | None = None,
         walks: int | None = None,
-        replacement_chains: int = 1,
-        block_size: int = 32,
-        cluster_swap: bool | None = None,
-        **kwargs: Any,
     ):
-        for name in sorted(kwargs):
-            close = difflib.get_close_matches(name, _KNOWN_KWARGS, n=1)
-            hint = f"; did you mean {close[0]!r}?" if close else ""
-            raise TypeError(
-                f"NestedSampler got an unexpected keyword argument {name!r}{hint}"
-            )
-        if ndim <= 0:
-            raise ValueError("ndim must be a positive integer")
-        if nlive <= 0:
-            raise ValueError("nlive must be a positive integer")
         if not callable(loglike):
             raise TypeError("loglike must be callable")
         if not callable(prior_transform):
             raise TypeError("prior_transform must be callable")
-
         self.loglike = loglike
         self.prior_transform = prior_transform
-        self.ndim = ndim
-        self.nlive = nlive
-        # The resolved options; checkpointed and checked on resume.
-        self._config = Config(
-            ndim,
-            nlive,
-            walks=walks,
-            replacement_chains=replacement_chains,
-            block_size=block_size,
-            cluster_swap=cluster_swap,
-        )
+        self.config = Config(ndim, nlive, num_delete, walks)
 
     def run(
         self,
-        key: PRNGKeyLike,
+        key,
         *,
         dlogz: float = 0.1,
         maxiter: int | None = None,
+        maxcall: int | None = None,
         progress: bool = False,
-        progress_interval: int = 100,
-        callback=None,
-        callback_interval: int = 100,
-        checkpoint_path=None,
-        checkpoint_interval: int = 100,
-    ) -> NestedSamplingResult:
-        """Run nested sampling and return a :class:`NestedSamplingResult`."""
+        checkpoint=None,
+        batched_data: bool = False,
+    ) -> NestedSamplingResult | list[NestedSamplingResult]:
+        """Run nested sampling from ``key`` (a PRNG key or an int seed).
 
-        return loop.run(
-            self._config,
-            self.loglike,
-            self.prior_transform,
-            key,
-            dlogz=dlogz,
-            maxiter=maxiter,
-            progress=progress,
-            progress_interval=progress_interval,
-            callback=callback,
-            callback_interval=callback_interval,
-            checkpoint_path=checkpoint_path,
-            checkpoint_interval=checkpoint_interval,
-        )
+        Stops once the live points hold less than ``dlogz`` of the evidence,
+        before more than ``maxiter`` dead points, once ``maxcall`` likelihood
+        evaluations are reached (checked after each step), or on a likelihood
+        plateau. ``progress`` prints one line per chunk of steps: dead points,
+        ``logz``, the dlogz remainder, calls, calls per second, the chain
+        acceptance and the step scale.
 
-    def resume(
-        self,
-        checkpoint_path,
-        *,
-        dlogz: float = 0.1,
-        maxiter: int | None = None,
-        progress: bool = False,
-        progress_interval: int = 100,
-        callback=None,
-        callback_interval: int = 100,
-        checkpoint_path_out=None,
-        checkpoint_interval: int = 100,
-    ) -> NestedSamplingResult:
-        """Resume nested sampling from a ``tinyns-ckpt-2`` checkpoint file.
+        ``checkpoint`` is a file path. If the file exists, the run resumes
+        from it; a checkpoint written with a different config, x64 flag,
+        float dtype, key or batch is refused (``ValueError``). The run writes
+        it atomically at a chunk boundary at most every 10 minutes and at the
+        end. A resumed run is bit-identical to an uninterrupted one, and
+        ``metadata["wall_time_s"]`` adds up the time of every session. A
+        checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
+        under this call's limits. The callables are not stored or checked.
 
-        The checkpoint's ``ndim``, ``nlive``, ``walks``, ``replacement_chains``,
-        ``block_size`` and ``cluster_swap`` must match this sampler's, or a
-        ``ValueError`` names the key that differs. The callables are not saved
-        and cannot be checked: pass the ``loglike`` and ``prior_transform`` the
-        run started with. A checkpoint saved after a replacement failure cannot
-        be resumed, and files written before tinyns v0.3 are not read.
+        Running out of device memory raises ``MemoryError`` with the
+        ``num_delete`` to lower.
+
+        ``key`` may be a batch of keys (``jax.random.split(key, B)``): the
+        ``B`` runs go through one compiled program (the step is vmapped over
+        the runs) and a list of ``B`` results is returned. Each is a draw from
+        the same distribution as the run of its key alone but is not
+        bit-identical to it (vmap changes the summation order; in float64 the
+        two agree to roundoff). With ``batched_data=True`` every array leaf of
+        a pytree ``loglike`` or ``prior_transform`` (e.g.
+        ``jax.tree_util.Partial(fn, data)`` with ``data`` stacked over runs)
+        carries the same leading axis of ``B``: run ``i`` sees slice ``i``.
         """
-
-        ckpt = checkpoint.load(checkpoint_path)
-        checkpoint.check_config(ckpt.config, self._config)
-        output_path = (
-            checkpoint_path if checkpoint_path_out is None else checkpoint_path_out
-        )
-        return loop.run(
-            self._config,
-            self.loglike,
-            self.prior_transform,
-            None,
-            dlogz=dlogz,
-            maxiter=maxiter,
-            progress=progress,
-            progress_interval=progress_interval,
-            callback=callback,
-            callback_interval=callback_interval,
-            checkpoint_path=output_path,
-            checkpoint_interval=checkpoint_interval,
-            resume=ckpt,
-        )
+        try:
+            return core.run(
+                key,
+                self.loglike,
+                self.prior_transform,
+                self.config,
+                dlogz=dlogz,
+                maxiter=maxiter,
+                maxcall=maxcall,
+                progress=progress,
+                checkpoint=checkpoint,
+                batched_data=batched_data,
+            )
+        except Exception as err:
+            if "RESOURCE_EXHAUSTED" not in str(err):
+                raise
+            k = self.config.num_delete
+            raise MemoryError(
+                f"out of device memory: a step evaluates num_delete={k} "
+                "likelihoods at once (times the batch of a batched run); "
+                f"lower num_delete, e.g. num_delete={max(1, k // 4)}"
+            ) from err

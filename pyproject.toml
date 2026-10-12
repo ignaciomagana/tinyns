@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tinyns"
-version = "0.2.5"
-description = "A tiny dynesty-style nested sampler for JAX likelihoods."
-keywords = ["nested-sampling", "jax", "bayesian-inference", "monte-carlo"]
+version = "1.0.0"
+description = "A tiny, fast, general-purpose nested sampler in JAX."
+keywords = ["nested-sampling", "jax", "gpu", "bayesian-inference", "evidence", "monte-carlo"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
@@ -15,6 +15,9 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Astronomy",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Physics",
 ]
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,10 +26,16 @@ authors = [
   { name = "tinyns contributors" },
 ]
 dependencies = [
-  "jax",
+  "jax>=0.4.31",
   "jaxlib",
   "numpy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ignaciomagana/tinyns"
+Repository = "https://github.com/ignaciomagana/tinyns"
+Issues = "https://github.com/ignaciomagana/tinyns/issues"
+Changelog = "https://github.com/ignaciomagana/tinyns/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
@@ -38,8 +47,12 @@ dev = [
 packages = ["src/tinyns"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "bench/tests"]
 pythonpath = ["src", "."]
+# Heavy statistical gates are marked slow and skipped by default; run them
+# with `pytest -m slow` (the last -m wins).
+addopts = "-m 'not slow'"
+markers = ["slow: heavy statistical gates (run with -m slow)"]
 
 [tool.ruff]
 line-length = 88

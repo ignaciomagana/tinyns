@@ -1,119 +1,16 @@
 # tinyns release checklist
 
-## Pre-release checks
-
 - [ ] `ruff check .`
-- [ ] `pytest`
-- [ ] Run core validation:
+- [ ] `pytest` with `JAX_ENABLE_X64=0` and with `JAX_ENABLE_X64=1`
+- [ ] `pytest -m slow` (the heavy statistical gates of the mode moves)
+- [ ] `python bench/validate.py`: the quick tier of the validation gate passes
+      (about 6 minutes on 4 CPU cores)
+- [ ] `python bench/validate.py --tier full` passes on a GPU or a Slurm node,
+      and again with `--no-x64`
+- [ ] every script in `examples/` runs
+- [ ] the version in `pyproject.toml` and the CHANGELOG entry agree
 
-```bash
-python validation/run_validation.py \
-  --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
-  --seeds 0 1 2 3 4 5 6 7 8 9 \
-  --nlive 200 \
-  --dlogz 0.1 \
-  --output validation_release.json
-
-python validation/summarize_validation.py validation_release.json
-```
-
-- [ ] Run benchmark smoke:
-
-```bash
-python benchmarks/bench_static.py \
-  --targets gaussian2d correlated_gaussian2d \
-  --seeds 0 1 2 \
-  --nlive 200 \
-  --dlogz 0.1 \
-  --output bench_release.json
-```
-
-- [ ] Run examples:
-
-  - [ ] `python examples/gaussian_2d.py`
-  - [ ] `python examples/gaussian_2d_rwalk_jax_block.py`
-  - [ ] `python examples/checkpoint_resume.py`
-  - [ ] `python examples/progress_and_callback.py`
-
-
-
-## Final v0.1.0-alpha checklist
-
-Run the final alpha gate from an up-to-date `main` checkout:
-
-```bash
-git checkout main
-git pull --ff-only origin main
-ruff check .
-pytest
-make quick-validation
-make overnight-b32
-make summarize-overnight
-python benchmarks/templates/gw_like_10d_tinyns_b32_figures.py --help
-```
-
-Optional non-gate checks:
-
-```bash
-make overnight-b16
-make overnight-comparison
-# Optional extended sweep: B64/B128
-# Optional expensive 10D stress target: not a release gate
-```
-
-B32 overnight remains the release gate. B64/B128 are optional diagnostics, not defaults. The 10D GW-like stress target is opt-in and not part of release gating.
-
-## v0.1.0-alpha caveats
-
-TinyNS v0.1.0-alpha is intended as a small static nested sampler with a validated low-dimensional JAX rwalk fast path. High-dimensional, strongly curved, or multimodal targets require target-specific validation. The included 10D GW-like benchmark is a stress test for constrained-replacement mixing, not a production GW parameter-estimation pipeline.
-
-## Repeatable release validation
-
-Use the Makefile shortcuts for the routine release path so sampler changes can be checked without remembering the long benchmark commands. The primary release gate is `make overnight-b32`. The B16, B64/B128, and block-size-1 comparison runs are optional diagnostics. Failures isolated to experimental paths should be tracked, but they do not block the core B32 release path unless they reveal shared infrastructure breakage:
-
-1. [ ] Run `make test`.
-2. [ ] Run `make quick-validation`.
-3. [ ] For release validation, run `make overnight-b32`.
-4. [ ] Optional comparison: run `make overnight-b16` and `make overnight-comparison` (block size 1); B64/B128 sweeps are optional performance diagnostics for cheap likelihoods or external target-specific benchmarking.
-5. [ ] Run `make summarize-overnight`.
-6. [ ] Confirm B32 has 100% success, zero replacement failures, and sane analytic pulls.
-7. [ ] Confirm experimental failures do not affect the core release path.
-
-The overnight Makefile targets are opt-in local validation commands and must not be added to CI. Generated JSON outputs are local artifacts and should not be committed.
-
-The primary release gate remains B32. B64/B128 sweeps are optional performance diagnostics for cheap likelihoods or external target-specific benchmarking. They should not replace the B32 gate unless future validation shows a clear robustness and efficiency advantage.
-
-The block loop checks convergence before launching a new block and after truncating a partially failed block. If the accepted prefix has already reached the requested `dlogz`, the run terminates successfully while recording the late replacement failure in metadata.
-
-## Documentation checks
-
-- [ ] README quickstart works
-- [ ] sampler recommendation table is up to date
-- [ ] validation README command works
-- [ ] benchmark command works
-- [ ] limitations are explicit
-
-## Current known limitations
-
-- static nested sampling only
-- no dynamic nested sampling
-- the host loop between jitted blocks is Python
-- `loglike` and `prior_transform` must be JAX-traceable
-- not a probabilistic programming framework
-
-- Recommended path release gate:
-  ```bash
-  python benchmarks/overnight_jax_validation.py \
-    --targets gaussian2d correlated_gaussian2d ring2d banana2d eggbox2d \
-    --seeds 0 1 2 3 4 5 6 7 8 9 \
-    --nlive 500 \
-    --dlogz 0.1 \
-    --maxiter 10000 \
-    --block-sizes 32 \
-    --output overnight_jax_validation_B32.json
-  ```
-  - [ ] Confirm 50/50 success.
-  - [ ] Confirm zero replacement failures.
-  - [ ] Confirm analytic RMS pull is sane, roughly near 1.
-  - [ ] Confirm B32 remains faster than block size 1.
-  - [ ] Confirm any failures on experimental paths are treated as experimental-path failures and do not block the core release unless they indicate shared infrastructure breakage.
+`bench/README.md` describes the gate's cases and criteria. A failed case is a
+3-sigma event under a correct sampler about once in a hundred cases: rerun it
+with another key and more seeds (`--cases NAME --seed 1 --seeds 128`) before
+calling it a regression.
