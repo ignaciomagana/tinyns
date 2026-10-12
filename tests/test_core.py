@@ -75,6 +75,9 @@ def fake_run(dead_logl, live_logl, m, k):
         logl_birth=np.full(m, -np.inf),
         it=np.int32(steps),
         logz=np.float64(0.0),
+        log_x_ties=np.float64(0.0),
+        lstar_prev=np.float64(np.nan),
+        tie_run=np.int32(0),
         log_scale=np.float64(0.0),
         ncall=np.int32(0),
         ncall_valid=np.int32(0),
@@ -94,6 +97,8 @@ def fake_run(dead_logl, live_logl, m, k):
         hop_tries=zeros,
         nclusters=zeros,
         neligible=zeros,
+        nlive=np.tile(m - np.arange(k, dtype=np.int32), (steps, 1)),
+        nslots=np.full((steps, k), m - k + 1, np.int32),
     )
     return state, dead
 
@@ -435,7 +440,7 @@ def test_k1_and_k_gt_1_agree_statistically() -> None:
 # --- the functional core -----------------------------------------------------
 
 
-def test_functional_loop_matches_the_insertion_replay() -> None:
+def test_functional_loop_ranks_match_the_insertion_replay() -> None:
     cfg = Config(2, 40, num_delete=5, walks=15)
     loglike = gauss(0.5, 0.1)
     state = init(7, loglike, identity, cfg)
@@ -447,10 +452,15 @@ def test_functional_loop_matches_the_insertion_replay() -> None:
     result = finalise(state, dead, cfg, prior_transform=lambda u: 2 * u)
     assert result.niter == 5 * len(rows) and result.num_delete == 5
     np.testing.assert_allclose(result.samples, 2 * np.asarray(result.samples_u))
-    replay = result.insertion_indices().reshape(-1, 5)
+    # The result holds the recorded ranks; without ties the replay of the
+    # births gives them too (a step with an unmoved chain's copy, tied with
+    # its seed, may differ: the recorded rank takes a random place there).
     np.testing.assert_array_equal(
-        np.sort(replay, axis=1), np.sort(np.asarray(dead.insertion), axis=1)
+        result.insertion_indices(), np.asarray(dead.insertion).reshape(-1)
     )
+    replay = np.sort(result._births[1].reshape(-1, 5), axis=1)
+    same = np.all(replay == np.sort(np.asarray(dead.insertion), axis=1), axis=1)
+    assert np.mean(same) > 0.95
     assert abs(result.logz) < 4 * result.logzerr + 0.05
 
 

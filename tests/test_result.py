@@ -75,6 +75,8 @@ def test_to_dict_contains_expected_keys() -> None:
         "logl_birth",
         "nlive_i",
         "labels",
+        "insertion_ranks",
+        "insertion_slots",
         "logz",
         "logzerr",
         "ncall",
@@ -92,9 +94,12 @@ def test_to_dict_contains_expected_keys() -> None:
 
 
 def test_to_dict_and_to_numpy_hold_every_saved_field(tmp_path) -> None:
-    """to_dict / to_numpy carry what save_npz writes, labels included."""
+    """to_dict / to_numpy carry what save_npz writes, labels and insertion
+    ranks included."""
     result = make_result()
     result.labels = jnp.array([0, 1, 0, 1], jnp.int32)
+    result.insertion_ranks = np.array([1, 0])
+    result.insertion_slots = np.array([2, 1])
     path = tmp_path / "result.npz"
     result.save_npz(path)
     with np.load(path) as saved:
@@ -103,6 +108,8 @@ def test_to_dict_and_to_numpy_hold_every_saved_field(tmp_path) -> None:
     assert stored | {"metadata"} == set(numpy_data) == set(result.to_dict())
     assert isinstance(numpy_data["labels"], np.ndarray)
     np.testing.assert_array_equal(numpy_data["labels"], [0, 1, 0, 1])
+
+    np.testing.assert_array_equal(numpy_data["insertion_slots"], [2, 1])
 
     result.labels = None  # a result without labels
     assert result.to_dict()["labels"] is None
@@ -397,6 +404,28 @@ def test_insertion_indices_are_rebuilt_from_the_birth_contours() -> None:
     assert result.insertion_indices().tolist() == [1, 1]
 
 
+def test_recorded_insertion_ranks_and_slots_are_used() -> None:
+    """The ranks the sampler recorded win over the replay, and each is tested
+    against its own number of slots (fewer on a plateau)."""
+    result = make_result()
+    result.insertion_ranks = np.array([0, 0])
+    result.insertion_slots = np.array([1, 1])
+    assert result.insertion_indices().tolist() == [0, 0]
+    rng = np.random.default_rng(5)
+    slots = rng.integers(1, 40, 2000)
+    ranks = rng.integers(0, slots)
+    result.niter = len(ranks)
+    result.insertion_ranks, result.insertion_slots = ranks, slots
+    assert result.insertion_test()["pvalue"] > 0.01
+    result.insertion_ranks = slots - 1  # always at the top
+    assert result.insertion_test()["pvalue"] < 1e-6
+    # Against a single slot count (the nlive of the run) the same uniform
+    # ranks would look biased low.
+    result.insertion_ranks, result.insertion_slots = ranks, None
+    result.nlive, result.num_delete = 40, 1
+    assert result.insertion_test()["pvalue"] < 1e-6
+
+
 def _replayed_result(ranks, nlive, k=1):
     """A result whose births insert each new point at the given ranks among
     the survivors of its step (``k`` deaths and births per step)."""
@@ -487,16 +516,18 @@ def test_insertion_test_passes_uniform_ranks_and_flags_biased_ones() -> None:
 
 
 def test_ks_pvalue_matches_the_kolmogorov_law() -> None:
-    from tinyns.result import _ks_uniform
+    from tinyns.result import _kolmogorov_pvalue, _ks_uniform, _rank_pit
 
-    assert _ks_uniform(np.arange(10), 10) == (0.0, 1.0)
-    ks, pvalue = _ks_uniform(np.zeros(100, dtype=int), 10)
-    assert ks == 0.9 and pvalue < 1e-20
-    # 227 of 400 ranks in the lower of two slots: D = 0.0675, at the 5%
-    # critical value 1.358 of the Kolmogorov law.
-    ks, pvalue = _ks_uniform(np.repeat([0, 1], [227, 173]), 2)
-    assert ks == 0.0675
-    assert abs(pvalue - 0.05) < 0.002
+    ks, pvalue = _ks_uniform((np.arange(10) + 0.5) / 10)
+    assert ks == pytest.approx(0.05) and pvalue == 1.0
+    ks, pvalue = _ks_uniform(np.full(100, 0.05))
+    assert ks == pytest.approx(0.95) and pvalue < 1e-20
+    # D = 0.0675 of 400 values is at the 5% critical value 1.358 of the
+    # Kolmogorov law.
+    assert abs(_kolmogorov_pvalue(400, 0.0675) - 0.05) < 0.002
+    # The randomized PIT of a rank is inside its slot.
+    pit = _rank_pit(np.array([0, 3, 9]), np.array([1, 4, 10]))
+    assert np.all((pit >= [0, 0.75, 0.9]) & (pit < [1, 1, 1]))
 
 
 def test_result_npz_round_trip(tmp_path) -> None:
@@ -521,6 +552,7 @@ def test_result_npz_round_trip(tmp_path) -> None:
     np.testing.assert_array_equal(loaded.logl_birth, result.logl_birth)
     np.testing.assert_array_equal(loaded.nlive_i, result.nlive_i)
     np.testing.assert_array_equal(loaded.labels, result.labels)
+    assert loaded.insertion_ranks is None and loaded.insertion_slots is None
     assert loaded.nlive == result.nlive
     assert loaded.num_delete == result.num_delete
     assert loaded.ndim == result.ndim

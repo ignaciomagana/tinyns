@@ -39,7 +39,11 @@ print(result.summary())  # logz is -log(400) = -5.99 within logzerr
 ```
 
 `loglike` and `prior_transform` are JAX-traceable functions of one point
-(tinyns vmaps them); a NaN likelihood counts as `-inf`. The whole API is
+(tinyns vmaps them). A NaN likelihood counts as `-inf`, and a region where
+the likelihood is `-inf` or NaN (outside a model's support, say) counts as
+prior volume with zero likelihood: `logz` is the evidence over the full
+prior. Exact likelihood ties (such a region, a finite plateau, a floor) are
+handled as plateaus (see How it works). The whole API is
 `NestedSampler(loglike, prior_transform, ndim, nlive, *, num_delete, walks)`
 and `sampler.run(key, *, dlogz=0.1, maxiter, maxcall, progress, checkpoint,
 batched_data)`. `key` is a PRNG key or an int seed, here and wherever tinyns
@@ -63,7 +67,9 @@ result = NestedSamplingResult.load_npz("result.npz")
 ```
 
 The arrays (`samples`, `samples_u`, `logl`, `logwt`, `logl_birth`, `nlive_i`,
-`labels`) hold the dead points in order, then the final live points.
+`labels`) hold the dead points in order, then the final live points;
+`insertion_ranks` and `insertion_slots` hold the rank of each new point
+among the survivors of its step, which `insertion_test()` reads.
 `metadata` has the settings and timings; `to_dict()` and `to_numpy()` return
 every field, and `to_dynesty_dict()` gives dynesty-style keys.
 
@@ -89,6 +95,19 @@ below are rejected, and a chain that never moves returns its seed.
 - **Evidence.** The `k` deaths of a step are counted at live counts
   `m, ..., m-k+1` (birth/death contours; Fowlie, Handley & Su); `logz` and
   `logzerr` are recomputed on the host in float64.
+- **Plateaus.** New points land strictly above `L*`, so live points tied at
+  one likelihood (a zero-likelihood region, a finite plateau, a floor) are
+  left behind and die over several steps. Following Fowlie, Handley & Su
+  (2021), the `q` tied deaths count at `m, m-1, ..., m-q+1`: a point born
+  above the tie is not live for the tied deaths still to come. The sampler
+  carries this in its state, so the running evidence, the stopping rule and
+  `result.nlive_i` all count it, and it ranks each new point among the
+  survivors strictly above `L*` for the insertion test. On a 5-D Gaussian
+  with zero likelihood on half the cube, logZ was 0.17 to 0.19 too high
+  without it (at every `nlive` and `num_delete`) and is now unbiased
+  (+0.010 ± 0.018 over 48 runs at nlive 500). On a gravitational-wave
+  population likelihood that is zero on 52% of its prior, 6 runs gave
+  -192.89 against a truth of -193.15; recounted, they give -193.11 ± 0.08.
 - **Driver.** A compiled `while_loop` runs chunks of steps on the device; the
   host syncs once per chunk (progress, checkpoints, stopping).
 
@@ -362,6 +381,16 @@ gives `finalise(..., ncall=total)`, as `examples/functional_core.py` does.
   enable x64.
 - **Insertion test.** Its p-values are honest up to `num_delete = nlive // 10`
   and anti-conservative above (see Choosing `nlive` and `num_delete`).
+- **Finite plateaus with few points above them.** When a plateau holds nearly
+  all the live points, the fraction of prior volume above it is estimated
+  from the few that are not, and the estimate is noisy: with 5 to 10 of 500
+  live points above a plateau (`L = -5` on half of the 5-D cube above),
+  logZ was +0.09 ± 0.05 high at `num_delete=25` and +0.06 ± 0.05 at 1 (it
+  was 3.1 too high before the plateau counts), and it scattered by 0.35
+  while `logzerr` said 0.09: `logzerr` misses the uncertainty of that
+  fraction, and `logz_bootstrap()` has it (0.36). Raise `nlive` there. A
+  zero-likelihood region with a fair share of the live points above it is
+  unbiased, and its `logzerr` is right.
 - **Compile cache.** A process keeps up to 8 compiled configurations.
 
 ## Benchmarks
