@@ -183,7 +183,9 @@ reruns that were deferred; the probe says which way each would move.
 ## Validation gate
 
 `python bench/validate.py --tier full` at afa58dd on the H100 (x64, 64 runs
-per case, key 0). All 10 cases pass.
+per case, key 0). All 10 cases pass. Rerun at 88c572b (after the plateau fix),
+it passes again with the same printed digits except `eggbox_d2` (dlogZ
++0.010 against +0.011); the quick tier passes 7 of 7.
 
 | case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | logit bias ± se | logit sd | lost | modes | unres | ncall | wall s | verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|

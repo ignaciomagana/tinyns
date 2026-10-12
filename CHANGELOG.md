@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0.0 (unreleased)
+## v1.0.0 (2026-10-12)
 
 tinyns v1 is a rewrite: a new full-JAX core, a new algorithm and a new API.
 **It is a hard break from v0.x.** There are no compatibility shims, no

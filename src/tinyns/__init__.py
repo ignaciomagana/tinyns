@@ -16,4 +16,4 @@ __all__ = [
     "LogZBootstrap",
 ]
 
-__version__ = "1.0.0.dev0"
+__version__ = "1.0.0"
