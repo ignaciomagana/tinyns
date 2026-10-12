@@ -226,10 +226,11 @@ have a reason:
   calls, and its `logzerr` is 2% smaller. If the device can evaluate several
   likelihoods at once, the default is faster by the batch size.
 
-**Memory** was no constraint: 40 batched runs at 64 dimensions peaked at 4 GiB
-of GPU memory with `nlive=4000` (7 GiB at a share of 0.5), and one run holds
-`niter * ndim` samples on the host (740 thousand dead points at 64-D,
-`nlive=4000`).
+**Memory** was no constraint on these targets: 40 batched runs at 64
+dimensions peaked at 4 GiB of GPU memory with `nlive=4000` (7 GiB at a share
+of 0.5), and one run holds `niter * ndim` samples on the host (740 thousand
+dead points at 64-D, `nlive=4000`). A heavy likelihood is different (see GPU
+notes).
 
 ## GPU notes
 
@@ -239,7 +240,12 @@ of GPU memory with `nlive=4000` (7 GiB at a share of 0.5), and one run holds
 - **Compile cache.** `jax.config.update("jax_compilation_cache_dir", path)`
   lets separate processes reuse compiled programs.
 - **Memory.** A step evaluates `num_delete` likelihoods at once (times the
-  batch size of a batched run). If that does not fit, lower `num_delete`.
+  batch size of a batched run), and so does the start of a run. For a heavy
+  likelihood the default does not fit: a gravitational-wave population
+  likelihood over 259 events and 4096 samples per event asked for 67 GB at
+  `num_delete=200`, and a 13-D mock of it 78 GB at 100, on an 80 GB H100.
+  Running out raises `MemoryError`; lower `num_delete` (25 and 100 fitted
+  there). The posterior does not depend on it.
 - **Reproducibility.** On a GPU in float32 a fixed seed is not bit-reproducible
   between processes: five identical runs of a 32-D mixture gave four different
   `logz`. On a CPU it is. The results agree in distribution.

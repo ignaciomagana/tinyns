@@ -91,6 +91,9 @@ class NestedSampler:
         checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
         under this call's limits. The callables are not stored or checked.
 
+        Running out of device memory raises ``MemoryError`` with the
+        ``num_delete`` to lower.
+
         ``key`` may be a batch of keys (``jax.random.split(key, B)``): the
         ``B`` runs go through one compiled program (the step is vmapped over
         the runs) and a list of ``B`` results is returned. Each is a draw from
@@ -101,15 +104,25 @@ class NestedSampler:
         ``jax.tree_util.Partial(fn, data)`` with ``data`` stacked over runs)
         carries the same leading axis of ``B``: run ``i`` sees slice ``i``.
         """
-        return core.run(
-            key,
-            self.loglike,
-            self.prior_transform,
-            self.config,
-            dlogz=dlogz,
-            maxiter=maxiter,
-            maxcall=maxcall,
-            progress=progress,
-            checkpoint=checkpoint,
-            batched_data=batched_data,
-        )
+        try:
+            return core.run(
+                key,
+                self.loglike,
+                self.prior_transform,
+                self.config,
+                dlogz=dlogz,
+                maxiter=maxiter,
+                maxcall=maxcall,
+                progress=progress,
+                checkpoint=checkpoint,
+                batched_data=batched_data,
+            )
+        except Exception as err:
+            if "RESOURCE_EXHAUSTED" not in str(err):
+                raise
+            k = self.config.num_delete
+            raise MemoryError(
+                f"out of device memory: a step evaluates num_delete={k} "
+                "likelihoods at once (times the batch of a batched run); "
+                f"lower num_delete, e.g. num_delete={max(1, k // 4)}"
+            ) from err
