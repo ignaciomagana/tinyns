@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import sys
 from importlib import metadata
 from pathlib import Path
 
@@ -40,6 +44,24 @@ def _ci_matrix() -> list[tuple[int, str, str]]:
     )
     assert entries, "no matrix entries found in ci.yml"
     return [(int(minor), x64, jax) for minor, x64, jax in entries]
+
+
+def _ci_step_script(name: str) -> str:
+    """The ``run: |`` script of the ci.yml step called ``name``."""
+    lines = CI.read_text().splitlines()
+    (start,) = [i for i, line in enumerate(lines) if line.strip() == f"- name: {name}"]
+    end = start + 1
+    while lines[end].strip() != "run: |":
+        assert not lines[end].strip().startswith("- name:"), f"{name!r} has no script"
+        end += 1
+    body = lines[end + 1 :]
+    indent = len(body[0]) - len(body[0].lstrip())
+    script = []
+    for line in body:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        script.append(line[indent:])
+    return "\n".join(script).rstrip("\n") + "\n"
 
 
 def test_version_has_one_source() -> None:
@@ -108,10 +130,60 @@ def test_ci_tests_every_python_and_the_newest_jax() -> None:
 def test_ci_runs_the_wheel_and_a_weekly_schedule() -> None:
     _ci_matrix()  # skips without ci.yml
     text = CI.read_text()
-    assert re.search(r"^  wheel:$", text, flags=re.M)
-    assert "python -m build" in text
-    assert "python -m pytest -o pythonpath=" in text  # not src/: the wheel
+    test_job, wheel_job = re.split(r"^  wheel:$", text, flags=re.M)
+    assert "python -m build" in wheel_job
+    assert "python -m pytest -o pythonpath=" in wheel_job  # not src/: the wheel
+    for job in (test_job, wheel_job):  # a failure log names the JAX it ran on
+        assert "jaxlib.__version__" in job
     assert re.search(r'schedule:\s+- cron: "[^"]+"', text)
+
+
+def test_ci_newest_jax_check_only_warns(tmp_path) -> None:
+    """The "latest is the newest JAX" step warns when the JAX is not the newest
+    or PyPI cannot be read, and never fails the job (GitHub runs it with
+    ``bash -e``)."""
+    _ci_matrix()  # skips without ci.yml
+    bash, curl = shutil.which("bash"), shutil.which("curl")
+    if not (bash and curl):
+        pytest.skip("needs bash and curl")
+    import jax
+
+    url = "https://pypi.org/pypi/jax/json"
+    script = _ci_step_script('Check that "latest" is the newest JAX')
+    assert url in script
+    script = script.replace("${{ matrix.python-version }}", "3.99")
+    assert "${{" not in script
+    # `python` on PATH is this interpreter, as in the job; curl reads file://
+    # URLs, so nothing goes to the network.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (bin_dir / "python").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    def run(body: str | None, flags: str = "-e") -> str:
+        source = tmp_path / "jax.json"
+        source.unlink(missing_ok=True)
+        if body is not None:
+            source.write_text(body)
+        proc = subprocess.run(
+            [bash, *flags.split(), "-c", script.replace(url, source.as_uri())],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    assert "::warning::" not in run(f'{{"info": {{"version": "{jax.__version__}"}}}}')
+    stale = run('{"info": {"version": "999.0"}}')
+    assert f"resolves jax {jax.__version__}, but the newest JAX is 999.0" in stale
+    # PyPI down (curl fails) or an error page instead of JSON, also with the
+    # `shell: bash` flags.
+    for flags in ("-e", "-e -o pipefail"):
+        for body in (None, "<html>503</html>"):
+            assert "::warning::could not read the newest JAX" in run(body, flags)
 
 
 def test_sdist_ships_only_the_listed_paths(tmp_path) -> None:
