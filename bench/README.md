@@ -27,7 +27,7 @@ bench/
 Run it before a release, and after any change to the sampler:
 
 ```bash
-python bench/validate.py                 # quick tier: about 6 min on 4 CPU cores
+python bench/validate.py                 # quick tier: about 7 min on 4 CPU cores
 python bench/validate.py --tier full     # every case: a GPU, or a Slurm node
 python bench/validate.py --no-x64        # the same in float32
 ```
@@ -42,35 +42,77 @@ is `--seeds` independent runs of one target, run as one batch of keys.
 | `rosen_d4` | 500 | 1000 | 100 |
 | `rosen_d10` | - | 1000 | 250 |
 | `funnel_d10`, `loggamma_d10`, `eggbox_d2` | 500 | 1000 | default |
+| `ndtri_d6` | 500 | 1000 | 144 |
+| `sepWbox_d4` | 1000 | 1000 | default |
 | `sepW_d10` | 2000 | 2000 | default |
 | `sepW_d18` | - | 4000 | default |
 
 - The quick tier runs 16 seeds, the full tier 64 at the default `nlive`.
-- Rosenbrock runs at `walks = 25 * ndim`: the default is calibrated on
-  Gaussians and is too short for a curved valley.
+- Rosenbrock runs at `walks = 25 * ndim`, where its logZ is unbiased, so the
+  two cases test the sampler on a curved valley. The default walks (60 at
+  d = 10) leave the 10-D Rosenbrock 0.05 +- 0.04 low at `nlive=1000` (the
+  README, Choosing `walks`), close to the 3 se of 64 seeds: a case at the
+  default would fail now and then for a bias the README already states. The
+  default walks are gated on the other cases, none of them curved.
+- `ndtri_d6` has a standard normal prior (`x = ndtri(u)`) and the data 3 prior
+  sd off centre in all 6 coordinates, so the posterior sits in a corner of
+  the unit cube, where the prior transform is far from affine. It runs at 4
+  times the default walks. At the default (36) the chains do not decorrelate
+  there, and the case fails `bias` and `scatter` in both tiers: logZ 0.60 to
+  0.64 (+- 0.18) low with a scatter 2.9 to 3.0 times `logzerr` in the quick
+  tier (float32 and x64), and 0.24 +- 0.08 low, 3.5 times, in the full tier
+  (x64). At 72 walks the scatter was still 1.7 times `logzerr` (32 runs at
+  `nlive=1000`); at 144 it is 1.05 at `nlive=1000` and 1.2 at 500.
 - The mixtures run at an `nlive` that gives the 6% minor mode more than
   `5 * ndim` live points, which is what it takes to resolve it.
+  `sepWbox_d4` is `sepW_d4` moved from the unit cube to the box [-3, 5]^4, so
+  its mode masses are scored on samples in coordinates that are not the
+  sampler's own.
 
 A case passes when all of these hold (se is the standard error over seeds):
 
 | criterion | rule |
 |---|---|
 | `bias` | \|mean logZ - truth\| < 3 se |
-| `scatter` | sd(logZ) / mean(logzerr) in [0.75, 1.3] |
-| `modes` | mixtures: logit bias of each minor mode weight < 3 se, its sd <= 0.4, no seed lost a mode |
+| `scatter` | sd(logZ) / mean(logzerr) in [0.75, 1.3], within its noise (below) |
+| `posterior` | Gaussians: along each eigenvector of the true covariance, the mean offset of the posterior (in units of the true sd) and the log of its variance over the true one are zero within their scatter over the seeds (Student's t, Bonferroni over the `2 * ndim` tests) |
+| `modes` | mixtures: logit bias of each minor mode weight < 3 se, its sd at most the case's limit, no seed lost a mode |
+| `hop` | mixtures: the inter-mode hop was tried and accepted at least 2% of its proposals in at least 90% of the runs |
 | `count` | `result.modes()` reports the true number of modes in at least 90% of the runs |
 | `flags` | every run converged, and `result.modes()` flags no mode `unresolved` |
 
-- **The scatter ratio is noisy.** Measured on N seeds it has a relative error
-  of `1 / sqrt(2 (N - 1))`: 18% at 16 seeds, 9% at 64. A case fails only when
-  the ratio is outside the band by more than 3 of those; the table prints that
-  interval. So the quick tier catches an error bar that is off by a factor of
-  about 2, and the full tier one that is off by 40%.
+- **What the scatter criterion catches.** Measured on N seeds the ratio has a
+  relative error of `1 / sqrt(2 (N - 1))`: 18% at 16 seeds, 9% at 64. A case
+  fails only when the ratio is outside the band by more than 3 of those, so
+  it passes measured ratios from 0.43 to 2.25 at 16 seeds and from 0.57 to
+  1.70 at 64. As factors by which `logzerr` is off (too small, or too large):
+
+  | seeds | caught in half the cases | caught in 95% |
+  |---|---|---|
+  | 16 (quick) | 2.3 too small, 2.25 too large | 3.2, 3.0 |
+  | 64 (full) | 1.7, 1.73 | 2.0, 2.0 |
+
+  A `logzerr` 40% too small (ratio 1.67) passes one full-tier case 61% of
+  the time; if every case had it, the full tier would fail 99% of the time.
+- **The posterior check** reads the Gaussian cases' samples, which no other
+  criterion does. A run's offsets scatter by about 0.02 (mean, in units of
+  the sd) and 0.03 (log variance) per direction at `nlive=500`, and 0.013 and
+  0.022 at 1000. With bounds of 4.3 to 5.1 at 16 seeds and about 4.1 to 4.4
+  at 64, a case fails an offset of about 0.02 sd in one direction's mean or
+  3% in its variance in the quick tier, and 0.006 sd or 1% in the full tier.
+  Samples in the wrong coordinates (the unit cube instead of the box) fail
+  by a t of hundreds.
+- **The limit on the mode-weight scatter** is 0.12 in logit for the `sepW`
+  cases and 0.4 (the accuracy floor) for LogGamma. With the hop the sepW
+  minor modes scatter by 0.02 to 0.07; with it off (`Config._hop=False`) by
+  0.25 to 0.37, which the floor alone let through. The limit holds at the
+  full tier's `nlive` and scales as `1 / sqrt(nlive)` when `--nlive`
+  overrides it, up to 0.4. A hop that never runs fails `hop` too.
 - **Mode weights are oracle masses**: the target's exact responsibility
   averaged over the posterior samples, not `result.modes()`.
 - **The mode count** is that of `result.modes()`. The truth is 1 for the
-  Gaussians, `rosen_d4` and the funnel, 4 for LogGamma and 2 for the
-  mixtures. Two cases have a range, and may flag `unresolved`:
+  Gaussians, `rosen_d4`, the funnel and `ndtri_d6`, 4 for LogGamma and 2 for
+  the mixtures. Two cases have a range, and may flag `unresolved`:
   - `rosen_d10` has a second lobe at `x_1 = -1` with 2.52% of the mass
     (`P(x_1 < 0)` by the quadrature that gives its evidence), joined to the
     main mode by a bridge of 0.8% (`|x_1| < 0.3`). One mode or two are both
@@ -78,22 +120,35 @@ A case passes when all of these hold (se is the standard error over seeds):
     `5 * ndim`, so a run that reports it flags it.
   - `eggbox_d2` has 18 modes that the sampler's clustering does not separate
     (a lattice has no two-way split). `modes()` counts the ones the live
-    points still hold apart: 15 to 18 at nlive 1000, 7 to 18 at 500. The case
-    passes with 8 to 18 modes, and a run that reports fewer than 18 must say
-    that its count is a lower bound (a mode that is not `tracked`, or the
-    full-slots warning). Its 2% modes hold about 10 live points at nlive 500.
-- **Expect a false FAIL now and then.** Each criterion is a 3-sigma test, and
-  the full tier runs about 25 of them. Rerun a failed case with another key
-  (`--cases NAME --seed 1`) and more seeds before believing it.
+    points still hold apart: 13 to 18 at nlive 1000 (192 runs), 4 to 18 at
+    500 (960 runs). The case passes with 3 to 18 modes, and a run that
+    reports fewer than 18 must say that its count is a lower bound (a mode
+    that is not `tracked`, or the full-slots warning). Its 2% modes hold
+    about 10 live points at nlive 500.
+- **Expect a false FAIL now and then.** The `bias` and logit-bias tests are
+  at 3 se with se estimated from the seeds, so a correct sampler fails each
+  in 0.9% of the cases at 16 seeds and 0.4% at 64 (Student's t), and the
+  `posterior` test in 0.27% (measured on `gauss_d2` and `gauss_d10`, float32
+  and x64: `posterior` failed 1 of 144 batches of 16 seeds, `bias` 3). Over
+  a tier that is a false FAIL in about 1 run in 8 of the quick tier and 1 in
+  14 of the full one. Rerun a failed case with another key and more seeds
+  (`--cases NAME --seed 1 --seeds 128`) before believing it.
 - **Pair A/B comparisons.** In float32 a seed's trajectory differs between
   CPU node types (on Hilda, HENON and SIRIUS nodes) as well as between CPU
   and GPU. Compare two versions or settings on the same seeds, run on one
   node type, and compare them seed by seed. An unpaired comparison once
   showed a fake trend: in the hop-eligibility study, 17 against 26 lost
   modes in 120 seeds, which vanished when the runs were paired.
-- `--json FILE` keeps every seed's logZ, logzerr and mode masses.
-- `--cases`, `--seeds` and `--nlive` override the tier, for a closer look at
-  one case.
+- `--json FILE` keeps every seed's logZ, logzerr, mode masses, hop
+  acceptance and posterior offsets. It also records the commit the gate ran
+  at (`git_sha`, with `-dirty` when a tracked file under `src`, `bench` or
+  `pyproject.toml` differs from it), which the header line prints too, and
+  where `tinyns` was imported from.
+- `--cases` runs the named cases whatever the tier, at the tier's `nlive` or,
+  for a case outside the tier, the full tier's. `--nlive` overrides the
+  `nlive` of the cases the tier (or `--cases`) runs, and warns when a
+  mixture's smallest mode then holds fewer than `5 * ndim` live points (the
+  case fails `flags`). `--seeds` overrides the tier's seeds, at least 2.
 
 ## Targets
 
@@ -103,21 +158,29 @@ recomputes the cached quadrature values.
 | name | d | logZ truth | modes |
 |---|---|---|---|
 | `gauss_d{2,8,16,32,64}` | 2-64 | analytic, `-d log 20` | - |
+| `ndtri_d{d}` | any | analytic | - (a normal prior, the data 3 prior sd off centre) |
 | `rosen_d{2,10}` | 2, 10 | 1-D transfer-operator quadrature | - (d = 10: a 2.5% lobe at `x_1 = -1`) |
 | `funnel_d10` | 10 | 1-D quadrature over v | - |
 | `loggamma_d{2,10,30}` | 2-30 | analytic (CDFs), ~ -2.3e-5 | 4 x 0.25 |
 | `eggbox_d2` | 2 | 2-D quadrature, 235.856 | not scored (18) |
 | `sepW_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 |
 | `connW_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 |
-| `sepWtw_d{d}` | any | analytic, 0 | 0.94 / 0.06 (banana-twisted main mode) |
+| `sepWtw_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 (banana-twisted main mode) |
+| `sepWbox_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 (in the box [-3, 5]^d) |
 | `sepM_d{10,18,32}` | 10-32 | analytic, 0 | 0.94 / 0.06 |
 | `mix3_d10` | 10 | analytic, 0 | 0.7 / 0.2 / 0.1 |
-| `needle_d{d}` | 4-32 | analytic, 0 | 0.8 / 0.2 (each mode a core with two thin arms) |
+| `needle_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.8 / 0.2 (each mode a core with two thin arms) |
 | `cauchy_d{d}` | >= 7 | analytic (CDFs, box included) | 0.797 / 0.203 (products of Cauchy and normal factors) |
 
 - **Gaussians**: covariance `Q diag(s^2) Q^T`, with `s` log-spaced over
   [0.1, 1] and `Q` a random rotation. The mean is in [-1, 1]^d and the prior
-  box is [-10, 10]^d, so the truncated mass is below 1e-18.
+  box is [-10, 10]^d, so the truncated mass is below 1e-18 and the posterior
+  is the Gaussian (its mean and covariance are in `meta`).
+- **`ndtri`**: a standard normal prior with `lnL = sum_i log N(x_i; 3, 0.3^2)`,
+  so the posterior, `N(2.75, 0.29^2)` in each coordinate, lies in a corner of
+  the unit cube (`u` from 0.985 to 0.9996). The target is written in the unit
+  cube: its box is [0, 1]^d and its likelihood applies `ndtri`, so every
+  sampler sees a box prior, and its samples are `u`.
 - **Mixtures** are the multimodality-prototype targets (`mm_targets.build`),
   ported verbatim; at d = 4, 10 and 18 the likelihood and responsibility match
   the original exactly. They live in
@@ -126,6 +189,11 @@ recomputes the cached quadrature values.
     per offset dim at d >= 10.
   - `conn`: an offset of 4 sigmas, so the two modes touch.
   - `W`/`M`: the minor-mode volume ratio, 0.21 or 0.03.
+  - `box`: the target in the box [-3, 5]^d (`BOX`), with the likelihood of
+    the unit-cube target at `u = (x + 3) / 8`, so logZ and the mode masses
+    do not change.
+  - The minor-mode shapes are set for d = 4, 10, 18 and 32 only; another d
+    raises a ValueError.
   - d = 32 reuses the d = 18 shapes: the minor mode is narrowed by the same
     factor in 15 of the 32 dims, so its volume ratio (0.21 or 0.03) is the
     d = 18 one, and it is oriented unlike the main mode (in the main mode's
@@ -247,6 +315,8 @@ How `run.py` works:
 **Record schema** `tinyns-bench-1` has these keys:
 
 - `schema, sampler, sampler_version, git_sha, target, ndim, seed`
+  (`git_sha` ends in `-dirty` when a tracked file under `src`, `bench` or
+  `pyproject.toml` differs from the commit; untracked files do not count)
 - `truth {logz, logz_source, mode_mass}`
 - `config {<resolved sampler settings>, variant, cli {nlive, dlogz, opts}}`
 - `hw {host, gpu, platform, cpu_model, cpu_threads, exclusive[, slurm_job, slurm_partition]}, jax, x64`
@@ -265,8 +335,9 @@ runs with `--opt` settings form their own sampler, labelled
 `name [key=value]`, so a matched-settings rerun sits next to the default one.
 
 - `--sha tinyns_v1=afa58dd` keeps only the `tinyns_v1` records written at
-  that commit (`git_sha`), and says how many it left out. Use it when a
-  results file holds runs of an older build.
+  that commit (`git_sha`) from an unmodified checkout, and says how many it
+  left out; `--sha tinyns_v1=afa58dd-dirty` keeps those of a modified one.
+  Use it when a results file holds runs of an older or a modified build.
 - `--reference-nlive 500,1000` keeps the headline to the reference's cells at
   those `nlive`, when it also ran at values no competitor ran at.
 
@@ -359,16 +430,21 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
 
 `pytest bench/tests` covers:
 
-- the target truths: 2-D grid integrals, the cached quadratures, and the exact
-  mode masses checked with direct draws from each mixture;
+- the target truths: 2-D grid integrals, the cached quadratures, the `ndtri`
+  evidence by quadrature, the exact mode masses checked with direct draws
+  from each mixture, and the `box` variant against the unit-cube one;
 - every installed adapter, on `gauss_d2` with nlive 100;
-- `run.py` and `summarize.py` end to end, including a timeout record;
+- `run.py` and `summarize.py` end to end, including a timeout record, and
+  the `-dirty` flag of `git_sha` in a scratch repository;
 - the report on synthetic records: merging, the accuracy flags, the headline
-  ratios and ranks, a missing reference, the commit filter, the cold-start
-  and compiled times, cells of several `nlive`;
+  ratios and ranks, a missing reference, the commit filter (clean and
+  modified builds apart), the cold-start and compiled times, cells of
+  several `nlive`;
 - the gate: its criteria on synthetic rows (the mode count and its
-  lower-bound flag among them), and one run of its code path on tiny
-  settings.
+  lower-bound flag, the eggbox floor, the logit-sd limit and the hop among
+  them), the posterior check on exact draws and its Student-t bounds, the
+  tier and override rules, degenerate inputs, and one run of its code path
+  on tiny settings, with the hop on and off.
 
 Adapters whose package is missing are skipped. CI has only tinyns installed,
 so there it runs the tinyns adapter that matches the installed version.
