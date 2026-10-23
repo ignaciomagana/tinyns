@@ -265,6 +265,49 @@ def test_seeds_and_walk_covariance_are_cross_fitted(monkeypatch, k) -> None:
     np.testing.assert_array_equal(fold[seeds], fold[filled])
 
 
+@pytest.mark.parametrize("k", [1, 12])
+def test_each_chain_walks_with_the_kernel_of_its_seeds_fold(monkeypatch, k) -> None:
+    """The chain seeded in fold j walks with the covariance fitted outside
+    fold j. Here fold j's factor moves coordinate j alone and the likelihood
+    reads the last coordinate only, so the one walk step is always accepted
+    and the coordinate a new point moved along names the kernel its chain
+    read."""
+    d, m = 4, 60
+    cfg = Config(d, m, num_delete=k, walks=1)
+    folds = cfg._folds
+    fold = np.arange(m) % folds
+    assert folds < d
+
+    def marker(u, mask):  # the fold left out of the mask is the kernel's
+        j = jnp.argmin(jnp.stack([jnp.sum(mask & (fold == i)) for i in range(folds)]))
+        e = jnp.eye(d, dtype=u.dtype)[j]
+        return 1e-2 * e[:, None] * e[None, :]
+
+    monkeypatch.setattr(core, "_live_chol", marker)
+
+    def loglike(x):
+        return -((x[-1] - 0.5) ** 2)
+
+    # Points in [0.2, 0.8]^d: no step of the walk leaves the cube.
+    u = jnp.asarray(np.random.default_rng(1).uniform(0.2, 0.8, (m, d)), FLOAT)
+    state = init(0, loglike, identity, cfg)
+    state = state._replace(u=u, logl=jax.vmap(loglike)(u))
+    new, _ = core._step(state, loglike, identity, cfg)
+    u = np.asarray(u)
+    filled = np.flatnonzero(np.asarray(new.logl_birth) > -np.inf)
+    assert len(filled) == k
+    read = []  # (the fold of the seed, the coordinate its chain moved)
+    for slot in filled:
+        same = u == np.asarray(new.u)[slot]
+        seed = np.flatnonzero(same.sum(axis=1) == d - 1)
+        assert len(seed) == 1  # all coordinates but the moved one agree
+        assert fold[seed[0]] == fold[slot]
+        read.append((int(fold[seed[0]]), int(np.flatnonzero(~same[seed[0]])[0])))
+    assert all(j == moved for j, moved in read), read
+    if k > 1:
+        assert {j for j, _ in read} == set(range(folds))
+
+
 def test_seeds_fall_back_when_a_fold_runs_short() -> None:
     """A fold with too few points above L* reuses them; a fold with none
     borrows from the others (two folds: the parity of the slot)."""
