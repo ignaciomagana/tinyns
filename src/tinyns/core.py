@@ -103,7 +103,10 @@ def default_walks(ndim: int) -> int:
     9 later on), and in high dimensions ``6 ndim`` steps leave a small upward
     logZ bias from that phase. This default keeps the bias below the logZ
     scatter on correlated Gaussians from 2 to 64 dimensions with 250 to 2000
-    live points. It is also enough for a 10-D Rosenbrock from
+    live points, for posteriors that are roughly Gaussian in the unit cube; a
+    nonlinear prior transform that presses most coordinates against faces of
+    the cube can need up to 4 times as many (``ndtri_d6`` in
+    ``bench/validate.py``). It is also enough for a 10-D Rosenbrock from
     ``nlive=1000``.
     """
     return max(25, 6 * ndim, ndim * ndim // 6)
