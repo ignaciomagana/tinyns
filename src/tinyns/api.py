@@ -38,8 +38,8 @@ class NestedSampler:
         chain that skips the likelihood of a proposal rejected without it
         (outside the cube, or by a local-walk or hop Hastings test), for
         expensive likelihoods. In a batch of runs that chain is vmapped over
-        the runs, and it evaluates those proposals too; ``ncall`` (and
-        ``maxcall``) still count only what the run evaluates alone.
+        the runs, and it evaluates those proposals too; ``ncall`` still counts
+        only what the run evaluates alone, and ``maxcall`` limits that count.
     walks:
         Steps per replacement chain, default ``max(25, 6 * ndim, ndim**2 // 6)``
         (:func:`tinyns.core.default_walks`): 6 steps per dimension up to 36

@@ -190,16 +190,21 @@ class State(NamedTuple):
     ``num_delete > 1`` the chains are vmapped and every proposal is evaluated
     (an out-of-cube one at its clip to the cube) and counted. With
     ``num_delete=1`` the other proposals skip the likelihood (``lax.cond``)
-    and are not counted, so ``ncall == ncall_valid``; but under a vmap over
-    runs (a batched :func:`run`, or ``jax.vmap(step)``) the ``cond`` becomes a
+    and are not counted, so ``ncall == ncall_valid``; but in a batched
+    :func:`run`, which vmaps the step over the runs, the ``cond`` becomes a
     select that evaluates them too, uncounted. ``ncall`` thus counts what the
     run alone evaluates, in a batch as well, and ``maxcall`` applies to it.
-    Both are int32, and :func:`run` drains them into host integers after
-    every chunk. A hand-written loop that may exceed ``2**31``
-    calls must count on the host too (``ncall += int(new.ncall - old.ncall)``
-    stays right when the counter wraps) and pass the total to
-    :func:`finalise`. ``logz`` is the running evidence of the dead points,
-    used only to stop; :func:`finalise` recomputes it.
+    Under ``jax.vmap(step)`` the ``lax.switch`` over the three chain kernels
+    also gets a batched index and runs all three, which triples the
+    evaluations (and the recluster ``cond`` computes a recluster at every
+    step); batch runs with :func:`run`, which passes one unbatched kernel
+    level and recluster predicate. Both are int32, and :func:`run` drains
+    them into host integers after every chunk. A hand-written loop that may
+    exceed ``2**31`` calls must count on the host too
+    (``ncall += int(new.ncall - old.ncall)`` stays right when the counter
+    wraps) and pass the total to :func:`finalise`. ``logz`` is the running
+    evidence of the dead points, used only to stop; :func:`finalise`
+    recomputes it.
 
     The log prior volume after the step is ``-it * S + log_x_ties``
     (:func:`_log_x`): ``-it * S`` is recomputed from ``it`` (no running sum
