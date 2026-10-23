@@ -766,7 +766,10 @@ def _split(name: str) -> tuple[str, int]:
 
 
 def mixture_spec(name: str) -> dict | None:
-    """The component weights, means and covariances of a mixture target."""
+    """The component weights, means and covariances of a mixture target.
+
+    For a box variant they are those of the unit-cube target, in
+    ``u = (x - lo) / (hi - lo)``, and ``box`` holds ``(lo, hi)``."""
     fam, d = _split(name)
     mm = re.fullmatch(r"(sep|conn)([WMSX])(tw)?(box)?", fam)
     if mm:
