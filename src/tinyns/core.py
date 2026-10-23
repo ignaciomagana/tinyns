@@ -30,6 +30,7 @@ import dataclasses
 import math
 import os
 import time
+import warnings
 from typing import Any, NamedTuple
 
 import jax
@@ -151,6 +152,20 @@ class Config:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
         _check_int("_folds", self._folds, 2)
+        # Each fold's walk covariance is fitted to the other folds' points,
+        # about (K - 1) / K of nlive, which span fewer than ndim directions
+        # below this: on a 32-D Gaussian nlive 40 left logZ 9 nats high.
+        least = self._folds / (self._folds - 1) * (ndim + 1)
+        if nlive < least:
+            warnings.warn(
+                f"nlive={nlive} is too few for ndim={ndim}: below "
+                f"{math.ceil(least)} live points the walk covariances, fitted to "
+                f"{self._folds - 1} of the {self._folds} folds, cannot span every "
+                "direction, and logZ can be biased far beyond logzerr; use at "
+                "least 5 * ndim",
+                UserWarning,
+                stacklevel=3,
+            )
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
@@ -1249,6 +1264,7 @@ def finalise(
         **({} if dlogz is None else {"dlogz": dlogz}),
         **_mode_info(dead, k, hops, hop_tries),
         "mode_tree": _mode_tree(state),
+        "mode_tree_dropped": _mode_tree_dropped(state),
         "folds": cfg._folds,
     }
     return NestedSamplingResult(
@@ -1313,7 +1329,9 @@ def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
 
 def _mode_tree(state: State) -> list:
     """``[label, parent label]`` of every cluster made by a split (labels as
-    :func:`_reported_label` records them), for ``result.metadata``."""
+    :func:`_reported_label` records them), for ``result.metadata``: the ids
+    below ``TREE_SIZE`` of each clustering (:func:`_mode_tree_dropped` counts
+    the others)."""
     tree, nxt = np.asarray(state.mode_tree), np.asarray(state.mode_next)
     folds = tree.shape[0]
     return [
@@ -1321,6 +1339,13 @@ def _mode_tree(state: State) -> list:
         for j in range(folds)
         for uid in range(1, min(int(nxt[j]), tree.shape[1]))
     ]
+
+
+def _mode_tree_dropped(state: State) -> int:
+    """The number of clusters made by a split whose parent ``mode_tree``
+    did not record: ``TREE_SIZE - 1`` ids per clustering are recorded."""
+    nxt = np.asarray(state.mode_next)
+    return int(np.maximum(nxt - _modes.TREE_SIZE, 0).sum())
 
 
 def _mode_info(dead: Dead, k: int, hops, hop_tries) -> dict:
