@@ -141,6 +141,12 @@ def _hoist_closure_consts(ref, example):
         if any(isinstance(c, _Tracer) for c in consts):
             return None  # it captures a value of an outer trace: nothing to hoist
         jaxpr = closed.jaxpr
+        if getattr(jaxpr, "consts", None):
+            # JAX >= 0.11: a Jaxpr holds its constants (``closed.jaxpr`` is
+            # ``closed``). Drop them, so that the cached ``rebuild`` keeps no
+            # hoisted array alive; it passes every constant to _eval_jaxpr.
+            # Same length: without constants the constvars become invars.
+            jaxpr = jaxpr.replace(consts=[None] * len(jaxpr.consts))
         constvars = jaxpr.constvars
         big = [
             i
