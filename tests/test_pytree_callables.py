@@ -516,6 +516,22 @@ def test_numpy_float_leaves_share_one_compile(backend_compiles) -> None:
     assert_same_result(results[1], run(loglike, plain_prior, maxiter=40))
 
 
+def test_batched_numpy_float_scalar_needs_the_lane_axis() -> None:
+    # Under batched_data a NumPy float scalar is an array leaf like the data,
+    # so it needs the lane axis; the error names what a shared value takes.
+    keys = random.split(random.PRNGKey(0), 2)
+    data = jnp.stack([make_data(10), make_data(12)[:10]])
+
+    def sampler(scale):
+        loglike = jax.tree_util.Partial(scaled_loglike_fn, data, scale)
+        return NestedSampler(loglike, plain_prior, NDIM, 40, num_delete=4)
+
+    with pytest.raises(ValueError, match=r"got shape \(\) .*as a Python float"):
+        sampler(np.float64(0.5)).run(keys, batched_data=True)
+    results = sampler(0.5).run(keys, batched_data=True, maxiter=20)
+    assert all(np.isfinite(r.logz) for r in results)
+
+
 def make_closure_prior(bounds):
     def prior(u):
         return prior_fn(bounds[:, :NDIM], u)

@@ -1532,9 +1532,15 @@ def run(
             )
         for leaf, axis in zip(leaves, axes, strict=True):
             if axis == 0 and (leaf.ndim == 0 or leaf.shape[0] != batch):
+                hint = (
+                    " (a NumPy float scalar or 0-d array is an array leaf too:"
+                    " pass a value shared by all runs as a Python float)"
+                    if leaf.ndim == 0
+                    else ""
+                )
                 raise ValueError(
                     f"batched_data: every array leaf needs a leading axis of "
-                    f"{batch} lanes, got shape {leaf.shape}"
+                    f"{batch} lanes, got shape {leaf.shape}{hint}"
                 )
     _check_prior_transform(
         _lane_callable(prior_transform, 0) if batched_data else prior_transform,
