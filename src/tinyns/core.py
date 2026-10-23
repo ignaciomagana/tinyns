@@ -1572,8 +1572,10 @@ def run(
             ncall[lane] += int(calls[lane])
             ncall_valid[lane] += int(valid[lane])
             n = int(count[lane])
+            # A copy: a view would keep the chunk's whole buffer (every lane,
+            # the full capacity) alive until the rows are concatenated.
             rows_by_lane[lane].append(
-                jax.tree_util.tree_map(lambda r, n=n, b=lane: r[:n, b], rows)
+                jax.tree_util.tree_map(lambda r, n=n, b=lane: np.array(r[:n, b]), rows)
             )
             if status[lane] == MAXCALL and (maxcall is None or ncall[lane] < maxcall):
                 status[lane] = RUNNING  # only the int32 window of the budget was used
