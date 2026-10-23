@@ -7,9 +7,12 @@ with frames fitted to the other half only (cross-fitting), must end in each
 mode in proportion to its volume. A control fits the frames to a set that
 includes the seed (no cross-fitting) and must fail, so the test has the power
 to see a seed in its own kernel. ``pytest -m slow`` runs it with 10^6 chains,
-which resolves 0.5% of the minor fraction. The local walk has its own test on
-one region cut into two frames of different shapes, where its proposal is not
-symmetric; a walk without the Hastings ratio fails it.
+which resolves 0.5% of the minor fraction. The two modes are far apart, so no
+point is in two ellipsoids; a second invariance test cuts one box into two
+frames whose ellipsoids overlap, where the hop's ratio of ellipsoid counts
+matters. The local walk has its own test on one region cut into two frames
+of different shapes, where its proposal is not symmetric; a walk without the
+Hastings ratio fails it.
 """
 
 from __future__ import annotations
@@ -184,12 +187,99 @@ def test_hop_proposal_is_uniform_on_the_eligible_ellipsoids() -> None:
     assert 0.0 <= uniform.min() and uniform.max() < 1.0
 
 
+def test_hop_accept_weighs_the_ellipsoids_that_hold_each_point() -> None:
+    """``q`` counts the eligible ellipsoids that hold a point: from a point in
+    one ellipsoid to a point in two the hop is accepted when ``U < 1/2``, in
+    three when ``U < 1/3``, and back always. An ellipsoid that is not
+    eligible does not count, and a proposal in none is refused."""
+    dtype = jnp.result_type(float)
+    r2max = modes.ELL_R2_PER_DIM * (D + 2.0)
+    eligible = jnp.asarray([True, True, True, False])
+    uniform = jnp.asarray((np.arange(1000) + 0.5) / 1000, dtype)
+
+    def r2(held):  # inside the ellipsoids ``held``, far outside the others
+        return jnp.asarray([0.5 * r2max if c in held else 2.0 * r2max
+                            for c in range(4)], dtype)
+
+    def accept(old, new):
+        return jax.vmap(
+            lambda v: modes.hop_accept(v, eligible, r2(new), r2(old), D)
+        )(uniform)
+
+    cases = [  # (ellipsoids of the old point, of the new, acceptance)
+        ({0}, {0, 1}, 1 / 2),
+        ({0}, {0, 1, 2}, 1 / 3),
+        ({0, 1}, {0, 1, 2}, 2 / 3),
+        ({1, 2}, {0, 1}, 1.0),
+        ({0, 1, 2}, {1}, 1.0),
+        ({0}, {0, 3}, 1.0),
+        ({0}, {3}, 0.0),
+        ({0}, set(), 0.0),
+    ]
+    for old, new, rate in cases:
+        np.testing.assert_array_equal(
+            accept(old, new), uniform < rate, err_msg=f"from {old} to {new}"
+        )
+
+
 def test_hop_keeps_the_constrained_prior() -> None:
     n = 20_000
     fraction, hops, tries = invariance(n, seed=2)
     assert tries == n * (WALKS // modes.HOP_EVERY)  # two eligible frames
     assert hops > 0.02 * tries
     assert abs(z_score(fraction, n)) < 4.0
+
+
+@pytest.mark.parametrize("local", [True, False])
+def test_hop_keeps_the_constrained_prior_where_the_ellipsoids_overlap(local) -> None:
+    """The two balls of :func:`invariance` are far apart: no point is in both
+    ellipsoids, and the hop's ratio of ellipsoid counts is always 1. Here one
+    box is cut into two frames whose ellipsoids overlap across the cut, where
+    the proposal is twice as dense. With the ratio the chains keep the
+    uniform law (a share of them in the overlap equal to its volume share);
+    a hop that took ``q`` for the indicator of the union of the ellipsoids
+    would pile them up there (z ~ +26)."""
+    lo, hi = 0.2, 0.8
+    dtype = jnp.result_type(float)
+    r2max = modes.ELL_R2_PER_DIM * (D + 2.0)
+
+    def box(u):
+        return jnp.where(jnp.all((u > lo) & (u < hi)), 0.0, -1.0)
+
+    rng = np.random.default_rng(3)
+    x = rng.uniform(lo, hi, (200, D))
+    lab = jnp.asarray(x[:, 0] > 0.5, jnp.int32)
+    x = jnp.asarray(x, dtype)
+    fr = modes.frames(modes.stats(x, lab, modes.C_MAX), 400)
+    assert int(jnp.sum(fr.eligible)) == 2
+    chol = core._live_chol(x, jnp.ones(200, bool))
+
+    count = jax.jit(jax.vmap(
+        lambda v: jnp.sum(fr.eligible & (modes.mahalanobis(fr, v)[0] <= r2max))
+    ))
+    nshare = 200_000
+    share = float(jnp.mean(
+        count(jnp.asarray(rng.uniform(lo, hi, (nshare, D)), dtype)) >= 2
+    ))
+    assert 0.03 < share < 0.1  # 0.05 of the box is in both ellipsoids
+    n = 20_000
+    seeds = jnp.asarray(rng.uniform(lo, hi, (n, D)), dtype)
+
+    def chain(key, s):
+        return core._chain(
+            key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), chol,
+            jnp.asarray(SCALE, dtype), box, lambda v: v, WALKS, False, fr, True,
+            local,
+        )
+
+    u, _, _, _, _, hops, tries = jax.jit(jax.vmap(chain))(
+        random.split(random.PRNGKey(11), n), seeds
+    )
+    assert int(jnp.sum(tries)) == n * (WALKS // modes.HOP_EVERY)
+    assert int(jnp.sum(hops)) > 0.2 * int(jnp.sum(tries))
+    fraction = float(jnp.mean(count(u) >= 2))
+    z = (fraction - share) / math.sqrt(share * (1 - share) * (1 / n + 1 / nshare))
+    assert abs(z) < 4.0, f"overlap {fraction:.4f} (volume {share:.4f}) z={z:+.2f}"
 
 
 @pytest.mark.slow
