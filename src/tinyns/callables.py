@@ -129,7 +129,8 @@ def _hoist_closure_consts(ref, example):
     whose arguments do not match ``example`` runs the callable itself.
     ``rebuild`` keeps the jaxpr, the small constants and ``ref`` (a weak
     reference), never the callable or the hoisted arrays. ``None`` (closure
-    semantics) means there is nothing to hoist or tracing failed.
+    semantics) means there is nothing to hoist or tracing failed. The hoisted
+    arrays are concrete even when this runs inside a user's ``jax.jit``.
     """
     if _eval_jaxpr is None:
         return None
@@ -138,7 +139,7 @@ def _hoist_closure_consts(ref, example):
         closed, out_shape = jax.make_jaxpr(fn, return_shape=True)(example)
         consts = list(closed.consts)
         if any(isinstance(c, _Tracer) for c in consts):
-            return None  # traced under an outer transformation: do not cache
+            return None  # it captures a value of an outer trace: nothing to hoist
         jaxpr = closed.jaxpr
         constvars = jaxpr.constvars
         big = [
@@ -146,9 +147,15 @@ def _hoist_closure_consts(ref, example):
             for i, (c, var) in enumerate(zip(consts, constvars, strict=True))
             if np.size(c) >= _HOIST_MIN_SIZE and jnp.shape(c) == var.aval.shape
         ]
-        hoisted = tuple(
-            jnp.asarray(consts[i], dtype=constvars[i].aval.dtype) for i in big
-        )
+        # Converted now even under a user's jit, where jnp.asarray would be
+        # staged and return a tracer of that trace: the split is cached, and
+        # a cached tracer breaks every later use of the callable.
+        with jax.ensure_compile_time_eval():
+            hoisted = tuple(
+                jnp.asarray(consts[i], dtype=constvars[i].aval.dtype) for i in big
+            )
+        if any(isinstance(h, _Tracer) for h in hoisted):
+            return None
     except Exception as exc:  # noqa: BLE001 - any failure keeps closure semantics
         _logger.debug("tinyns: not hoisting constants of %r: %r", fn, exc)
         return None

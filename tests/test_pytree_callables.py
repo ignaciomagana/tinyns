@@ -302,6 +302,59 @@ def test_nested_jit_operand_is_hoisted() -> None:
     assert_same_result(run(loglike), run(partial))
 
 
+def first_hoisted_inside_a_user_jit(data):
+    """A closure over ``data`` whose constant is first hoisted inside the
+    user's ``jax.jit`` around ``init``; returns it and that state."""
+
+    def loglike(theta):
+        return -0.5 * jnp.sum(((theta - jnp.min(data)) / 0.1) ** 2)
+
+    state = jax.jit(lambda key: core.init(key, loglike, closure_prior, CFG))(
+        random.PRNGKey(0)
+    )
+    return loglike, state
+
+
+@pytest.mark.parametrize("kind", ["float64", "float32", "weak"])
+@pytest.mark.usefixtures("fresh_caches")
+def test_closure_first_hoisted_inside_a_user_jit_is_cached_concrete(kind) -> None:
+    # Converting a NumPy or weak-typed constant is staged under the user's
+    # jit; the cached hoisted leaf was a tracer of that trace, and every later
+    # use of the closure raised UnexpectedTracerError.
+    n = 2 * _SMALLEST_HOISTED
+    data = {
+        "float64": np.full(n, 0.2),
+        "float32": np.full(n, 0.2, np.float32),
+        "weak": jnp.full(n, 0.2),
+    }[kind]
+    loglike, state = first_hoisted_inside_a_user_jit(data)
+    (hoisted,) = _callable_leaves(loglike, closure_prior, NDIM)
+    assert isinstance(hoisted, jax.Array)
+    assert not isinstance(hoisted, jax.core.Tracer)
+    state, _ = core.step(state, loglike, closure_prior, CFG)  # eager
+    assert np.all(np.isfinite(state.logl))
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_numpy_closure_first_hoisted_inside_a_user_jit_runs_everywhere() -> None:
+    data = np.full(2 * _SMALLEST_HOISTED, 0.2)
+    loglike, state = first_hoisted_inside_a_user_jit(data)
+
+    def steps(state, length):
+        def body(state, _):
+            return core.step(state, loglike, closure_prior, CFG)
+
+        return jax.lax.scan(body, state, None, length=length)[0]
+
+    state = steps(state, 2)  # lax.scan, eager
+    jitted = jax.jit(steps, static_argnums=1)
+    for length in (2, 3):  # the second call retraces
+        assert np.all(np.isfinite(jitted(state, length).logl))
+    result = run(loglike, maxiter=40)
+    assert np.isfinite(result.logz)
+    assert np.all(np.isfinite(result.samples))
+
+
 @pytest.mark.usefixtures("fresh_caches")
 def test_hoisted_one_dimensional_closure_and_prior() -> None:
     # ndim=1 with a scalar-returning prior transform that also captures a
