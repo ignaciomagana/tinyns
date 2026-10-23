@@ -85,14 +85,16 @@ SLAB_NEIGHBOURS = 8
 # clustering found two, while the dips between the lumps of needle_d18
 # bottom out 7.8 to 9.0 above the bulk (8 runs) and a 2-D pair 3 sigma apart
 # stays one mode (0.08 to 0.16 above). With both tests, pass 6 keeps equal
-# Gaussians apart from about 3.3 sigma in 2-D, 3.9 in 3-D, 4.8 in 5-D and
-# 5.2 in 6-D, and from 5.4 (the depth) on in 7-D and up, but only where
-# passes 1 to 5 separated them: at 5 sigma in 5-D they did in 4 of 16 runs.
-# Nor does it help a close mode of less mass: the clustering leaves it in
-# the labels it split the heavier one from, which also hold both modes'
-# points from before the split, and passes 2 and 3 merge the two. In 2-D a
-# mode of mass 0.1 or 0.2 at 4.5 to 5.5 sigma was one mode with the other in
-# all 40 runs, and a 0.1 mode at 6.5 sigma in 9 of 16 (nlive 500).
+# Gaussians apart from about 2.5 sigma in 1-D (a dip of 0.13: two modes in
+# 32 of 32 runs at nlive 200 and 500, one at 2.2 sigma), 3.3 in 2-D, 3.9 in
+# 3-D, 4.8 in 5-D and 5.2 in 6-D, and from 5.4 (the depth) on in 7-D and up,
+# but only where passes 1 to 5 separated them: at 5 sigma in 5-D they did in
+# 7 of 32 runs. Nor does it help a close mode of less mass: the clustering
+# leaves it in the labels it split the heavier one from, which also hold
+# both modes' points from before the split, and passes 2 and 3 merge the
+# two. In 2-D a mode of mass 0.1 or 0.2 at 4.5 to 5.5 sigma was one mode
+# with the other in 70 of 72 runs (a 0.2 mode at 5 sigma was kept apart in
+# 2 of 16), and a 0.1 mode at 6.5 sigma in 18 of 32 (nlive 500).
 SADDLE_DEPTH = 3.0
 SADDLE_BINS = 16
 # The sampler's clustering separated a mode if at least SEPARATED_SHARE of
@@ -767,14 +769,15 @@ class NestedSamplingResult:
            leave gaps as separate modes do, but the dead points show no
            saddle between them. In few dimensions the bulk of a mode lies
            close to its peak, and a shallow dip below the bulk of both
-           separates two modes (equal Gaussians from about 3.3 standard
-           deviations apart in 2-D, 3.9 in 3-D, against 5.4 from the depth
-           alone), if the passes before separated them. A close mode of
-           less mass is not separated before: the clustering leaves it in
-           the labels it split the heavier one from (in 2-D a mode of mass
-           0.1 was one mode with the other up to about 6.5 standard
-           deviations apart). A lump joined to its mode only along a curved
-           path (a funnel neck) is not found this way.
+           separates two modes (equal Gaussians from about 2.5 standard
+           deviations apart in 1-D, 3.3 in 2-D, 3.9 in 3-D, against 5.4
+           from the depth alone), if the passes before separated them. A
+           close mode of less mass is mostly not separated before: the
+           clustering leaves it in the labels it split the heavier one from
+           (in 2-D a mode of mass 0.1 or 0.2 was one mode with the other in
+           nearly all runs at 4.5 to 5.5 standard deviations apart, and a
+           0.1 mode in about half of them at 6.5). A lump joined to its mode
+           only along a curved path (a funnel neck) is not found this way.
 
         Each mode's live count ``n(t)`` is rebuilt from the birth and death
         iterations. The mode is isolated from the first iteration at which
@@ -815,7 +818,13 @@ class NestedSamplingResult:
         0.053, 0.046 and 0.065 and ``fold_sd / sqrt(3)`` of 0.015, 0.012 and
         0.027; for modes of one height ``run_sd`` is ``fold_sd / sqrt(3)``.
         Three folds give two degrees of freedom, so one run's value is good
-        to a factor of about 2.
+        to a factor of about 2. That holds for runs that kept every mode: a
+        run that lost a mode, or most of one, lies far outside its
+        ``run_sd``, and the warnings of :meth:`diagnostics` need not say so.
+        On 16 other seeds of the mixture above, one run kept 0.47 of the
+        0.75 mode (logZ 9 ``logzerr`` low), and the masses scattered by
+        0.31, 0.25 and 0.27; without it by 0.069, 0.058 and 0.101, against
+        a median ``run_sd`` of 0.053, 0.048 and 0.062.
 
         Per mode: ``mass``, ``urn_sd``, ``fold_mass``, ``fold_sd``,
         ``run_sd`` (``None`` without folds), ``min_live`` (the smallest ``n``
