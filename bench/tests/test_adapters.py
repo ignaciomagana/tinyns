@@ -3,9 +3,123 @@ stops, the padded batches of the CPU likelihood, and the headline's cells."""
 
 from __future__ import annotations
 
+import contextlib
+import math
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
+from bench import adapters
+from bench.targets import get_target
+
+# The XLA compile of one program (or its load from the persistent cache).
+BACKEND_COMPILE = "/jax/core/compile/backend_compile_duration"
+
+
+@contextlib.contextmanager
+def backend_compiles():
+    """Collect the duration of every XLA compile inside the block."""
+    import jax
+
+    seen, on = [], [True]
+
+    def listen(event, duration, **_):
+        if on[0] and event == BACKEND_COMPILE:
+            seen.append(duration)
+
+    jax.monitoring.register_event_duration_secs_listener(listen)
+    try:
+        yield seen
+    finally:
+        on[0] = False  # JAX 0.4 has no public way to unregister it
+
+
+def _warm_keys():
+    """Compile the key ops the adapters run before their timers start."""
+    import jax
+
+    jax.random.split(jax.random.PRNGKey(0))
+
+
+@pytest.mark.parametrize("name", ["blackjax_nss"])
+def test_compile_s_covers_every_compile_of_the_run(name):
+    """Every XLA compile of a run is inside ``compile_s``, so ``wall - compile``
+    is a compiled run. BlackJAX's eager post-processing used to compile in
+    ``run s`` (about 9 s of a BlackJAX run on the H100). ``nlive`` 120 keeps
+    the kernels of the other tests out of the way."""
+    reason = adapters.unavailable_reason(name)
+    if reason:
+        pytest.skip(reason)
+    _warm_keys()
+    cfg = dict(nlive=120, dlogz=0.1, variant="default", opts={})
+    with backend_compiles() as seen:
+        out = adapters.load(name).run(get_target("gauss_d2"), 3, cfg)
+    assert seen, "nothing compiled: the test cannot see the split"
+    assert sum(seen) <= out["compile_s"] + 0.05, (sum(seen), out["compile_s"])
+    assert out["compile_s"] < out["wall_s"]
+
+
+def _blackjax_reference(target, seed, nlive, dlogz):
+    """The adapter's run, one step at a time: (steps, calls) at the first step
+    whose state meets the stopping rule. The keys are the adapter's (each
+    chunk of ``2 * ceil(nlive / k)`` steps splits one key)."""
+    import blackjax
+    import jax
+    import jax.numpy as jnp
+
+    d, k = target.ndim, max(1, nlive // 10)
+    nsteps = 2 * math.ceil(nlive / k)
+
+    def loglike_u(u):
+        inside = jnp.all((u >= 0.0) & (u <= 1.0))
+        ll = target.loglike(target.prior_transform(jnp.clip(u, 0.0, 1.0)))
+        return jnp.where(inside, ll, -jnp.inf)
+
+    def logprior_u(u):
+        return jnp.where(jnp.all((u >= 0.0) & (u <= 1.0)), 0.0, -jnp.inf)
+
+    algo = blackjax.nss(
+        logprior_fn=logprior_u, loglikelihood_fn=loglike_u, num_delete=k,
+        num_inner_steps=max(5, 2 * d),
+    )
+
+    @jax.jit
+    def step(state, key):
+        state, info = algo.step(key, state)
+        ui = info.update_info
+        lz, lzl = state.integrator.logZ, state.integrator.logZ_live
+        calls = jnp.sum(2 + ui.num_expansions + ui.num_shrink)
+        return state, calls, jnp.logaddexp(lz, lzl) - lz < dlogz
+
+    key, k_init = jax.random.split(jax.random.PRNGKey(seed))
+    state = jax.jit(algo.init)(jax.random.uniform(k_init, (nlive, d)))
+    steps, calls = 0, nlive
+    while True:
+        key, sub = jax.random.split(key)
+        for step_key in jax.random.split(sub, nsteps):
+            state, c, done = step(state, step_key)
+            steps, calls = steps + 1, calls + int(c)
+            if done:
+                return steps, calls
+
+
+def test_blackjax_stops_at_the_first_step_that_meets_dlogz():
+    """The rule is tested after every step, as in a step-by-step loop; the
+    adapter used to test it once per 20-step chunk and ran on (+18-20% calls
+    on the 2-D targets at nlive 500)."""
+    reason = adapters.unavailable_reason("blackjax_nss")
+    if reason:
+        pytest.skip(reason)
+    t = get_target("gauss_d2")
+    cfg = dict(nlive=100, dlogz=0.1, variant="default", opts={})
+    for seed in (0, 1):
+        out = adapters.load("blackjax_nss").run(t, seed, cfg)
+        steps, calls = _blackjax_reference(t, seed, 100, 0.1)
+        assert (out["config"]["niter_steps"], out["ncall"]) == (steps, calls)
+        assert abs(out["logz"] - t.logz) < 5 * max(out["logzerr"], 0.2)
+    # maxiter stops at that step, not at the end of a chunk
+    out = adapters.load("blackjax_nss").run(t, 0, dict(cfg, opts={"maxiter": "7"}))
+    assert out["config"]["niter_steps"] == 7
 
 
 def test_vectorized_likelihood_compiles_once_per_power_of_two():
@@ -29,3 +143,5 @@ def test_vectorized_likelihood_compiles_once_per_power_of_two():
         assert np.allclose(f(x), -0.5 * np.sum(x**2, axis=1))
     assert len(traces) == 7
     assert f(np.ones(3)).shape == (1,)  # one point, as UltraNest sends it
+
+
