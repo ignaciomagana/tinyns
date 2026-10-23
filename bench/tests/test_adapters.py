@@ -149,6 +149,10 @@ def test_blackjax_stops_at_the_first_step_that_meets_dlogz():
     # maxiter stops at that step, not at the end of a chunk
     out = adapters.load("blackjax_nss").run(t, 0, dict(cfg, opts={"maxiter": "7"}))
     assert out["config"]["niter_steps"] == 7
+    # and one past the int32 range is no limit (the loop compares in int32)
+    big = dict(cfg, opts={"maxiter": str(2**31)})
+    out = adapters.load("blackjax_nss").run(t, 1, big)
+    assert (out["config"]["niter_steps"], out["ncall"]) == (steps, calls)
 
 
 def test_vectorized_likelihood_compiles_once_per_power_of_two():

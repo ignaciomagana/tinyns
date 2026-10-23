@@ -29,7 +29,8 @@ for the persistent compilation cache: the post-processing is run once more
 after the timed run, and the difference of the two times is counted as
 compilation. ``config`` keeps both (``post_first_s``, ``post_s``).
 
-Options: ``num_delete``, ``num_inner_steps``, ``maxiter`` (NS steps).
+Options: ``num_delete``, ``num_inner_steps``, ``maxiter`` (NS steps, clamped
+to ``2**31 - 1``).
 """
 
 from __future__ import annotations
@@ -64,7 +65,8 @@ def run(target, seed, cfg):
     d, nlive = target.ndim, int(cfg["nlive"])
     num_delete = int(opts.get("num_delete", max(1, nlive // 10)))
     num_inner = int(opts.get("num_inner_steps", max(5, 2 * d)))
-    maxiter = int(opts.get("maxiter", 10_000_000))
+    # the loop compares it with an int32 step count
+    maxiter = min(int(opts.get("maxiter", 10_000_000)), np.iinfo(np.int32).max)
     nsteps = 2 * math.ceil(nlive / num_delete)
     dlogz = float(cfg["dlogz"])
 
