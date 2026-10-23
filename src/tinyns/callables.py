@@ -6,7 +6,10 @@ cache key) plus their array leaves (jit arguments). Pytree callables split into
 their array leaves and their static structure; closures and plain functions
 have their large jaxpr constants hoisted, and are cached by identity through a
 weak reference. The kernel builders are cached on the specs
-(:func:`_kernel_cache`), so a cache never holds a dataset.
+(:func:`_kernel_cache`), so a cache never holds an array leaf or a hoisted
+constant. An array embedded in the compiled program (captured by the function
+of a ``Partial`` with array arguments, or inside an inner ``jax.jit`` or
+``custom_jvp`` of a closure) stays alive while its kernels are cached.
 """
 
 from __future__ import annotations
@@ -94,20 +97,23 @@ def _partition_callable(fn):
     ``dynamic`` is the tuple of array leaves of
     ``jax.tree_util.tree_flatten(fn)``: ``jax.Array``, ``np.ndarray`` and
     NumPy floating and complex scalars (``sigmas[i]`` of a NumPy array).
-    ``static`` holds the treedef and every other leaf: Python scalars, NumPy
-    integers and booleans (equinox traces these; here they may size shapes
-    and steer Python control flow) and any other object. They are part of
-    the compiled program, so each new value compiles again: wrap a
-    per-dataset Python float in ``jnp.asarray``. The compiled kernels take
-    ``dynamic`` as explicit jit arguments and rebuild ``fn`` inside the trace
-    with :func:`_combine_callable`, so large data are not embedded as
+    ``static`` holds the treedef and every other leaf: Python scalars (static
+    in equinox too), NumPy integers and booleans (equinox traces these; here
+    they stay static because they may size shapes and steer Python control
+    flow) and any other object. They are part of the compiled program, so
+    each new value compiles again: wrap a per-dataset Python float in
+    ``jnp.asarray``. A NumPy float leaf is traced, so Python control flow or
+    a shape on it raises: pass a Python float there. The compiled kernels
+    take ``dynamic`` as explicit jit arguments and rebuild ``fn`` inside the
+    trace with :func:`_combine_callable`, so large data are not embedded as
     constants.
 
     An array that the treedef holds is not a leaf. The function of a
     ``Partial`` is part of its structure, so an array that function captures
     is embedded in the compiled program, and the kernel caches keep it alive
     until they drop the spec: pass shared arrays as arguments of the
-    ``Partial``.
+    ``Partial``. This holds as soon as the ``Partial`` has one dynamic leaf,
+    a NumPy float scalar included; without one it is split like a closure.
 
     A plain function or closure flattens to ``[fn]``: ``dynamic`` is empty and
     :func:`_combine_callable` returns ``fn`` itself (closure semantics). Such
@@ -153,6 +159,10 @@ def _hoist_closure_consts(ref, example):
     reference), never the callable or the hoisted arrays. ``None`` (closure
     semantics) means there is nothing to hoist or tracing failed. The hoisted
     arrays are concrete even when this runs inside a user's ``jax.jit``.
+    Only the constants of the top-level jaxpr are lifted: an array captured
+    inside the body of an inner ``jax.jit`` or by the rule of a
+    ``custom_jvp`` stays embedded in the jaxpr's equations, and so alive
+    while the kernels are cached.
     """
     if _eval_jaxpr is None:
         return None
