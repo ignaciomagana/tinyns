@@ -61,9 +61,10 @@ both, with the same printed digits. The rows were not rerun.
   small ones compile again in every process, and `wall s` includes them.
   `run s` is wall minus `compile s`, where the sampler times its
   compilation apart (tinyns and BlackJAX; JAXNS does not). In these records
-  it still holds some compilation: about 9 s per BlackJAX run, and the init
-  kernel and prior map of tinyns (Known gaps). `first s` is the first seed
-  of the cell, which compiled everything: a cold start.
+  it still holds some compilation: the first-call compiles of BlackJAX's
+  eager ops, inside a fixed cost of about 9 s per run, and the init kernel
+  and prior map of tinyns (Known gaps). `first s` is the first seed of the
+  cell, which compiled everything: a cold start.
 - **Likelihood calls** are what each sampler counts. tinyns counts every
   evaluation, the out-of-cube lanes of its vmapped chains included; BlackJAX
   and JAXNS do not count the lanes that idle inside a vmap. BlackJAX's
@@ -92,18 +93,20 @@ default 1000).**
 - No run of tinyns v1 timed out or raised an error (2240 runs).
 - **Time.** A compiled run takes 1.1 to 20 s on the H100 and a first run 9 to
   31 s. BlackJAX NSS's `run s` is 9.0 to 77 s, but about 9 s of every run is
-  a fixed cost, the compilation of its post-processing (Known gaps): over its
-  24 cells at nlive 500, `run s` = 9.3 s + 62 us per call of a chain (ncall /
-  num_delete; R² = 0.998), against 1.95 s + 14.7 us for tinyns (R² =
-  0.95). Its ratio to tinyns's compiled time, 4.0 to 8.1 as recorded, is
-  therefore mostly that fixed cost at low d; the ratio of the slopes is 4.2,
-  and past both fixed costs it is 3.9 to 5.2 on the four cells where
-  BlackJAX's run is more than three times its fixed cost (`gauss_d64` and
-  the three 32-D mixtures). JAXNS takes 16 to 360 s with its programs
-  cached (7 s to 19 min at its default chain count), and tinyns 0.x 6 to
-  510 s. The CPU samplers take from 6 s (dynesty, 2-D) to more than 4 h on
-  4 cores; that is a different machine and a likelihood called from Python,
-  so it measures a workflow and not an algorithm.
+  a fixed cost: over its 24 cells at nlive 500, `run s` = 9.3 s + 62 us per
+  call of a chain (ncall / num_delete; R² = 0.998), against 1.95 s + 14.7 us
+  for tinyns (R² = 0.95). On CPU the old adapter's fixed cost is almost all
+  first-call compilation of its eager ops, mostly its post-processing. The
+  H100's was not split; that it is the same compilation is an inference
+  (Known gaps). Its ratio to tinyns's compiled time, 4.0 to 8.1 as recorded,
+  is therefore mostly that fixed cost at low d; the ratio of the slopes is
+  4.2, and past both fixed costs it is 3.9 to 5.2 on the four cells where
+  BlackJAX's run is more than three times its fixed cost (`gauss_d64` and the
+  three 32-D mixtures). JAXNS takes 16 to 360 s with its programs cached (7 s
+  to 19 min at its default chain count), and tinyns 0.x 6 to 510 s. The CPU
+  samplers take from 6 s (dynesty, 2-D) to more than 4 h on 4 cores; that is
+  a different machine and a likelihood called from Python, so it measures a
+  workflow and not an algorithm.
 - **Likelihood calls.** tinyns v1 is not the sampler with the fewest calls.
   - Nautilus needs 1.7 to 24 times fewer calls than tinyns at nlive 500, and
     reaches an rms 2 to 28 times smaller with them. Where it is accurate it
@@ -207,16 +210,21 @@ move, and CPU measurements the fifth.
   and Nautilus's own 2000). The headline ratios use tinyns at 500 and 1000
   and correct for the difference with the costs at equal rms.
 - **Adapter faults in these records, fixed since.** The H100 cells were
-  not measured again with the fixed adapters; that rerun is a follow-up.
-  - *BlackJAX's `run s` holds a fixed cost of about 9 s, its compiles.* Its
+  not measured again with the fixed adapters; that rerun is a follow-up,
+  and it would also measure how much of BlackJAX's fixed cost is
+  compilation.
+  - *BlackJAX's `run s` holds the compiles of its eager ops.* Its
     post-processing (`finalise`, `log_weights`, the prior map) runs op by
-    op on arrays whose length depends on the run, so each op compiled on
-    its first call in every process, outside `compile s`, and each is too
-    small for the persistent cache. The fit above puts that fixed cost at
-    9.3 s per run on the H100 (tinyns's is 1.95 s). On CPU, in a fresh
-    process with a warm cache, it is 2.3 to 2.4 s of a `run s` of 2.4 s on
-    `gauss_d2` and 2.8 s on `gauss_d8`; with the fix the two take 0.07 and
-    0.38 s.
+    op on arrays whose length depends on the run, as did the key splits,
+    reshapes and sums between its chunks and the draw of its initial
+    points, so each op compiled on its first call in every process,
+    outside `compile s`, and each is too small for the persistent cache. On
+    CPU, in a fresh process with a warm cache, these compiles are 2.3 to
+    2.4 s of a `run s` of 2.4 s on `gauss_d2` and 2.8 s on `gauss_d8`; with
+    the fix the two take 0.07 and 0.38 s. On the H100 the fit above puts a
+    fixed cost of 9.3 s in every run (tinyns's is 1.95 s), but the records
+    do not split it: that it is mostly these compiles is inferred from the
+    CPU measurement.
   - *tinyns's `run s` holds its init kernel and prior map*, which compiled
     (or loaded) inside the timed run; `compile s` was the step kernel only.
     On CPU that is 0.35 to 0.39 s of a `run s` of 0.5 s on `gauss_d2` and
