@@ -293,16 +293,17 @@ def test_seeds_fall_back_when_a_fold_runs_short() -> None:
 
 
 def test_walk_mask_falls_back_when_too_few_points_remain() -> None:
+    """Fewer than ndim + 1 points of the other folds above L*: every point of
+    the other folds (still cross-fitted, of full rank); all live points only
+    when even those are too few."""
     above = jnp.asarray([True] * 6 + [False] * 4)
-    other = jnp.asarray([True, False] * 5)  # 3 even points above L*
-    seeds = jnp.asarray([1, 3])
+    other = jnp.asarray([True, False] * 5)  # 3 even points above L*, 5 in all
     np.testing.assert_array_equal(
-        core._walk_mask(above, other, seeds, 2), np.asarray(above & other)
+        core._walk_mask(above, other, 2), np.asarray(above & other)
     )
-    held_out = np.asarray(above).copy()
-    held_out[[1, 3]] = False  # 4 points: the step's seeds left out
-    np.testing.assert_array_equal(core._walk_mask(above, other, seeds, 3), held_out)
-    np.testing.assert_array_equal(core._walk_mask(above, other, seeds, 4), above)
+    np.testing.assert_array_equal(core._walk_mask(above, other, 3), np.asarray(other))
+    np.testing.assert_array_equal(core._walk_mask(above, other, 4), np.asarray(other))
+    np.testing.assert_array_equal(core._walk_mask(above, other, 5), np.ones(10, bool))
     # A step on a nearly exhausted live set still runs: 2 points above L*,
     # both seeds, in 2-D.
     cfg = Config(2, 4, num_delete=2, walks=5)

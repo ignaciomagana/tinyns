@@ -303,7 +303,7 @@ def _live_chol(u, mask):
     return std[:, None] * chol
 
 
-def _walk_mask(above, other, seeds, ndim):
+def _walk_mask(above, other, ndim):
     """The live points whose covariance shapes the walk of the chains seeded
     in one fold: the points ``other`` (outside the fold) above ``L*``.
 
@@ -317,14 +317,19 @@ def _walk_mask(above, other, seeds, ndim):
     order ``ndim / nlive``, which overestimated logZ unless the walks were
     long.
 
-    When fewer than ``ndim + 1`` such points remain (a nearly exhausted live
-    set) the points above ``L*`` other than the step's seeds are used, and
-    the seeds too if that is still too few, so the covariance has full rank.
+    When fewer than ``ndim + 1`` of them lie above ``L*`` (at the start of a
+    run whose likelihood is ``-inf`` or tied on most of the prior, or on a
+    nearly exhausted live set), every point outside the fold is used, those
+    at or below ``L*`` too: the covariance stays cross-fitted and of full
+    rank, and spans the region the few points above ``L*`` were drawn from.
+    (Falling back to the points above ``L*`` of every fold, the seeds among
+    them, kept the chains near the few finite points of a run's start, and
+    logZ came out several ``logzerr`` high in 10 and 20 dimensions.) Only
+    when the live set is too small for that (``nlive`` below about ``1.5
+    (ndim + 1)``) are all live points used.
     """
-    m = above.shape[0]
-    held_out = above & ~jnp.zeros((m,), bool).at[seeds].set(True)
-    mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, held_out)
-    return jnp.where(jnp.sum(mask) >= ndim + 1, mask, above)
+    mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, other)
+    return jnp.where(jnp.sum(mask) >= ndim + 1, mask, jnp.ones_like(mask))
 
 
 def _hop_steps(walks: int, n_hops: int) -> np.ndarray:
@@ -817,7 +822,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # covariance, the cluster frames of the hop and of the local walk) is
     # built from the points outside fold j alone.
     chols = jnp.stack([
-        _live_chol(state.u, _walk_mask(above, fold != j, seeds, cfg.ndim))
+        _live_chol(state.u, _walk_mask(above, fold != j, cfg.ndim))
         for j in range(folds)
     ])
     frames = _frames(state)  # frames[j]: fitted outside fold j
