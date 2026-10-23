@@ -347,6 +347,10 @@ next to the accurate-cells table.
   the median of the finished runs only; `wall s` counts the timeouts too.
 - **Seeds.** 20 per target (40 for the mixtures); the CPU samplers have 10 at
   d >= 32.
+- **Records of the v1 sweep.** `RESULTS.md` was measured before the adapter
+  fixes above (BlackJAX's stop and `compile_s`, tinyns's warm-up, the padded
+  CPU batches). Its Known gaps say what each changes; the H100 cells have
+  not been measured again.
 
 ## Multimodality bake-off (`bench/bakeoff/`)
 
