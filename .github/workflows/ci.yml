@@ -3,20 +3,18 @@ name: CI
 on:
   push:
   pull_request:
+  # Weekly, so a new JAX release is tested before a user meets it.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11"]
-        x64: ["0"]
-        jax: ["latest"]
         include:
-          # The full suite with 64-bit floats as well.
-          - python-version: "3.11"
-            x64: "1"
-            jax: "latest"
           # The minimum supported JAX (pyproject.toml), on the minimum Python.
           - python-version: "3.10"
             x64: "0"
@@ -24,6 +22,33 @@ jobs:
           - python-version: "3.10"
             x64: "1"
             jax: "0.4.31"
+          # The newest JAX on Python 3.10 and 3.11, pinned: JAX >= 0.7 needs
+          # Python 3.11 and JAX >= 0.11 needs Python 3.12.
+          - python-version: "3.10"
+            x64: "0"
+            jax: "0.6.2"
+          - python-version: "3.11"
+            x64: "0"
+            jax: "0.10.2"
+          - python-version: "3.11"
+            x64: "1"
+            jax: "0.10.2"
+          # The newest JAX, unpinned.
+          - python-version: "3.12"
+            x64: "0"
+            jax: "latest"
+          - python-version: "3.13"
+            x64: "0"
+            jax: "latest"
+          - python-version: "3.13"
+            x64: "1"
+            jax: "latest"
+          - python-version: "3.14"
+            x64: "0"
+            jax: "latest"
+          - python-version: "3.15"
+            x64: "0"
+            jax: "latest"
     name: test (py${{ matrix.python-version }}, x64=${{ matrix.x64 }}, jax ${{ matrix.jax }})
     env:
       JAX_ENABLE_X64: ${{ matrix.x64 }}
@@ -44,8 +69,63 @@ jobs:
         if: matrix.jax != 'latest'
         run: python -m pip install "jax==${{ matrix.jax }}" "jaxlib==${{ matrix.jax }}"
 
+      - name: Show versions
+        run: |
+          python -c "import sys, jax, jaxlib, numpy; print('python', sys.version.split()[0], 'jax', jax.__version__, 'jaxlib', jaxlib.__version__, 'numpy', numpy.__version__)"
+
+      - name: Check that "latest" is the newest JAX
+        if: matrix.jax == 'latest'
+        run: |
+          newest=$(curl -fsS https://pypi.org/pypi/jax/json | python -c "import json, sys; print(json.load(sys.stdin)['info']['version'])")
+          installed=$(python -c "import jax; print(jax.__version__)")
+          if [ "$installed" != "$newest" ]; then
+            echo "::warning::py${{ matrix.python-version }} resolves jax $installed, but the newest JAX is $newest: relabel or pin this job"
+          fi
+
       - name: Run Ruff
         run: ruff check .
 
       - name: Run tests
         run: pytest
+
+  wheel:
+    # Build the sdist, build the wheel from it, install the wheel and run the
+    # tests from the unpacked sdist (without its src/) against the installed
+    # package: what a user of the release gets.
+    name: wheel (py3.13, jax latest, tests against the installed wheel)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build the sdist and the wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+
+      - name: Check the distributions
+        run: |
+          python -m twine check --strict dist/*
+          tar tzf dist/*.tar.gz
+          python -m zipfile -l dist/*.whl
+
+      - name: Install the wheel
+        run: python -m pip install dist/*.whl pytest hatchling
+
+      - name: Unpack the sdist without src/
+        run: |
+          mkdir sdist
+          tar xzf dist/*.tar.gz -C sdist --strip-components=1
+          rm -r sdist/src
+
+      - name: Run tests against the installed wheel
+        working-directory: sdist
+        run: |
+          python -c "import tinyns; print(tinyns.__version__, tinyns.__file__); assert 'site-packages' in tinyns.__file__"
+          python -m pytest -o pythonpath= -p no:cacheprovider

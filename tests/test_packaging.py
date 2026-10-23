@@ -1,4 +1,4 @@
-"""The package metadata and the sdist's file list."""
+"""The package metadata, the sdist's file list and the CI matrix agree."""
 
 from __future__ import annotations
 
@@ -13,6 +13,9 @@ import tinyns
 tomllib = pytest.importorskip("tomllib")  # Python 3.11+
 
 ROOT = Path(__file__).resolve().parents[1]
+CI = ROOT / ".github" / "workflows" / "ci.yml"
+# The oldest Python that the newest JAX supports (JAX >= 0.11 needs 3.12).
+NEWEST_JAX_MIN_PYTHON = 12
 
 
 def _pyproject() -> dict:
@@ -25,6 +28,18 @@ def _python_minors(classifiers: list[str]) -> list[int]:
     return sorted(
         int(m.group(1)) for c in classifiers if (m := re.fullmatch(pattern, c))
     )
+
+
+def _ci_matrix() -> list[tuple[int, str, str]]:
+    """The test job's (python minor, x64, jax) entries."""
+    if not CI.exists():  # an unpacked sdist has no .github/
+        pytest.skip("no .github/workflows/ci.yml")
+    entries = re.findall(
+        r'- python-version: "3\.(\d+)"\s+x64: "([01])"\s+jax: "([^"]+)"',
+        CI.read_text(),
+    )
+    assert entries, "no matrix entries found in ci.yml"
+    return [(int(minor), x64, jax) for minor, x64, jax in entries]
 
 
 def test_version_has_one_source() -> None:
@@ -69,6 +84,34 @@ def test_python_classifiers_match_requires_python() -> None:
     minors = _python_minors(project["classifiers"])
     assert minors == list(range(minors[0], minors[-1] + 1))
     assert project["requires-python"] == f">=3.{minors[0]}"
+
+
+def test_ci_tests_every_python_and_the_newest_jax() -> None:
+    """CI runs each Python the classifiers list, the JAX floor, and the newest
+    JAX unpinned on every Python that the newest JAX supports."""
+    matrix = _ci_matrix()
+    minors = _python_minors(_pyproject()["project"]["classifiers"])
+    assert sorted({minor for minor, _, _ in matrix}) == minors
+    for minor in minors:
+        if minor >= NEWEST_JAX_MIN_PYTHON:
+            assert (minor, "0", "latest") in matrix, f"no py3.{minor} jax latest job"
+        else:
+            # JAX >= 0.7 needs Python 3.11 and >= 0.11 needs 3.12, so "latest"
+            # on these is an old JAX: such jobs are pinned and named for it.
+            assert all(jax != "latest" for m, _, jax in matrix if m == minor)
+    floor = re.fullmatch(r"jax>=(\S+)", _pyproject()["project"]["dependencies"][0])
+    assert floor is not None
+    for x64 in "01":
+        assert (minors[0], x64, floor.group(1)) in matrix
+
+
+def test_ci_runs_the_wheel_and_a_weekly_schedule() -> None:
+    _ci_matrix()  # skips without ci.yml
+    text = CI.read_text()
+    assert re.search(r"^  wheel:$", text, flags=re.M)
+    assert "python -m build" in text
+    assert "python -m pytest -o pythonpath=" in text  # not src/: the wheel
+    assert re.search(r'schedule:\s+- cron: "[^"]+"', text)
 
 
 def test_sdist_ships_only_the_listed_paths(tmp_path) -> None:
