@@ -1233,7 +1233,7 @@ def finalise(
         status = CONVERGED
     samples = u
     if prior_transform is not None:
-        samples = _transform(prior_transform, u, state.u.dtype)
+        samples = _transform(prior_transform, u, state.u.dtype, _transform_block(k))
     info = {
         "status": STATUS[status],
         "num_delete": k,
@@ -1274,8 +1274,16 @@ def finalise(
     )
 
 
-# Rows per call of the compiled prior transform of :func:`finalise`.
-_TRANSFORM_BLOCK = 65536
+# The final prior pass of :func:`finalise` maps the samples in blocks of the
+# power of two at or above num_delete (a step maps num_delete rows at once),
+# and at least this many rows. A block that runs out of device memory is
+# halved (:func:`_transform`).
+_TRANSFORM_BLOCK = 1024
+
+
+def _transform_block(num_delete: int) -> int:
+    """Rows per call of the final prior pass of a run of ``num_delete``."""
+    return max(_TRANSFORM_BLOCK, 1 << (num_delete - 1).bit_length())
 
 
 @_kernel_cache
@@ -1286,12 +1294,13 @@ def _transform_kernel(prior_spec):
     return jax.jit(kernel)
 
 
-def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
+def _transform(prior_transform, u: np.ndarray, dtype, block: int) -> np.ndarray:
     """``prior_transform`` of every row of ``u``, as a ``(len(u), -1)`` array.
 
-    The rows go through one compiled kernel in blocks of ``_TRANSFORM_BLOCK``
-    (the last one padded), so the lanes of a batch, whose sample counts
-    differ, share one compile.
+    The rows go through one compiled kernel in blocks of ``block`` rows (the
+    last one padded), so the lanes of a batch, whose sample counts differ,
+    share one compile. A block that runs out of device memory is halved and
+    the pass goes on from it; ``MemoryError`` if one row does not fit.
     """
     n, d = u.shape
     leaves, spec = _split_callable(
@@ -1301,13 +1310,26 @@ def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
     kernel = _transform_kernel(spec)
     u = np.asarray(u, dtype)
     out = []
-    for start in range(0, n, _TRANSFORM_BLOCK):
-        block = u[start : start + _TRANSFORM_BLOCK]
-        rows = len(block)
-        if rows < _TRANSFORM_BLOCK:  # the last block, padded
-            pad = np.full((_TRANSFORM_BLOCK - rows, d), 0.5, dtype)
-            block = np.concatenate([block, pad])
-        out.append(np.asarray(kernel(block, *leaves))[:rows].reshape(rows, -1))
+    start = 0
+    while start < n:
+        rows = min(block, n - start)
+        chunk = u[start : start + rows]
+        if rows < block:  # the last block, padded
+            chunk = np.concatenate([chunk, np.full((block - rows, d), 0.5, dtype)])
+        try:
+            theta = kernel(chunk, *leaves)
+            out.append(np.asarray(theta)[:rows].reshape(rows, -1))
+        except Exception as err:
+            if "RESOURCE_EXHAUSTED" not in str(err):
+                raise
+            if block == 1:
+                raise MemoryError(
+                    "out of device memory in the final prior_transform pass "
+                    "of finalise, even one sample at a time"
+                ) from err
+            block //= 2
+            continue
+        start += rows
     return np.concatenate(out) if out else np.zeros((0, d), dtype)
 
 

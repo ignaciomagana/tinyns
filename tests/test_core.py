@@ -515,6 +515,56 @@ def test_host_call_count_survives_int32_wraparound() -> None:
     assert int(after) < 0 and int(after - before) == 25
 
 
+def test_final_prior_pass_blocks_follow_num_delete() -> None:
+    # A step maps num_delete rows through the prior at once; the final pass
+    # took 65536 rows whatever the run, and a heavy prior that sampled fine
+    # ran out of memory there.
+    assert core._transform_block(1) == core._transform_block(1000) == 1024
+    assert core._transform_block(1025) == 2048
+    assert core._transform_block(5000) == 8192
+
+
+def spy_transform_kernel(monkeypatch, fits):
+    """Record the rows of each prior-pass call; raise XLA's out-of-memory error
+    for blocks with more rows than ``fits``."""
+    blocks = []
+    real = core._transform_kernel
+
+    def kernel_of(spec):
+        kernel = real(spec)
+
+        def call(u, *leaves):
+            blocks.append(len(u))
+            if len(u) > fits:
+                raise RuntimeError("RESOURCE_EXHAUSTED: Out of memory allocating")
+            return kernel(u, *leaves)
+
+        return call
+
+    monkeypatch.setattr(core, "_transform_kernel", kernel_of)
+    return blocks
+
+
+def test_final_prior_pass_halves_its_block_out_of_memory(monkeypatch) -> None:
+    cfg = Config(1, 40, num_delete=4)
+    state, dead = fake_run(np.linspace(-9.0, -1.0, 80), np.zeros(40), 40, 4)
+
+    def prior(u):
+        return jnp.sin(3.0 * u) - u
+
+    expected = finalise(state, dead, cfg, prior_transform=prior).samples
+    assert expected.shape == (120, 1)
+    blocks = spy_transform_kernel(monkeypatch, fits=64)
+    result = finalise(state, dead, cfg, prior_transform=prior)
+    # Halved down to 64 rows, then two blocks of 64 (the second one padded).
+    assert blocks == [1024, 512, 256, 128, 64, 64]
+    np.testing.assert_array_equal(result.samples, expected)
+
+    spy_transform_kernel(monkeypatch, fits=0)
+    with pytest.raises(MemoryError, match="even one sample at a time"):
+        finalise(state, dead, cfg, prior_transform=prior)
+
+
 def test_public_key_arguments_accept_int_seeds() -> None:
     cfg = Config(2, 20, num_delete=2, walks=5)
     loglike = gauss(0.5, 0.1)
