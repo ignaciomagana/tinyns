@@ -185,13 +185,13 @@ class State(NamedTuple):
     """The live set and the run scalars, threaded through :func:`step`.
 
     ``ncall`` counts the likelihood evaluations (out-of-cube proposals of a
-    vmapped step are evaluated, clipped, and counted) and ``ncall_valid`` the
-    in-cube ones; both are int32, and :func:`run` drains them into host
-    integers after every chunk. A hand-written loop that may exceed ``2**31``
-    calls must count on the host too (``ncall += int(new.ncall - old.ncall)``
-    stays right when the counter wraps) and pass the total to
-    :func:`finalise`. ``logz`` is the running evidence of the dead points,
-    used only to stop; :func:`finalise` recomputes it.
+    vmapped step are evaluated, at the chain's point, and counted) and
+    ``ncall_valid`` the in-cube ones; both are int32, and :func:`run` drains
+    them into host integers after every chunk. A hand-written loop that may
+    exceed ``2**31`` calls must count on the host too (``ncall +=
+    int(new.ncall - old.ncall)`` stays right when the counter wraps) and pass
+    the total to :func:`finalise`. ``logz`` is the running evidence of the
+    dead points, used only to stop; :func:`finalise` recomputes it.
 
     The log prior volume after the step is ``-it * S + log_x_ties``
     (:func:`_log_x`): ``-it * S`` is recomputed from ``it`` (no running sum
@@ -203,7 +203,7 @@ class State(NamedTuple):
     """
 
     key: Any  # PRNG key
-    u: Any  # (m, d) live points in the unit cube
+    u: Any  # (m, d) live points in the open unit cube
     logl: Any  # (m,)
     logl_birth: Any  # (m,) contour each live point was born above; -inf at init
     it: Any  # int32 steps done
@@ -385,10 +385,12 @@ def _chain(
 ):
     """A fixed-length constrained Metropolis chain from ``(u, logl)``.
 
-    Proposals outside the unit cube or at or below ``lstar`` are rejected; an
-    unmoved chain returns its seed. With ``skip`` (one unbatched chain) a
-    proposal that fails the likelihood-free tests skips the likelihood
-    (``lax.cond``); otherwise the clipped proposal is evaluated and masked.
+    Proposals outside the open unit cube or at or below ``lstar`` are
+    rejected; an unmoved chain returns its seed. With ``skip`` (one unbatched
+    chain) a proposal that fails the likelihood-free tests skips the
+    likelihood (``lax.cond``); otherwise it is evaluated and masked (one
+    outside the cube at the chain's point), so the callables only ever see
+    points of the open cube.
 
     The steps are the random walk ``u + s L z``, except that with ``hop``
     every ``HOP_EVERY``-th step is the inter-mode hop from the chain's
@@ -523,16 +525,19 @@ def _chain(
             h_ok = _modes.hop_accept(hop_uniforms[index], mine.eligible, r2_new, r2, d)
             ok = jnp.where(hop, h_ok, ok)
 
-        inside = jnp.all((prop >= 0.0) & (prop <= 1.0))
+        # The open cube: the faces have zero measure, and a transform such
+        # as ndtri(u) or -log(u) is infinite on them. A proposal outside is
+        # evaluated (vmapped) at the chain's point instead, and masked.
+        inside = jnp.all((prop > 0.0) & (prop < 1.0))
         call = inside & ok
-        clipped = jnp.clip(prop, 0.0, 1.0)
+        at = jnp.where(inside, prop, u)
         if skip:
             new = lax.cond(
-                call, evaluate, lambda v: jnp.asarray(-jnp.inf, dtype), clipped
+                call, evaluate, lambda v: jnp.asarray(-jnp.inf, dtype), at
             )
             nev = nev + call.astype(jnp.int32)
         else:
-            new = jnp.where(call, evaluate(clipped), -jnp.inf)
+            new = jnp.where(call, evaluate(at), -jnp.inf)
             nev = nev + 1
         accept = call & (new > lstar)
         u = jnp.where(accept, prop, u)
@@ -558,6 +563,9 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
     dtype = jnp.result_type(float)
     key, sub = random.split(key)
     u = random.uniform(sub, (m, d), dtype)
+    # A draw of exactly 0 (one in 2^23 per coordinate in float32) moves into
+    # the open cube, to half the spacing of the draws.
+    u = jnp.where(u > 0, u, jnp.finfo(dtype).eps / 2)
     logl = lax.map(
         lambda v: _loglike_u(loglike, prior_transform, v, dtype), u, batch_size=k
     )

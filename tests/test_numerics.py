@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import random
+from jax.scipy.special import ndtri
 
 from tinyns import Config, NestedSampler, core, init, step
 
@@ -161,5 +162,58 @@ def test_seeds_follow_the_rule(m, k, folds, frac) -> None:
         np.testing.assert_array_equal(
             np.asarray(seeds), reference_seeds(gumbel, uniform, above, worst, folds)
         )
+
+
+# --- the open unit cube ------------------------------------------------------
+
+
+def test_initial_draws_of_zero_move_into_the_open_cube(monkeypatch) -> None:
+    """A uniform draw of exactly 0 (one in 2^23 per coordinate in float32)
+    would map to -inf under ndtri: it becomes half the draws' spacing."""
+    uniform = random.uniform
+
+    def with_zeros(key, shape=(), dtype=float, *args, **kwargs):
+        u = uniform(key, shape, dtype, *args, **kwargs)
+        return u.at[::3, 0].set(0.0) if len(shape) == 2 else u
+
+    monkeypatch.setattr(random, "uniform", with_zeros)
+    state = core._init(random.PRNGKey(0), gauss, ndtri, Config(3, 30))
+    u = np.asarray(state.u)
+    assert np.all((u > 0) & (u < 1))
+    np.testing.assert_array_equal(u[::3, 0], jnp.finfo(FLOAT).eps / 2)
+    assert np.all(np.isfinite(np.asarray(state.logl)))
+
+
+@pytest.mark.skipif(FLOAT != jnp.float32, reason="a float32 draw")
+def test_float32_seed_with_a_zero_draw_starts_in_the_open_cube() -> None:
+    """Seed 4860 draws an exact 0 among its 500 x 4 initial uniforms."""
+
+    def loglike(x):
+        return -0.5 * jnp.sum(((x - 0.3) / 0.5) ** 2)
+
+    state = init(4860, loglike, ndtri, Config(4, 500))
+    assert np.all(np.asarray(state.u) > 0)
+
+
+@pytest.mark.parametrize("k", [1, 5])
+def test_chains_never_reach_a_face(k) -> None:
+    """A likelihood piled against the face u = 1, about 4 float spacings
+    wide: proposals that round to 1.0 are rejected, no sample lies on the
+    face, and no out-of-cube proposal is evaluated on one."""
+    lam = 0.25 / float(jnp.finfo(FLOAT).epsneg)
+    faces = []
+
+    def on_face(u):
+        faces.append(int(np.sum(np.any((u <= 0) | (u >= 1), axis=-1))))
+
+    def loglike(u):
+        jax.debug.callback(on_face, u)
+        return lam * jnp.sum(u - 1.0)
+
+    result = NestedSampler(loglike, identity, 1, 20, num_delete=k).run(0)
+    u = np.asarray(result.samples_u)
+    assert result.success and len(faces) > 0
+    assert np.all((u > 0) & (u < 1))
+    assert sum(faces) == 0
 
 
