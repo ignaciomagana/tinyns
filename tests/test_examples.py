@@ -67,7 +67,8 @@ def test_sbc_batched_example() -> None:
     # 90% coverage is 0.90 +- 0.027 and the 50% coverage 0.50 +- 0.044. Too
     # narrow posteriors lower both; too wide ones raise both, which the 50%
     # coverage sees first. (Here 0.875 and 0.39 in float32, 0.875 and 0.52
-    # in float64; over 8 master seeds 0.86-0.95 and 0.39-0.56.)
+    # in float64 and on JAX 0.4.34; over 8 master seeds 0.86-0.95 and
+    # 0.39-0.56.)
     distance = np.abs(np.asarray(quantiles) - 0.5)
     assert 0.80 <= np.mean(distance < 0.45) <= 0.98
     assert 0.35 <= np.mean(distance < 0.25) <= 0.65
