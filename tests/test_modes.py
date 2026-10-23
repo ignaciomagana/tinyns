@@ -413,11 +413,12 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
     each. The clustering cuts the needle's modes into lumps and the hop
     balances them only in part, which the warning says. A needle run loses
     its minor mode now and then (one mode and no warning: 2 of 112 runs,
-    float32 and float64), so 3 of the 4 must report both modes and the
-    warning. The plain modes are not cut into lumps; the warning may still
-    say that the hop was off, which happens on some trajectories (on JAX
-    0.4.31 the hop never ran in 2 of 8 runs at nlive 500, and the minor mode
-    was lost), but never that the modes were lumps."""
+    float32 and float64), so one of the 4 may do that, and the others must
+    report both modes and the warning. The plain modes are not cut into
+    lumps; the warning may still say that the hop was off, which happens on
+    some trajectories (on JAX 0.4.31 the hop never ran in 2 of 8 runs at
+    nlive 500, and the minor mode was lost), but never that the modes were
+    lumps."""
     from bench.targets import build_needle, build_two_mode, mixture_target
 
     from tinyns import result as result_module
@@ -432,14 +433,14 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
             modes = diagnostics["modes"]
             warned = [w for w in diagnostics["warnings"] if "only in part" in w]
             if arms:
+                if len(modes) == 1 and not warned:  # the minor mode was lost
+                    missed.append(i)
+                    continue
+                assert len(modes) >= 2, i
                 # The minor mass of this target scatters widely (0.31 on one).
-                minor = sum(m["mass"] for m in modes[1:])
-                if not (
-                    len(modes) >= 2 and 0.05 < minor < 0.45
-                    and diagnostics["mode_lumps"] > 1.5 and len(warned) == 1
-                    and "it cut modes into lumps" in warned[0]
-                ):
-                    missed.append((i, len(modes), minor, diagnostics["mode_lumps"]))
+                assert 0.05 < sum(m["mass"] for m in modes[1:]) < 0.45, i
+                assert diagnostics["mode_lumps"] > 1.5 and len(warned) == 1, i
+                assert "it cut modes into lumps" in warned[0], i
                 continue
             assert diagnostics["mode_lumps"] < 1.2
             assert not any("slots were full" in w for w in diagnostics["warnings"])
