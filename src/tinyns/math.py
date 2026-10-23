@@ -1,10 +1,18 @@
-"""Small log-space helpers for the result object: weights, ESS, resampling."""
+"""Small log-space helpers for the result object: weights, ESS, resampling.
+
+They compute in NumPy float64 on the host, whatever JAX's precision: a
+result's ``logwt`` is float64, and normalizing it in float32 loses weight once
+``|logwt|`` is large (at ``|logwt| ~ 1e6`` the float32 weights are off by about
+3%). On the host they also compile nothing, so a new result (of a new sample
+count) costs no compilation. Only :func:`systematic_resample` draws from a JAX
+key, its start offset.
+"""
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-import jax.numpy as jnp
 import numpy as np
 from jax import random
 
@@ -32,22 +40,22 @@ def logsumexp(values: ArrayLike) -> float:
         The log of the summed exponentials. Empty inputs return ``-inf``.
     """
 
-    array = jnp.asarray(values, dtype=float)
+    array = np.asarray(values, dtype=np.float64)
     if array.size == 0:
         return float("-inf")
-    if bool(jnp.any(jnp.isnan(array))):
+    if np.any(np.isnan(array)):
         return float("nan")
-    if bool(jnp.any(jnp.isposinf(array))):
+    if np.any(np.isposinf(array)):
         return float("inf")
 
-    maximum = jnp.max(array)
-    if bool(jnp.isneginf(maximum)):
+    maximum = np.max(array)
+    if np.isneginf(maximum):
         return float("-inf")
 
-    return float(maximum + jnp.log(jnp.sum(jnp.exp(array - maximum))))
+    return float(maximum + np.log(np.sum(np.exp(array - maximum))))
 
 
-def logdiffexp(a: float, b: float):
+def logdiffexp(a: float, b: float) -> float:
     """Return ``log(exp(a) - exp(b))`` safely.
 
     The real-valued result is defined only when ``a > b``.
@@ -55,52 +63,57 @@ def logdiffexp(a: float, b: float):
 
     if b >= a:
         raise ValueError("logdiffexp requires a > b")
-    return a + jnp.log1p(-jnp.exp(b - a))
+    return float(a + np.log1p(-np.exp(b - a)))
 
 
-def normalize_log_weights(logw: ArrayLike):
-    """Return log weights normalized to sum to one in probability space.
+def normalize_log_weights(logw: ArrayLike) -> np.ndarray:
+    """Return log weights normalized to sum to one in probability space
+    (NumPy float64).
 
     Empty, NaN, and all-negative-infinity inputs have no defined probability
     distribution and raise ValueError. If one or more entries are positive
     infinity, probability is shared uniformly among those entries.
     """
 
-    logw = jnp.asarray(logw, dtype=float)
+    logw = np.asarray(logw, dtype=np.float64)
     if logw.size == 0:
         raise ValueError("log weights must not be empty")
-    if bool(jnp.any(jnp.isnan(logw))):
+    if np.any(np.isnan(logw)):
         raise ValueError("log weights must not contain NaN")
 
-    positive_infinity = jnp.isposinf(logw)
-    if bool(jnp.any(positive_infinity)):
-        count = jnp.sum(positive_infinity, dtype=logw.dtype)
-        return jnp.where(positive_infinity, -jnp.log(count), -jnp.inf)
+    positive_infinity = np.isposinf(logw)
+    if np.any(positive_infinity):
+        count = np.count_nonzero(positive_infinity)
+        return np.where(positive_infinity, -math.log(count), -np.inf)
 
-    maximum = jnp.max(logw)
-    if bool(jnp.isneginf(maximum)):
+    maximum = np.max(logw)
+    if np.isneginf(maximum):
         raise ValueError("log weights must contain at least one finite value")
-    return logw - (maximum + jnp.log(jnp.sum(jnp.exp(logw - maximum))))
+    shifted = logw - maximum  # max + log(sum) would round to an ulp of |max|
+    return shifted - np.log(np.sum(np.exp(shifted)))
 
 
-def effective_sample_size_from_log_weights(logw: ArrayLike):
+def effective_sample_size_from_log_weights(logw: ArrayLike) -> float:
     """Return the effective sample size implied by unnormalized log weights."""
 
-    normalized = normalize_log_weights(logw)
-    weights = jnp.exp(normalized)
-    return 1.0 / jnp.sum(jnp.square(weights))
+    weights = np.exp(normalize_log_weights(logw))
+    return float(1.0 / np.sum(np.square(weights)))
 
 
-def systematic_resample(key, logw: ArrayLike, n: int):
+def systematic_resample(key, logw: ArrayLike, n: int) -> np.ndarray:
     """Draw ``n`` systematic-resampling indices from log weights.
 
-    ``key`` is a PRNG key or an int seed.
+    ``key`` is a PRNG key or an int seed; it draws the offset ``U`` of the
+    ``n`` evenly spaced positions ``(U + i) / n`` (in float32, so the indices
+    do not depend on the x64 flag). Index ``j`` comes ``floor(n w_j)`` or
+    ``ceil(n w_j)`` times, and the indices are in increasing order: they are
+    not independent draws, and a prefix of them is not a sample of the
+    weights (:meth:`tinyns.NestedSamplingResult.resample_equal` permutes
+    them). An index of zero weight is never drawn.
     """
 
-    normalized = normalize_log_weights(logw)
-    weights = jnp.exp(normalized)
-    cdf = jnp.cumsum(weights)
-    start = random.uniform(as_key(key), shape=()) / n
-    positions = start + jnp.arange(n) / n
-    return jnp.searchsorted(cdf, positions, side="left")
-
+    cdf = np.cumsum(np.exp(normalize_log_weights(logw)))
+    cdf /= cdf[-1]  # exactly 1 at the end, so no position lies beyond it
+    start = float(random.uniform(as_key(key), (), np.float32))
+    positions = (start + np.arange(n)) / n
+    return np.searchsorted(cdf, positions, side="right")

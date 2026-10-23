@@ -79,6 +79,10 @@ _MAX_SCALE = 10.0
 _CHUNK_EFOLDS = 4.0
 _CHUNK_SECONDS = 45.0
 _CHECKPOINT_SECONDS = 600.0
+# On resume, the number of live points (of highest likelihood) and of dead
+# points (spread over the death order) of each lane that are evaluated again
+# (:func:`_check_resume`).
+_RESUME_CHECKS = 16
 _INT32_MAX = 2**31 - 1
 # The frames a chain looks up at every step when no clustering has more in use
 # (kernel 1 of :func:`_kernel_level`).
@@ -155,12 +159,13 @@ class Config:
         for name in ("_hop", "_local"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
-        _check_int("_folds", self._folds, 2)
+        folds = _check_int("_folds", self._folds, 2)
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
             ("num_delete", k),
             ("walks", walks),
+            ("_folds", folds),
         ):
             object.__setattr__(self, name, value)
 
@@ -1041,6 +1046,27 @@ def _init_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
 
 
 @_kernel_cache
+def _logl_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
+    """Jitted ``loglike(prior_transform(u))`` of the rows of ``u``, ``(n, d)``,
+    in batches of ``num_delete`` like :func:`_init`; ``axes`` (a batched run;
+    see :func:`_init_kernel`) vmaps it over a leading lane axis of ``u``."""
+
+    def lane(u, leaves):
+        loglike, prior_transform = _rebuild(loglike_spec, prior_spec, leaves)
+        return lax.map(
+            lambda v: _loglike_u(loglike, prior_transform, v, u.dtype), u,
+            batch_size=min(cfg.num_delete, u.shape[0]),
+        )
+
+    def kernel(u, *leaves):
+        if axes is None:
+            return lane(u, leaves)
+        return jax.vmap(lane, in_axes=(0, axes))(u, leaves)
+
+    return jax.jit(kernel)
+
+
+@_kernel_cache
 def _step_kernel(loglike_spec, prior_spec, cfg: Config):
     def kernel(state, *leaves):
         state = _maybe_recluster(state, cfg)
@@ -1454,6 +1480,78 @@ def _lane_callable(fn, lane: int):
     )
 
 
+def _check_resume(path, state: State, dead: list, cfg: Config, kernel,
+                  leaves) -> None:
+    """Raise ``ValueError`` unless ``loglike(prior_transform(u))`` gives back
+    the likelihoods stored in a checkpoint, in every lane with its own data:
+    those of the ``_RESUME_CHECKS`` live points of highest likelihood and of
+    as many dead points (``dead``, one :class:`Dead` per lane), spread evenly
+    over the death order (the same count in every lane).
+
+    The callables are not stored in a checkpoint: this refuses one written
+    for another likelihood, prior or dataset, which would otherwise be
+    resumed (a finished one returned as it is). The dead points see a change
+    the live ones do not: a wider constraint of a plateau whose live points
+    all lie in the old one, or a change where the run has been. A change at
+    none of the points checked is not seen. ``kernel`` is the run's
+    :func:`_logl_kernel`. It compiles apart from the run's kernels, so the
+    values may differ in the last bits: finite ones match to a relative
+    ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``,
+    and infinite ones (a NaN is stored as ``-inf``) exactly. In float32 a
+    change smaller than that (``3.5e-4 |logL|``) is not seen: a new noise
+    realisation of the same model, for example, once ``|logL|`` is above
+    about ``1e5`` (the change goes like ``sqrt(|logL|)``). Setting
+    ``_RESUME_CHECKS = 0`` skips the check, for a likelihood that does not
+    give back its own values to that tolerance.
+    """
+    n = min(_RESUME_CHECKS, cfg.nlive)
+    if n == 0:
+        return
+    batched = state.u.ndim == 3
+    u, logl = np.asarray(state.u), np.asarray(state.logl)
+    if not batched:  # one lane: give it a lane axis
+        u, logl = u[None], logl[None]
+    top = np.argsort(-logl, axis=1, kind="stable")[:, :n]
+    u = np.take_along_axis(u, top[..., None], axis=1)
+    logl = np.take_along_axis(logl, top, axis=1)
+    m = min(_RESUME_CHECKS, *(rows.logl.size for rows in dead))
+    if m:
+        dead_u, dead_logl = [], []
+        for rows in dead:
+            i = np.linspace(0, rows.logl.size - 1, m).round().astype(int)
+            dead_u.append(np.asarray(rows.u).reshape(-1, u.shape[-1])[i])
+            dead_logl.append(np.asarray(rows.logl).reshape(-1)[i])
+        u = np.concatenate([u, np.stack(dead_u)], axis=1)
+        logl = np.concatenate([logl, np.stack(dead_logl)], axis=1)
+    old = logl.astype(np.float64)
+    new = kernel(jnp.asarray(u if batched else u[0]), *leaves)
+    new = np.asarray(new, np.float64).reshape(old.shape)
+    rtol = math.sqrt(np.finfo(state.u.dtype).eps)
+    finite = np.isfinite(old)
+    with np.errstate(invalid="ignore"):  # inf - inf
+        diff = np.abs(new - old) / (1.0 + np.abs(old))
+    bad = ~np.where(finite, diff <= rtol, new == old)
+    if np.any(bad):
+        lane, i = np.argwhere(bad)[0]
+        where = f" (lane {lane})" if batched else ""
+        how = (
+            f"a relative difference of {float(diff[lane, i]):.3g} where "
+            f"{rtol:.3g} is allowed" if finite[lane, i]
+            else "an infinite value must come back exactly"
+        )
+        raise ValueError(
+            f"{path}: this loglike and prior_transform do not give back the "
+            f"likelihoods stored in the checkpoint{where}: "
+            f"{float(new[lane, i])!r} against {float(old[lane, i])!r} stored "
+            f"at a {'live' if i < n else 'dead'} point ({how}), at "
+            f"{int(bad[lane].sum())} of the {n} live and {m} dead points "
+            "checked. A checkpoint of another likelihood, prior or dataset is "
+            "not resumed: use one checkpoint path per problem. If this is the "
+            "same problem and its likelihood does not give back its own "
+            "values, tinyns.core._RESUME_CHECKS = 0 skips this check"
+        )
+
+
 def _dead_template(cfg: Config, dtype) -> Dead:
     """The rows of one step as zeros."""
     k, d = cfg.num_delete, cfg.ndim
@@ -1498,13 +1596,18 @@ def run(
     ``progress``, prints one line per chunk.
 
     ``checkpoint`` is a path: if the file exists the run resumes from it
-    (refusing a different config, x64 flag, float dtype, key or batch), and
-    the run writes it atomically at a chunk boundary at most every
-    ``_CHECKPOINT_SECONDS`` and at the end. A resumed run is bit-identical to
-    an uninterrupted one: each step splits ``state.key``, so the random stream
-    depends on the step count only, never on where the chunks end. A status of
-    ``converged``, ``maxiter`` or ``maxcall`` in the checkpoint is re-tested
-    against this call's limits, so a run stopped by ``maxiter`` continues.
+    (refusing a different config, x64 flag, float dtype, key or batch, and
+    live or dead points whose likelihoods ``loglike`` and ``prior_transform``
+    do not give back: :func:`_check_resume`), and the run writes it
+    atomically at a chunk boundary at most every ``_CHECKPOINT_SECONDS`` and
+    at the end. A path that cannot be written raises ``OSError`` before
+    anything compiles; a symbolic link (or ``..``) in it is resolved once.
+    A resumed run is bit-identical to an uninterrupted one on the same JAX
+    build and device (a checkpoint of another warns): each step splits
+    ``state.key``, so the random stream depends on the step count only, never
+    on where the chunks end. A status of ``converged``, ``maxiter`` or
+    ``maxcall`` in the checkpoint is re-tested against this call's limits, so
+    a run stopped by ``maxiter`` continues.
 
     A batch of keys (a leading axis of ``B``) runs ``B`` independent runs in
     one compiled program and returns a list of ``B`` results. With
@@ -1522,6 +1625,8 @@ def run(
     key, batch = _key_batch(key)
     if batched_data and batch is None:
         raise ValueError("batched_data=True needs a batch of keys")
+    if checkpoint is not None:  # the file read and written: links resolved
+        checkpoint = _checkpoint.check_writable(checkpoint)
     loglike = _device_leaves(loglike)
     prior_transform = _device_leaves(prior_transform)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
@@ -1565,6 +1670,10 @@ def run(
             batched_data=batched_data,
             key=key,
         )
+        _check_resume(
+            checkpoint, ckpt.state, ckpt.dead, cfg,
+            _logl_kernel(ll_spec, pt_spec, cfg, axes), leaves,
+        )
         state = ckpt.state
         status = np.asarray(state.status)
         stopped = np.isin(status, (CONVERGED, MAXITER, MAXCALL))  # re-tested
@@ -1574,12 +1683,14 @@ def run(
         ncall, ncall_valid = list(ckpt.ncall), list(ckpt.ncall_valid)
         wall0, compile_s, nchunks = ckpt.wall_time_s, ckpt.compile_s, ckpt.chunks
         sampling_s = ckpt.sampling_s
+        mixed_build = ckpt.mixed_build
     else:
         state = _init_kernel(ll_spec, pt_spec, cfg, axes)(key, *leaves)
         rows_by_lane = [[_empty_dead(cfg, dtype)] for _ in range(lanes)]
         ncall, ncall_valid = [0] * lanes, [0] * lanes
         wall0 = compile_s = sampling_s = 0.0
         nchunks = 0
+        mixed_build = False
 
     capacity = max(1, math.ceil(_CHUNK_EFOLDS / cfg.log_shrink))
     kernel = _chunk_kernel(ll_spec, pt_spec, cfg, capacity, axes)
@@ -1613,6 +1724,7 @@ def run(
                 config=dataclasses.asdict(cfg),
                 batch=batch,
                 batched_data=batched_data,
+                mixed_build=mixed_build,
             ),
         )
 

@@ -84,12 +84,24 @@ class NestedSampler:
 
         ``checkpoint`` is a file path. If the file exists, the run resumes
         from it; a checkpoint written with a different config, x64 flag,
-        float dtype, key or batch is refused (``ValueError``). The run writes
-        it atomically at a chunk boundary at most every 10 minutes and at the
-        end. A resumed run is bit-identical to an uninterrupted one, and
+        float dtype, key or batch is refused (``ValueError``). The callables
+        are not stored: on resume the 16 live points of highest likelihood
+        and 16 dead points spread over the run (of each run of a batch) are
+        evaluated again, and a checkpoint whose stored likelihoods they do
+        not give back (another likelihood, prior or dataset) is refused too,
+        so use one checkpoint path per problem. They must match to a relative
+        ``sqrt(eps)`` of the float dtype, and infinite values exactly. In
+        float32 a change below ``3.5e-4 |logL|`` is not seen (a new noise
+        realisation of the same model once ``|logL|`` is above about
+        ``1e5``), nor one at none of the points checked. A path that cannot
+        be written raises ``OSError`` before the run starts. The run writes
+        the file atomically at a chunk boundary at most every 10 minutes and
+        at the end. A resumed run is bit-identical to an uninterrupted one on
+        the same JAX build and device (a checkpoint of another warns), and
         ``metadata["wall_time_s"]`` adds up the time of every session. A
         checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
-        under this call's limits. The callables are not stored or checked.
+        under this call's limits. A symbolic link at the path is written
+        through.
 
         Running out of device memory raises ``MemoryError`` with what to
         lower: ``num_delete``, or the number of keys of a batched run.
