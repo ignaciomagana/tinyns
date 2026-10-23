@@ -97,15 +97,21 @@ def capped_gauss(mu, sigma, top, x):
     return jnp.minimum(-0.5 * jnp.sum(((x - mu) / sigma) ** 2), top)
 
 
+def scaled(width, u):
+    return width * u
+
+
 def test_batched_data_resume_with_lanes_in_mixed_states(tmp_path,
                                                         monkeypatch) -> None:
     """A batched_data run killed while one lane has converged, one has ended
-    on a plateau and one still runs resumes bit-identically, lane by lane."""
+    on a plateau and one still runs resumes bit-identically, lane by lane
+    (the likelihood and the prior both carry per-lane data)."""
     mu = jnp.asarray([[0.3, 0.3], [0.5, 0.6], [0.7, 0.4]])
     sigma = jnp.asarray([0.003, 0.1, 0.03])
     top = jnp.asarray([0.0, 0.0, -2.0])  # lane 2: a flat top, so a plateau
     loglike = Partial(capped_gauss, mu, sigma[:, None], top)
-    sampler = NestedSampler(loglike, identity, 2, 40, num_delete=4)
+    prior = Partial(scaled, jnp.asarray([[1.0], [2.0], [1.5]]))
+    sampler = NestedSampler(loglike, prior, 2, 40, num_delete=4)
     keys = jax.random.split(jax.random.key(11), 3)
     full = sampler.run(keys, batched_data=True)
     assert [r.metadata["status"] for r in full] == [
