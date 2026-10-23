@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import warnings
@@ -199,10 +200,12 @@ def test_config_warns_when_the_walk_covariances_cannot_span_ndim() -> None:
 
 def test_the_nlive_warning_names_the_users_line() -> None:
     """The warning points at the line that built the ``Config`` or the
-    ``NestedSampler``, not at tinyns (it named ``tinyns/api.py`` for a
-    ``NestedSampler``)."""
+    ``NestedSampler``, not at tinyns or the stdlib (it named
+    ``tinyns/api.py`` for a ``NestedSampler`` and ``dataclasses.py`` for a
+    ``Config`` re-made with ``dataclasses.replace``)."""
     for build in (
         lambda: Config(32, 40),
+        lambda: dataclasses.replace(Config(32, 100), nlive=40),
         lambda: NestedSampler(gauss(0.5, 0.1), identity, 32, nlive=40),
     ):
         with warnings.catch_warnings(record=True) as caught:

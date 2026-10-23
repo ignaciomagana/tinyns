@@ -97,10 +97,12 @@ def _check_int(name: str, value, minimum: int) -> int:
 
 def _user_stacklevel() -> int:
     """The ``stacklevel`` at which a warning issued by the caller of this
-    function names the first frame outside tinyns: the user's line, whether
-    they built a :class:`Config` or a ``NestedSampler``."""
+    function names the first frame outside tinyns and ``dataclasses``: the
+    user's line, whether they built a :class:`Config`, re-made one with
+    ``dataclasses.replace`` or built a ``NestedSampler``."""
+    own = ("tinyns", "dataclasses")
     frame, level = sys._getframe(1), 1
-    while frame and frame.f_globals.get("__name__", "").split(".")[0] == "tinyns":
+    while frame and frame.f_globals.get("__name__", "").split(".")[0] in own:
         frame, level = frame.f_back, level + 1
     return level
 
