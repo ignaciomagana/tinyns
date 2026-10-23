@@ -287,8 +287,8 @@ def test_diagnostics_warns_on_nonfinite_logzerr_and_low_acceptance() -> None:
     assert "low replacement acceptance" in warnings
 
 
-def test_diagnostics_warns_when_most_chains_do_not_move() -> None:
-    """Too few walks leave most chains at their seed, which the insertion test
+def test_diagnostics_warns_when_many_chains_do_not_move() -> None:
+    """Too few walks leave many chains at their seed, which the insertion test
     barely sees; diagnostics() says so."""
     from tinyns import NestedSampler
     from tinyns.result import UNMOVED_WARN
