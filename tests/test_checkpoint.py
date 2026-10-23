@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.tree_util import Partial
 
 from tinyns import NestedSampler, core
 from tinyns import checkpoint as ckpt
@@ -90,6 +91,52 @@ def test_kill_and_resume_is_bit_identical(tmp_path, monkeypatch, num_delete,
     # The finished checkpoint returns the same result without new steps.
     again = sampler.run(key, checkpoint=path)
     assert_same_result(again, full)
+
+
+def capped_gauss(mu, sigma, top, x):
+    return jnp.minimum(-0.5 * jnp.sum(((x - mu) / sigma) ** 2), top)
+
+
+def test_batched_data_resume_with_lanes_in_mixed_states(tmp_path,
+                                                        monkeypatch) -> None:
+    """A batched_data run killed while one lane has converged, one has ended
+    on a plateau and one still runs resumes bit-identically, lane by lane."""
+    mu = jnp.asarray([[0.3, 0.3], [0.5, 0.6], [0.7, 0.4]])
+    sigma = jnp.asarray([0.003, 0.1, 0.03])
+    top = jnp.asarray([0.0, 0.0, -2.0])  # lane 2: a flat top, so a plateau
+    loglike = Partial(capped_gauss, mu, sigma[:, None], top)
+    sampler = NestedSampler(loglike, identity, 2, 40, num_delete=4)
+    keys = jax.random.split(jax.random.key(11), 3)
+    full = sampler.run(keys, batched_data=True)
+    assert [r.metadata["status"] for r in full] == [
+        "converged", "converged", "plateau"
+    ]
+    path = tmp_path / "batch.npz"
+
+    # Checkpoint after every one-step chunk; crash at the first mixed state.
+    seen = []
+    with monkeypatch.context() as patch:
+        patch.setattr(core, "_CHECKPOINT_SECONDS", 0.0)
+        patch.setattr(core, "_CHUNK_SECONDS", 0.0)
+        save = ckpt.save
+
+        def save_then_crash(p, c):
+            save(p, c)
+            status = set(np.asarray(c.state.status).tolist())
+            seen.append(status)
+            if status == {core.RUNNING, core.CONVERGED, core.PLATEAU}:
+                raise Crash
+
+        patch.setattr(ckpt, "save", save_then_crash)
+        with pytest.raises(Crash):
+            sampler.run(keys, checkpoint=path, batched_data=True)
+    assert len(seen) > 1
+    resumed = sampler.run(keys, checkpoint=path, batched_data=True)
+    for a, b in zip(resumed, full, strict=True):
+        assert a.metadata["resumed"]
+        assert_same_result(a, b)
+        np.testing.assert_array_equal(a.labels, b.labels)
+        np.testing.assert_array_equal(a.insertion_ranks, b.insertion_ranks)
 
 
 def test_maxcall_is_counted_across_resumes(tmp_path) -> None:
