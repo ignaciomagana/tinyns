@@ -68,25 +68,31 @@ SLAB_SCORE = 30.0
 SLAB_NEIGHBOURS = 8
 # Two modes are one if the likelihood dips by less than SADDLE_DEPTH between
 # them and the bottom of the dip lies above the posterior median likelihood
-# of either (:func:`_apart`). The split test also cuts lumps off one mode
-# whose contours are a core with thin arms, and the lumps leave gaps in the
-# live points too: dips of 0.0 to 1.8 between such lumps and their mode
-# (needle_d18 of ``bench.targets``, 16 runs; an 18-D posterior with a funnel
-# neck, 3 runs), against at least 5.7 between the separate modes of LogGamma
-# (2-D and 10-D) and 40 to 200 for the Gaussian mixtures, the product of
-# Cauchy factors and the eggbox (nlive 400 to 1000, 132 runs). In few
-# dimensions no depth tells both apart: two equal Gaussians D sigma apart dip
-# by D^2/8 - log 2 in any dimension (1.84 at 4.5 sigma), and pairs 3.5 to 5
-# sigma apart in 2-D and 4.5 to 5 in 3-D, which the clustering separates,
-# were one mode in all 96 runs (nlive 500). But the bulk of a mode lies close
-# to its peak there (a Gaussian's posterior median 0.69 below it in 2-D,
-# 1.18 in 3-D and 8.7 in 18-D), and such a dip runs below the bulk of both:
-# those pairs are now two modes in the 95 runs whose clustering found two,
-# while the dips between the lumps of needle_d18 bottom out 7.8 to 9.0 above
-# the bulk (8 runs) and a 2-D pair 3 sigma apart stays one mode (0.08 to
-# 0.16 above). With both tests, equal Gaussians are two modes from about 3.3
-# sigma apart in 2-D, 3.9 in 3-D, 4.8 in 5-D and 5.2 in 6-D, and from 5.4
-# (the depth) on in 7-D and up.
+# of at least one of them (:func:`_apart`). The split test also cuts lumps
+# off one mode whose contours are a core with thin arms, and the lumps leave
+# gaps in the live points too: dips of 0.0 to 1.8 between such lumps and
+# their mode (needle_d18 of ``bench.targets``, 16 runs; an 18-D posterior
+# with a funnel neck, 3 runs), against at least 5.7 between the separate
+# modes of LogGamma (2-D and 10-D) and 40 to 200 for the Gaussian mixtures,
+# the product of Cauchy factors and the eggbox (nlive 400 to 1000, 132
+# runs). In few dimensions no depth tells both apart: two equal Gaussians D
+# sigma apart dip by D^2/8 - log 2 in any dimension (1.84 at 4.5 sigma), and
+# pairs 3.5 to 5 sigma apart in 2-D and 4.5 to 5 in 3-D, which the
+# clustering separates, were one mode in all 96 runs (nlive 500). But the
+# bulk of a mode lies close to its peak there (a Gaussian's posterior median
+# 0.69 below it in 2-D, 1.18 in 3-D and 8.7 in 18-D), and such a dip runs
+# below the bulk of both: those pairs are now two modes in the 95 runs whose
+# clustering found two, while the dips between the lumps of needle_d18
+# bottom out 7.8 to 9.0 above the bulk (8 runs) and a 2-D pair 3 sigma apart
+# stays one mode (0.08 to 0.16 above). With both tests, pass 6 keeps equal
+# Gaussians apart from about 3.3 sigma in 2-D, 3.9 in 3-D, 4.8 in 5-D and
+# 5.2 in 6-D, and from 5.4 (the depth) on in 7-D and up, but only where
+# passes 1 to 5 separated them: at 5 sigma in 5-D they did in 4 of 16 runs.
+# Nor does it help a close mode of less mass: the clustering leaves it in
+# the labels it split the heavier one from, which also hold both modes'
+# points from before the split, and passes 2 and 3 merge the two. In 2-D a
+# mode of mass 0.1 or 0.2 at 4.5 to 5.5 sigma was one mode with the other in
+# all 40 runs, and a 0.1 mode at 6.5 sigma in 9 of 16 (nlive 500).
 SADDLE_DEPTH = 3.0
 SADDLE_BINS = 16
 # The sampler's clustering separated a mode if at least SEPARATED_SHARE of
@@ -755,15 +761,20 @@ class NestedSamplingResult:
            than ``SADDLE_DEPTH`` along the line between them (the highest
            likelihood in each of ``SADDLE_BINS`` stretches of their
            discriminant direction) and the bottom of the dip lies above the
-           posterior median likelihood of either (:func:`_apart`): the split
-           test also cuts lumps off a mode whose contours have thin arms or a
-           funnel neck, and their live points leave gaps as separate modes
-           do, but the dead points show no saddle between them. In few
-           dimensions the bulk of a mode lies close to its peak, and a
-           shallow dip below the bulk of both separates two modes (equal
-           Gaussians from about 3.3 standard deviations apart in 2-D, 3.9 in
-           3-D, against 5.4 from the depth alone). A lump joined to its mode
-           only along a curved path (a funnel neck) is not found this way.
+           posterior median likelihood of at least one of them
+           (:func:`_apart`): the split test also cuts lumps off a mode whose
+           contours have thin arms or a funnel neck, and their live points
+           leave gaps as separate modes do, but the dead points show no
+           saddle between them. In few dimensions the bulk of a mode lies
+           close to its peak, and a shallow dip below the bulk of both
+           separates two modes (equal Gaussians from about 3.3 standard
+           deviations apart in 2-D, 3.9 in 3-D, against 5.4 from the depth
+           alone), if the passes before separated them. A close mode of
+           less mass is not separated before: the clustering leaves it in
+           the labels it split the heavier one from (in 2-D a mode of mass
+           0.1 was one mode with the other up to about 6.5 standard
+           deviations apart). A lump joined to its mode only along a curved
+           path (a funnel neck) is not found this way.
 
         Each mode's live count ``n(t)`` is rebuilt from the birth and death
         iterations. The mode is isolated from the first iteration at which
