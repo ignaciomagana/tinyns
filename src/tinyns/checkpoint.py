@@ -19,9 +19,12 @@ previous checkpoint or the new one, never a torn file. It holds
 - ``meta_json``: the format, the tinyns version, the resolved ``Config``, the
   x64 flag and float dtype, the lane count and ``batched_data``, the host call
   counters (Python ints, one per lane), the accumulated ``wall_time_s``,
-  ``compile_s`` and ``sampling_s`` and the number of chunks.
+  ``compile_s`` and ``sampling_s``, the number of chunks, and the JAX build
+  and device the run is bit-identical on (:func:`_environment`).
 
 Files of any other format are refused; there is no reader for older formats.
+A different JAX build or device is not refused but warned about: the resumed
+run is a valid run, but it may not be bit-identical to an uninterrupted one.
 The file keeps the mode of the checkpoint it replaces (a new one gets the mode
 of any new file, ``0o666`` less the umask), so a ``chmod`` that shares it with
 a group survives the rewrites.
@@ -40,6 +43,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import jaxlib
 import numpy as np
 from jax import random
 
@@ -107,6 +111,22 @@ def _dtype_name() -> str:
     return jnp.dtype(jnp.result_type(float)).name
 
 
+def _environment() -> dict:
+    """The JAX build and device that a resume is bit-identical on: the JAX
+    and jaxlib versions, ``jax_threefry_partitionable`` (it changes the random
+    stream; its default changed in JAX 0.5), the backend and the kind of the
+    default device."""
+    return {
+        "jax_version": jax.__version__,
+        "jaxlib_version": jaxlib.__version__,
+        "threefry_partitionable": getattr(
+            jax.config, "jax_threefry_partitionable", None
+        ),
+        "backend": jax.default_backend(),
+        "device_kind": jax.devices()[0].device_kind,
+    }
+
+
 def save(path, ckpt: Checkpoint) -> None:
     """Write ``ckpt`` to ``path`` atomically (temporary file, fsync, replace)."""
     from tinyns import __version__
@@ -140,6 +160,7 @@ def save(path, ckpt: Checkpoint) -> None:
         "compile_s": float(ckpt.compile_s),
         "sampling_s": float(ckpt.sampling_s),
         "chunks": int(ckpt.chunks),
+        **_environment(),
     }
     arrays["meta_json"] = np.asarray(json.dumps(meta, sort_keys=True))
     _atomic_savez(path, arrays)
@@ -165,6 +186,25 @@ def _temp_file(path: str) -> tuple[int, str]:
             os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
         return fd, tmp
     raise FileExistsError(f"no unused temporary file name next to {path}")
+
+
+def check_writable(path) -> None:
+    """Raise ``OSError`` naming ``path`` unless a file can be written next to
+    it, as :func:`save` does: a run checks its checkpoint path before it
+    compiles and samples, not at its first save. A temporary file is created
+    and removed (``os.access`` is unreliable on network file systems)."""
+    path = os.fspath(path)
+    try:
+        fd, tmp = _temp_file(path)
+    except OSError as exc:
+        directory = os.path.dirname(os.path.abspath(path))
+        raise type(exc)(
+            exc.errno,
+            f"cannot write the checkpoint {path} in the directory {directory}: "
+            f"{exc.strerror or exc}",
+        ) from exc
+    os.close(fd)
+    os.unlink(tmp)
 
 
 def _atomic_savez(path, arrays: dict, compressed: bool = False) -> None:
@@ -199,6 +239,8 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
     Raises ``ValueError`` naming the mismatch when the file is not a
     ``tinyns-ckpt-7`` checkpoint, or when its config, x64 flag, float dtype,
     lane count, ``batched_data`` or starting key differ from this run's.
+    Warns when it was written by another tinyns version, JAX build or device
+    (:func:`_environment`): the resumed run may not be bit-identical.
     Returns a :class:`Checkpoint`.
     """
     from tinyns import __version__
@@ -209,6 +251,8 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
         data = np.load(path, allow_pickle=False)
     except Exception as exc:  # noqa: BLE001 - any unreadable file is refused
         raise ValueError(f"{path} is not a {FORMAT} checkpoint: {exc}") from exc
+    if not isinstance(data, np.lib.npyio.NpzFile):  # a .npy file
+        raise ValueError(f"{path} is not a {FORMAT} checkpoint (not an .npz file)")
     with data:
         if "meta_json" not in data.files:
             raise ValueError(f"{path} is not a {FORMAT} checkpoint")
@@ -242,10 +286,18 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 f"{path}: the checkpoint was started from a different key; pass "
                 "the original key or a new checkpoint path"
             )
-        if meta["tinyns_version"] != __version__:
+        now = {"tinyns_version": __version__, **_environment()}
+        changed = [
+            name for name, value in now.items() if meta.get(name, value) != value
+        ]
+        if changed:
             warnings.warn(
-                f"{path} was written by tinyns {meta['tinyns_version']}, this is "
-                f"{__version__}: the resumed run may not be bit-identical",
+                f"{path} was written with "
+                + ", ".join(f"{name}={meta[name]!r}" for name in changed)
+                + "; this run has "
+                + ", ".join(f"{name}={now[name]!r}" for name in changed)
+                + ": the resumed run may not be bit-identical to an "
+                "uninterrupted one",
                 stacklevel=3,
             )
         fields = {}

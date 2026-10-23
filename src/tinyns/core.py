@@ -150,12 +150,13 @@ class Config:
         for name in ("_hop", "_local"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
-        _check_int("_folds", self._folds, 2)
+        folds = _check_int("_folds", self._folds, 2)
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
             ("num_delete", k),
             ("walks", walks),
+            ("_folds", folds),
         ):
             object.__setattr__(self, name, value)
 
@@ -1456,6 +1457,8 @@ def run(
     key, batch = _key_batch(key)
     if batched_data and batch is None:
         raise ValueError("batched_data=True needs a batch of keys")
+    if checkpoint is not None:
+        _checkpoint.check_writable(checkpoint)
     loglike = _device_leaves(loglike)
     prior_transform = _device_leaves(prior_transform)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
