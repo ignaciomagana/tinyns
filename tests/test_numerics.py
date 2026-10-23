@@ -186,7 +186,12 @@ def test_initial_draws_of_zero_move_into_the_open_cube(monkeypatch) -> None:
 
 @pytest.mark.skipif(FLOAT != jnp.float32, reason="a float32 draw")
 def test_float32_seed_with_a_zero_draw_starts_in_the_open_cube() -> None:
-    """Seed 4860 draws an exact 0 among its 500 x 4 initial uniforms."""
+    """Seed 4860 draws an exact 0 among its 500 x 4 initial uniforms (with
+    the PRNG of JAX 0.5 and later; the test above covers the mechanism on
+    every version)."""
+    _, sub = random.split(random.PRNGKey(4860))
+    if np.all(np.asarray(random.uniform(sub, (500, 4), FLOAT)) > 0):
+        pytest.skip("this JAX's PRNG draws no zero for seed 4860")
 
     def loglike(x):
         return -0.5 * jnp.sum(((x - 0.3) / 0.5) ** 2)
