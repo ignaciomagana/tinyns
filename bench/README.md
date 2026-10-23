@@ -97,7 +97,7 @@ A case passes when all of these hold (se is the standard error over seeds):
 - **The posterior check** reads the Gaussian cases' samples, which no other
   criterion does. A run's offsets scatter by about 0.02 (mean, in units of
   the sd) and 0.03 (log variance) per direction at `nlive=500`, and 0.013 and
-  0.022 at 1000. With bounds of 4.3 to 5.1 at 16 seeds and about 4.1 to 4.4
+  0.022 at 1000. With bounds of 4.3 to 5.1 at 16 seeds and about 3.6 to 4.4
   at 64, a case fails an offset of about 0.02 sd in one direction's mean or
   3% in its variance in the quick tier, and 0.006 sd or 1% in the full tier.
   Samples in the wrong coordinates (the unit cube instead of the box) fail
@@ -434,12 +434,13 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
   evidence by quadrature, the exact mode masses checked with direct draws
   from each mixture, and the `box` variant against the unit-cube one;
 - every installed adapter, on `gauss_d2` with nlive 100;
-- `run.py` and `summarize.py` end to end, including a timeout record, and
-  the `-dirty` flag of `git_sha` in a scratch repository;
+- `run.py` and `summarize.py` end to end, including a timeout record;
 - the report on synthetic records: merging, the accuracy flags, the headline
   ratios and ranks, a missing reference, the commit filter (clean and
   modified builds apart), the cold-start and compiled times, cells of
   several `nlive`;
+- the commit stamp of `run.py`: the `-dirty` flag of `git_sha`, in a scratch
+  repository;
 - the gate: its criteria on synthetic rows (the mode count and its
   lower-bound flag, the eggbox floor, the logit-sd limit and the hop among
   them), the posterior check on exact draws and its Student-t bounds, the
