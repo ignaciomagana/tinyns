@@ -152,6 +152,15 @@ ELL_R2_PER_DIM = 1.0  # hop ellipsoids: Mahalanobis^2 <= (d + 2) * this
 LLOYD_ITERS = 30  # 2-means iterations of a split
 SPLIT_EM_ITERS = 8  # hard-EM iterations refining a split
 REFINE_ITERS = 2  # warm-started hard-EM iterations of a recluster
+# Every product of the sampler runs at full float32 precision. JAX's default
+# on an A100 or H100 is TF32 (a 10-bit mantissa): the mean of a cluster 1e-5
+# wide at u = 0.5 then loses its digits, and the Hastings ratios gain noise.
+PRECISION = lax.Precision.HIGHEST
+
+
+def matmul(a, b):
+    """``a @ b`` at :data:`PRECISION`."""
+    return jnp.matmul(a, b, precision=PRECISION)
 
 
 class Stats(NamedTuple):
@@ -236,9 +245,9 @@ def stats(x, labels, nslots: int) -> Stats:
     """
     member = (labels[None, :] == jnp.arange(nslots)[:, None]).astype(x.dtype)
     count = jnp.sum(member, axis=1)
-    mu = (member @ x) / jnp.maximum(count, 1.0)[:, None]
+    mu = matmul(member, x) / jnp.maximum(count, 1.0)[:, None]
     dev = (x[None, :, :] - mu[:, None, :]) * member[:, :, None]  # (K, m, d)
-    scat = jnp.einsum("kmi,kmj->kij", dev, dev)
+    scat = jnp.einsum("kmi,kmj->kij", dev, dev, precision=PRECISION)
     return Stats(mu, scat, count)
 
 
@@ -261,7 +270,8 @@ def frames(st: Stats, nlive: int | None = None) -> Frames:
     eye = jnp.eye(d, dtype=dtype)
     pinv = jax.scipy.linalg.cho_solve((pchol, True), eye)
     dof = jnp.maximum(count - 1.0, 1.0)
-    kappa = jnp.maximum(jnp.einsum("ij,kij->k", pinv, scat) / (d * dof), 1e-6)
+    kappa = jnp.einsum("ij,kij->k", pinv, scat, precision=PRECISION)
+    kappa = jnp.maximum(kappa / (d * dof), 1e-6)
     rho = SHRINK * d / (dof + SHRINK * d)
     cov = (1.0 - rho)[:, None, None] * scat / dof[:, None, None] + (rho * kappa)[
         :, None, None
@@ -299,7 +309,7 @@ def _eligible(logdet, count, active, nlive, d):
 def mahalanobis(fr: Frames, x):
     """Squared Mahalanobis distance of ``x`` to every frame (``inf`` if
     inactive) and the whitened offsets ``L^-1 (x - mu)``, shape ``(C, d)``."""
-    y = jnp.einsum("cij,cj->ci", fr.ichol, x[None, :] - fr.mu)
+    y = jnp.einsum("cij,cj->ci", fr.ichol, x[None, :] - fr.mu, precision=PRECISION)
     r2 = jnp.sum(y * y, axis=-1)
     return jnp.where(fr.active, r2, jnp.inf), y
 
@@ -348,7 +358,7 @@ def hop_proposal(key, eligible, logdet, frame):
     # GPU that fusion compiled for 40 to 90 s at d = 32 and 64.
     z = optimization_barrier(random.normal(k_dir, (d,), dtype))
     ball = z / jnp.linalg.norm(z) * uni[1] ** (1.0 / d)
-    point = mu + math.sqrt(ELL_R2_PER_DIM * (d + 2.0)) * (chol @ ball)
+    point = mu + math.sqrt(ELL_R2_PER_DIM * (d + 2.0)) * matmul(chol, ball)
     return point, uni[2]
 
 
@@ -384,11 +394,13 @@ def _assign(fr: Frames, x, keep, whitened: bool = False):
     log_weight = jnp.log(jnp.maximum(fr.count, 1e-30) / total)
     offset = 2.0 * fr.logdet - 2.0 * log_weight  # (C,)
     if whitened:
-        z = jnp.einsum("kij,mj->kmi", fr.ichol, x)
-        z = z - jnp.einsum("kij,kj->ki", fr.ichol, fr.mu)[:, None, :]
+        z = jnp.einsum("kij,mj->kmi", fr.ichol, x, precision=PRECISION)
+        z = z - jnp.einsum("kij,kj->ki", fr.ichol, fr.mu, precision=PRECISION)[
+            :, None, :
+        ]
     else:
         dev = x[None, :, :] - fr.mu[:, None, :]  # (K, m, d)
-        z = jnp.einsum("kij,kmj->kmi", fr.ichol, dev)
+        z = jnp.einsum("kij,kmj->kmi", fr.ichol, dev, precision=PRECISION)
     score = jnp.sum(z * z, axis=2) + offset[:, None]
     score = jnp.where(fr.active[:, None], score, jnp.inf)
     return jnp.where(keep, jnp.argmin(score, axis=0), -1).astype(jnp.int32)
@@ -429,10 +441,10 @@ def _fisher(x, w, part):
     """Fisher separation of the rows ``w`` split by ``part`` (both float 0/1)."""
     wa, wb = w * (1.0 - part), w * part
     na, nb = jnp.sum(wa), jnp.sum(wb)
-    mua = (wa @ x) / jnp.maximum(na, 1.0)
-    mub = (wb @ x) / jnp.maximum(nb, 1.0)
+    mua = matmul(wa, x) / jnp.maximum(na, 1.0)
+    mub = matmul(wb, x) / jnp.maximum(nb, 1.0)
     dev = (x - jnp.where(part[:, None] > 0.5, mub, mua)) * w[:, None]
-    within = _ridge(dev.T @ dev / jnp.maximum(na + nb - 2.0, 1.0))
+    within = _ridge(matmul(dev.T, dev) / jnp.maximum(na + nb - 2.0, 1.0))
     dm = mub - mua
     chol, ok = _cholesky(within)
     z = solve_triangular(chol, dm, lower=True)
@@ -480,42 +492,42 @@ def _split(x, mask):
     w = mask.astype(dtype)
     n = jnp.sum(w)
     big = n >= max(2 * MIN_SPLIT_POINTS, 4 * d)
-    mean = (w @ x) / jnp.maximum(n, 1.0)
+    mean = matmul(w, x) / jnp.maximum(n, 1.0)
     xc = (x - mean) * w[:, None]
-    chol, _ = _cholesky(_ridge(xc.T @ xc / jnp.maximum(n - 1.0, 1.0)))
+    chol, _ = _cholesky(_ridge(matmul(xc.T, xc) / jnp.maximum(n - 1.0, 1.0)))
     ichol = solve_triangular(chol, jnp.eye(d, dtype=dtype), lower=True)
-    y = xc @ ichol.T  # whitened; 0 outside
+    y = matmul(xc, ichol.T)  # whitened; 0 outside
     r2 = jnp.sum(y * y, axis=1)
     far = y[jnp.argmax(jnp.where(mask, r2, -jnp.inf))]
     far2 = y[jnp.argmax(jnp.where(mask, jnp.sum((y - far) ** 2, axis=1), -jnp.inf))]
-    total = w @ y
+    total = matmul(w, y)
 
     def nearer(c0, c1):
         """The rows nearer to ``c1`` than to ``c0``: ``|y - c1|^2 < |y -
         c0|^2``, as one product with ``y``."""
-        return 2.0 * (y @ (c0 - c1)) < jnp.sum(c0 * c0) - jnp.sum(c1 * c1)
+        return 2.0 * matmul(y, c0 - c1) < jnp.sum(c0 * c0) - jnp.sum(c1 * c1)
 
-    kurt = (y * (w * r2)[:, None]).T @ y / jnp.maximum(n, 1.0)
+    kurt = matmul((y * (w * r2)[:, None]).T, y) / jnp.maximum(n, 1.0)
     _, vecs = jnp.linalg.eigh(kurt)
 
     def unit(v):
         return v / jnp.maximum(jnp.linalg.norm(v), 1e-30)
 
     dirs = jnp.concatenate([vecs.T, unit(far)[None], unit(far2 - far)[None]])
-    ratios, cuts = jax.vmap(lambda v: _best_cut(y @ v, mask))(dirs)
+    ratios, cuts = jax.vmap(lambda v: _best_cut(matmul(y, v), mask))(dirs)
     _, top = lax.top_k(ratios, 2)
     starts = jnp.stack([
         nearer(jnp.zeros((d,), dtype), far),
         nearer(far, far2),
-        y @ dirs[top[0]] > cuts[top[0]],
-        y @ dirs[top[1]] > cuts[top[1]],
+        matmul(y, dirs[top[0]]) > cuts[top[0]],
+        matmul(y, dirs[top[1]]) > cuts[top[1]],
     ]) & mask
 
     def one(part):
         def lloyd(part):
             weight = part.astype(dtype)
             n1 = jnp.sum(weight)
-            sum1 = weight @ y
+            sum1 = matmul(weight, y)
             c1 = sum1 / jnp.maximum(n1, 1.0)
             c0 = (total - sum1) / jnp.maximum(n - n1, 1.0)
             return nearer(c0, c1) & mask

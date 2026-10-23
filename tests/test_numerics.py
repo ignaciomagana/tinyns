@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax import random
+from jax import lax, random
 from jax.scipy.special import ndtri
 
 from tinyns import Config, NestedSampler, core, init, modes, step
@@ -263,5 +263,33 @@ def test_float32_separation_along_a_narrow_axis() -> None:
     assert abs(pair / j - 1.0) < 0.02
     assert abs(float(split) / j - 1.0) < 0.05
     assert np.mean(np.asarray(part) == side) in (0.0, 1.0)
+
+
+# --- the precision of the internal products ----------------------------------
+
+
+@pytest.mark.parametrize("k", [1, 4])
+def test_internal_products_run_at_full_precision(k) -> None:
+    """Every product of a step and of a recluster asks for HIGHEST precision,
+    so a GPU's TF32 (JAX's default for float32 on an A100 or H100, a 10-bit
+    mantissa) does not touch the means of clusters in the unit cube or the
+    Hastings ratios. The likelihood here makes no product of its own."""
+    cfg = Config(3, 40, num_delete=k)
+    state = init(0, gauss, identity, cfg)
+    programs = [
+        jax.make_jaxpr(lambda s: core._step(s, gauss, identity, cfg))(state),
+        jax.make_jaxpr(core._recluster)(state),
+    ]
+    precisions = [
+        eqn.params["precision"]
+        for closed in programs
+        for eqn in _equations(closed.jaxpr)
+        if eqn.primitive.name == "dot_general"
+    ]
+    assert len(precisions) > 10
+    for precision in precisions:
+        assert precision is not None
+        pair = precision if isinstance(precision, tuple) else (precision,)
+        assert all(p == lax.Precision.HIGHEST for p in pair), precision
 
 

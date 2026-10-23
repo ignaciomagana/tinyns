@@ -293,11 +293,12 @@ def _live_chol(u, mask):
     m, d = u.shape
     w = mask.astype(u.dtype)
     n = jnp.maximum(jnp.sum(w), 1.0)
-    x = (u - (w @ u) / n) * w[:, None]
+    x = (u - _modes.matmul(w, u) / n) * w[:, None]
     dof = jnp.maximum(n - 1.0, 1.0)
     std = jnp.sqrt(jnp.sum(x * x, axis=0) / dof)
     z = x / jnp.where(std > 0, std, 1.0)
-    corr = z.T @ z / dof + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
+    corr = _modes.matmul(z.T, z) / dof
+    corr = corr + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
     chol = jnp.linalg.cholesky(corr)
     chol = jnp.where(jnp.all(jnp.isfinite(chol)), chol, jnp.eye(d, dtype=u.dtype))
     return std[:, None] * chol
@@ -442,13 +443,15 @@ def _chain(
         mine = near
 
         def live_step(z):
-            return chol @ z
+            return _modes.matmul(chol, z)
 
         def frame_chol(c):
             return near.chol[c]
 
         def offsets(v):
-            return jnp.einsum("cij,cj->ci", near.ichol, v - near.mu)
+            return jnp.einsum(
+                "cij,cj->ci", near.ichol, v - near.mu, precision=_modes.PRECISION
+            )
 
     else:
         if tracked:
@@ -458,13 +461,15 @@ def _chain(
             ))
 
         def live_step(z):
-            return jnp.einsum("fij,j->fi", chol, z)[fold]
+            return jnp.einsum("fij,j->fi", chol, z, precision=_modes.PRECISION)[fold]
 
         def frame_chol(c):
             return near.chol[fold, c]
 
         def offsets(v):
-            y = jnp.einsum("fcij,fcj->fci", near.ichol, v - near.mu)
+            y = jnp.einsum(
+                "fcij,fcj->fci", near.ichol, v - near.mu, precision=_modes.PRECISION
+            )
             return y[fold]
 
     if draws is None:
@@ -502,7 +507,7 @@ def _chain(
         z = random.normal(k_z, u.shape, u.dtype)
         move = live_step(z)
         if local:
-            move = jnp.where(use_local, frame_chol(c) @ z, move)
+            move = jnp.where(use_local, _modes.matmul(frame_chol(c), z), move)
         prop = u + scale * move
         hop = jnp.asarray(False)
         if tracked and n_hops > 0:
