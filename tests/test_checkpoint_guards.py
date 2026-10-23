@@ -86,9 +86,10 @@ def test_an_infinite_stored_likelihood_must_come_back_exactly(tmp_path) -> None:
     same path, returned the finished ``logz=-inf`` run, and a model that is
     finite where the old one was ``-inf`` resumed an early checkpoint."""
     path = tmp_path / "nan.npz"
-    NestedSampler(lambda x: jnp.nan * x[0], identity, 2, 50, num_delete=5).run(
-        0, checkpoint=path
-    )
+    with pytest.warns(RuntimeWarning, match="no live point has a finite likelihood"):
+        NestedSampler(lambda x: jnp.nan * x[0], identity, 2, 50, num_delete=5).run(
+            0, checkpoint=path
+        )
     fixed = NestedSampler(gauss, identity, 2, 50, num_delete=5)
     with pytest.raises(ValueError, match="an infinite value must come back exactly"):
         fixed.run(0, checkpoint=path)
