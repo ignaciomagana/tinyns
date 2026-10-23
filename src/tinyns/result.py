@@ -66,13 +66,26 @@ SEPARATION_SIGMA = 3.0
 SLAB_SCORE = 30.0
 SLAB_NEIGHBOURS = 8
 # Two modes are one if the likelihood dips by less than SADDLE_DEPTH between
-# them (:func:`_saddle_depth`). The split test also cuts lumps off one mode
+# them and the bottom of the dip lies above the posterior median likelihood
+# of either (:func:`_apart`). The split test also cuts lumps off one mode
 # whose contours are a core with thin arms, and the lumps leave gaps in the
 # live points too: dips of 0.0 to 1.8 between such lumps and their mode
 # (needle_d18 of ``bench.targets``, 16 runs; an 18-D posterior with a funnel
 # neck, 3 runs), against at least 5.7 between the separate modes of LogGamma
 # (2-D and 10-D) and 40 to 200 for the Gaussian mixtures, the product of
-# Cauchy factors and the eggbox (nlive 400 to 1000, 132 runs).
+# Cauchy factors and the eggbox (nlive 400 to 1000, 132 runs). In few
+# dimensions no depth tells both apart: two equal Gaussians D sigma apart dip
+# by D^2/8 - log 2 in any dimension (1.84 at 4.5 sigma), and pairs 3.5 to 5
+# sigma apart in 2-D and 4.5 to 5 in 3-D, which the clustering separates,
+# were one mode in all 96 runs (nlive 500). But the bulk of a mode lies close
+# to its peak there (a Gaussian's posterior median 0.69 below it in 2-D,
+# 1.18 in 3-D and 8.7 in 18-D), and such a dip runs below the bulk of both:
+# those pairs are now two modes in the 95 runs whose clustering found two,
+# while the dips between the lumps of needle_d18 bottom out 7.8 to 9.0 above
+# the bulk (8 runs) and a 2-D pair 3 sigma apart stays one mode (0.08 to
+# 0.16 above). With both tests, equal Gaussians are two modes from about 3.3
+# sigma apart in 2-D, 3.9 in 3-D, 4.8 in 5-D and 5.2 in 6-D, and from 5.4
+# (the depth) on in 7-D and up.
 SADDLE_DEPTH = 3.0
 SADDLE_BINS = 16
 # The sampler's clustering separated a mode if at least SEPARATED_SHARE of
@@ -273,16 +286,27 @@ def _weighted_median(x, weights) -> float:
     return float(x[order][min(np.searchsorted(cw, 0.5 * cw[-1]), len(x) - 1)])
 
 
-def _saddle_depth(u, logl, weights, a, b) -> float:
-    """How far the likelihood dips between the samples ``a`` and ``b``.
+def _apart(u, logl, weights, a, b) -> bool:
+    """Whether the samples ``a`` and ``b`` are separate modes: the likelihood
+    dips between them (:func:`_saddle`) by at least ``SADDLE_DEPTH``, or to
+    below the posterior median likelihood of both."""
+    depth, saddle = _saddle(u, logl, weights, a, b)
+    bulk = min(_weighted_median(logl[mask], weights[mask]) for mask in (a, b))
+    return depth >= SADDLE_DEPTH or saddle < bulk
+
+
+def _saddle(u, logl, weights, a, b) -> tuple[float, float]:
+    """How far the likelihood dips between the samples ``a`` and ``b``, and
+    the likelihood at the bottom of the dip: ``(depth, saddle)``.
 
     Along the Fisher discriminant of the two sets (posterior-weighted
     covariances), the stretch between their weighted medians is cut into
     ``SADDLE_BINS`` bins, and each bin's profile is the highest likelihood
-    of a sample of ``a`` or ``b`` in it. The depth is the lower of the two
-    end bins' profiles minus the lowest profile (``inf`` if a bin is empty;
-    0 for sets with the same median). Dead points cover every contour, so
-    between separate modes the bins hold only the samples of low contours.
+    of a sample of ``a`` or ``b`` in it. ``saddle`` is the lowest profile and
+    ``depth`` the lower of the two end bins' profiles minus ``saddle``
+    (``inf`` and ``-inf`` if a bin is empty; ``(0, inf)``, no dip, for sets
+    with the same median). Dead points cover every contour, so between
+    separate modes the bins hold only the samples of low contours.
     """
 
     def moments(mask):
@@ -298,13 +322,14 @@ def _saddle_depth(u, logl, weights, a, b) -> float:
     pa = _weighted_median(u[a] @ w, weights[a])
     pb = _weighted_median(u[b] @ w, weights[b])
     if not pb > pa:
-        return 0.0
+        return 0.0, math.inf
     both = a | b
     at = np.floor((u[both] @ w - pa) / (pb - pa) * SADDLE_BINS).astype(int)
     inside = (at >= 0) & (at <= SADDLE_BINS)  # the median of b: the last bin
     profile = np.full(SADDLE_BINS, -np.inf)
     np.maximum.at(profile, np.minimum(at[inside], SADDLE_BINS - 1), logl[both][inside])
-    return float(min(profile[0], profile[-1]) - profile.min())
+    saddle = float(profile.min())
+    return float(min(profile[0], profile[-1]) - saddle), saddle
 
 
 def _kolmogorov_pvalue(n: int, ks: float) -> float:
@@ -693,11 +718,16 @@ class NestedSamplingResult:
         6. two modes are one if the likelihood of their samples dips by less
            than ``SADDLE_DEPTH`` along the line between them (the highest
            likelihood in each of ``SADDLE_BINS`` stretches of their
-           discriminant direction): the split test also cuts lumps off a mode
-           whose contours have thin arms or a funnel neck, and their live
-           points leave gaps as separate modes do, but the dead points show
-           no saddle between them. A lump joined to its mode only along a
-           curved path (a funnel neck) is not found this way.
+           discriminant direction) and the bottom of the dip lies above the
+           posterior median likelihood of either (:func:`_apart`): the split
+           test also cuts lumps off a mode whose contours have thin arms or a
+           funnel neck, and their live points leave gaps as separate modes
+           do, but the dead points show no saddle between them. In few
+           dimensions the bulk of a mode lies close to its peak, and a
+           shallow dip below the bulk of both separates two modes (equal
+           Gaussians from about 3.3 standard deviations apart in 2-D, 3.9 in
+           3-D, against 5.4 from the depth alone). A lump joined to its mode
+           only along a curved path (a funnel neck) is not found this way.
 
         Each mode's live count ``n(t)`` is rebuilt from the birth and death
         iterations. The mode is isolated from the first iteration at which
@@ -799,7 +829,7 @@ class NestedSamplingResult:
         # 6. Modes that the likelihood does not dip between are one mode.
         logl, group = np.asarray(self.logl, dtype=float), np.arange(len(kept))
         for a, b in itertools.combinations(range(len(kept)), 2):
-            if _saddle_depth(u, logl, weights, label == a, label == b) < SADDLE_DEPTH:
+            if not _apart(u, logl, weights, label == a, label == b):
                 group[group == group[b]] = group[a]
         whole = [all(tracked[c] for c in kept[group == g]) for g in np.unique(group)]
         label = np.unique(group[label], return_inverse=True)[1]

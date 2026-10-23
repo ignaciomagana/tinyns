@@ -377,7 +377,7 @@ def test_saddle_depth_tells_lumps_from_modes() -> None:
     """Dead points cover every contour, so the likelihood of the samples
     between two separate modes dips; between a mode and a lump of it, it
     does not."""
-    from tinyns.result import SADDLE_DEPTH, _saddle_depth
+    from tinyns.result import SADDLE_DEPTH, _apart, _saddle
 
     rng = np.random.default_rng(0)
     d = 6
@@ -391,10 +391,59 @@ def test_saddle_depth_tells_lumps_from_modes() -> None:
     logl = np.logaddexp(-0.5 * r2, np.log(1 / 3) - 0.5 * r2c)
     weights = np.where(np.arange(len(u)) < len(prior), 1e-6, 1.0)
     near = r2 < r2c
-    assert _saddle_depth(u, logl, weights, near, ~near) > 4 * SADDLE_DEPTH
+    assert _saddle(u, logl, weights, near, ~near)[0] > 4 * SADDLE_DEPTH
+    assert _apart(u, logl, weights, near, ~near)
     one = near & (r2 < 30)  # a single mode, cut in two
     lump = u[:, 1] >= 1.0
-    assert _saddle_depth(u, logl, weights, one & ~lump, one & lump) < 1.0
+    depth, saddle = _saddle(u, logl, weights, one & ~lump, one & lump)
+    assert depth < 1.0 and saddle > np.median(logl[one & lump])
+    assert not _apart(u, logl, weights, one & ~lump, one & lump)
+
+
+def test_a_shallow_dip_below_the_bulk_of_both_modes_separates_them() -> None:
+    """Two equal Gaussians D sigma apart dip by D^2/8 - log 2 in any
+    dimension: 1.84 at 4.5 sigma, less than ``SADDLE_DEPTH``. In 2-D and
+    3-D the posterior median of each lies 0.69 and 1.18 below its peak, so
+    that dip separates their bulks; at 3 sigma (a dip of 0.43) it does not."""
+    from tinyns.result import SADDLE_DEPTH, _apart, _saddle
+
+    rng = np.random.default_rng(1)
+    for d, sep, apart in ((2, 4.5, True), (3, 4.5, True), (2, 3.0, False)):
+        centre = np.zeros(d)
+        centre[0] = sep
+        prior = rng.uniform(-6.0, 10.0, (20000, d))  # early samples: anywhere
+        post = rng.normal(size=(8000, d))
+        post[4000:] += centre
+        u = np.concatenate([prior, post])
+        r2, r2c = np.sum(u**2, axis=1), np.sum((u - centre) ** 2, axis=1)
+        logl = np.logaddexp(-0.5 * r2, -0.5 * r2c)
+        weights = np.where(np.arange(len(u)) < len(prior), 1e-9, 1.0)
+        near = r2 < r2c
+        depth = _saddle(u, logl, weights, near, ~near)[0]
+        assert depth == pytest.approx(sep**2 / 8 - math.log(2), abs=0.2)
+        assert depth < SADDLE_DEPTH
+        assert _apart(u, logl, weights, near, ~near) == apart, (d, sep)
+
+
+def test_close_modes_in_few_dimensions_are_counted() -> None:
+    """Two equal Gaussians 4.5 sigma apart in 2-D: the clustering separates
+    them (label purity 99.8%), and pass 6 merged them into one mode of mass
+    1 in 32 of 32 runs, because their likelihood dips by 1.84 only."""
+    sigma, half = 0.02, 2.25 * 0.02
+    centres = jnp.array([[0.5 - half, 0.5], [0.5 + half, 0.5]])
+
+    def pair(theta):
+        r2 = jnp.sum(((theta - centres) / sigma) ** 2, axis=1)
+        return jax.scipy.special.logsumexp(-0.5 * r2)
+
+    keys = jax.random.split(jax.random.key(1), 4)
+    for result in NestedSampler(pair, lambda u: u, 2, nlive=500).run(keys):
+        modes = result.modes()
+        assert len(modes) == 2 and all(m["tracked"] for m in modes)
+        right = np.asarray(result.samples)[:, 0] > 0.5
+        truth = np.asarray(result.weights())[right].sum()
+        assert min(truth, 1 - truth) == pytest.approx(modes[1]["mass"], abs=0.01)
+        assert modes[1]["mass"] == pytest.approx(0.5, abs=0.1)
 
 
 def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
