@@ -91,7 +91,10 @@ class NestedSampler:
         from it; a checkpoint written with a different config, x64 flag,
         float dtype, key or batch is refused (``ValueError``). The run writes
         it atomically at a chunk boundary at most every 10 minutes and at the
-        end. A resumed run is bit-identical to an uninterrupted one, and
+        end. The random stream depends on the step count only: on a CPU (and
+        the same JAX version) a resumed run is bit-identical to an
+        uninterrupted one, and on a GPU in float32, where a fixed seed is not
+        bit-reproducible between processes, the two agree in distribution.
         ``metadata["wall_time_s"]`` adds up the time of every session. A
         checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
         under this call's limits. The callables are not stored or checked.

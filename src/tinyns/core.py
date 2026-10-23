@@ -1444,9 +1444,12 @@ def run(
     ``checkpoint`` is a path: if the file exists the run resumes from it
     (refusing a different config, x64 flag, float dtype, key or batch), and
     the run writes it atomically at a chunk boundary at most every
-    ``_CHECKPOINT_SECONDS`` and at the end. A resumed run is bit-identical to
-    an uninterrupted one: each step splits ``state.key``, so the random stream
-    depends on the step count only, never on where the chunks end. A status of
+    ``_CHECKPOINT_SECONDS`` and at the end. Each step splits ``state.key``, so
+    the random stream depends on the step count only, never on where the
+    chunks end: on a CPU (and the same JAX version) a resumed run is
+    bit-identical to an uninterrupted one. On a GPU in float32, where a fixed
+    seed is not bit-reproducible between processes, a run resumed in a new
+    process agrees with an uninterrupted one in distribution. A status of
     ``converged``, ``maxiter`` or ``maxcall`` in the checkpoint is re-tested
     against this call's limits, so a run stopped by ``maxiter`` continues.
 
