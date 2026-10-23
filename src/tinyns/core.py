@@ -328,6 +328,12 @@ def _walk_mask(above, other, ndim):
     logZ came out several ``logzerr`` high in 10 and 20 dimensions.) Only
     when the live set is too small for that (``nlive`` below about ``1.5
     (ndim + 1)``) are all live points used.
+
+    The rule counts points, not directions: on an extreme support (a slab 1%
+    of the prior wide in 10-D) the ``ndim + 1`` or more points above ``L*``
+    of the next step can be copies of a few (a chain that did not move
+    returns its seed), and the covariance is rank-deficient for that step.
+    Testing its conditioning instead of the count left logZ unchanged.
     """
     mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, other)
     return jnp.where(jnp.sum(mask) >= ndim + 1, mask, jnp.ones_like(mask))
