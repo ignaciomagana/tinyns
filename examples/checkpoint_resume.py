@@ -2,8 +2,10 @@
 
 ``run(key, checkpoint=path)`` writes ``path`` (at most every 10 minutes and
 at the end) and resumes from it when it exists. Here the first call stops at
-``maxiter``; the second call picks the run up from the file. The resumed
-result is bit-identical to an uninterrupted run with the same key.
+``maxiter``; the second call picks the run up from the file. On a CPU the
+resumed result is bit-identical to an uninterrupted run with the same key; on
+a GPU in float32, where a fixed seed is not bit-reproducible between
+processes, a run resumed in a new process agrees with it in distribution.
 """
 
 import tempfile

@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.tree_util import Partial
 
 from tinyns import NestedSampler, core
 from tinyns import checkpoint as ckpt
@@ -90,6 +91,58 @@ def test_kill_and_resume_is_bit_identical(tmp_path, monkeypatch, num_delete,
     # The finished checkpoint returns the same result without new steps.
     again = sampler.run(key, checkpoint=path)
     assert_same_result(again, full)
+
+
+def capped_gauss(mu, sigma, top, x):
+    return jnp.minimum(-0.5 * jnp.sum(((x - mu) / sigma) ** 2), top)
+
+
+def scaled(width, u):
+    return width * u
+
+
+def test_batched_data_resume_with_lanes_in_mixed_states(tmp_path,
+                                                        monkeypatch) -> None:
+    """A batched_data run killed while one lane has converged, one has ended
+    on a plateau and one still runs resumes bit-identically, lane by lane
+    (the likelihood and the prior both carry per-lane data)."""
+    mu = jnp.asarray([[0.3, 0.3], [0.5, 0.6], [0.7, 0.4]])
+    sigma = jnp.asarray([0.003, 0.1, 0.03])
+    top = jnp.asarray([0.0, 0.0, -2.0])  # lane 2: a flat top, so a plateau
+    loglike = Partial(capped_gauss, mu, sigma[:, None], top)
+    prior = Partial(scaled, jnp.asarray([[1.0], [2.0], [1.5]]))
+    sampler = NestedSampler(loglike, prior, 2, 40, num_delete=4)
+    keys = jax.random.split(jax.random.key(11), 3)
+    full = sampler.run(keys, batched_data=True)
+    assert [r.metadata["status"] for r in full] == [
+        "converged", "converged", "plateau"
+    ]
+    path = tmp_path / "batch.npz"
+
+    # Checkpoint after every one-step chunk; crash at the first mixed state.
+    seen = []
+    with monkeypatch.context() as patch:
+        patch.setattr(core, "_CHECKPOINT_SECONDS", 0.0)
+        patch.setattr(core, "_CHUNK_SECONDS", 0.0)
+        save = ckpt.save
+
+        def save_then_crash(p, c):
+            save(p, c)
+            status = set(np.asarray(c.state.status).tolist())
+            seen.append(status)
+            if status == {core.RUNNING, core.CONVERGED, core.PLATEAU}:
+                raise Crash
+
+        patch.setattr(ckpt, "save", save_then_crash)
+        with pytest.raises(Crash):
+            sampler.run(keys, checkpoint=path, batched_data=True)
+    assert len(seen) > 1
+    resumed = sampler.run(keys, checkpoint=path, batched_data=True)
+    for a, b in zip(resumed, full, strict=True):
+        assert a.metadata["resumed"]
+        assert_same_result(a, b)
+        np.testing.assert_array_equal(a.labels, b.labels)
+        np.testing.assert_array_equal(a.insertion_ranks, b.insertion_ranks)
 
 
 def test_maxcall_is_counted_across_resumes(tmp_path) -> None:
@@ -212,3 +265,35 @@ def test_progress_prints_one_line_per_chunk(capsys) -> None:
     assert len(lines) == results[0].metadata["chunks"]
     assert "lanes running=0/3" in lines[-1]
     assert f"ncall={sum(r.ncall for r in results)} " in lines[-1]
+    assert lines[-1].endswith("[converged=3]")
+
+
+def test_batched_progress_reads_the_running_lanes(capsys) -> None:
+    """The batched line takes niter, dlogz and scale over the running lanes:
+    a lane that stopped (here a flat likelihood, a plateau at step 0) does
+    not pin them. The last line counts the lanes in each status."""
+    flat = Partial(capped_gauss, jnp.full((2, 2), 0.5), 0.1, jnp.asarray([0.0, -1e9]))
+    sampler = NestedSampler(flat, identity, 2, 50, num_delete=5)
+    results = sampler.run(jax.random.split(jax.random.key(0), 2), progress=True,
+                          batched_data=True)
+    assert [r.metadata["status"] for r in results] == ["converged", "plateau"]
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) > 2
+    for line in lines[:-1]:
+        assert "lanes running=1/2" in line and line.endswith(" [plateau=1]")
+        assert "niter=0.." not in line and "inf" not in line
+    ncall = sum(r.ncall for r in results)
+    assert lines[-1].startswith(f"tinyns: lanes running=0/2 ncall={ncall} ")
+    assert lines[-1].endswith(" [converged=1 plateau=1]")
+    assert "niter=" not in lines[-1] and "scale=" not in lines[-1]
+
+    status = np.asarray([core.CONVERGED, core.RUNNING, core.PLATEAU, core.RUNNING])
+    line = core._progress_line(
+        sampler.config, 4, status, np.asarray([60, 59, 0, 40]),
+        np.zeros(4), np.asarray([0.09, 0.5, np.inf, 1.25]), [1, 2, 3, 4], 1.0,
+        0.25, np.asarray([9.0, 1.0, 9.0, 2.0]),
+    )
+    assert line == (
+        "tinyns: lanes running=2/4 niter=200..295 dlogz<=1.25 ncall=10 "
+        "calls/s=1 acc=0.250 scale=1.5 [converged=1 plateau=1]"
+    )

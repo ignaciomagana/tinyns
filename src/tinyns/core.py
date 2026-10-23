@@ -229,14 +229,27 @@ class Config:
 class State(NamedTuple):
     """The live set and the run scalars, threaded through :func:`step`.
 
-    ``ncall`` counts the likelihood evaluations (out-of-cube proposals of a
-    vmapped step are evaluated, at the chain's point, and counted) and
-    ``ncall_valid`` the in-cube ones; both are int32, and :func:`run` drains
-    them into host integers after every chunk. A hand-written loop that may
-    exceed ``2**31`` calls must count on the host too (``ncall +=
-    int(new.ncall - old.ncall)`` stays right when the counter wraps) and pass
-    the total to :func:`finalise`. ``logz`` is the running evidence of the
-    dead points, used only to stop; :func:`finalise` recomputes it.
+    ``ncall`` counts the likelihood evaluations the algorithm makes and
+    ``ncall_valid`` the proposals that pass the likelihood-free tests (inside
+    the open unit cube, and the Hastings test of a local-walk or hop step).
+    With ``num_delete > 1`` the chains are vmapped and every proposal is
+    evaluated (an out-of-cube one at the chain's point) and counted. With
+    ``num_delete=1`` the other proposals skip the likelihood (``lax.cond``)
+    and are not counted, so ``ncall == ncall_valid``; but in a batched
+    :func:`run`, which vmaps the step over the runs, the ``cond`` becomes a
+    select that evaluates them too (an out-of-cube one at the chain's point),
+    uncounted. ``ncall`` thus counts what the run alone evaluates, in a batch
+    as well, and ``maxcall`` applies to it. Under ``jax.vmap(step)`` the
+    ``lax.switch`` over the three chain kernels also gets a batched index and
+    runs all three, which triples the evaluations (and the recluster ``cond``
+    computes a recluster at every step); batch runs with :func:`run`, which
+    passes one unbatched kernel level and recluster predicate. ``ncall`` and
+    ``ncall_valid`` are int32, and :func:`run` drains them into host integers
+    after every chunk. A hand-written loop that may exceed ``2**31`` calls
+    must count on the host too (``ncall += int(new.ncall - old.ncall)`` stays
+    right when the counter wraps) and pass the total to :func:`finalise`.
+    ``logz`` is the running evidence of the dead points, used only to stop;
+    :func:`finalise` recomputes it.
 
     The log prior volume after the step is ``-it * S + log_x_ties``
     (:func:`_log_x`): ``-it * S`` is recomputed from ``it`` (no running sum
@@ -259,7 +272,7 @@ class State(NamedTuple):
     tie_run: Any  # int32 consecutive steps, ending with the last, at lstar_prev
     log_scale: Any  # log of the walk-step multiplier
     ncall: Any  # int32 likelihood evaluations
-    ncall_valid: Any  # int32 in-cube likelihood evaluations
+    ncall_valid: Any  # int32 proposals passing the likelihood-free tests
     status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU, INVALID
     # Mode tracking (tinyns.modes). The live slots form K folds (slot index
     # mod K); clustering j is of the points outside fold j. label[j, i] is
@@ -442,9 +455,11 @@ def _chain(
     Proposals outside the open unit cube or at or below ``lstar`` are
     rejected; an unmoved chain returns its seed. With ``skip`` (one unbatched
     chain) a proposal that fails the likelihood-free tests skips the
-    likelihood (``lax.cond``); otherwise it is evaluated and masked (one
-    outside the cube at the chain's point), so the callables only ever see
-    points of the open cube.
+    likelihood (``lax.cond``; a vmap over runs turns it into a select, which
+    evaluates the proposal but does not count it); otherwise it is evaluated
+    and masked. Wherever one outside the cube is evaluated, it is evaluated
+    at the chain's point, so the callables only ever see points of the open
+    cube.
 
     The steps are the random walk ``u + s L z``, except that with ``hop``
     every ``HOP_EVERY``-th step is the inter-mode hop from the chain's
@@ -954,7 +969,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
 
         def run():
             draws = (step_keys, *hop_draws)
-            if k == 1:  # no vmap: the cond really skips out-of-cube proposals
+            if k == 1:  # no vmap: the cond skips rejected proposals (in one run)
                 first = jax.tree_util.tree_map(lambda a: a[0], draws)
                 out = chain(seeds[0], chain_fold[0], first, True)
                 return tuple(x[None] for x in out)
@@ -1741,12 +1756,14 @@ def run(
     atomically at a chunk boundary at most every ``_CHECKPOINT_SECONDS`` and
     at the end. A path that cannot be written raises ``OSError`` before
     anything compiles; a symbolic link (or ``..``) in it is resolved once.
-    A resumed run is bit-identical to an uninterrupted one on the same JAX
-    build and device (a checkpoint of another warns): each step splits
-    ``state.key``, so the random stream depends on the step count only, never
-    on where the chunks end. A status of ``converged``, ``maxiter`` or
-    ``maxcall`` in the checkpoint is re-tested against this call's limits, so
-    a run stopped by ``maxiter`` continues.
+    Each step splits ``state.key``, so the random stream depends on the step
+    count only, never on where the chunks end: on a CPU a resumed run is
+    bit-identical to an uninterrupted one on the same JAX build (a checkpoint
+    of another build or device warns). On a GPU in float32, where a fixed
+    seed is not bit-reproducible between processes, a run resumed in a new
+    process agrees with an uninterrupted one in distribution. A status of
+    ``converged``, ``maxiter`` or ``maxcall`` in the checkpoint is re-tested
+    against this call's limits, so a run stopped by ``maxiter`` continues.
 
     A batch of keys (a leading axis of ``B``) runs ``B`` independent runs in
     one compiled program and returns a list of ``B`` results. With
@@ -1899,8 +1916,10 @@ def run(
             ncall[lane] += int(calls[lane])
             ncall_valid[lane] += int(valid[lane])
             n = int(count[lane])
+            # A copy: a view would keep the chunk's whole buffer (every lane,
+            # the full capacity) alive until the rows are concatenated.
             rows_by_lane[lane].append(
-                jax.tree_util.tree_map(lambda r, n=n, b=lane: r[:n, b], rows)
+                jax.tree_util.tree_map(lambda r, n=n, b=lane: np.array(r[:n, b]), rows)
             )
             if status[lane] == MAXCALL and (maxcall is None or ncall[lane] < maxcall):
                 status[lane] = RUNNING  # only the int32 window of the budget was used
@@ -1969,7 +1988,10 @@ def run(
 
 def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale):
     """One progress line: iteration, logz, dlogz, calls, calls/s, acceptance
-    and step scale (for a batch: the running lanes and the range of each)."""
+    and step scale. For a batch: the number of running lanes, the range of
+    the iteration, the largest dlogz and the median scale over the running
+    lanes alone (a stopped lane is frozen), and the number of stopped lanes
+    in each status."""
     k = cfg.num_delete
     if batch is None:
         return (
@@ -1978,9 +2000,19 @@ def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale
             f"acc={acc:.3f} scale={float(scale[0]):.3g} [{STATUS[int(status[0])]}]"
         )
     running = status == RUNNING
-    return (
-        f"tinyns: lanes running={int(running.sum())}/{batch} "
-        f"niter={int(it.min()) * k}..{int(it.max()) * k} "
-        f"dlogz<={float(np.max(remain)):.3g} ncall={sum(ncall)} "
-        f"calls/s={rate:.3g} acc={acc:.3f} scale={float(np.median(scale)):.3g}"
-    )
+    line = f"tinyns: lanes running={int(running.sum())}/{batch} "
+    if running.any():
+        it = it[running]
+        line += (
+            f"niter={int(it.min()) * k}..{int(it.max()) * k} "
+            f"dlogz<={float(np.max(remain[running])):.3g} "
+        )
+    line += f"ncall={sum(ncall)} calls/s={rate:.3g} acc={acc:.3f}"
+    if running.any():
+        line += f" scale={float(np.median(scale[running])):.3g}"
+    stopped = np.bincount(status[~running], minlength=len(STATUS))
+    if stopped.any():
+        line += " [" + " ".join(
+            f"{name}={n}" for name, n in zip(STATUS, stopped, strict=True) if n
+        ) + "]"
+    return line

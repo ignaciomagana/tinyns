@@ -36,9 +36,13 @@ class NestedSampler:
     num_delete:
         Live points deleted and replaced per step, default
         ``max(1, nlive // 10)``, at most ``nlive // 2``. Its replacement chains
-        run in parallel (vmapped); ``num_delete=1`` runs one unbatched chain
-        that skips the likelihood of out-of-cube proposals, for expensive
-        likelihoods.
+        run in parallel (vmapped) and evaluate every proposal (an out-of-cube
+        one at the chain's point); ``num_delete=1`` runs one unbatched
+        chain that skips the likelihood of a proposal rejected without it
+        (outside the cube, or by a local-walk or hop Hastings test), for
+        expensive likelihoods. In a batch of runs that chain is vmapped over
+        the runs, and it evaluates those proposals too; ``ncall`` still counts
+        only what the run evaluates alone, and ``maxcall`` limits that count.
     walks:
         Steps per replacement chain, default ``max(25, 6 * ndim, ndim**2 // 6)``
         (:func:`tinyns.core.default_walks`): 6 steps per dimension up to 36
@@ -85,7 +89,11 @@ class NestedSampler:
         ``success=False``; a lane of a batch stops alone). ``progress`` prints
         one line per chunk of steps: dead points, ``logz``, the dlogz
         remainder, calls, calls per second, the chain acceptance and the step
-        scale.
+        scale. For a batch of runs it gives the number running, the range of
+        dead points, the largest dlogz remainder and the median step scale
+        over the running runs (left out once none runs), the calls of all
+        runs, calls per second and the acceptance, and the number of stopped
+        runs in each status.
 
         ``checkpoint`` is a file path. If the file exists, the run resumes
         from it; a checkpoint written with a different config, x64 flag,
@@ -101,8 +109,11 @@ class NestedSampler:
         ``1e5``), nor one at none of the points checked. A path that cannot
         be written raises ``OSError`` before the run starts. The run writes
         the file atomically at a chunk boundary at most every 10 minutes and
-        at the end. A resumed run is bit-identical to an uninterrupted one on
-        the same JAX build and device (a checkpoint of another warns), and
+        at the end. The random stream depends on the step count only: on a
+        CPU a resumed run is bit-identical to an uninterrupted one on the same
+        JAX build (a checkpoint of another build or device warns), and on a
+        GPU in float32, where a fixed seed is not bit-reproducible between
+        processes, the two agree in distribution.
         ``metadata["wall_time_s"]`` adds up the time of every session. A
         checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
         under this call's limits. A symbolic link at the path is written
@@ -116,10 +127,14 @@ class NestedSampler:
         the runs) and a list of ``B`` results is returned. Each is a draw from
         the same distribution as the run of its key alone but is not
         bit-identical to it (vmap changes the summation order; in float64 the
-        two agree to roundoff). With ``batched_data=True`` every array leaf of
-        a pytree ``loglike`` or ``prior_transform`` (e.g.
-        ``jax.tree_util.Partial(fn, data)`` with ``data`` stacked over runs)
-        carries the same leading axis of ``B``: run ``i`` sees slice ``i``.
+        two agree to roundoff). The batch computes every run until the last
+        one stops (a stopped run is frozen, not skipped), so the device
+        evaluates about ``B`` times the likelihood calls of the longest run;
+        each result's ``ncall`` counts its own run's calls. With
+        ``batched_data=True`` every array leaf of a pytree ``loglike`` or
+        ``prior_transform`` (e.g. ``jax.tree_util.Partial(fn, data)`` with
+        ``data`` stacked over runs) carries the same leading axis of ``B``:
+        run ``i`` sees slice ``i``.
         """
         try:
             return core.run(

@@ -132,6 +132,33 @@ def test_batched_maxiter_maxcall_and_resume(tmp_path) -> None:
         sampler.run(keys, checkpoint=path, batched_data=True)
 
 
+def test_lane_rows_are_copied_out_of_the_chunk_buffer(monkeypatch) -> None:
+    """The dead rows a lane keeps from a chunk own their memory: a view into
+    the chunk's buffer (every lane, the full capacity) would keep the whole
+    buffer of every chunk alive until the end of the run."""
+    pieces = []
+    concat = core._concat
+
+    def spy(rows):
+        pieces.extend(rows)
+        return concat(rows)
+
+    def held(x):  # bytes of the buffer that x keeps alive
+        while isinstance(x.base, np.ndarray):
+            x = x.base
+        return x.nbytes
+
+    monkeypatch.setattr(core, "_concat", spy)
+    monkeypatch.setattr(core, "_CHUNK_SECONDS", 0.0)  # one step per chunk
+    sampler = NestedSampler(gauss, identity, 2, 40, num_delete=4)
+    sampler.run(jax.random.split(jax.random.key(0), 3), maxiter=40)
+    sampler.run(0, maxiter=40)
+    assert len(pieces) > 20
+    for piece in pieces:
+        for x in piece:
+            assert held(x) == x.nbytes
+
+
 def test_batch_arguments_are_validated() -> None:
     keys = jax.random.split(jax.random.key(0), 3)
     sampler = NestedSampler(gauss, identity, 2, 20)
