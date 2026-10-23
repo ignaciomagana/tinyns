@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
+import sys
 import time
 import warnings
 from typing import Any, NamedTuple
@@ -105,6 +106,18 @@ def _check_int(name: str, value, minimum: int) -> int:
     return int(value)
 
 
+def _user_stacklevel() -> int:
+    """The ``stacklevel`` at which a warning issued by the caller of this
+    function names the first frame outside tinyns and ``dataclasses``: the
+    user's line, whether they built a :class:`Config`, re-made one with
+    ``dataclasses.replace`` or built a ``NestedSampler``."""
+    own = ("tinyns", "dataclasses")
+    frame, level = sys._getframe(1), 1
+    while frame and frame.f_globals.get("__name__", "").split(".")[0] in own:
+        frame, level = frame.f_back, level + 1
+    return level
+
+
 def default_walks(ndim: int) -> int:
     """Default chain length: ``max(25, 6 ndim, ndim^2 // 6)``.
 
@@ -168,6 +181,20 @@ class Config:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
         folds = _check_int("_folds", self._folds, 2)
+        # Each fold's walk covariance is fitted to the other folds' points,
+        # about (K - 1) / K of nlive, which span fewer than ndim directions
+        # below this: on a 32-D Gaussian nlive 40 left logZ 9 nats high.
+        least = folds / (folds - 1) * (ndim + 1)
+        if nlive < least:
+            warnings.warn(
+                f"nlive={nlive} is too few for ndim={ndim}: below "
+                f"{math.ceil(least)} live points the walk covariances, fitted to "
+                f"{folds - 1} of the {folds} folds, cannot span every "
+                "direction, and logZ can be biased far beyond logzerr; use at "
+                "least 5 * ndim",
+                UserWarning,
+                stacklevel=_user_stacklevel(),
+            )
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
@@ -1395,6 +1422,7 @@ def finalise(
         **({} if dlogz is None else {"dlogz": dlogz}),
         **_mode_info(dead, k, hops, hop_tries),
         "mode_tree": _mode_tree(state),
+        "mode_tree_dropped": _mode_tree_dropped(state),
         "folds": cfg._folds,
     }
     return NestedSamplingResult(
@@ -1506,7 +1534,9 @@ def _transform(prior_transform, u: np.ndarray, dtype, block: int) -> np.ndarray:
 
 def _mode_tree(state: State) -> list:
     """``[label, parent label]`` of every cluster made by a split (labels as
-    :func:`_reported_label` records them), for ``result.metadata``."""
+    :func:`_reported_label` records them), for ``result.metadata``: the ids
+    below ``TREE_SIZE`` of each clustering (:func:`_mode_tree_dropped` counts
+    the others)."""
     tree, nxt = np.asarray(state.mode_tree), np.asarray(state.mode_next)
     folds = tree.shape[0]
     return [
@@ -1514,6 +1544,13 @@ def _mode_tree(state: State) -> list:
         for j in range(folds)
         for uid in range(1, min(int(nxt[j]), tree.shape[1]))
     ]
+
+
+def _mode_tree_dropped(state: State) -> int:
+    """The number of clusters made by a split whose parent ``mode_tree``
+    did not record: ``TREE_SIZE - 1`` ids per clustering are recorded."""
+    nxt = np.asarray(state.mode_next)
+    return int(np.maximum(nxt - _modes.TREE_SIZE, 0).sum())
 
 
 def _mode_info(dead: Dead, k: int, hops, hop_tries) -> dict:

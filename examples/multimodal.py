@@ -40,10 +40,13 @@ def main():
     print(result.summary())
     print(f"true logZ: {TRUE_LOGZ:.4f}, true masses: 0.75, 0.25")
 
+    # run_sd: the run-to-run scatter of the mass in logit, measured within
+    # the run (the folds' spread and the prior-volume error they share).
     for i, mode in enumerate(result.modes()):
         print(
-            f"mode {i}: mass {mode['mass']:.3f}, smallest live count "
-            f"{mode['min_live']}, unresolved: {mode['unresolved']}"
+            f"mode {i}: mass {mode['mass']:.3f} (logit sd {mode['run_sd']:.2g}), "
+            f"smallest live count {mode['min_live']}, "
+            f"unresolved: {mode['unresolved']}"
         )
     return result
 

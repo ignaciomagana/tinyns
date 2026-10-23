@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import os
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -253,6 +256,55 @@ def test_config_rejects_invalid_values(kwargs, error) -> None:
         Config(**{"ndim": 2, "nlive": 10, **kwargs})
 
 
+def test_config_warns_when_the_walk_covariances_cannot_span_ndim() -> None:
+    """A fold's walk covariance is fitted to the other two folds' points,
+    about 2/3 of nlive: below 1.5 (ndim + 1) they span fewer than ndim
+    directions (on a 32-D Gaussian logZ came out 9 nats high at nlive 40)."""
+    with pytest.warns(UserWarning, match="nlive=40 is too few for ndim=32"):
+        Config(32, 40)
+    with pytest.warns(UserWarning, match="below 5 live points"):
+        Config(2, 4, num_delete=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Config(32, 50)  # 1.5 * 33 = 49.5
+        Config(2, 5)
+
+
+def test_the_nlive_warning_names_the_users_line() -> None:
+    """The warning points at the line that built the ``Config`` or the
+    ``NestedSampler``, not at tinyns or the stdlib (it named
+    ``tinyns/api.py`` for a ``NestedSampler`` and ``dataclasses.py`` for a
+    ``Config`` re-made with ``dataclasses.replace``)."""
+    for build in (
+        lambda: Config(32, 40),
+        lambda: dataclasses.replace(Config(32, 100), nlive=40),
+        lambda: NestedSampler(gauss(0.5, 0.1), identity, 32, nlive=40),
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            build()
+        assert [os.path.basename(w.filename) for w in caught] == ["test_core.py"]
+
+
+def test_mode_tree_counts_the_splits_it_did_not_record() -> None:
+    """``metadata["mode_tree"]`` records the parents of the first
+    ``TREE_SIZE - 1`` cluster ids of each clustering; ``mode_tree_dropped``
+    counts the others (a float32 run whose clustering churned made 3306
+    splits and recorded 1533, with no sign of it)."""
+    from types import SimpleNamespace
+
+    from tinyns.modes import TREE_SIZE
+
+    result = NestedSampler(gauss(0.5, 0.1), identity, 2, nlive=40).run(0)
+    assert result.metadata["mode_tree_dropped"] == 0
+    state = SimpleNamespace(
+        mode_tree=np.zeros((3, TREE_SIZE), np.int32),
+        mode_next=np.array([TREE_SIZE + 88, 3, TREE_SIZE], np.int32),
+    )
+    assert len(core._mode_tree(state)) == 2 * (TREE_SIZE - 1) + 2
+    assert core._mode_tree_dropped(state) == 88
+
+
 # --- init and step -----------------------------------------------------------
 
 
@@ -421,7 +473,8 @@ def test_walk_mask_falls_back_when_too_few_points_remain() -> None:
     np.testing.assert_array_equal(core._walk_mask(above, other, 5), np.ones(10, bool))
     # A step on a nearly exhausted live set still runs: 2 points above L*,
     # both seeds, in 2-D.
-    cfg = Config(2, 4, num_delete=2, walks=5)
+    with pytest.warns(UserWarning, match="too few for ndim=2"):
+        cfg = Config(2, 4, num_delete=2, walks=5)
     loglike = gauss(0.5, 0.2)
     state = init(0, loglike, identity, cfg)
     new, _ = step(state, loglike, identity, cfg)
