@@ -80,7 +80,8 @@ class NestedSampler:
         evaluations are reached (checked after each step), or on a likelihood
         plateau. ``progress`` prints one line per chunk of steps: dead points,
         ``logz``, the dlogz remainder, calls, calls per second, the chain
-        acceptance and the step scale.
+        acceptance and the step scale (for a batch of runs: over the running
+        runs, and the number of stopped runs in each status).
 
         ``checkpoint`` is a file path. If the file exists, the run resumes
         from it; a checkpoint written with a different config, x64 flag,

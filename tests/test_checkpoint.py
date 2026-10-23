@@ -259,3 +259,34 @@ def test_progress_prints_one_line_per_chunk(capsys) -> None:
     assert len(lines) == results[0].metadata["chunks"]
     assert "lanes running=0/3" in lines[-1]
     assert f"ncall={sum(r.ncall for r in results)} " in lines[-1]
+    assert lines[-1].endswith("[converged=3]")
+
+
+def test_batched_progress_reads_the_running_lanes(capsys) -> None:
+    """The batched line takes niter, dlogz and scale over the running lanes:
+    a lane that stopped (here a flat likelihood, a plateau at step 0) does
+    not pin them. The last line counts the lanes in each status."""
+    flat = Partial(capped_gauss, jnp.full((2, 2), 0.5), 0.1, jnp.asarray([0.0, -1e9]))
+    sampler = NestedSampler(flat, identity, 2, 50, num_delete=5)
+    results = sampler.run(jax.random.split(jax.random.key(0), 2), progress=True,
+                          batched_data=True)
+    assert [r.metadata["status"] for r in results] == ["converged", "plateau"]
+    lines = capsys.readouterr().out.strip().splitlines()
+    for line in lines[:-1]:
+        assert "lanes running=1/2" in line and line.endswith(" [plateau=1]")
+        assert "niter=0.." not in line and "inf" not in line
+    ncall = sum(r.ncall for r in results)
+    assert lines[-1].startswith(f"tinyns: lanes running=0/2 ncall={ncall} ")
+    assert lines[-1].endswith(" [converged=1 plateau=1]")
+    assert "niter=" not in lines[-1] and "scale=" not in lines[-1]
+
+    status = np.asarray([core.CONVERGED, core.RUNNING, core.PLATEAU, core.RUNNING])
+    line = core._progress_line(
+        sampler.config, 4, status, np.asarray([60, 59, 0, 40]),
+        np.zeros(4), np.asarray([0.09, 0.5, np.inf, 1.25]), [1, 2, 3, 4], 1.0,
+        0.25, np.asarray([9.0, 1.0, 9.0, 2.0]),
+    )
+    assert line == (
+        "tinyns: lanes running=2/4 niter=200..295 dlogz<=1.25 ncall=10 "
+        "calls/s=1 acc=0.250 scale=1.5 [converged=1 plateau=1]"
+    )

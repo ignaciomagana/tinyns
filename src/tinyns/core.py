@@ -1644,7 +1644,10 @@ def run(
 
 def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale):
     """One progress line: iteration, logz, dlogz, calls, calls/s, acceptance
-    and step scale (for a batch: the running lanes and the range of each)."""
+    and step scale. For a batch: the number of running lanes, the range of
+    the iteration, the largest dlogz and the median scale over the running
+    lanes alone (a stopped lane is frozen), and the number of stopped lanes
+    in each status."""
     k = cfg.num_delete
     if batch is None:
         return (
@@ -1653,9 +1656,19 @@ def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale
             f"acc={acc:.3f} scale={float(scale[0]):.3g} [{STATUS[int(status[0])]}]"
         )
     running = status == RUNNING
-    return (
-        f"tinyns: lanes running={int(running.sum())}/{batch} "
-        f"niter={int(it.min()) * k}..{int(it.max()) * k} "
-        f"dlogz<={float(np.max(remain)):.3g} ncall={sum(ncall)} "
-        f"calls/s={rate:.3g} acc={acc:.3f} scale={float(np.median(scale)):.3g}"
-    )
+    line = f"tinyns: lanes running={int(running.sum())}/{batch} "
+    if running.any():
+        it = it[running]
+        line += (
+            f"niter={int(it.min()) * k}..{int(it.max()) * k} "
+            f"dlogz<={float(np.max(remain[running])):.3g} "
+        )
+    line += f"ncall={sum(ncall)} calls/s={rate:.3g} acc={acc:.3f}"
+    if running.any():
+        line += f" scale={float(np.median(scale[running])):.3g}"
+    stopped = np.bincount(status[~running], minlength=len(STATUS))
+    if stopped.any():
+        line += " [" + " ".join(
+            f"{name}={n}" for name, n in zip(STATUS, stopped, strict=True) if n
+        ) + "]"
+    return line
