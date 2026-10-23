@@ -221,7 +221,7 @@ recomputes the cached quadrature values.
 |---|---|---|
 | `tinyns_v02[:noswap]` | gpu | `release/0.x` = 2f67111; see below |
 | `tinyns_v1[:k1]` | gpu | the installed v1 package; `k1` is `num_delete=1` |
-| `blackjax_nss` | gpu | `blackjax.nss`, `num_delete = nlive/10`, `num_inner_steps = max(5, 2d)` |
+| `blackjax_nss` | gpu | `blackjax.nss`, `num_delete = nlive/10` (the bench's choice; BlackJAX's default is 1), `num_inner_steps = max(5, 2d)` |
 | `dynesty[:rwalk100]` | cpu | `bound='multi', sample='auto'`, or `sample='rwalk', walks=100` |
 | `ultranest[:slice]` | cpu | MLFriends, or `SliceSampler(nsteps=2d, mixture directions)` |
 | `nautilus[:discard]` | cpu | defaults (`n_live=2000`), or `discard_exploration=True`; `--opt pool=N` |
@@ -234,22 +234,43 @@ when you read the table:
   v0.3 series in progress (PRs 1-6 merged on main). It behaves like v0.2.5 with
   the code pruned, and its `__version__` still says 0.2.5.
 - **Termination.** `--dlogz` (default 0.1) goes to tinyns, BlackJAX and
-  dynesty. The others keep their own stopping rules:
+  dynesty; the BlackJAX adapter tests it after every step, inside its
+  compiled loop. The others keep their own stopping rules:
   - Nautilus stops at `f_live=0.01` and `n_eff=10000`.
-  - JAXNS stops at `dlogZ = log1p(1e-3)`.
+  - JAXNS stops at `dlogZ = log1p(1e-3)`, which is a remaining-evidence
+    fraction of 1e-3 at the contour likelihood, not a log-evidence
+    remainder. In low dimensions that is later than tinyns's rule: about
+    1.5 times the calls at d = 2 (1.0 to 2.4 per seed), 1.2 to 1.3 at d = 4
+    to 8 and under 10% more from d = 16, with the same logZ and logzerr.
   - UltraNest keeps `dlogz=0.5`, because its `dlogz` is a target uncertainty:
-    a value of 0.1 makes it add live points. It also keeps `frac_remain=0.01`.
+    a value of 0.1 makes it add live points. It also keeps `frac_remain=0.01`
+    (1% of the evidence left in the live points, against about 9.5% for
+    `dlogz = 0.1`), which costs about 1.25 times the calls on `gauss_d2`.
 - **Evidence error.** Nautilus reports no `logzerr`, so its `scat/err` is
   blank.
 - **`ncall`** is the number of likelihood evaluations the sampler counts. The
   vmapped samplers (BlackJAX, JAXNS) count per-chain evaluations; lanes that
   sit idle inside a vmap are not counted.
 - **Time.** `wall_s` covers the whole run, compilation included.
-  `compile_s` is the compilation part when it can be separated (tinyns,
-  BlackJAX).
+  `compile_s` is the compilation part, every compile of the run, where it
+  can be separated (tinyns and BlackJAX); `run s` = wall - compile is then a
+  compiled run.
+  - tinyns v1 runs a one-step warm-up of the same sampler first and counts
+    it as `compile_s`: it compiles (or loads) the init and step kernels, the
+    prior map and the small ops of the driver. `metadata["compile_s"]` alone
+    covers only the step kernel.
+  - BlackJAX compiles `init` and its loop ahead of time; its post-processing
+    (`finalise`, `log_weights`, the prior map) runs op by op, and each op
+    compiles on its first call in a process and is too small for the
+    persistent cache. The adapter runs the post-processing twice and counts
+    the difference as compilation.
+  - tinyns 0.x's `compile_s` is what 0.x times itself: the time until its
+    first block of iterations ends.
 - **Devices.** The CPU samplers call the jitted JAX likelihood on CPU
   (`JAX_PLATFORMS=cpu`). dynesty calls it one point at a time; UltraNest and
-  Nautilus call it in batches through `vmap`.
+  Nautilus call it in batches through `vmap`, padded to the next power of two
+  so that the batch sizes (56 to 59 in an UltraNest MLFriends run) compile
+  only a few programs. Their compiles are inside `wall_s`.
 - **Precision.** x64 is on by default (`--no-x64` turns it off).
 
 ## Environments
@@ -376,10 +397,12 @@ accurate when:
 - for a mixture, at most 10% of its seeds lost a mode, and the logit bias of
   the mode weight is within 3 se or 0.1.
 
-The headline's ratios are geometric means over the targets where both samplers
-are accurate. A sampler that is cheap where it is accurate, and accurate on
-few targets, still ranks well there: read the rank next to the accurate-cells
-table.
+The headline's ratios are geometric means over the reference cells where both
+samplers are accurate, and `common / ran cells` counts reference cells, not
+targets: with `--reference-nlive 500,1000` every target is two cells, each
+paired with the competitor's one cell. A sampler that is cheap where it is
+accurate, and accurate on few targets, still ranks well there: read the rank
+next to the accurate-cells table.
 
 **Read the costs with these in mind:**
 
@@ -392,10 +415,16 @@ table.
   - Nautilus runs 2000 live points to an effective sample size of 10000.
   - JAXNS's default is `30 * ndim` live points: 60 at d = 2, 1920 at d = 64.
   - UltraNest stops at `dlogz = 0.5` and may add live points.
+  - JAXNS and UltraNest stop later than `dlogz = 0.1` in low dimensions
+    (see Termination above), which adds calls but not accuracy.
 - **Timeouts.** A run stops at 1 h on the GPU and at 4 h on a CPU. `ncall` is
   the median of the finished runs only; `wall s` counts the timeouts too.
 - **Seeds.** 20 per target (40 for the mixtures); the CPU samplers have 10 at
   d >= 32.
+- **Records of the v1 sweep.** `RESULTS.md` was measured before the adapter
+  fixes above (BlackJAX's stop and `compile_s`, tinyns's warm-up, the padded
+  CPU batches). Its Known gaps say what each changes; the H100 cells have
+  not been measured again.
 
 ## Multimodality bake-off (`bench/bakeoff/`)
 
@@ -437,6 +466,10 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
   evidence by quadrature, the exact mode masses checked with direct draws
   from each mixture, and the `box` variant against the unit-cube one;
 - every installed adapter, on `gauss_d2` with nlive 100;
+- the adapters' timing and stopping (`test_adapters.py`): every compile of a
+  tinyns or BlackJAX run falls inside `compile_s`, BlackJAX stops at the
+  first step that meets `dlogz`, and the CPU likelihood compiles once per
+  power-of-two batch;
 - `run.py` and `summarize.py` end to end, including a timeout record;
 - the report on synthetic records: merging, the accuracy flags, the headline
   ratios and ranks, a missing reference, the commit filter (clean and

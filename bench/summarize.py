@@ -49,8 +49,9 @@ A sampler that ran at several ``nlive`` has one row for each.
 
 **Headline** (only when ``--reference``, default ``tinyns_v1``, has records):
 per family, each competitor's calls, wall time, rms and logit sd relative to the
-reference (geometric means over the targets where both are accurate), the same
-costs at equal rms, and the reference's rank by those (``headline``).
+reference (geometric means over the reference cells where both are accurate:
+a target counts once per ``nlive`` the reference ran it at), the same costs at
+equal rms, and the reference's rank by those (``headline``).
 ``--reference-nlive 500,1000`` keeps the headline to the reference's cells at
 those ``nlive``, when it also ran at values no competitor ran at.
 """
@@ -459,8 +460,11 @@ def headline(rows, reference: str, nlive=None):
 
     A reference cell pairs with the competitor's cell of the same target (of
     the nearest ``nlive`` when there are several). ``common`` counts the
-    targets where both are accurate, out of those both ran. The ratios are
-    competitor / reference, as geometric means over the common targets:
+    reference cells where both are accurate, out of the ``ran`` reference
+    cells the competitor has a target for. These are cells, not targets: with
+    the reference at two ``nlive`` a target counts twice, and pairs twice
+    with the same competitor cell. The ratios are competitor / reference, as
+    geometric means over the common cells:
 
     ``ncall``, ``wall_s``   as run. Above 1: the reference is cheaper.
     ``rms``, ``logit_sd``   above 1: the reference is more precise.
@@ -555,12 +559,14 @@ def headline_markdown(rows, reference: str, nlive=None) -> str:
         )
     out += [
         "",
-        f"Competitor / `{reference}`, geometric mean over the common accurate "
-        f"targets. Above 1: `{reference}` needs fewer calls or less time, or has "
-        "the smaller rms or logit sd. `at equal rms` is the cost ratio times "
-        "the squared rms ratio (cost taken to go as 1 / rms^2). Wall times "
-        "compare across hardware labels only as measured.\n",
-        "| family | competitor | hw | common / ran | calls | wall time | rms "
+        f"Competitor / `{reference}`, geometric mean over the `{reference}` "
+        "cells of the family where both are accurate (`common`, out of the "
+        "`ran` cells whose target the competitor ran; a target counts once per "
+        f"`{reference}` nlive). Above 1: `{reference}` needs fewer calls or less "
+        "time, or has the smaller rms or logit sd. `at equal rms` is the cost "
+        "ratio times the squared rms ratio (cost taken to go as 1 / rms^2). "
+        "Wall times compare across hardware labels only as measured.\n",
+        "| family | competitor | hw | common / ran cells | calls | wall time | rms "
         "| calls at equal rms | wall time at equal rms | logit sd |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
