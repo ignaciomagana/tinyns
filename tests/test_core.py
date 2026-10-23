@@ -548,6 +548,7 @@ def spy_transform_kernel(monkeypatch, fits):
 def test_final_prior_pass_halves_its_block_out_of_memory(monkeypatch) -> None:
     cfg = Config(1, 40, num_delete=4)
     state, dead = fake_run(np.linspace(-9.0, -1.0, 80), np.zeros(40), 40, 4)
+    state = state._replace(u=state.u.astype(FLOAT))  # the dtype of a real run
 
     def prior(u):
         return jnp.sin(3.0 * u) - u
