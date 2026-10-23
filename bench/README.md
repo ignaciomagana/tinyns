@@ -108,6 +108,9 @@ A case passes when all of these hold (se is the standard error over seeds):
   0.25 to 0.37, which the floor alone let through. The limit holds at the
   full tier's `nlive` and scales as `1 / sqrt(nlive)` when `--nlive`
   overrides it, up to 0.4. A hop that never runs fails `hop` too.
+- **The hop limit** of 2% sits far below what the hop accepts: at least 0.20
+  in LogGamma and 0.72 in the sepW cases, `sepW_d18` at `nlive=4000`
+  included (416 runs on CPU, float32 and x64).
 - **Mode weights are oracle masses**: the target's exact responsibility
   averaged over the posterior samples, not `result.modes()`.
 - **The mode count** is that of `result.modes()`. The truth is 1 for the

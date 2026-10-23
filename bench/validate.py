@@ -105,6 +105,10 @@ class Case(NamedTuple):
 #   0.07 at the gate's nlive, and without it (Config._hop=False) 0.25 to 0.37
 #   (H100 and CPU, 16 and 64 seeds), which the accuracy floor of 0.4 lets
 #   through; 0.12 tells them apart.
+# - hop: in 416 stock CPU runs at the gate's nlive (loggamma_d10, sepWbox_d4,
+#   sepW_d10 and sepW_d18, float32 and x64) the hop accepted at least 0.20
+#   of its proposals (LogGamma; 0.72 for the sepW cases), ten times
+#   HOP_ACCEPT_WARN. With it off its acceptance is None in every run.
 # - modes: the smallest and the largest number of modes a run may report.
 #   - rosen_d10 has a second lobe at x_1 = -1 with 2.52% of the mass (by the
 #     quadrature of ``bench.targets``, P(x_1 < 0)), joined to the main mode by
