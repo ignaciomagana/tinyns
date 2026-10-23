@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 LOG_2PI = math.log(2.0 * math.pi)
+# np.trapezoid is NumPy >= 2; NumPy 1.x has only np.trapz.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 
 
 @dataclass(frozen=True)
@@ -225,7 +227,7 @@ def funnel_logz_quadrature(d: int, n: int = 200001) -> float:
         / (FUNNEL_SIGMA_V * math.sqrt(2 * math.pi))
         * erf_v(FUNNEL_X / (math.sqrt(2.0) * sd)) ** (d - 1)
     )
-    integral = np.trapezoid(f, v)
+    integral = _trapezoid(f, v)
     logv = math.log(2 * FUNNEL_V) + (d - 1) * math.log(2 * FUNNEL_X)
     return math.log(integral) - logv
 
@@ -287,9 +289,11 @@ def loggamma(d: int) -> Target:
     at 1/3 and 2/3, coordinate 2 an equal mixture of normals at 1/3 and 2/3, all
     with scale 1/30. Coordinates 3..(d+2)/2 are LogGamma at 2/3, the rest normal
     at 2/3. Each factor is a normalised density, so logZ = 0 up to the box
-    truncation; the exact value (about -4.5e-5 per LogGamma factor, from the
-    heavy left tail) is computed from the CDFs. Four modes (component of
-    coordinate 1 x component of coordinate 2), each of mass ~1/4.
+    truncation; the exact value is computed from the CDFs. It is about
+    -2.27e-5 at every d: the box cuts 4.5e-5 of the left tail of the LogGamma
+    at 1/3 (half of coordinate 1), and 2e-9 of each LogGamma at 2/3. Four
+    modes (component of coordinate 1 x component of coordinate 2), each of
+    mass ~1/4.
     """
     if d < 2:
         raise ValueError("loggamma needs d >= 2")
@@ -425,7 +429,13 @@ def build_two_mode(d, w2, variant="sep", shape="M", seed=0, twist=0.0):
     ``y_j - twist * sigma_j * (y_i / sigma_i)^2`` (``i`` the widest dim, ``j``
     the narrowest dim that is not offset), so logZ and the mode masses are
     unchanged.
+
+    The minor-mode shapes are set for d = 4, 10, 18 and 32 only (``SHAPES``).
     """
+    if d not in SHAPES[shape]:
+        raise ValueError(
+            f"the mixture targets have d in {sorted(SHAPES[shape])}, not {d}"
+        )
     rng = np.random.default_rng(seed)
     sig = np.geomspace(SIG_MIN, SIG_MAX, d)
     rng.shuffle(sig)
