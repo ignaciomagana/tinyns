@@ -19,10 +19,11 @@ class NestedSampler:
     ----------
     loglike:
         JAX-traceable function of one point in parameter space returning its
-        log likelihood (NaN counts as ``-inf``). It may be a JAX pytree
-        callable such as ``jax.tree_util.Partial(loglike_fn, data)``: its array
-        leaves are passed to the compiled kernels as arguments, so datasets of
-        one shape share one compiled program.
+        log likelihood (NaN counts as ``-inf``; ``+inf`` is not valid: the run
+        stops with ``success=False`` and the status ``"invalid"``). It may be
+        a JAX pytree callable such as ``jax.tree_util.Partial(loglike_fn,
+        data)``: its array leaves are passed to the compiled kernels as
+        arguments, so datasets of one shape share one compiled program.
     prior_transform:
         JAX-traceable function mapping one unit-cube point to parameter space.
         May be a pytree callable, like ``loglike``.

@@ -50,8 +50,8 @@ def main():
     # its increments on the host (a difference stays right across a wrap).
     ncall = int(state.ncall)
     # delta_logz is the evidence the live points could still add, in log
-    # units. step sets the status only on a likelihood plateau, and the loop
-    # stops there.
+    # units. step sets the status only on a likelihood plateau or at a
+    # likelihood of +inf, and the loop stops there.
     while delta_logz(state, cfg) >= DLOGZ and STATUS[int(state.status)] == "running":
         before = state.ncall
         state, dead = chunk(state)  # leaves of shape (STEPS_PER_CHUNK, k, ...)

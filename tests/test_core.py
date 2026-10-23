@@ -11,7 +11,7 @@ import pytest
 from jax import random
 
 import tinyns
-from tinyns import Config, NestedSampler, core, finalise, init, step
+from tinyns import STATUS, Config, NestedSampler, core, finalise, init, step
 from tinyns.result import _evidence
 
 FLOAT = jnp.result_type(float)
@@ -433,6 +433,82 @@ def test_constant_likelihood_is_a_plateau_with_exact_evidence() -> None:
     assert result.logzerr < 1e-12  # the widths sum to 1 exactly
 
 
+@pytest.mark.parametrize("value", [-jnp.inf, jnp.nan])
+def test_no_finite_likelihood_is_not_a_success(value) -> None:
+    """No initial point has a finite likelihood: step 0 finds nothing above
+    L* = -inf. It was a plateau with success=True and logz = -inf, and
+    summary(), print(result) and diagnostics() then raised."""
+    sampler = NestedSampler(lambda x: value * x[0], identity, 2, 50, num_delete=5)
+    with pytest.warns(RuntimeWarning, match="no live point has a finite likelihood"):
+        result = sampler.run(0)
+    assert not result.success and result.metadata["status"] == "invalid"
+    assert result.logz == -math.inf and result.niter == 0
+    assert "raise nlive" in result.message
+    assert "success: False" in str(result) and result.message in result.summary()
+    diagnostics = result.diagnostics()
+    assert diagnostics["posterior_ess"] == 0.0 and result.posterior_ess() == 0.0
+    assert math.isnan(diagnostics["live_weight_fraction"])
+    assert diagnostics["warnings"][0] == result.message
+    with pytest.raises(ValueError, match="no sample has a positive posterior weight"):
+        result.resample_equal(0)
+    with pytest.raises(ValueError, match="no sample has a positive posterior weight"):
+        result.weights()
+
+
+def spike(x):
+    """+inf on a disc of area 0.03 at the peak of a Gaussian."""
+    r2 = jnp.sum((x - 0.5) ** 2)
+    return jnp.where(r2 < 0.01, jnp.inf, -0.5 * r2 / 0.1**2)
+
+
+def test_plus_infinite_likelihood_stops_the_run() -> None:
+    """A likelihood of +inf (a float32 overflow, say) never dies: the run went
+    on to a plateau of +inf points and reported success with logz = +inf.
+    The first step after which a +inf point is live now stops it."""
+    cfg = Config(2, 60, num_delete=6, walks=10)
+    with pytest.warns(RuntimeWarning, match=r"loglike returned \+inf"):
+        result = core.run(1, spike, identity, cfg)
+    assert not result.success and result.metadata["status"] == "invalid"
+    assert result.logz == math.inf and "+inf" in result.message
+    # Stopped at once: at most the initial +inf points and one step's births.
+    n_inf = int(np.sum(np.isposinf(result.logl)))
+    at_init = int(np.sum(np.isposinf(init(1, spike, identity, cfg).logl)))
+    assert 1 <= n_inf <= at_init + 6
+    assert result.message in result.diagnostics()["warnings"]
+    assert "success: False" in str(result)
+    # The functional core: step sets the status "invalid", its rows are valid.
+    state = init(1, spike, identity, cfg)
+    while STATUS[int(state.status)] == "running":
+        state, dead = step(state, spike, identity, cfg)
+    assert STATUS[int(state.status)] == "invalid" and int(state.it) == result.niter // 6
+    assert np.any(np.isposinf(state.logl)) and not np.any(np.isposinf(dead.logl))
+
+
+def test_an_invalid_lane_stops_alone() -> None:
+    """One lane of a batch without a finite likelihood and one with a +inf
+    region stop as invalid; the run does not raise and the other lane
+    converges as it would alone."""
+
+    def loglike(data, x):  # data: (offset, +inf disc on or off)
+        r2 = jnp.sum((x - 0.5) ** 2)
+        inf = (r2 < 0.01) & (data[1] > 0)
+        return jnp.where(inf, jnp.inf, data[0] - 0.5 * r2 / 0.1**2)
+
+    data = jnp.asarray([[0.0, 0.0], [-jnp.inf, 0.0], [0.0, 1.0]])
+    sampler = NestedSampler(jax.tree_util.Partial(loglike, data), identity, 2, 60,
+                            num_delete=6, walks=10)
+    with pytest.warns(RuntimeWarning) as record:
+        ok, nowhere, inf = sampler.run(jax.random.split(jax.random.key(2), 3),
+                                       batched_data=True)
+    assert ok.success and ok.metadata["status"] == "converged"
+    assert abs(ok.logz - math.log(2 * math.pi * 0.01)) < 4 * ok.logzerr + 0.05
+    assert nowhere.metadata["status"] == "invalid" and nowhere.logz == -math.inf
+    assert inf.metadata["status"] == "invalid" and inf.logz == math.inf
+    assert not nowhere.success and not inf.success
+    messages = {str(w.message) for w in record}
+    assert {nowhere.message, inf.message} <= messages
+
+
 def test_runs_under_jax_debug_nans() -> None:
     """The contour of the last step starts at -inf (it was a NaN sentinel,
     which made every run fail in init under jax_debug_nans)."""
@@ -585,7 +661,7 @@ def test_finalise_reports_convergence_of_a_hand_written_loop() -> None:
         finalise(state, jax.tree_util.tree_map(lambda x: x[:-1], dead), cfg)
 
     # A status the loop or the driver set is kept: dlogz never overrides it.
-    for code in (core.MAXITER, core.MAXCALL, core.PLATEAU):
+    for code in (core.MAXITER, core.MAXCALL, core.PLATEAU, core.INVALID):
         forced = state._replace(status=jnp.asarray(code, jnp.int32))
         result = finalise(forced, dead, cfg, dlogz=0.1)
         assert result.metadata["status"] == tinyns.STATUS[code]

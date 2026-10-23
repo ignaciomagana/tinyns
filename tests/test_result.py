@@ -376,6 +376,25 @@ def test_diagnostics_success_with_high_final_delta_logz_triggers_warning() -> No
     )
 
 
+def test_a_result_without_posterior_weight_reports_instead_of_raising() -> None:
+    """logz = -inf (no finite likelihood found): ESS 0 and NaN fractions."""
+    result = make_result()
+    result.logwt = jnp.full(4, -jnp.inf)
+    result.logz, result.logzerr = -math.inf, math.nan
+    result.success, result.message = False, "no live point has a finite likelihood"
+
+    diagnostics = result.diagnostics()
+
+    assert result.posterior_ess() == 0.0 and diagnostics["posterior_ess"] == 0.0
+    for name in ("max_weight_fraction", "live_weight_fraction", "dead_weight_fraction"):
+        assert math.isnan(diagnostics[name])
+    assert diagnostics["warnings"][0] == result.message
+    assert diagnostics["modes"] == result.modes() and len(result.modes()) == 1
+    assert "posterior ESS: 0.0" in result.summary() and str(result)
+    with pytest.raises(ValueError, match="no live point has a finite likelihood"):
+        result.resample_equal(0, n=3)
+
+
 def test_diagnostics_low_ess_triggers_warning() -> None:
     result = NestedSamplingResult(
         samples_u=jnp.zeros((101, 1)),

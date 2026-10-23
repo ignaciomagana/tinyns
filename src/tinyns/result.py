@@ -500,7 +500,9 @@ class NestedSamplingResult:
 
     success: bool = True
     """True if the run converged (``dlogz``) or ended on a likelihood plateau;
-    False if it stopped at ``maxiter`` or ``maxcall``."""
+    False if it stopped at ``maxiter`` or ``maxcall``, or if ``logz`` is not
+    finite (status ``"invalid"``: a likelihood of +inf, or no finite
+    likelihood found)."""
 
     message: str = ""
     """Human-readable status of the run."""
@@ -512,9 +514,23 @@ class NestedSamplingResult:
     ``wall_time_s``, ``compile_s``, ``sampling_s``, ``resumed`` and more (the
     CHANGELOG lists the keys)."""
 
+    def _no_weight(self) -> bool:
+        """True if no sample has a positive posterior weight (``logz = -inf``:
+        no finite likelihood was found)."""
+        logwt = np.asarray(self.logwt, dtype=float)
+        return logwt.size > 0 and not np.any(logwt > -np.inf)
+
+    def _check_weight(self) -> None:
+        if self._no_weight():
+            raise ValueError(
+                "no sample has a positive posterior weight (logz is -inf)"
+                + (f": {self.message}" if self.message else "")
+            )
+
     def log_weights(self):
         """Return posterior weights normalized in log space."""
 
+        self._check_weight()
         return normalize_log_weights(self.logwt)
 
     def weights(self):
@@ -523,8 +539,11 @@ class NestedSamplingResult:
         return jnp.exp(self.log_weights())
 
     def posterior_ess(self) -> float:
-        """Return the effective sample size of the posterior weights."""
+        """Return the effective sample size of the posterior weights (0 when
+        no sample has a positive weight)."""
 
+        if self._no_weight():
+            return 0.0
         return float(effective_sample_size_from_log_weights(self.logwt))
 
     def max_weight_fraction(self) -> float:
@@ -759,7 +778,7 @@ class NestedSamplingResult:
         (``mode_hop_off``). A mode lost before the end leaves no trace in its
         own run, and neither does one that never held more than about
         ``ndim`` live points per fold. A unimodal run (or a result without
-        :attr:`labels`) gives one mode of mass 1.
+        :attr:`labels`, or without posterior weight) gives one mode of mass 1.
         """
 
         fold = self._sample_folds()
@@ -769,7 +788,7 @@ class NestedSamplingResult:
                 "fold_sd": None if folds is None else 0.0,
                 "min_live": int(self.nlive), "isolation_iteration": 0,
                 "unresolved": False, "tracked": True}]
-        if int(self.niter) == 0 or self.labels is None:
+        if int(self.niter) == 0 or self.labels is None or self._no_weight():
             return one
         try:
             return self._modes(one)
@@ -1339,14 +1358,21 @@ class NestedSamplingResult:
         ``LUMPS_WARN``, ``mode_hop_off`` at least ``HOP_OFF_WARN`` or
         ``hop_acceptance`` below ``HOP_ACCEPT_WARN``), with the folds' masses
         of each mode, and when the slots were full in a run of several modes.
+        A result without posterior weight (``logz = -inf``) has
+        ``posterior_ess`` 0 and NaN weight fractions.
         """
 
         metadata = {} if self.metadata is None else self.metadata
+        weighted = not self._no_weight()
         posterior_ess = self.posterior_ess()
         nposterior = int(jnp.asarray(self.logwt).size)
-        max_weight_fraction = self.max_weight_fraction()
-        entropy_fraction = self.posterior_weight_entropy_fraction()
-        live_weight_fraction = self.live_weight_fraction()
+        max_weight_fraction = entropy_fraction = math.nan
+        live_weight_fraction = dead_weight_fraction = math.nan
+        if weighted:
+            max_weight_fraction = self.max_weight_fraction()
+            entropy_fraction = self.posterior_weight_entropy_fraction()
+            live_weight_fraction = self.live_weight_fraction()
+            dead_weight_fraction = self.dead_weight_fraction()
         insertion = self.insertion_test()
         modes = self.modes()
         separated = min(mode["isolation_iteration"] for mode in modes)
@@ -1410,14 +1436,14 @@ class NestedSamplingResult:
             "max_weight_fraction": max_weight_fraction,
             "posterior_weight_entropy_fraction": entropy_fraction,
             "live_weight_fraction": live_weight_fraction,
-            "dead_weight_fraction": self.dead_weight_fraction(),
+            "dead_weight_fraction": dead_weight_fraction,
             "final_delta_logz": final_delta_logz,
             "acceptance": acceptance,
             "insertion_pvalue": insertion["pvalue"],
             "modes": modes,
             "mode_slots_full": self._mode_slots()[1],
-            "mode_lumps": self._lumps(separated, len(modes)),
-            "mode_hop_off": self._hop_off(separated),
+            "mode_lumps": self._lumps(separated, len(modes)) if weighted else None,
+            "mode_hop_off": self._hop_off(separated) if weighted else None,
             "hop_acceptance": metadata.get("hop_acceptance"),
             "warnings": warnings,
         }
@@ -1433,6 +1459,7 @@ class NestedSamplingResult:
             n = max(1, int(self.posterior_ess()))
         if n < 1:
             raise ValueError("n must be at least 1")
+        self._check_weight()
 
         indices = systematic_resample(key, self.logwt, n)
         return jnp.asarray(self.samples)[indices]
