@@ -63,9 +63,18 @@ def test_sbc_batched_example() -> None:
     assert len(results) == module.B
     assert all(result.success for result in results)
     assert quantiles.shape == (module.B, 2)
-    # 64 lanes: the 90% coverage is 0.90 +- 0.04 for a calibrated sampler.
-    inside = np.abs(np.asarray(quantiles) - 0.5) < 0.45
-    assert inside.mean() > 0.7
+    # 128 quantiles (64 lanes, 2 parameters): for a calibrated sampler the
+    # 90% coverage is 0.90 +- 0.027 and the 50% coverage 0.50 +- 0.044.
+    # Posteriors too narrow lower both, too wide ones raise both. Here 0.875
+    # and 0.52 in float64 and in float32 on JAX 0.4.34, 0.875 and 0.39 in
+    # float32 on JAX >= 0.5 (0.35 to 0.39 with other resampling keys). Each
+    # of the three draws its own 64 datasets, and the last ones give 0.375
+    # with their exact posteriors: the low value is the data's, not the
+    # sampler's, so the 50% coverage may go down to 0.30. The bounds fail
+    # posteriors 20% too narrow (float32, float64) or 50% too wide.
+    distance = np.abs(np.asarray(quantiles) - 0.5)
+    assert 0.80 <= np.mean(distance < 0.45) <= 0.98
+    assert 0.30 <= np.mean(distance < 0.25) <= 0.65
 
 
 def test_functional_core_example() -> None:

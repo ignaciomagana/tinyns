@@ -34,13 +34,21 @@ def test_two_mode_runs_find_both_modes() -> None:
     400, x64 off and on, minor mass 0.25 +- 0.012; the v0.3 heuristic missed
     11). Before modes() measured a small label's distance to the others at
     their own posterior medians, 3 of the 192 reported one mode: the
-    clustering had cut three points off the minor mode in its last steps."""
-    for seed in range(5):
-        result = NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(seed)
+    clustering had cut three points off the minor mode in its last steps.
+    The hop keeps the urn balanced, which the window on each run's minor
+    mass hardly sees: with the hop off (``_hop=False``) all 32 runs of one
+    batch fell in it, but over 16 runs the minor masses scatter by 0.037 to
+    0.078 (sd; 6 batches, x64 off and on) against 0.012 to 0.016 with it.
+    The sd must be under 0.03, and the mean (0.25 +- 0.004) within 0.02 of
+    the truth."""
+    keys = jax.random.split(jax.random.key(0), 16)
+    masses = []
+    for result in NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(keys):
         weights = np.asarray(result.weights())
         minor = np.asarray(result.samples)[:, 0] > 0.55
         mass = weights[minor].sum() / weights.sum()
-        assert 0.15 < mass < 0.35  # truth 0.25; the hop keeps the urn balanced
+        masses.append(mass)
+        assert 0.15 < mass < 0.35  # truth 0.25
         assert abs(result.logz) < 4 * result.logzerr + 0.1  # truth 0
         modes = result.modes()
         assert len(modes) == 2
@@ -48,6 +56,8 @@ def test_two_mode_runs_find_both_modes() -> None:
         assert modes[1]["mass"] == pytest.approx(mass, abs=0.005)
         assert all(0 < m["urn_sd"] < 1 for m in modes)
         assert not any(m["unresolved"] for m in modes)
+    assert np.std(masses, ddof=1) < 0.03, masses
+    assert abs(np.mean(masses) - W_MINOR) < 0.02, masses
 
 
 def test_unresolved_flags_a_mode_below_five_points_per_dimension() -> None:
@@ -399,30 +409,39 @@ def test_saddle_depth_tells_lumps_from_modes() -> None:
 
 def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
     """The needle target of ``bench.targets`` (each mode a core with two
-    thin arms) against the same two modes without arms. The clustering cuts
-    the needle's modes into lumps and the hop balances them only in part,
-    which the warning says. The plain modes are not cut into lumps; the
-    warning may still say that the hop was off, which happens on some
-    trajectories (on JAX 0.4.31 the hop never ran in 2 of 8 runs at nlive
-    500, and the minor mode was lost), but never that the modes were lumps."""
+    thin arms) against the same two modes without arms, 4 batched runs of
+    each. The clustering cuts the needle's modes into lumps and the hop
+    balances them only in part, which the warning says. A needle run loses
+    its minor mode now and then (one mode and no warning: 2 of 112 runs,
+    float32 and float64), so one of the 4 may do that, and the others must
+    report both modes and the warning. The plain modes are not cut into
+    lumps; the warning may still say that the hop was off, which happens on
+    some trajectories (on JAX 0.4.31 the hop never ran in 2 of 8 runs at
+    nlive 500, and the minor mode was lost), but never that the modes were
+    lumps."""
     from bench.targets import build_needle, build_two_mode, mixture_target
 
     from tinyns import result as result_module
 
+    keys = jax.random.split(jax.random.key(0), 4)
     for spec, arms in ((build_needle(10), True), (build_two_mode(10, 0.2), False)):
         target = mixture_target("needle" if arms else "plain", spec)
         sampler = NestedSampler(target.loglike, target.prior_transform, 10, nlive=500)
-        diagnostics = sampler.run(0).diagnostics()
-        modes = diagnostics["modes"]
-        warned = [w for w in diagnostics["warnings"] if "only in part" in w]
-        if arms:
-            assert len(modes) >= 2
-            # One float32 run; its trajectory differs between CI runners, and
-            # the minor mass of this target scatters widely (0.31 on one).
-            assert 0.05 < sum(m["mass"] for m in modes[1:]) < 0.45
-            assert diagnostics["mode_lumps"] > 1.5 and len(warned) == 1
-            assert "it cut modes into lumps" in warned[0]
-        else:
+        missed = []
+        for i, result in enumerate(sampler.run(keys)):
+            diagnostics = result.diagnostics()
+            modes = diagnostics["modes"]
+            warned = [w for w in diagnostics["warnings"] if "only in part" in w]
+            if arms:
+                if len(modes) == 1 and not warned:  # the minor mode was lost
+                    missed.append(i)
+                    continue
+                assert len(modes) >= 2, i
+                # The minor mass of this target scatters widely (0.31 on one).
+                assert 0.05 < sum(m["mass"] for m in modes[1:]) < 0.45, i
+                assert diagnostics["mode_lumps"] > 1.5 and len(warned) == 1, i
+                assert "it cut modes into lumps" in warned[0], i
+                continue
             assert diagnostics["mode_lumps"] < 1.2
             assert not any("slots were full" in w for w in diagnostics["warnings"])
             acceptance = diagnostics["hop_acceptance"]
@@ -430,6 +449,7 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
                 acceptance is not None and acceptance < result_module.HOP_ACCEPT_WARN
             )
             assert off or not warned
+        assert len(missed) <= 1, missed
 
 
 @pytest.mark.slow
