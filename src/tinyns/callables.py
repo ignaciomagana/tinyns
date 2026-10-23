@@ -239,7 +239,11 @@ def _split_callable(fn, key, example):
     is empty and ``spec.rebuild`` returns the callable itself. That split is
     cached per callable identity and ``key`` (a tuple of plain values that
     determines ``example()``) for as long as the callable is alive, so the
-    hoisted leaves and the spec are the same objects on every call.
+    hoisted leaves and the spec are the same objects on every call. A new
+    object compiles the kernels again: a new lambda, or a bound method
+    (``model.loglike`` is a new object at each access; store it once). They
+    are not cached by equality, which would reuse a kernel built for an
+    object after the object changed (``model.mu = 5``).
     """
     dynamic, static = _partition_callable(fn)
     if dynamic:

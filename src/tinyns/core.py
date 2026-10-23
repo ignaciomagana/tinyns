@@ -1146,6 +1146,16 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     (``STATUS[int(state.status)] == "plateau"``); otherwise ``status`` is left
     as it is (``RUNNING`` after :func:`init`). Before the step, the live
     points are reclustered if a recluster is due (``cfg.recluster_every``).
+
+    Pass the same ``loglike`` and ``prior_transform`` objects at every call.
+    The compiled step is cached on a pytree callable's structure (such as
+    ``jax.tree_util.Partial(fn, data)``) and on any other callable's identity
+    (:mod:`tinyns.callables`), so a new object compiles it again: seconds per
+    call in an eager loop whose compiled step takes milliseconds. A bound
+    method is a new object at every access: store ``ll = model.loglike``
+    once, or use a module-level function or a pytree callable with array
+    leaves. A loop under ``jax.jit`` or ``lax.scan`` traces the step once and
+    is not affected.
     """
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
