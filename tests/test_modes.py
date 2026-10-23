@@ -328,6 +328,44 @@ def test_folds_measure_the_scatter_of_the_mode_masses(two_mode_run) -> None:
     assert "fold sd" in result.summary()
 
 
+def test_modes_are_worked_out_once(two_mode_run, monkeypatch) -> None:
+    """``modes()``, ``diagnostics()`` and ``summary()`` share one pass over
+    the samples; each caller gets its own copy."""
+    from tinyns.result import NestedSamplingResult
+
+    result = dataclasses.replace(two_mode_run)  # nothing cached yet
+    calls = []
+    work = NestedSamplingResult._modes
+
+    def counted(self, one):
+        calls.append(1)
+        return work(self, one)
+
+    monkeypatch.setattr(NestedSamplingResult, "_modes", counted)
+    first = result.modes()
+    result.diagnostics(), result.summary(), str(result)
+    assert len(calls) == 1
+    first[0]["mass"] = -1.0
+    first[0]["fold_mass"][0] = -1.0
+    assert result.modes()[0]["mass"] > 0 and result.modes()[0]["fold_mass"][0] > 0
+
+
+def test_nearest_neighbours_are_found_in_blocks(monkeypatch) -> None:
+    """The nearest-neighbour search of pass 3 takes its distances in blocks:
+    a row of every pair at once took 6.2 GB at nlive 8000 in 18-D."""
+    from tinyns import result as result_module
+
+    rng = np.random.default_rng(0)
+    z = rng.normal(size=(300, 4))
+    rows = np.flatnonzero(rng.random(300) < 0.6)
+    dist = np.sum((z[rows][:, None, :] - z[None, :, :]) ** 2, axis=-1)
+    dist[np.arange(len(rows)), rows] = np.inf
+    monkeypatch.setattr(result_module, "_NEAREST_BLOCK", 7 * z.size)
+    nearest = result_module._nearest_other(z, rows)
+    np.testing.assert_array_equal(nearest, np.argmin(dist, axis=1))
+    assert len(result_module._nearest_other(z, rows[:0])) == 0
+
+
 def test_hop_warning_reads_the_recorded_history(two_mode_run) -> None:
     """The warning that the hop balanced the modes only in part comes from
     the run's record: the clustering held many clusters per mode (lumps),

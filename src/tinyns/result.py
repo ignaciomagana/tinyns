@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import copy
 import itertools
 import json
 import math
@@ -108,6 +109,9 @@ PURE_LABEL, SEPARATED_SHARE = 0.9, 0.5
 # and 0.82 in 2 of 8 LogGamma runs, and it accepted at least 0.19 of its
 # proposals on every target but the 18-D posterior (0.6 to 0.8%).
 LUMPS_WARN, HOP_OFF_WARN, HOP_ACCEPT_WARN = 1.5, 0.5, 0.02
+# The nearest-neighbour search of modes() takes its distances in blocks of
+# about this many coordinate differences (float64: 32 MB, at any nlive).
+_NEAREST_BLOCK = 2**22
 
 
 def _jsonable(value):
@@ -200,6 +204,20 @@ def _nearest_mode(u, weights, label, k):
         logdet = np.sum(np.log(np.diag(chol)))
         score.append(np.sum(z * z, axis=0) + 2 * logdet - 2 * math.log(mass))
     return np.argmin(np.asarray(score), axis=0)
+
+
+def _nearest_other(z, rows) -> np.ndarray:
+    """The nearest other row of ``z`` (Euclidean) to each of the rows
+    ``rows``, taken in blocks of about ``_NEAREST_BLOCK`` distances, so
+    that the memory does not grow as ``len(rows) * len(z)``."""
+    nearest = np.zeros(len(rows), dtype=int)
+    block = max(1, _NEAREST_BLOCK // max(z.size, 1))
+    for start in range(0, len(rows), block):
+        i = rows[start : start + block]
+        dist = np.sum((z[i][:, None, :] - z[None, :, :]) ** 2, axis=-1)
+        dist[np.arange(len(i)), i] = np.inf
+        nearest[start : start + block] = np.argmin(dist, axis=1)
+    return nearest
 
 
 def _discriminant(x, side):
@@ -775,9 +793,15 @@ class NestedSamplingResult:
         (``mode_hop_off``). A mode lost before the end leaves no trace in its
         own run, and neither does one that never held more than about
         ``ndim`` live points per fold. A unimodal run (or a result without
-        :attr:`labels`) gives one mode of mass 1.
+        :attr:`labels`) gives one mode of mass 1. The modes are worked out
+        once per result; each call returns a copy.
         """
 
+        return copy.deepcopy(self._mode_list)
+
+    @cached_property
+    def _mode_list(self) -> list[dict[str, Any]]:
+        """:meth:`modes`, worked out once per result."""
         fold = self._sample_folds()
         folds = None if fold is None else int(fold.max()) + 1
         one = [{"mass": 1.0, "urn_sd": 0.0,
@@ -1140,9 +1164,8 @@ class NestedSamplingResult:
             dev = x - x.mean(0)
             chol = np.linalg.cholesky(_ridge(dev.T @ dev / max(len(x) - 1, 1)))
             z = np.linalg.solve(chol, dev.T).T
-            dist = np.sum((z[other][:, None, :] - z[None, :, :]) ** 2, axis=-1)
-            dist[np.arange(other.sum()), np.flatnonzero(other)] = np.inf
-            if not (other.any() and np.any(owner[np.argmin(dist, axis=1)] == m)):
+            nearest = _nearest_other(z, np.flatnonzero(other))
+            if not (other.any() and np.any(owner[nearest] == m)):
                 of_label[members] = -1
         return np.unique(of_label, return_inverse=True)[1][label] - 1
 
