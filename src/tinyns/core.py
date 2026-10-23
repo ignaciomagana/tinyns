@@ -1129,7 +1129,9 @@ def init(key, loglike, prior_transform, cfg: Config) -> State:
 
     ``key`` is a PRNG key or an int seed. The points are evaluated with
     ``lax.map`` in batches of ``cfg.num_delete``, the batch a step uses.
+    ``prior_transform`` must return one array (``TypeError`` otherwise).
     """
+    _check_prior_transform(prior_transform, cfg.ndim)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
     )
@@ -1149,6 +1151,18 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     (``STATUS[int(state.status)] == "plateau"``); otherwise ``status`` is left
     as it is (``RUNNING`` after :func:`init`). Before the step, the live
     points are reclustered if a recluster is due (``cfg.recluster_every``).
+
+    Pass the same ``loglike`` and ``prior_transform`` objects at every call.
+    The compiled step is cached on a pytree callable's structure (such as
+    ``jax.tree_util.Partial(fn, data)``) and on any other callable's identity
+    (:mod:`tinyns.callables`), so a new object compiles it again: seconds per
+    call in an eager loop whose compiled step takes milliseconds. A bound
+    method is a new object at every access: store ``ll = model.loglike``
+    once, or use a module-level function or a pytree callable with array
+    leaves. A step inside ``lax.scan``, or in one jitted function called
+    repeatedly, is traced once and is not affected. A Python loop under
+    ``jax.jit`` that passes a new object at every step traces each step
+    anew, though the jitted function still compiles once.
     """
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
@@ -1238,7 +1252,7 @@ def finalise(
         status = CONVERGED
     samples = u
     if prior_transform is not None:
-        samples = _transform(prior_transform, u, state.u.dtype)
+        samples = _transform(prior_transform, u, state.u.dtype, _transform_block(k))
     info = {
         "status": STATUS[status],
         "num_delete": k,
@@ -1279,8 +1293,40 @@ def finalise(
     )
 
 
-# Rows per call of the compiled prior transform of :func:`finalise`.
-_TRANSFORM_BLOCK = 65536
+# The final prior pass of :func:`finalise` maps the samples in blocks of the
+# power of two at or above num_delete (a step maps num_delete rows at once),
+# and at least this many rows. A block that runs out of device memory is
+# halved (:func:`_transform`).
+_TRANSFORM_BLOCK = 1024
+
+
+def _transform_block(num_delete: int) -> int:
+    """Rows per call of the final prior pass of a run of ``num_delete``."""
+    return max(_TRANSFORM_BLOCK, 1 << (num_delete - 1).bit_length())
+
+
+def _check_theta(theta) -> None:
+    """Raise ``TypeError`` unless ``theta`` (the output of ``prior_transform``
+    or its shape) is one array; its shape is free (a scalar at ``ndim=1``,
+    derived parameters)."""
+    if not isinstance(theta, (jax.Array, jax.ShapeDtypeStruct)):
+        raise TypeError(
+            f"prior_transform must return one array, got {type(theta).__name__} "
+            f"{jax.tree_util.tree_structure(theta)}: stack the parameters into "
+            "a vector (jnp.stack) and unpack them in loglike"
+        )
+
+
+def _check_prior_transform(prior_transform, ndim: int) -> None:
+    """Check that ``prior_transform`` returns one array, before a run samples
+    (``finalise`` could not map the samples otherwise). A prior that cannot
+    be evaluated abstractly here is left to the compiled kernels."""
+    u = jax.ShapeDtypeStruct((int(ndim),), jnp.result_type(float))
+    try:
+        theta = jax.eval_shape(prior_transform, u)
+    except Exception:  # noqa: BLE001 - the kernels raise their own error
+        return
+    _check_theta(theta)
 
 
 @_kernel_cache
@@ -1291,12 +1337,13 @@ def _transform_kernel(prior_spec):
     return jax.jit(kernel)
 
 
-def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
+def _transform(prior_transform, u: np.ndarray, dtype, block: int) -> np.ndarray:
     """``prior_transform`` of every row of ``u``, as a ``(len(u), -1)`` array.
 
-    The rows go through one compiled kernel in blocks of ``_TRANSFORM_BLOCK``
-    (the last one padded), so the lanes of a batch, whose sample counts
-    differ, share one compile.
+    The rows go through one compiled kernel in blocks of ``block`` rows (the
+    last one padded), so the lanes of a batch, whose sample counts differ,
+    share one compile. A block that runs out of device memory is halved and
+    the pass goes on from it; ``MemoryError`` if one row does not fit.
     """
     n, d = u.shape
     leaves, spec = _split_callable(
@@ -1306,13 +1353,27 @@ def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
     kernel = _transform_kernel(spec)
     u = np.asarray(u, dtype)
     out = []
-    for start in range(0, n, _TRANSFORM_BLOCK):
-        block = u[start : start + _TRANSFORM_BLOCK]
-        rows = len(block)
-        if rows < _TRANSFORM_BLOCK:  # the last block, padded
-            pad = np.full((_TRANSFORM_BLOCK - rows, d), 0.5, dtype)
-            block = np.concatenate([block, pad])
-        out.append(np.asarray(kernel(block, *leaves))[:rows].reshape(rows, -1))
+    start = 0
+    while start < n:
+        rows = min(block, n - start)
+        chunk = u[start : start + rows]
+        if rows < block:  # the last block, padded
+            chunk = np.concatenate([chunk, np.full((block - rows, d), 0.5, dtype)])
+        try:
+            theta = kernel(chunk, *leaves)
+            _check_theta(theta)
+            out.append(np.asarray(theta)[:rows].reshape(rows, -1))
+        except Exception as err:
+            if "RESOURCE_EXHAUSTED" not in str(err):
+                raise
+            if block == 1:
+                raise MemoryError(
+                    "out of device memory in the final prior_transform pass "
+                    "of finalise, even one sample at a time"
+                ) from err
+            block //= 2
+            continue
+        start += rows
     return np.concatenate(out) if out else np.zeros((0, d), dtype)
 
 
@@ -1478,10 +1539,20 @@ def run(
             )
         for leaf, axis in zip(leaves, axes, strict=True):
             if axis == 0 and (leaf.ndim == 0 or leaf.shape[0] != batch):
+                hint = (
+                    " (a NumPy float scalar or 0-d array is an array leaf too:"
+                    " pass a value shared by all runs as a Python float)"
+                    if leaf.ndim == 0
+                    else ""
+                )
                 raise ValueError(
                     f"batched_data: every array leaf needs a leading axis of "
-                    f"{batch} lanes, got shape {leaf.shape}"
+                    f"{batch} lanes, got shape {leaf.shape}{hint}"
                 )
+    _check_prior_transform(
+        _lane_callable(prior_transform, 0) if batched_data else prior_transform,
+        cfg.ndim,
+    )
     lanes = 1 if batch is None else batch
     dtype = jnp.result_type(float)
 
