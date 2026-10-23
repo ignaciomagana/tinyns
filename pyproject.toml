@@ -56,9 +56,12 @@ path = "src/tinyns/__init__.py"
 packages = ["src/tinyns"]
 
 [tool.hatch.build.targets.sdist]
-# An explicit list: a build from a working tree with untracked files (agent
-# worktrees, run outputs) still ships only these. The tests, bench/ and the
-# examples ship, so the suite runs from the sdist against an installed wheel.
+# An explicit list of top-level paths: a build from a working tree leaves out
+# the rest of it (agent worktrees under .claude/, run outputs at the root). An
+# untracked file inside these paths still ships unless .gitignore covers it;
+# `make dist` builds from `git archive HEAD`, so none does. The tests, bench/
+# and the examples ship, so the suite runs from the sdist against an installed
+# wheel.
 only-include = [
   "src",
   "tests",

@@ -187,8 +187,9 @@ def test_ci_newest_jax_check_only_warns(tmp_path) -> None:
 
 
 def test_sdist_ships_only_the_listed_paths(tmp_path) -> None:
-    """Untracked files in the build tree (agent worktrees under .claude/, run
-    outputs) stay out of the sdist."""
+    """Files outside the listed top-level paths (agent worktrees under
+    .claude/, run outputs at the root) stay out of a sdist built from a working
+    tree."""
     pytest.importorskip("hatchling")
     from hatchling.builders.sdist import SdistBuilder
 
