@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import warnings
 
 import jax
@@ -194,6 +195,20 @@ def test_config_warns_when_the_walk_covariances_cannot_span_ndim() -> None:
         warnings.simplefilter("error")
         Config(32, 50)  # 1.5 * 33 = 49.5
         Config(2, 5)
+
+
+def test_the_nlive_warning_names_the_users_line() -> None:
+    """The warning points at the line that built the ``Config`` or the
+    ``NestedSampler``, not at tinyns (it named ``tinyns/api.py`` for a
+    ``NestedSampler``)."""
+    for build in (
+        lambda: Config(32, 40),
+        lambda: NestedSampler(gauss(0.5, 0.1), identity, 32, nlive=40),
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            build()
+        assert [os.path.basename(w.filename) for w in caught] == ["test_core.py"]
 
 
 def test_mode_tree_counts_the_splits_it_did_not_record() -> None:

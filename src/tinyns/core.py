@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
+import sys
 import time
 import warnings
 from typing import Any, NamedTuple
@@ -92,6 +93,16 @@ def _check_int(name: str, value, minimum: int) -> int:
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return int(value)
+
+
+def _user_stacklevel() -> int:
+    """The ``stacklevel`` at which a warning issued by the caller of this
+    function names the first frame outside tinyns: the user's line, whether
+    they built a :class:`Config` or a ``NestedSampler``."""
+    frame, level = sys._getframe(1), 1
+    while frame and frame.f_globals.get("__name__", "").split(".")[0] == "tinyns":
+        frame, level = frame.f_back, level + 1
+    return level
 
 
 def default_walks(ndim: int) -> int:
@@ -164,7 +175,7 @@ class Config:
                 "direction, and logZ can be biased far beyond logzerr; use at "
                 "least 5 * ndim",
                 UserWarning,
-                stacklevel=3,
+                stacklevel=_user_stacklevel(),
             )
         for name, value in (
             ("ndim", ndim),
