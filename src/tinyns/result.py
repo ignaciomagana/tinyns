@@ -129,9 +129,9 @@ def _information(logwt, logl, logz: float) -> float:
     if not np.all(np.isfinite(weights)) or np.any((weights > 0.0) & ~finite):
         return math.nan
     contributing = (weights > 0.0) & finite
-    with np.errstate(invalid="ignore"):  # 0 * inf where nothing contributes
-        terms = np.where(contributing, weights * (logl - logz), 0.0)
-    return max(float(np.sum(terms)), 0.0)
+    # Mask before multiplying: 0 * -inf would be NaN.
+    information = np.sum(weights * np.where(contributing, logl - logz, 0.0))
+    return max(float(information), 0.0)
 
 
 def _ridge(cov):
@@ -396,22 +396,34 @@ def _log_weights(logl, nlive_i, log_t=None):
 def _evidence(logl, nlive_i):
     """Return ``(logwt, logz, logzerr)`` in float64 (see :func:`_log_weights`).
 
-    ``logzerr = sqrt(sum_i dH_i / n_i)``, with ``dH_i`` the increment of the
-    running information at sample ``i`` and ``n_i = nlive_i[i]``; at a
-    constant live count ``n`` it is Skilling's ``sqrt(H / n)``.
+    ``logzerr`` is the spread of ``logz`` over the prior-volume path, to
+    first order: the shrinkage of sample ``j`` has ``Var(log t_j) = 1 /
+    n_j^2`` (``t_j ~ Beta(n_j, 1)``, ``n_j = nlive_i[j]``) and moves ``logz``
+    by ``S_j = d logz / d log t_j = sum_{i>j} p_i - L_j X_j / Z`` (``p_i``
+    the normalized weights; ``S = 0`` for the last sample, which takes all
+    the volume left), so ``logzerr^2 = sum_j (S_j / n_j)^2``. At a constant
+    live count ``n`` it is close to Skilling's ``sqrt(H / n)``. Unlike a sum
+    of information increments it keeps the volume uncertainty of the deaths
+    on a plateau below the posterior mass (zero-weight deaths, ``S_j``
+    near 1) and is never negative; the deaths of a plateau that holds the
+    remaining mass (``S_j = 0``) add none, since their widths sum to the
+    volume left exactly. With few live points above a plateau the spread of
+    ``logz`` is skewed, which :meth:`NestedSamplingResult.logz_bootstrap`
+    (it draws the shrinkages) shows.
     """
     logl = np.asarray(logl, dtype=np.float64)
-    logwt = _log_weights(logl, nlive_i)
+    n = np.asarray(nlive_i, dtype=np.float64)
+    logwt = _log_weights(logl, n)
     logz = float(_np_logsumexp(logwt, axis=0))
     if not math.isfinite(logz):
         return logwt, logz, math.nan
     p = np.exp(logwt - logz)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        c = np.cumsum(p)
-        a = np.cumsum(np.where(p > 0.0, p * logl, 0.0))
-        h = np.where(c > 0.0, a / c - np.log(c) - logz, 0.0)
-    var = np.sum(np.diff(h, prepend=0.0) / np.asarray(nlive_i, dtype=np.float64))
-    return logwt, logz, math.sqrt(max(float(var), 0.0))
+    after = np.concatenate([np.cumsum(p[::-1])[::-1][1:], [0.0]])  # sum_{i>j} p_i
+    with np.errstate(divide="ignore"):
+        own = np.exp(logl + np.cumsum(-1.0 / n) - logz)  # L_j X_j / Z; 0 at -inf
+    s = after - own
+    s[-1] = 0.0
+    return logwt, logz, math.sqrt(float(np.sum((s / n) ** 2)))
 
 
 @dataclass(kw_only=True)
@@ -425,7 +437,9 @@ class NestedSamplingResult:
     ``nlive, ..., 1`` over the final live points. On a likelihood plateau
     (live points tied at one likelihood) the tied deaths count at
     ``nlive, nlive - 1, ...`` across the steps they take (Fowlie, Handley and
-    Su 2021), so ``nlive_i`` is lower there.
+    Su 2021), so ``nlive_i`` is lower there, and so it is for the final live
+    points still tied at the last step's contour (a run that ended on a
+    plateau, or stopped during one).
     """
 
     samples_u: ArrayLike
@@ -489,7 +503,9 @@ class NestedSamplingResult:
 
     success: bool = True
     """True if the run converged (``dlogz``) or ended on a likelihood plateau;
-    False if it stopped at ``maxiter`` or ``maxcall``."""
+    False if it stopped at ``maxiter`` or ``maxcall``, or if ``logz`` is not
+    finite (status ``"invalid"``: a likelihood of +inf, or no finite
+    likelihood found)."""
 
     message: str = ""
     """Human-readable status of the run."""
@@ -501,6 +517,19 @@ class NestedSamplingResult:
     ``wall_time_s``, ``compile_s``, ``sampling_s``, ``resumed`` and more (the
     CHANGELOG lists the keys)."""
 
+    def _no_weight(self) -> bool:
+        """True if no sample has a positive posterior weight (``logz = -inf``:
+        no finite likelihood was found)."""
+        logwt = np.asarray(self.logwt, dtype=float)
+        return logwt.size > 0 and not np.any(logwt > -np.inf)
+
+    def _check_weight(self) -> None:
+        if self._no_weight():
+            raise ValueError(
+                "no sample has a positive posterior weight (logz is -inf)"
+                + (f": {self.message}" if self.message else "")
+            )
+
     def log_weights(self) -> np.ndarray:
         """Return posterior weights normalized in log space.
 
@@ -508,6 +537,7 @@ class NestedSamplingResult:
         host (:mod:`tinyns.math`), whatever JAX's precision.
         """
 
+        self._check_weight()
         return normalize_log_weights(self.logwt)
 
     def weights(self) -> np.ndarray:
@@ -516,8 +546,11 @@ class NestedSamplingResult:
         return np.exp(self.log_weights())
 
     def posterior_ess(self) -> float:
-        """Return the effective sample size of the posterior weights."""
+        """Return the effective sample size of the posterior weights (0 when
+        no sample has a positive weight)."""
 
+        if self._no_weight():
+            return 0.0
         return effective_sample_size_from_log_weights(self.logwt)
 
     def max_weight_fraction(self) -> float:
@@ -752,7 +785,7 @@ class NestedSamplingResult:
         (``mode_hop_off``). A mode lost before the end leaves no trace in its
         own run, and neither does one that never held more than about
         ``ndim`` live points per fold. A unimodal run (or a result without
-        :attr:`labels`) gives one mode of mass 1.
+        :attr:`labels`, or without posterior weight) gives one mode of mass 1.
         """
 
         fold = self._sample_folds()
@@ -762,7 +795,7 @@ class NestedSamplingResult:
                 "fold_sd": None if folds is None else 0.0,
                 "min_live": int(self.nlive), "isolation_iteration": 0,
                 "unresolved": False, "tracked": True}]
-        if int(self.niter) == 0 or self.labels is None:
+        if int(self.niter) == 0 or self.labels is None or self._no_weight():
             return one
         try:
             return self._modes(one)
@@ -1332,14 +1365,33 @@ class NestedSamplingResult:
         ``LUMPS_WARN``, ``mode_hop_off`` at least ``HOP_OFF_WARN`` or
         ``hop_acceptance`` below ``HOP_ACCEPT_WARN``), with the folds' masses
         of each mode, and when the slots were full in a run of several modes.
+
+        A run that ended on a likelihood plateau (``metadata["status"]`` is
+        ``"plateau"``) stopped where it should: the final live points are
+        the plateau and carry its posterior mass whatever ``dlogz``, so the
+        checks of the final live weight and of ``final_delta_logz`` are
+        skipped and one note gives that mass (more live points can find a
+        higher region that none of them reached). The checks of the final
+        live weight are skipped on an ``"invalid"`` run too, which neither
+        ``dlogz`` nor ``nlive`` mends. A result without posterior weight
+        (``logz = -inf``) has ``posterior_ess`` 0 and NaN weight fractions.
         """
 
         metadata = {} if self.metadata is None else self.metadata
+        plateau = metadata.get("status") == "plateau"
+        # The final live weight says nothing of the stopping rule on a
+        # plateau (it is the plateau's) or at a likelihood of +inf.
+        check_stop = metadata.get("status") not in ("plateau", "invalid")
+        weighted = not self._no_weight()
         posterior_ess = self.posterior_ess()
         nposterior = int(np.size(self.logwt))
-        max_weight_fraction = self.max_weight_fraction()
-        entropy_fraction = self.posterior_weight_entropy_fraction()
-        live_weight_fraction = self.live_weight_fraction()
+        max_weight_fraction = entropy_fraction = math.nan
+        live_weight_fraction = dead_weight_fraction = math.nan
+        if weighted:
+            max_weight_fraction = self.max_weight_fraction()
+            entropy_fraction = self.posterior_weight_entropy_fraction()
+            live_weight_fraction = self.live_weight_fraction()
+            dead_weight_fraction = self.dead_weight_fraction()
         insertion = self.insertion_test()
         modes = self.modes()
         separated = min(mode["isolation_iteration"] for mode in modes)
@@ -1356,22 +1408,30 @@ class NestedSamplingResult:
             warnings.append("posterior dominated by a small number of weighted samples")
         if entropy_fraction < 0.5:
             warnings.append("low posterior weight entropy")
-        if live_weight_fraction > 0.5:
+        if live_weight_fraction > 0.5 and check_stop:
             warnings.append(
                 "final live points carry most posterior weight; consider tighter "
                 "dlogz or more live points"
             )
-        if live_weight_fraction > 0.25 and dlogz is not None and dlogz >= 0.1:
+        if (
+            live_weight_fraction > 0.25
+            and dlogz is not None
+            and dlogz >= 0.1
+            and check_stop
+        ):
             warnings.append(
                 "large final-live weight fraction; evidence may be sensitive to "
                 "stopping"
             )
         if (
             self.success
+            and check_stop
             and None not in (final_delta_logz, dlogz)
             and final_delta_logz > dlogz
         ):
             warnings.append("successful run has final_delta_logz above requested dlogz")
+        if plateau and weighted:
+            warnings.append(self._plateau_note())
         if not math.isfinite(float(self.logzerr)):
             warnings.append("logzerr is not finite")
         if acceptance is not None and acceptance < 0.01:
@@ -1403,17 +1463,32 @@ class NestedSamplingResult:
             "max_weight_fraction": max_weight_fraction,
             "posterior_weight_entropy_fraction": entropy_fraction,
             "live_weight_fraction": live_weight_fraction,
-            "dead_weight_fraction": self.dead_weight_fraction(),
+            "dead_weight_fraction": dead_weight_fraction,
             "final_delta_logz": final_delta_logz,
             "acceptance": acceptance,
             "insertion_pvalue": insertion["pvalue"],
             "modes": modes,
             "mode_slots_full": self._mode_slots()[1],
-            "mode_lumps": self._lumps(separated, len(modes)),
-            "mode_hop_off": self._hop_off(separated),
+            "mode_lumps": self._lumps(separated, len(modes)) if weighted else None,
+            "mode_hop_off": self._hop_off(separated) if weighted else None,
             "hop_acceptance": metadata.get("hop_acceptance"),
             "warnings": warnings,
         }
+
+    def _plateau_note(self) -> str:
+        """The note of :meth:`diagnostics` on a run that ended on a plateau:
+        the posterior mass of the final live points tied at the highest
+        likelihood (the plateau)."""
+        niter = int(self.niter)
+        live = np.asarray(self.logl, dtype=float)[niter:]
+        top = live == live.max() if live.size else live.astype(bool)
+        mass = float(np.sum(self._weights[niter:][top]))
+        return (
+            f"the run ended on a likelihood plateau, which holds {mass:.3g} of "
+            "the posterior in the final live points on it (a tighter dlogz does "
+            "not change that; raise nlive if a higher region could have been "
+            "missed)"
+        )
 
     def resample_equal(self, key, n: int | None = None) -> np.ndarray:
         """Return ``n`` equally weighted posterior samples (systematic resampling).
@@ -1437,6 +1512,7 @@ class NestedSamplingResult:
             raise TypeError("n must be an integer") from None
         if n < 1:
             raise ValueError("n must be at least 1")
+        self._check_weight()
 
         key_start, key_order = random.split(as_key(key))
         indices = systematic_resample(key_start, self.logwt, n)

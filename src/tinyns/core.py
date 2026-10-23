@@ -30,6 +30,7 @@ import dataclasses
 import math
 import os
 import time
+import warnings
 from typing import Any, NamedTuple
 
 import jax
@@ -51,14 +52,21 @@ from tinyns.math import as_key
 from tinyns.result import NestedSamplingResult, _evidence
 
 # Run status codes (State.status): ``STATUS[code]`` is the name of ``code``.
-RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU = range(5)
-STATUS = ("running", "converged", "maxiter", "maxcall", "plateau")
+RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU, INVALID = range(6)
+STATUS = ("running", "converged", "maxiter", "maxcall", "plateau", "invalid")
 _MESSAGES = (
     "running",
     "converged: the live points hold less than dlogz of the evidence",
     "stopped at maxiter before reaching dlogz",
     "stopped at maxcall before reaching dlogz",
     "likelihood plateau: no live point lies above the deleted ones",
+    "loglike returned +inf at a live point (an overflow? write it in log "
+    "space or enable x64): logz is +inf and the run stopped there",
+)
+# The message of an INVALID result whose logz is -inf.
+_NO_FINITE = (
+    "no live point has a finite likelihood (-inf or NaN wherever sampled): "
+    "check loglike, or raise nlive if its support is tiny"
 )
 
 # Step-scale adaptation: the walk step is ``exp(log_scale) * L z`` with ``L``
@@ -208,8 +216,9 @@ class State(NamedTuple):
     to lose precision in float32) and ``log_x_ties`` is the extra
     compression of the deaths tied with an earlier step's contour, exactly 0
     on a run without ties. ``lstar_prev`` is the contour of the last step
-    (NaN before the first) and ``tie_run`` the number of consecutive steps,
-    ending with the last, whose contour equals it (:func:`_tie_counts`).
+    (-inf before the first, with ``it = 0``) and ``tie_run`` the number of
+    consecutive steps, ending with the last, whose contour equals it
+    (:func:`_tie_counts`).
     """
 
     key: Any  # PRNG key
@@ -219,12 +228,12 @@ class State(NamedTuple):
     it: Any  # int32 steps done
     logz: Any  # running log evidence of the dead points
     log_x_ties: Any  # extra log prior volume removed by tied deaths (<= 0)
-    lstar_prev: Any  # contour of the last step; NaN before the first
+    lstar_prev: Any  # contour of the last step; -inf before the first
     tie_run: Any  # int32 consecutive steps, ending with the last, at lstar_prev
     log_scale: Any  # log of the walk-step multiplier
     ncall: Any  # int32 likelihood evaluations
     ncall_valid: Any  # int32 in-cube likelihood evaluations
-    status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL or PLATEAU
+    status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU, INVALID
     # Mode tracking (tinyns.modes). The live slots form K folds (slot index
     # mod K); clustering j is of the points outside fold j. label[j, i] is
     # point i's cluster slot in clustering j (-1 when i is in fold j), and
@@ -284,7 +293,8 @@ class Dead(NamedTuple):
 
 
 def _loglike_u(loglike, prior_transform, u, dtype):
-    """``loglike(prior_transform(u))`` as a ``dtype`` scalar; NaN becomes -inf."""
+    """``loglike(prior_transform(u))`` as a ``dtype`` scalar; NaN becomes -inf
+    (+inf is kept: :func:`_step` stops the run on it)."""
     logl = jnp.asarray(loglike(prior_transform(u)))
     if logl.shape != ():
         raise ValueError(f"loglike must return a scalar, got shape {logl.shape}")
@@ -601,7 +611,7 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         it=jnp.zeros((), i32),
         logz=jnp.asarray(-jnp.inf, dtype),
         log_x_ties=jnp.zeros((), dtype),
-        lstar_prev=jnp.asarray(jnp.nan, dtype),
+        lstar_prev=jnp.asarray(-jnp.inf, dtype),
         tie_run=jnp.zeros((), i32),
         log_scale=jnp.asarray(math.log(_INITIAL_SCALE), dtype),
         ncall=jnp.asarray(m, i32),
@@ -837,10 +847,11 @@ def _tie_counts(dead_logl, state: State, cfg: Config):
     the previous step's contour (``lstar_prev``) is tied, and the
     ``tie_run`` steps at that contour have taken ``k`` deaths each, so death
     ``j`` counts at ``m - j - k * tie_run``. Any other death counts at
-    ``m - j``.
+    ``m - j``, as does every death of the first step (``lstar_prev`` is -inf
+    there, a sentinel and not a contour).
     """
     m, k = cfg.nlive, cfg.num_delete
-    tied = dead_logl == state.lstar_prev
+    tied = (dead_logl == state.lstar_prev) & (state.it > 0)
     base = jnp.arange(m, m - k, -1, dtype=jnp.int32)
     nlive = jnp.where(tied, base - k * state.tie_run, base)
     return jnp.maximum(nlive, 1), tied
@@ -1026,7 +1037,11 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         for name in State._fields
         if name not in ("key", "ncall", "ncall_valid")
     })
-    return new, dead
+    # A live point with a likelihood of +inf never dies: it is not valid, and
+    # the first step after which one is live (from init or new) sets INVALID.
+    invalid = (n_above > 0) & jnp.any(jnp.isposinf(new.logl))
+    status = jnp.where(invalid, jnp.asarray(INVALID, jnp.int32), new.status)
+    return new._replace(status=status), dead
 
 
 def delta_logz(state: State, cfg: Config):
@@ -1219,13 +1234,28 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     """Delete the ``k`` lowest live points and replace them; return the new
     state and the step's :class:`Dead` rows.
 
-    It does not test termination: loop while :func:`delta_logz` is above
-    your ``dlogz`` and pass that ``dlogz`` to :func:`finalise`. On a plateau
-    (no live point above the deleted ones) the live set is unchanged, the rows
-    are not valid and ``status`` becomes ``PLATEAU``
-    (``STATUS[int(state.status)] == "plateau"``); otherwise ``status`` is left
-    as it is (``RUNNING`` after :func:`init`). Before the step, the live
-    points are reclustered if a recluster is due (``cfg.recluster_every``).
+    It does not test dlogz: loop while :func:`delta_logz` is at or above
+    your ``dlogz`` and the status is ``"running"``, and pass that ``dlogz``
+    to :func:`finalise`. On a plateau (no live point above the deleted ones)
+    the state is returned as it was (``it`` too) but for ``status``, which
+    becomes ``PLATEAU`` (``STATUS[int(state.status)] == "plateau"``), and the
+    rows are not valid; a step after which a live point has a likelihood of
+    +inf sets ``INVALID`` (``"invalid"``; its rows are valid). Otherwise
+    ``status`` is left as it is (``RUNNING`` after :func:`init`). So the
+    rows of the first ``int(state.it)`` steps are the valid ones::
+
+        rows = []
+        while delta_logz(state, cfg) >= dlogz:
+            state, dead = step(state, loglike, prior_transform, cfg)
+            rows.append(dead)
+            if STATUS[int(state.status)] != "running":  # a plateau, or +inf
+                break
+        dead = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs)[: int(state.it)], *rows
+        )
+
+    Before the step, the live points are reclustered if a recluster is due
+    (``cfg.recluster_every``).
 
     Pass the same ``loglike`` and ``prior_transform`` objects at every call.
     The compiled step is cached on a pytree callable's structure (such as
@@ -1257,13 +1287,18 @@ def finalise(
 ) -> NestedSamplingResult:
     """Build the :class:`NestedSamplingResult` from the final state and the rows.
 
-    ``dead`` holds the valid rows of every step in order, with any leading
-    shape (``(steps, k)`` or flat). Each dead row dies at its recorded live
-    count (``dead.nlive``: ``m - j`` for death ``j`` of a step, fewer on a
-    likelihood plateau) and the final live points are appended by
-    increasing likelihood at live counts ``m, m-1, ..., 1``; the weights,
-    ``logz`` and ``logzerr = sqrt(sum_i dH_i / n_i)`` are recomputed in
-    float64 (:func:`tinyns.result._evidence`). ``result.labels`` holds each
+    ``dead`` holds the valid rows of the ``state.it`` steps in order, with
+    any leading shape (``(steps, k)`` or flat; other row counts raise
+    ``ValueError``: drop the rows of a step on a plateau, see :func:`step`).
+    Each dead row dies at its recorded live count (``dead.nlive``: ``m - j``
+    for death ``j`` of a step, fewer on a likelihood plateau) and the final
+    live points are appended by increasing likelihood at live counts ``m,
+    m-1, ..., 1``, but those still tied at the last step's contour (a run
+    that stopped on a plateau, or during one), which count on from the
+    plateau's last dead row as :func:`_tie_counts` does: ``m - j - k *
+    tie_run``. The weights, ``logz`` and ``logzerr`` (first order in the
+    prior-volume shrinkages) are recomputed in float64
+    (:func:`tinyns.result._evidence`). ``result.labels`` holds each
     sample's cluster label when it died (the final live points: their last
     labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads, and
     ``result.insertion_ranks`` / ``insertion_slots`` the in-sampler insertion
@@ -1272,11 +1307,15 @@ def finalise(
     points).
 
     ``result.success`` and ``result.message`` are read from ``state.status``.
-    :func:`step` leaves it ``RUNNING`` (or sets ``PLATEAU``), so after a
-    hand-written loop pass the ``dlogz`` the loop stopped at: a running state
-    with ``delta_logz(state, cfg) < dlogz`` (the driver's rule) is reported as
-    converged. Without ``dlogz``, or above it, the result has
-    ``success=False`` and the message ``"running"``.
+    :func:`step` leaves it ``RUNNING`` (or sets ``PLATEAU`` or ``INVALID``),
+    so after a hand-written loop pass the ``dlogz`` the loop stopped at: a
+    running state with ``delta_logz(state, cfg) < dlogz`` (the driver's rule)
+    is reported as converged. Without ``dlogz``, or above it, the result has
+    ``success=False`` and the message ``"running"``. A result whose ``logz``
+    is not finite has the status ``"invalid"`` and ``success=False``,
+    whatever stopped the run, with a message (also issued as a
+    ``RuntimeWarning``) for ``logz = +inf`` (a likelihood of +inf) or
+    ``-inf`` (no finite likelihood was found).
 
     ``ncall`` overrides ``state.ncall``, an int32 that wraps after ``2**31``
     calls: the driver drains it, and a long hand-written loop passes its own
@@ -1290,8 +1329,12 @@ def finalise(
     m, d, k = cfg.nlive, cfg.ndim, cfg.num_delete
     dead_logl = np.asarray(dead.logl, np.float64).reshape(-1)
     niter = dead_logl.size
-    if niter % k:
-        raise ValueError(f"{niter} dead rows are not whole steps of {k}")
+    if niter != int(state.it) * k:
+        raise ValueError(
+            f"{niter} dead rows, but the state has done {int(state.it)} steps of "
+            f"{k}: pass the rows of the first state.it steps (a step on a "
+            "plateau returns rows that are not valid)"
+        )
     order = np.argsort(np.asarray(state.logl), kind="stable")
     u = np.concatenate([np.asarray(dead.u).reshape(-1, d), np.asarray(state.u)[order]])
     logl = np.concatenate([dead_logl, np.asarray(state.logl, np.float64)[order]])
@@ -1306,9 +1349,13 @@ def finalise(
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)
-    nlive_i = np.concatenate([
-        np.asarray(dead.nlive, np.int64).reshape(-1), m - np.arange(m)
-    ])
+    # The live points still tied at the last step's contour (a prefix: every
+    # live point is at or above it) die after the tie_run steps of k tied
+    # deaths there (_tie_counts; tie_run is 0 before the first step).
+    live_n = m - np.arange(m)
+    tied = logl[niter:] == float(state.lstar_prev)
+    live_n = np.maximum(np.where(tied, live_n - k * int(state.tie_run), live_n), 1)
+    nlive_i = np.concatenate([np.asarray(dead.nlive, np.int64).reshape(-1), live_n])
     logwt, logz, logzerr = _evidence(logl, nlive_i)
 
     log_x = -(niter // k) * cfg.log_shrink + float(state.log_x_ties)
@@ -1325,6 +1372,11 @@ def finalise(
     status = int(state.status)
     if status == RUNNING and dlogz is not None and delta_logz(state, cfg) < dlogz:
         status = CONVERGED
+    message = _MESSAGES[status]
+    if not math.isfinite(logz):
+        status = INVALID
+        message = _MESSAGES[INVALID] if logz > 0 else _NO_FINITE
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
     samples = u
     if prior_transform is not None:
         samples = _transform(prior_transform, u, state.u.dtype, _transform_block(k))
@@ -1363,7 +1415,7 @@ def finalise(
         num_delete=k,
         ndim=d,
         success=status in (CONVERGED, PLATEAU),
-        message=_MESSAGES[status],
+        message=message,
         metadata={**info, **(metadata or {})},
     )
 
@@ -1640,9 +1692,10 @@ def run(
 
     Stops when ``delta_logz < dlogz``, before ``maxiter`` dead points would be
     exceeded, once ``maxcall`` likelihood evaluations are reached (checked
-    after each step) or on a plateau. Chunks of steps run on the device; the
-    host syncs once per chunk, sizes the next one to about 45 s and, with
-    ``progress``, prints one line per chunk.
+    after each step), on a plateau, or at a live likelihood of +inf (status
+    ``"invalid"``, ``success=False``; a lane of a batch stops alone). Chunks
+    of steps run on the device; the host syncs once per chunk, sizes the next
+    one to about 45 s and, with ``progress``, prints one line per chunk.
 
     ``checkpoint`` is a path: if the file exists the run resumes from it
     (refusing a different config, x64 flag, float dtype, key or batch, and

@@ -19,10 +19,11 @@ class NestedSampler:
     ----------
     loglike:
         JAX-traceable function of one point in parameter space returning its
-        log likelihood (NaN counts as ``-inf``). It may be a JAX pytree
-        callable such as ``jax.tree_util.Partial(loglike_fn, data)``: its array
-        leaves are passed to the compiled kernels as arguments, so datasets of
-        one shape share one compiled program.
+        log likelihood (NaN counts as ``-inf``; ``+inf`` is not valid: the run
+        stops with ``success=False`` and the status ``"invalid"``). It may be
+        a JAX pytree callable such as ``jax.tree_util.Partial(loglike_fn,
+        data)``: its array leaves are passed to the compiled kernels as
+        arguments, so datasets of one shape share one compiled program.
     prior_transform:
         JAX-traceable function mapping one unit-cube point to parameter space.
         It is only called on the open cube ``(0, 1)^ndim``, never on a face,
@@ -79,10 +80,12 @@ class NestedSampler:
 
         Stops once the live points hold less than ``dlogz`` of the evidence,
         before more than ``maxiter`` dead points, once ``maxcall`` likelihood
-        evaluations are reached (checked after each step), or on a likelihood
-        plateau. ``progress`` prints one line per chunk of steps: dead points,
-        ``logz``, the dlogz remainder, calls, calls per second, the chain
-        acceptance and the step scale.
+        evaluations are reached (checked after each step), on a likelihood
+        plateau, or at a live likelihood of ``+inf`` (status ``"invalid"``,
+        ``success=False``; a lane of a batch stops alone). ``progress`` prints
+        one line per chunk of steps: dead points, ``logz``, the dlogz
+        remainder, calls, calls per second, the chain acceptance and the step
+        scale.
 
         ``checkpoint`` is a file path. If the file exists, the run resumes
         from it; a checkpoint written with a different config, x64 flag,

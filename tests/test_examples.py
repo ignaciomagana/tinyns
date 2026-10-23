@@ -7,6 +7,7 @@ import math
 import re
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,25 @@ def test_sbc_batched_example() -> None:
 def test_functional_core_example() -> None:
     module, result = _run_example("functional_core")
     assert _near_truth(result, module.TRUE_LOGZ)
+
+
+def test_functional_core_example_on_a_plateau(monkeypatch) -> None:
+    """With an indicator likelihood (1 on [-5, 5]^3, 0 elsewhere: Z = 1/8)
+    the run ends on its plateau inside a chunk. The steps after it return
+    rows that are not valid, and the example keeps the first ``state.it``
+    steps (it passed them all: logZ -4.6 for a truth of -2.08)."""
+    path = ROOT / "examples" / "functional_core.py"
+    spec = importlib.util.spec_from_file_location("tinyns_example_plateau", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def box(theta):
+        return jnp.where(jnp.all(jnp.abs(theta) < 5.0), 0.0, -jnp.inf)
+
+    monkeypatch.setattr(module, "loglike", box)
+    result = module.main()
+    assert result.metadata["status"] == "plateau" and result.niter % 50 == 0
+    assert abs(result.logz - math.log(1 / 8)) < 4 * result.logzerr + 0.05
 
 
 def test_readme_code_blocks_run(tmp_path, monkeypatch, capsys) -> None:
