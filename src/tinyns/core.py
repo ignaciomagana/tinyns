@@ -221,7 +221,7 @@ class State(NamedTuple):
     tie_run: Any  # int32 consecutive steps, ending with the last, at lstar_prev
     log_scale: Any  # log of the walk-step multiplier
     ncall: Any  # int32 likelihood evaluations
-    ncall_valid: Any  # int32 in-cube likelihood evaluations
+    ncall_valid: Any  # int32 proposals passing the likelihood-free tests
     status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL or PLATEAU
     # Mode tracking (tinyns.modes). The live slots form K folds (slot index
     # mod K); clustering j is of the points outside fold j. label[j, i] is
