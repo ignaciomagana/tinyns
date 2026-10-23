@@ -287,6 +287,33 @@ def test_diagnostics_warns_on_nonfinite_logzerr_and_low_acceptance() -> None:
     assert "low replacement acceptance" in warnings
 
 
+def test_diagnostics_warns_when_most_chains_do_not_move() -> None:
+    """Too few walks leave most chains at their seed, which the insertion test
+    barely sees; diagnostics() says so."""
+    from tinyns import NestedSampler
+    from tinyns.result import UNMOVED_WARN
+
+    def loglike(theta):
+        return -0.5 * jnp.sum(theta**2)
+
+    def short(result):
+        return [w for w in result.diagnostics()["warnings"] if "did not move" in w]
+
+    for walks, warned in ((1, True), (None, False)):
+        sampler = NestedSampler(loglike, lambda u: 8.0 * u - 4.0, 2, 50, walks=walks)
+        result = sampler.run(0)
+        assert (result.metadata["unmoved_fraction"] >= UNMOVED_WARN) == warned
+        assert len(short(result)) == warned
+    result = make_result()
+    for fraction, warned in ((0.29, False), (0.3, True)):
+        result.metadata = {"unmoved_fraction": fraction}
+        assert short(result) == (
+            ["30% of the replacement chains did not move: walks is too short "
+             "(logZ may be biased and scatter beyond logzerr); rerun with twice "
+             "the walks"] if warned else []
+        )
+
+
 def test_max_weight_fraction_returns_expected_value() -> None:
     result = make_result()
     result.logwt = jnp.log(jnp.array([0.2, 0.3, 0.5]))
