@@ -225,3 +225,18 @@ benchmarks/results/*.json
 
 # TinyNS checkpoint files
 *.checkpoint.npz
+
+# Claude Code: agent worktrees, environments and scratch files
+.claude/
+
+# Outputs of the README, examples/ and bench/ commands, written to the
+# repository root when run from there
+/result.npz
+/run.npz
+/results.jsonl
+/gate.json
+/jobs.txt
+/report.md
+/table.md
+/cells.csv
+/cells.json

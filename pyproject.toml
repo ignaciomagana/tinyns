@@ -46,6 +46,21 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/tinyns"]
 
+[tool.hatch.build.targets.sdist]
+# An explicit list: a build from a working tree with untracked files (agent
+# worktrees, run outputs) still ships only these. The tests, bench/ and the
+# examples ship, so the suite runs from the sdist against an installed wheel.
+only-include = [
+  "src",
+  "tests",
+  "bench",
+  "examples",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "pyproject.toml",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "bench/tests"]
 pythonpath = ["src", "."]
