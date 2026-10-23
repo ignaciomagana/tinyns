@@ -222,11 +222,13 @@ def test_float32_seed_with_a_zero_draw_starts_in_the_open_cube() -> None:
     assert np.all(np.asarray(state.u) > 0)
 
 
-@pytest.mark.parametrize("k", [1, 5])
-def test_chains_never_reach_a_face(k) -> None:
+@pytest.mark.parametrize("k, lanes", [(1, 0), (5, 0), (1, 2)])
+def test_chains_never_reach_a_face(k, lanes) -> None:
     """A likelihood piled against the face u = 1, about 4 float spacings
     wide: proposals that round to 1.0 are rejected, no sample lies on the
-    face, and no out-of-cube proposal is evaluated on one."""
+    face, and no out-of-cube proposal is evaluated on one. ``lanes``: a
+    batched run, whose vmap turns the cond of ``num_delete=1`` into a select
+    that evaluates every proposal."""
     lam = 0.25 / float(jnp.finfo(FLOAT).epsneg)
     faces = []
 
@@ -237,11 +239,13 @@ def test_chains_never_reach_a_face(k) -> None:
         jax.debug.callback(on_face, u)
         return lam * jnp.sum(u - 1.0)
 
-    result = NestedSampler(loglike, identity, 1, 20, num_delete=k).run(0)
-    u = np.asarray(result.samples_u)
-    assert result.success and len(faces) > 0
-    assert np.all((u > 0) & (u < 1))
-    assert sum(faces) == 0
+    key = random.split(random.PRNGKey(0), lanes) if lanes else 0
+    results = NestedSampler(loglike, identity, 1, 20, num_delete=k).run(key)
+    for result in results if lanes else [results]:
+        u = np.asarray(result.samples_u)
+        assert result.success
+        assert np.all((u > 0) & (u < 1))
+    assert len(faces) > 0 and sum(faces) == 0
 
 
 # --- float32 cluster frames --------------------------------------------------
