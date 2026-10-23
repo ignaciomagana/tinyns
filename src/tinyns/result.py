@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 from jax import random
 
+from tinyns.checkpoint import _atomic_savez
 from tinyns.math import (
     as_key,
     effective_sample_size_from_log_weights,
@@ -1481,24 +1482,32 @@ class NestedSamplingResult:
 
     def save_npz(self, path) -> None:
         """Save the final result to a compressed NumPy ``.npz`` file (with
-        :attr:`labels` and the insertion ranks when present)."""
+        :attr:`labels` and the insertion ranks when present).
+
+        The file is ``path`` itself (no ``.npz`` is appended), written
+        atomically like a checkpoint (:mod:`tinyns.checkpoint`). ``path`` may
+        also be a writable binary file object.
+        """
 
         optional = {
             name: np.asarray(getattr(self, name))
             for name in _RESULT_NPZ_OPTIONAL
             if getattr(self, name) is not None
         }
-        np.savez_compressed(
-            path,
+        arrays = {
             **{name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS},
             **optional,
             **{
                 name: np.asarray(kind(getattr(self, name)))
                 for name, kind in _RESULT_NPZ_SCALARS.items()
             },
-            metadata_json=np.asarray(json.dumps(self.metadata, default=_jsonable)),
-            format_version=np.asarray(_RESULT_NPZ_FORMAT_VERSION),
-        )
+            "metadata_json": np.asarray(json.dumps(self.metadata, default=_jsonable)),
+            "format_version": np.asarray(_RESULT_NPZ_FORMAT_VERSION),
+        }
+        if hasattr(path, "write"):
+            np.savez_compressed(path, **arrays)
+        else:
+            _atomic_savez(path, arrays, compressed=True)
 
     @classmethod
     def load_npz(cls, path) -> NestedSamplingResult:

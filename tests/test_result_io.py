@@ -1,11 +1,14 @@
-"""Result files and weight statistics: ``load_npz`` keeps the saved dtypes,
-and the weights, ESS, information and resampling are computed in NumPy
-float64 (without compiling anything), with the resampled set in a random
-order."""
+"""Result files and weight statistics: ``save_npz`` writes the exact path,
+``load_npz`` keeps the saved dtypes, and the weights, ESS, information and
+resampling are computed in NumPy float64 (without compiling anything), with
+the resampled set in a random order."""
 
 from __future__ import annotations
 
+import io
 import logging
+import os
+import stat
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +47,37 @@ def make_result(n: int, offset: float = 0.0) -> NestedSamplingResult:
 def reference_weights(logwt) -> np.ndarray:
     logwt = np.asarray(logwt, np.float64)
     return np.exp(logwt - np.logaddexp.reduce(logwt))
+
+
+def test_save_npz_writes_the_exact_path(tmp_path) -> None:
+    """``np.savez_compressed`` appended ``.npz`` to a path without it, so
+    ``load_npz`` of the same path failed."""
+    result = make_result(40)
+    for name in ("result", "result.out", "result.npz"):
+        result.save_npz(tmp_path / name)
+        assert NestedSamplingResult.load_npz(tmp_path / name).logz == result.logz
+    # No suffix appended and no temporary file left.
+    assert sorted(os.listdir(tmp_path)) == ["result", "result.npz", "result.out"]
+    buffer = io.BytesIO()  # a file object is written as it is
+    result.save_npz(buffer)
+    buffer.seek(0)
+    assert NestedSamplingResult.load_npz(buffer).niter == result.niter
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_save_npz_keeps_the_mode_of_the_file_it_replaces(tmp_path) -> None:
+    umask = os.umask(0o022)
+    try:
+        plain = tmp_path / "plain"
+        plain.write_bytes(b"")
+        path = tmp_path / "result.npz"
+        make_result(40).save_npz(path)
+        assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(plain.stat().st_mode)
+        path.chmod(0o640)
+        make_result(40).save_npz(path)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    finally:
+        os.umask(umask)
 
 
 def test_load_npz_keeps_the_saved_dtypes(tmp_path) -> None:

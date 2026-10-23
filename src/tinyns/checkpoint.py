@@ -22,6 +22,9 @@ previous checkpoint or the new one, never a torn file. It holds
   ``compile_s`` and ``sampling_s`` and the number of chunks.
 
 Files of any other format are refused; there is no reader for older formats.
+The file keeps the mode of the checkpoint it replaces (a new one gets the mode
+of any new file, ``0o666`` less the umask), so a ``chmod`` that shares it with
+a group survives the rewrites.
 """
 
 from __future__ import annotations
@@ -30,7 +33,8 @@ import contextlib
 import dataclasses
 import json
 import os
-import tempfile
+import secrets
+import stat
 import warnings
 from typing import Any
 
@@ -141,15 +145,39 @@ def save(path, ckpt: Checkpoint) -> None:
     _atomic_savez(path, arrays)
 
 
-def _atomic_savez(path, arrays: dict) -> None:
+def _temp_file(path: str) -> tuple[int, str]:
+    """Create a new file next to ``path`` for writing; return ``(fd, name)``.
+
+    It is created like any new file (mode ``0o666`` less the umask, where
+    ``mkstemp`` would make it ``0o600``) and then takes the mode of ``path``
+    if that exists, so that replacing ``path`` keeps its mode.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    prefix = os.path.join(directory, f".{os.path.basename(path)}.")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for _ in range(100):
+        tmp = f"{prefix}{secrets.token_hex(4)}.tmp"
+        try:
+            fd = os.open(tmp, flags, 0o666)
+        except FileExistsError:
+            continue
+        with contextlib.suppress(OSError):  # no file to replace yet
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        return fd, tmp
+    raise FileExistsError(f"no unused temporary file name next to {path}")
+
+
+def _atomic_savez(path, arrays: dict, compressed: bool = False) -> None:
+    """Write ``arrays`` to the ``.npz`` file ``path`` (exactly that name):
+    a temporary file in the same directory, ``fsync``, then ``os.replace``,
+    so that a crash leaves the old file or the new one. The file keeps the
+    mode of the file it replaces (:func:`_temp_file`)."""
     path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
-    )
+    fd, tmp = _temp_file(path)
     try:
         with os.fdopen(fd, "wb") as f:
-            np.savez(f, **arrays)
+            (np.savez_compressed if compressed else np.savez)(f, **arrays)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
