@@ -1,11 +1,12 @@
 """Checkpoint guards: a checkpoint of another problem is refused (some of its
 live and dead points are evaluated again), the path is checked before the run
 and resolved once, the JAX build is recorded and a change warns, the file
-keeps its mode and a link at the path is written through, and odd inputs fail
-early instead of at the last save."""
+keeps its mode, a link at the path is written through and a failed write names
+the path, and odd inputs fail early instead of at the last save."""
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -228,6 +229,24 @@ def test_a_path_through_a_missing_directory_is_resolved_once(tmp_path,
     assert os.listdir(tmp_path / "sub") == ["run.npz"]
     result = sampler.run(0, maxiter=100, checkpoint="missing/../run.npz")
     assert result.metadata["resumed"] and result.niter == 100
+
+
+def test_a_failed_save_names_the_checkpoint(tmp_path, monkeypatch) -> None:
+    """The error of a failed write named the hidden temporary file (or no
+    file at all)."""
+    sampler = NestedSampler(gauss, identity, 2, 50, num_delete=5)
+    path = tmp_path / "run.npz"
+    sampler.run(0, maxiter=50, checkpoint=path)
+
+    def full(f, **arrays):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(np, "savez", full)
+    written = os.path.realpath(path)  # the run resolves the path once
+    with pytest.raises(OSError, match=re.escape(f"cannot write {written} ")) as info:
+        sampler.run(0, maxiter=100, checkpoint=path)
+    assert info.value.errno == errno.ENOSPC and ".run.npz." not in str(info.value)
+    assert os.listdir(tmp_path) == ["run.npz"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="symbolic links")

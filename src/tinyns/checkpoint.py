@@ -221,6 +221,16 @@ def _temp_file(path: str) -> tuple[int, str]:
     raise FileExistsError(f"no unused temporary file name next to {path}")
 
 
+def _cannot_write(exc: OSError, what: str, directory: str) -> OSError:
+    """``exc`` again, naming ``what`` (the file asked for) and ``directory``
+    instead of the temporary file next to it."""
+    message = f"cannot write {what} in the directory {directory}: "
+    message += exc.strerror or str(exc)
+    if exc.errno is None:
+        return type(exc)(message)
+    return type(exc)(exc.errno, message)
+
+
 def check_writable(path) -> str:
     """Raise ``OSError`` naming ``path`` unless a file can be written next to
     it, as :func:`save` does: a run checks its checkpoint path before it
@@ -232,11 +242,8 @@ def check_writable(path) -> str:
     try:
         fd, tmp = _temp_file(target)
     except OSError as exc:
-        directory = os.path.dirname(target)
-        raise type(exc)(
-            exc.errno,
-            f"cannot write the checkpoint {path} in the directory {directory}: "
-            f"{exc.strerror or exc}",
+        raise _cannot_write(
+            exc, f"the checkpoint {path}", os.path.dirname(target)
         ) from exc
     os.close(fd)
     os.unlink(tmp)
@@ -248,19 +255,27 @@ def _atomic_savez(path, arrays: dict, compressed: bool = False) -> None:
     a temporary file in the same directory, ``fsync``, then ``os.replace``,
     so that a crash leaves the old file or the new one. The file keeps the
     mode of the file it replaces (:func:`_temp_file`), and a symbolic link at
-    ``path`` is written through (:func:`_file_path`)."""
-    path = _file_path(path)
+    ``path`` is written through (:func:`_file_path`). This needs write access
+    to the directory, and a read-only file is replaced like any other. An
+    ``OSError`` names ``path``, not the temporary file."""
+    name = os.fspath(path)
+    path = _file_path(name)
     directory = os.path.dirname(path)
-    fd, tmp = _temp_file(path)
+    try:
+        fd, tmp = _temp_file(path)
+    except OSError as exc:
+        raise _cannot_write(exc, name, directory) from exc
     try:
         with os.fdopen(fd, "wb") as f:
             (np.savez_compressed if compressed else np.savez)(f, **arrays)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-    except BaseException:
+    except BaseException as exc:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+        if isinstance(exc, OSError):
+            raise _cannot_write(exc, name, directory) from exc
         raise
     with contextlib.suppress(OSError):  # make the rename durable (POSIX)
         dir_fd = os.open(directory, os.O_RDONLY)

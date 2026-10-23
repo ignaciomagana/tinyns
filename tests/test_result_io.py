@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import stat
 import warnings
 
@@ -79,6 +80,15 @@ def test_save_npz_writes_through_a_symbolic_link(tmp_path) -> None:
     result.save_npz(link)  # replaces it
     assert link.is_symlink() and os.listdir(shared) == ["result.npz"]
     assert NestedSamplingResult.load_npz(shared / "result.npz").niter == result.niter
+
+
+def test_a_failed_save_npz_names_the_file(tmp_path) -> None:
+    """The atomic write's errors named its hidden temporary file."""
+    path = tmp_path / "missing" / "result.npz"
+    with pytest.raises(FileNotFoundError,
+                       match=re.escape(f"cannot write {path} ")) as info:
+        make_result(40).save_npz(path)
+    assert ".result.npz." not in str(info.value)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
