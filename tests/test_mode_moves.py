@@ -191,7 +191,8 @@ def test_hop_accept_weighs_the_ellipsoids_that_hold_each_point() -> None:
     """``q`` counts the eligible ellipsoids that hold a point: from a point in
     one ellipsoid to a point in two the hop is accepted when ``U < 1/2``, in
     three when ``U < 1/3``, and back always. An ellipsoid that is not
-    eligible does not count, and a proposal in none is refused."""
+    eligible does not count, a proposal in none is refused, and from a point
+    in none every hop is refused."""
     dtype = jnp.result_type(float)
     r2max = modes.ELL_R2_PER_DIM * (D + 2.0)
     eligible = jnp.asarray([True, True, True, False])
@@ -215,6 +216,9 @@ def test_hop_accept_weighs_the_ellipsoids_that_hold_each_point() -> None:
         ({0}, {0, 3}, 1.0),
         ({0}, {3}, 0.0),
         ({0}, set(), 0.0),
+        (set(), {0}, 0.0),
+        (set(), {0, 1}, 0.0),
+        ({3}, {0}, 0.0),
     ]
     for old, new, rate in cases:
         np.testing.assert_array_equal(
