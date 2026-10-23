@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,14 +20,15 @@ BACKEND_COMPILE = "/jax/core/compile/backend_compile_duration"
 
 @contextlib.contextmanager
 def backend_compiles():
-    """Collect the duration of every XLA compile inside the block."""
+    """Collect ``(end, duration)`` of every XLA compile inside the block, with
+    ``end`` on the ``time.perf_counter`` clock."""
     import jax
 
     seen, on = [], [True]
 
     def listen(event, duration, **_):
         if on[0] and event == BACKEND_COMPILE:
-            seen.append(duration)
+            seen.append((time.perf_counter(), duration))
 
     jax.monitoring.register_event_duration_secs_listener(listen)
     try:
@@ -54,37 +56,58 @@ def test_blackjax_compile_s_covers_every_compile_of_the_run():
     cfg = dict(nlive=120, dlogz=0.1, variant="default", opts={})
     with backend_compiles() as seen:
         out = adapters.load("blackjax_nss").run(get_target("gauss_d2"), 3, cfg)
+    total = sum(d for _, d in seen)
     assert seen, "nothing compiled: the test cannot see the split"
-    assert sum(seen) <= out["compile_s"] + 0.05, (sum(seen), out["compile_s"])
+    assert total <= out["compile_s"] + 0.05, (total, out["compile_s"])
     assert out["compile_s"] < out["wall_s"]
 
 
 def test_tinyns_run_s_holds_no_compile(monkeypatch):
-    """The tinyns run that ``run s`` times compiles (almost) nothing: its init
-    and step kernels, its prior map and the driver's small ops compile in a
-    one-step warm-up run, which is ``compile_s``. They used to compile in the
-    timed run, of which ``metadata["compile_s"]`` covered only the step
-    kernel."""
+    """Every XLA compile of the timed tinyns run falls in its zero-step chunk
+    call, which ``metadata["compile_s"]`` times; the other programs (the init
+    kernel, the prior map of ``finalise``, the driver's small ops) compile in
+    a one-step warm-up run, also in ``compile_s``. They used to compile in the
+    timed run outside that call, so in ``run s``."""
     import tinyns
+    import tinyns.core as core
 
     if adapters.unavailable_reason("tinyns_v1"):
         pytest.skip("tinyns v1 is not installed")
-    calls = []
-    run = tinyns.NestedSampler.run
+    runs, zero_step = [], []  # (start, end) of each run() / zero-step chunk
+    run, chunk_kernel = tinyns.NestedSampler.run, core._chunk_kernel
 
     def timed_run(self, *args, **kw):
-        with backend_compiles() as seen:
-            res = run(self, *args, **kw)
-        calls.append(sum(seen))
-        return res
+        start = time.perf_counter()
+        try:
+            return run(self, *args, **kw)
+        finally:
+            runs.append((start, time.perf_counter()))
+
+    def timed_chunk_kernel(*args, **kw):
+        kernel = chunk_kernel(*args, **kw)
+
+        def call(state, n_steps, *rest):
+            start = time.perf_counter()
+            out = kernel(state, n_steps, *rest)  # compiles before it returns
+            if int(n_steps) == 0:
+                zero_step.append((start, time.perf_counter()))
+            return out
+
+        return call
 
     monkeypatch.setattr(tinyns.NestedSampler, "run", timed_run)
+    monkeypatch.setattr(core, "_chunk_kernel", timed_chunk_kernel)
     _warm_keys()
     cfg = dict(nlive=136, dlogz=0.1, variant="default", opts={})
-    out = adapters.load("tinyns_v1").run(get_target("gauss_d2"), 3, cfg)
-    assert sum(calls) > 0, "nothing compiled: the test cannot see the split"
-    # the result's run compiled under a tenth of what compile_s holds
-    assert calls[-1] <= 0.1 * out["compile_s"], (calls, out["compile_s"])
+    with backend_compiles() as seen:
+        out = adapters.load("tinyns_v1").run(get_target("gauss_d2"), 3, cfg)
+    assert seen and zero_step, "nothing compiled: the test cannot see the split"
+    (start, end), zero = runs[-1], zero_step[-1]
+    in_run_s = [
+        d for t, d in seen if start <= t <= end and not zero[0] <= t <= zero[1]
+    ]
+    # base: the init kernel and the prior map, 4 to 6% of compile_s on CPU
+    assert sum(in_run_s) <= 0.01 * out["compile_s"], (in_run_s, out["compile_s"])
     assert out["compile_s"] < out["wall_s"]
 
 
