@@ -119,6 +119,28 @@ def test_seeding_and_ranks_make_no_k_by_m_arrays() -> None:
     assert max(sizes) < 8 * m
 
 
+def test_insertion_ranks_search_without_a_loop() -> None:
+    """The binary searches of the insertion ranks are unrolled: no loop of
+    ``ceil(log2(nlive + 1))`` sequential steps is left for a GPU to run."""
+    m = 1009
+    cfg = Config(2, m, num_delete=97, walks=12)
+    state = init(0, gauss, identity, cfg)
+    closed = jax.make_jaxpr(lambda s: core._step(s, gauss, identity, cfg))(state)
+    levels = math.ceil(math.log2(m + 1))
+
+    def rolled(eqn):
+        # JAX 0.12 keeps the search as one primitive, earlier JAX a scan.
+        if getattr(eqn.params.get("_prim"), "method", None) == "scan":
+            return True
+        return (
+            eqn.primitive.name == "scan"
+            and eqn.params["length"] == levels
+            and eqn.params["unroll"] < levels
+        )
+
+    assert not any(rolled(eqn) for eqn in _equations(closed.jaxpr))
+
+
 def reference_seeds(gumbel, uniform, above, worst, folds):
     """The seeding rule of :func:`tinyns.core._seeds`, one dead slot at a
     time: the fold's points above L* by decreasing score (the lower slot

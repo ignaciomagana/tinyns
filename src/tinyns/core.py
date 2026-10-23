@@ -920,10 +920,14 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # chain) are in a random order with it: the rank takes a uniform place
     # among them, from a key folded off k_seed (the other draws are as they
     # were). The survivors' likelihoods are sorted once (the others padded
-    # with +inf, which only the count of equals could see).
+    # with +inf, which only the count of equals could see). The two binary
+    # searches are unrolled: JAX's default runs each as a loop of log2(nlive)
+    # sequential steps, which a GPU pays for at every step (a CPU step takes
+    # the same time either way).
     ranked = jnp.sort(jnp.where(above, state.logl, jnp.inf))
-    below = jnp.searchsorted(ranked, new_logl, side="left").astype(jnp.int32)
-    upto = jnp.searchsorted(ranked, new_logl, side="right").astype(jnp.int32)
+    below = jnp.searchsorted(ranked, new_logl, side="left", method="scan_unrolled")
+    upto = jnp.searchsorted(ranked, new_logl, side="right", method="scan_unrolled")
+    below, upto = below.astype(jnp.int32), upto.astype(jnp.int32)
     same = jnp.minimum(upto, n_above) - below
     place = random.uniform(random.fold_in(k_seed, 1), (k,), dtype)
     place = jnp.minimum((place * (same + 1).astype(dtype)).astype(jnp.int32), same)
