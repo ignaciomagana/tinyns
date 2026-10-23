@@ -33,9 +33,13 @@ class NestedSampler:
     num_delete:
         Live points deleted and replaced per step, default
         ``max(1, nlive // 10)``, at most ``nlive // 2``. Its replacement chains
-        run in parallel (vmapped); ``num_delete=1`` runs one unbatched chain
-        that skips the likelihood of out-of-cube proposals, for expensive
-        likelihoods.
+        run in parallel (vmapped) and evaluate every proposal (an out-of-cube
+        one at its clip to the cube); ``num_delete=1`` runs one unbatched
+        chain that skips the likelihood of a proposal rejected without it
+        (outside the cube, or by a local-walk or hop Hastings test), for
+        expensive likelihoods. In a batch of runs that chain is vmapped over
+        the runs, and it evaluates those proposals too; ``ncall`` (and
+        ``maxcall``) still count only what the run evaluates alone.
     walks:
         Steps per replacement chain, default ``max(25, 6 * ndim, ndim**2 // 6)``
         (:func:`tinyns.core.default_walks`): 6 steps per dimension up to 36
