@@ -127,7 +127,8 @@ def _information(logwt, logl, logz: float):
     ):
         return jnp.asarray(math.nan)
     contributing = (weights > 0.0) & finite
-    information = jnp.sum(jnp.where(contributing, weights * (logl - logz), 0.0))
+    # Mask before multiplying: 0 * -inf is NaN (jax_debug_nans raises on it).
+    information = jnp.sum(weights * jnp.where(contributing, logl - logz, 0.0))
     return jnp.maximum(information, 0.0)
 
 

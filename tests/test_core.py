@@ -511,14 +511,26 @@ def test_an_invalid_lane_stops_alone() -> None:
 
 def test_runs_under_jax_debug_nans() -> None:
     """The contour of the last step starts at -inf (it was a NaN sentinel,
-    which made every run fail in init under jax_debug_nans)."""
+    which made every run fail in init under jax_debug_nans), and the
+    information no longer forms 0 * -inf at a likelihood of -inf (which made
+    diagnostics() fail there)."""
     cfg = Config(2, 30, num_delete=3, walks=10)
     loglike = gauss(0.5, 0.1)
+
+    def disc(x):  # 0 on a disc of area 0.25, -inf elsewhere
+        return jnp.where(jnp.sum((x - 0.5) ** 2) < 0.25 / math.pi, 0.0, -jnp.inf)
+
     with jax.debug_nans(True):
         state = init(0, loglike, identity, cfg)
         assert float(state.lstar_prev) == -math.inf and int(state.tie_run) == 0
         result = core.run(0, loglike, identity, cfg)
+        assert result.diagnostics()["information"] > 0.0
+        indicator = core.run(0, disc, identity, cfg)
+        information = indicator.diagnostics()["information"]
     assert result.success and abs(result.logz) < 4 * result.logzerr + 0.05
+    assert indicator.metadata["status"] == "plateau"
+    # All the weight is at L = 1: H = log(1 / Z).
+    assert information == pytest.approx(-indicator.logz, rel=1e-4)
 
 
 def test_flat_top_likelihood_stops_on_the_plateau() -> None:
