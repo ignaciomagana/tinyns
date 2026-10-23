@@ -1362,15 +1362,20 @@ class NestedSamplingResult:
 
         A run that ended on a likelihood plateau (``metadata["status"]`` is
         ``"plateau"``) stopped where it should: the final live points are
-        the plateau and carry its posterior mass whatever ``dlogz`` and
-        ``nlive``, so the checks of the final live weight and of
-        ``final_delta_logz`` are skipped and one note gives that mass. A
-        result without posterior weight (``logz = -inf``) has
-        ``posterior_ess`` 0 and NaN weight fractions.
+        the plateau and carry its posterior mass whatever ``dlogz``, so the
+        checks of the final live weight and of ``final_delta_logz`` are
+        skipped and one note gives that mass (more live points can find a
+        higher region that none of them reached). The checks of the final
+        live weight are skipped on an ``"invalid"`` run too, which neither
+        ``dlogz`` nor ``nlive`` mends. A result without posterior weight
+        (``logz = -inf``) has ``posterior_ess`` 0 and NaN weight fractions.
         """
 
         metadata = {} if self.metadata is None else self.metadata
         plateau = metadata.get("status") == "plateau"
+        # The final live weight says nothing of the stopping rule on a
+        # plateau (it is the plateau's) or at a likelihood of +inf.
+        check_stop = metadata.get("status") not in ("plateau", "invalid")
         weighted = not self._no_weight()
         posterior_ess = self.posterior_ess()
         nposterior = int(jnp.asarray(self.logwt).size)
@@ -1397,7 +1402,7 @@ class NestedSamplingResult:
             warnings.append("posterior dominated by a small number of weighted samples")
         if entropy_fraction < 0.5:
             warnings.append("low posterior weight entropy")
-        if live_weight_fraction > 0.5 and not plateau:
+        if live_weight_fraction > 0.5 and check_stop:
             warnings.append(
                 "final live points carry most posterior weight; consider tighter "
                 "dlogz or more live points"
@@ -1406,7 +1411,7 @@ class NestedSamplingResult:
             live_weight_fraction > 0.25
             and dlogz is not None
             and dlogz >= 0.1
-            and not plateau
+            and check_stop
         ):
             warnings.append(
                 "large final-live weight fraction; evidence may be sensitive to "
@@ -1414,7 +1419,7 @@ class NestedSamplingResult:
             )
         if (
             self.success
-            and not plateau
+            and check_stop
             and None not in (final_delta_logz, dlogz)
             and final_delta_logz > dlogz
         ):
@@ -1474,8 +1479,9 @@ class NestedSamplingResult:
         mass = float(np.sum(self._weights[niter:][top]))
         return (
             f"the run ended on a likelihood plateau, which holds {mass:.3g} of "
-            "the posterior in the final live points on it (dlogz and nlive do "
-            "not change that)"
+            "the posterior in the final live points on it (a tighter dlogz does "
+            "not change that; raise nlive if a higher region could have been "
+            "missed)"
         )
 
     def resample_equal(self, key, n: int | None = None):

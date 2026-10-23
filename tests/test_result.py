@@ -378,7 +378,7 @@ def test_diagnostics_success_with_high_final_delta_logz_triggers_warning() -> No
 
 def test_diagnostics_of_a_plateau_stop_skip_the_stopping_warnings() -> None:
     """A run that ended on a plateau: the final live points are the plateau,
-    whatever dlogz and nlive; one note gives its posterior mass."""
+    whatever dlogz; one note gives its posterior mass."""
     result = make_result()
     result.logwt = jnp.log(jnp.array([0.1, 0.1, 0.4, 0.4]))
     result.metadata = {"dlogz": 0.1, "final_delta_logz": 0.2, "status": "plateau"}
@@ -389,6 +389,8 @@ def test_diagnostics_of_a_plateau_stop_skip_the_stopping_warnings() -> None:
     assert not any(text in w for w in warnings for text in stopping), warnings
     (note,) = [w for w in warnings if "plateau" in w]
     assert note.startswith("the run ended on a likelihood plateau, which holds 0.4 ")
+    # nlive can change it: a higher region that no live point reached.
+    assert "a tighter dlogz does not change that; raise nlive" in note
 
 
 def test_a_result_without_posterior_weight_reports_instead_of_raising() -> None:

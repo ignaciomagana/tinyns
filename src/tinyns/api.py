@@ -78,10 +78,12 @@ class NestedSampler:
 
         Stops once the live points hold less than ``dlogz`` of the evidence,
         before more than ``maxiter`` dead points, once ``maxcall`` likelihood
-        evaluations are reached (checked after each step), or on a likelihood
-        plateau. ``progress`` prints one line per chunk of steps: dead points,
-        ``logz``, the dlogz remainder, calls, calls per second, the chain
-        acceptance and the step scale.
+        evaluations are reached (checked after each step), on a likelihood
+        plateau, or at a live likelihood of ``+inf`` (status ``"invalid"``,
+        ``success=False``; a lane of a batch stops alone). ``progress`` prints
+        one line per chunk of steps: dead points, ``logz``, the dlogz
+        remainder, calls, calls per second, the chain acceptance and the step
+        scale.
 
         ``checkpoint`` is a file path. If the file exists, the run resumes
         from it; a checkpoint written with a different config, x64 flag,

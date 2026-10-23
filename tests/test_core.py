@@ -474,7 +474,11 @@ def test_plus_infinite_likelihood_stops_the_run() -> None:
     n_inf = int(np.sum(np.isposinf(result.logl)))
     at_init = int(np.sum(np.isposinf(init(1, spike, identity, cfg).logl)))
     assert 1 <= n_inf <= at_init + 6
-    assert result.message in result.diagnostics()["warnings"]
+    warnings = result.diagnostics()["warnings"]
+    assert warnings[0] == result.message
+    # No advice on dlogz or nlive, which do not mend a likelihood of +inf.
+    stopping = ("consider tighter dlogz", "final-live", "final_delta_logz")
+    assert not any(text in w for w in warnings for text in stopping), warnings
     assert "success: False" in str(result)
     # The functional core: step sets the status "invalid", its rows are valid.
     state = init(1, spike, identity, cfg)
