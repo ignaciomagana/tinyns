@@ -72,7 +72,7 @@ def test_a_batched_checkpoint_is_checked_lane_by_lane(tmp_path) -> None:
     changed = NestedSampler(
         Partial(loglike_data, data.at[2].add(0.5)), prior, 1, 50, num_delete=5
     )
-    with pytest.raises(ValueError, match=r"live points \(lane 2\)"):
+    with pytest.raises(ValueError, match=r"stored in the checkpoint \(lane 2\)"):
         changed.run(keys, batched_data=True, checkpoint=path)
     results = sampler.run(keys, batched_data=True, checkpoint=path)
     assert all(result.metadata["resumed"] for result in results)
@@ -103,6 +103,28 @@ def test_an_infinite_stored_likelihood_must_come_back_exactly(tmp_path) -> None:
     with pytest.raises(ValueError, match="an infinite value must come back exactly"):
         widened.run(0, checkpoint=path)
     assert sampler.run(0, maxiter=8, checkpoint=path).metadata["resumed"]
+
+
+def test_a_change_the_live_points_do_not_see_is_refused(tmp_path) -> None:
+    """Only the live points of highest likelihood were evaluated again: a
+    finished plateau run, whose live points all lie in the box, resumed with a
+    wider box was returned as it was (its dead points come back finite)."""
+
+    def box(half):
+        def loglike(x):
+            return jnp.where(jnp.all(jnp.abs(x - 0.5) < half), 0.0, -jnp.inf)
+
+        return loglike
+
+    path = tmp_path / "box.npz"
+    sampler = NestedSampler(box(0.2), identity, 2, 50, num_delete=5)
+    done = sampler.run(0, checkpoint=path)
+    assert done.metadata["status"] == "plateau" and np.isfinite(done.logz)
+    wider = NestedSampler(box(0.45), identity, 2, 50, num_delete=5)
+    with pytest.raises(ValueError, match="stored at a dead point"):
+        wider.run(0, checkpoint=path)
+    again = sampler.run(0, checkpoint=path)  # the same box comes back
+    assert again.metadata["resumed"] and again.logz == done.logz
 
 
 def test_the_refusal_gives_the_relative_difference(tmp_path) -> None:

@@ -79,8 +79,9 @@ _MAX_SCALE = 10.0
 _CHUNK_EFOLDS = 4.0
 _CHUNK_SECONDS = 45.0
 _CHECKPOINT_SECONDS = 600.0
-# On resume, the live points of highest likelihood of each lane that are
-# evaluated again (:func:`_check_resume`).
+# On resume, the number of live points (of highest likelihood) and of dead
+# points (spread over the death order) of each lane that are evaluated again
+# (:func:`_check_resume`).
 _RESUME_CHECKS = 16
 _INT32_MAX = 2**31 - 1
 # The frames a chain looks up at every step when no clustering has more in use
@@ -1413,19 +1414,27 @@ def _lane_callable(fn, lane: int):
     )
 
 
-def _check_resume(path, state: State, cfg: Config, kernel, leaves) -> None:
+def _check_resume(path, state: State, dead: list, cfg: Config, kernel,
+                  leaves) -> None:
     """Raise ``ValueError`` unless ``loglike(prior_transform(u))`` gives back
-    the stored likelihoods of the ``_RESUME_CHECKS`` live points of highest
-    likelihood of every lane of a checkpoint, each lane with its own data.
+    the likelihoods stored in a checkpoint, in every lane with its own data:
+    those of the ``_RESUME_CHECKS`` live points of highest likelihood and of
+    as many dead points (``dead``, one :class:`Dead` per lane), spread evenly
+    over the death order (the same count in every lane).
 
     The callables are not stored in a checkpoint: this refuses one written
     for another likelihood, prior or dataset, which would otherwise be
-    resumed (a finished one returned as it is). ``kernel`` is the run's
+    resumed (a finished one returned as it is). The dead points see a change
+    the live ones do not: a wider constraint of a plateau whose live points
+    all lie in the old one, or a change where the run has been. A change at
+    none of the points checked is not seen. ``kernel`` is the run's
     :func:`_logl_kernel`. It compiles apart from the run's kernels, so the
     values may differ in the last bits: finite ones match to a relative
     ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``,
     and infinite ones (a NaN is stored as ``-inf``) exactly. In float32 a
-    change smaller than that (``3.5e-4 |logL|``) is not seen. Setting
+    change smaller than that (``3.5e-4 |logL|``) is not seen: a new noise
+    realisation of the same model, for example, once ``|logL|`` is above
+    about ``1e5`` (the change goes like ``sqrt(|logL|)``). Setting
     ``_RESUME_CHECKS = 0`` skips the check, for a likelihood that does not
     give back its own values to that tolerance.
     """
@@ -1438,7 +1447,17 @@ def _check_resume(path, state: State, cfg: Config, kernel, leaves) -> None:
         u, logl = u[None], logl[None]
     top = np.argsort(-logl, axis=1, kind="stable")[:, :n]
     u = np.take_along_axis(u, top[..., None], axis=1)
-    old = np.take_along_axis(logl, top, axis=1).astype(np.float64)
+    logl = np.take_along_axis(logl, top, axis=1)
+    m = min(_RESUME_CHECKS, *(rows.logl.size for rows in dead))
+    if m:
+        dead_u, dead_logl = [], []
+        for rows in dead:
+            i = np.linspace(0, rows.logl.size - 1, m).round().astype(int)
+            dead_u.append(np.asarray(rows.u).reshape(-1, u.shape[-1])[i])
+            dead_logl.append(np.asarray(rows.logl).reshape(-1)[i])
+        u = np.concatenate([u, np.stack(dead_u)], axis=1)
+        logl = np.concatenate([logl, np.stack(dead_logl)], axis=1)
+    old = logl.astype(np.float64)
     new = kernel(jnp.asarray(u if batched else u[0]), *leaves)
     new = np.asarray(new, np.float64).reshape(old.shape)
     rtol = math.sqrt(np.finfo(state.u.dtype).eps)
@@ -1456,11 +1475,12 @@ def _check_resume(path, state: State, cfg: Config, kernel, leaves) -> None:
         )
         raise ValueError(
             f"{path}: this loglike and prior_transform do not give back the "
-            f"likelihoods of the checkpoint's live points{where}: "
+            f"likelihoods stored in the checkpoint{where}: "
             f"{float(new[lane, i])!r} against {float(old[lane, i])!r} stored "
-            f"({how}), at {int(bad[lane].sum())} of the {n} points checked. A "
-            "checkpoint of another likelihood, prior or dataset is not "
-            "resumed: use one checkpoint path per problem. If this is the "
+            f"at a {'live' if i < n else 'dead'} point ({how}), at "
+            f"{int(bad[lane].sum())} of the {n} live and {m} dead points "
+            "checked. A checkpoint of another likelihood, prior or dataset is "
+            "not resumed: use one checkpoint path per problem. If this is the "
             "same problem and its likelihood does not give back its own "
             "values, tinyns.core._RESUME_CHECKS = 0 skips this check"
         )
@@ -1511,10 +1531,11 @@ def run(
 
     ``checkpoint`` is a path: if the file exists the run resumes from it
     (refusing a different config, x64 flag, float dtype, key or batch, and
-    live points whose likelihoods ``loglike`` and ``prior_transform`` do not
-    give back: :func:`_check_resume`), and the run writes it atomically at a
-    chunk boundary at most every ``_CHECKPOINT_SECONDS`` and at the end. A
-    path that cannot be written raises ``OSError`` before anything compiles.
+    live or dead points whose likelihoods ``loglike`` and ``prior_transform``
+    do not give back: :func:`_check_resume`), and the run writes it
+    atomically at a chunk boundary at most every ``_CHECKPOINT_SECONDS`` and
+    at the end. A path that cannot be written raises ``OSError`` before
+    anything compiles.
     A resumed run is bit-identical to an uninterrupted one on the same JAX
     build and device (a checkpoint of another warns): each step splits
     ``state.key``, so the random stream depends on the step count only, never
@@ -1574,7 +1595,7 @@ def run(
             key=key,
         )
         _check_resume(
-            checkpoint, ckpt.state, cfg,
+            checkpoint, ckpt.state, ckpt.dead, cfg,
             _logl_kernel(ll_spec, pt_spec, cfg, axes), leaves,
         )
         state = ckpt.state
