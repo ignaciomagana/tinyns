@@ -272,6 +272,7 @@ def test_batched_progress_reads_the_running_lanes(capsys) -> None:
                           batched_data=True)
     assert [r.metadata["status"] for r in results] == ["converged", "plateau"]
     lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) > 2
     for line in lines[:-1]:
         assert "lanes running=1/2" in line and line.endswith(" [plateau=1]")
         assert "niter=0.." not in line and "inf" not in line
