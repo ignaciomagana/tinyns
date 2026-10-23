@@ -293,10 +293,10 @@ def _live_chol(u, mask):
     m, d = u.shape
     w = mask.astype(u.dtype)
     n = jnp.maximum(jnp.sum(w), 1.0)
-    x = (u - _modes.matmul(w, u) / n) * w[:, None]
+    x = (u - _modes.matmul(w, u)[None] / n) * w[:, None]
     dof = jnp.maximum(n - 1.0, 1.0)
     std = jnp.sqrt(jnp.sum(x * x, axis=0) / dof)
-    z = x / jnp.where(std > 0, std, 1.0)
+    z = x / jnp.where(std > 0, std, 1.0)[None]
     corr = _modes.matmul(z.T, z) / dof
     corr = corr + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
     chol = jnp.linalg.cholesky(corr)
@@ -450,7 +450,7 @@ def _chain(
 
         def offsets(v):
             return jnp.einsum(
-                "cij,cj->ci", near.ichol, v - near.mu, precision=_modes.PRECISION
+                "cij,cj->ci", near.ichol, v[None] - near.mu, precision=_modes.PRECISION
             )
 
     else:
@@ -468,7 +468,8 @@ def _chain(
 
         def offsets(v):
             y = jnp.einsum(
-                "fcij,fcj->fci", near.ichol, v - near.mu, precision=_modes.PRECISION
+                "fcij,fcj->fci", near.ichol, v[None, None] - near.mu,
+                precision=_modes.PRECISION,
             )
             return y[fold]
 
@@ -590,8 +591,9 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         ncall=jnp.asarray(m, i32),
         ncall_valid=jnp.asarray(m, i32),
         status=jnp.asarray(RUNNING, i32),
-        label=jnp.where(_fold(m, folds)[None, :] == jnp.arange(folds)[:, None], -1, 0)
-        .astype(i32),
+        label=jnp.where(
+            _fold(m, folds)[None, :] == jnp.arange(folds, dtype=i32)[:, None], -1, 0
+        ).astype(i32),
         **_empty_frames(d, folds, dtype),
     )
 
@@ -941,7 +943,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     log_x_ties = state.log_x_ties + jnp.sum(jnp.where(tied, log_t - plain_t, 0.0))
     # The step scale adapts to the random-walk acceptance alone.
     walk_moves = jnp.sum(moves - hops).astype(dtype)
-    acceptance = walk_moves / jnp.maximum(k * walks - jnp.sum(hop_tries), 1)
+    walk_tries = jnp.maximum(k * walks - jnp.sum(hop_tries), 1).astype(dtype)
+    acceptance = walk_moves / walk_tries
     rate = 0.5 * min(1.0, k / 32)
     log_scale = jnp.clip(
         state.log_scale + rate * jnp.clip(acceptance - _TARGET_ACCEPT, -0.5, 0.5),
@@ -975,7 +978,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     nearest = jax.vmap(  # over clusterings j: (folds, k)
         lambda fr: _modes.nearest(fr, new_u)
     )(frames)
-    nearest = jnp.where(jnp.arange(folds)[:, None] == dead_fold[None, :], -1, nearest)
+    clustering = jnp.arange(folds, dtype=i32)
+    nearest = jnp.where(clustering[:, None] == dead_fold[None, :], -1, nearest)
     new = new._replace(label=state.label.at[:, worst].set(nearest))
     n_clusters = jnp.max(jnp.sum(frames.active, axis=1))
     n_eligible = jnp.min(jnp.sum(frames.eligible, axis=1))

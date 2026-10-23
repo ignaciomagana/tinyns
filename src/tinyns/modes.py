@@ -226,14 +226,15 @@ def _ridge(cov):
     scale = jnp.mean(var, axis=-1, keepdims=True)
     scale = jnp.where(scale > 0, scale, jnp.finfo(cov.dtype).tiny)
     ridge = 10.0 * eps * (var + eps * scale)
-    return cov + ridge[..., None] * jnp.eye(d, dtype=cov.dtype)
+    eye = jnp.broadcast_to(jnp.eye(d, dtype=cov.dtype), cov.shape)
+    return cov + ridge[..., None] * eye
 
 
 def _cholesky(cov):
     """Cholesky factor and a flag; the identity where the factorization fails."""
     chol = jnp.linalg.cholesky(cov)
     ok = jnp.all(jnp.isfinite(chol), axis=(-2, -1))
-    eye = jnp.eye(cov.shape[-1], dtype=cov.dtype)
+    eye = jnp.broadcast_to(jnp.eye(cov.shape[-1], dtype=cov.dtype), cov.shape)
     return jnp.where(ok[..., None, None], chol, eye), ok
 
 
@@ -243,7 +244,8 @@ def stats(x, labels, nslots: int) -> Stats:
     Rows with a label outside ``0..nslots-1`` (e.g. ``-1``) are left out. The
     scatter is taken about the cluster mean (no ``m x d x d`` intermediate).
     """
-    member = (labels[None, :] == jnp.arange(nslots)[:, None]).astype(x.dtype)
+    slots = jnp.arange(nslots, dtype=labels.dtype)
+    member = (labels[None, :] == slots[:, None]).astype(x.dtype)
     count = jnp.sum(member, axis=1)
     mu = matmul(member, x) / jnp.maximum(count, 1.0)[:, None]
     dev = (x[None, :, :] - mu[:, None, :]) * member[:, :, None]  # (K, m, d)
@@ -275,8 +277,8 @@ def frames(st: Stats, nlive: int | None = None) -> Frames:
     rho = SHRINK * d / (dof + SHRINK * d)
     cov = (1.0 - rho)[:, None, None] * scat / dof[:, None, None] + (rho * kappa)[
         :, None, None
-    ] * pooled
-    cov = jnp.where((count > 1.5)[:, None, None], cov, pooled)
+    ] * pooled[None]
+    cov = jnp.where((count > 1.5)[:, None, None], cov, pooled[None])
     chol, ok = _cholesky(_ridge(cov))
     active = nonempty & ok
     ichol = solve_triangular(chol, jnp.broadcast_to(eye, chol.shape), lower=True)
@@ -373,8 +375,8 @@ def hop_accept(uniform, eligible, r2_new, r2_old, d: int):
     above ``L*``.
     """
     r2max = ELL_R2_PER_DIM * (d + 2.0)
-    n_new = jnp.sum(eligible & (r2_new <= r2max))
-    n_old = jnp.sum(eligible & (r2_old <= r2max))
+    n_new = jnp.sum(eligible & (r2_new <= r2max)).astype(uniform.dtype)
+    n_old = jnp.sum(eligible & (r2_old <= r2max)).astype(uniform.dtype)
     return (uniform * n_new < n_old) & (n_new >= 1)
 
 
@@ -443,7 +445,7 @@ def _fisher(x, w, part):
     na, nb = jnp.sum(wa), jnp.sum(wb)
     mua = matmul(wa, x) / jnp.maximum(na, 1.0)
     mub = matmul(wb, x) / jnp.maximum(nb, 1.0)
-    dev = (x - jnp.where(part[:, None] > 0.5, mub, mua)) * w[:, None]
+    dev = (x - jnp.where(part[:, None] > 0.5, mub[None], mua[None])) * w[:, None]
     within = _ridge(matmul(dev.T, dev) / jnp.maximum(na + nb - 2.0, 1.0))
     dm = mub - mua
     chol, ok = _cholesky(within)
@@ -493,13 +495,14 @@ def _split(x, mask):
     n = jnp.sum(w)
     big = n >= max(2 * MIN_SPLIT_POINTS, 4 * d)
     mean = matmul(w, x) / jnp.maximum(n, 1.0)
-    xc = (x - mean) * w[:, None]
+    xc = (x - mean[None]) * w[:, None]
     chol, _ = _cholesky(_ridge(matmul(xc.T, xc) / jnp.maximum(n - 1.0, 1.0)))
     ichol = solve_triangular(chol, jnp.eye(d, dtype=dtype), lower=True)
     y = matmul(xc, ichol.T)  # whitened; 0 outside
     r2 = jnp.sum(y * y, axis=1)
     far = y[jnp.argmax(jnp.where(mask, r2, -jnp.inf))]
-    far2 = y[jnp.argmax(jnp.where(mask, jnp.sum((y - far) ** 2, axis=1), -jnp.inf))]
+    far2 = jnp.sum((y - far[None]) ** 2, axis=1)
+    far2 = y[jnp.argmax(jnp.where(mask, far2, -jnp.inf))]
     total = matmul(w, y)
 
     def nearer(c0, c1):
@@ -521,7 +524,7 @@ def _split(x, mask):
         nearer(far, far2),
         matmul(y, dirs[top[0]]) > cuts[top[0]],
         matmul(y, dirs[top[1]]) > cuts[top[1]],
-    ]) & mask
+    ]) & mask[None]
 
     def one(part):
         def lloyd(part):
@@ -573,7 +576,7 @@ def _merge(u, labels):
 
     def body(carry):
         labels, j = carry
-        flat = jnp.argmin(j)
+        flat = jnp.argmin(j).astype(jnp.int32)
         a = jnp.minimum(flat // C_MAX, flat % C_MAX)
         b = jnp.maximum(flat // C_MAX, flat % C_MAX)
         labels = jnp.where(labels == b, a, labels).astype(jnp.int32)
@@ -605,7 +608,7 @@ def _split_all(u, labels):
     lanes, m, d = u.shape
     threshold = split_threshold(d)
     min_size = max(2 * MIN_SPLIT_POINTS, 4 * d)
-    slots = jnp.arange(C_MAX)
+    slots = jnp.arange(C_MAX, dtype=jnp.int32)
     lane = jnp.arange(lanes)
 
     def sizes(labels):
@@ -628,8 +631,8 @@ def _split_all(u, labels):
         # slots do not depend on the orientation of the cut (the sign of an
         # eigenvector, which batched and single solvers can choose apart).
         go = due(labels, js, todo)
-        c = jnp.argmax(js, axis=1)
-        free = jnp.argmin(sizes(labels) > 0, axis=1)
+        c = jnp.argmax(js, axis=1).astype(jnp.int32)
+        free = jnp.argmin(sizes(labels) > 0, axis=1).astype(jnp.int32)
         member = labels == c[:, None]
         part = parts[lane, c]
         first = jnp.take_along_axis(part, jnp.argmax(member, axis=1)[:, None], 1)
@@ -645,7 +648,7 @@ def _split_all(u, labels):
         todo = todo | (changed & (sizes(labels) >= min_size))
         # Search the first pending cluster of every lane that has one.
         has = jnp.any(todo, axis=1)
-        pick = jnp.argmax(todo, axis=1)
+        pick = jnp.argmax(todo, axis=1).astype(jnp.int32)
         target = jnp.where(has, pick, C_MAX)  # C_MAX: no row has this label
 
         def search(_):
@@ -688,7 +691,8 @@ def recluster_lanes(u, labels):
     labels = jnp.where(labels < 0, -1, jnp.clip(labels, 0, C_MAX - 1))
     labels = labels.astype(jnp.int32)
     labels = jax.vmap(lambda u, lab: _refine(u, lab, C_MAX, REFINE_ITERS))(u, labels)
-    occupied = jnp.any(labels[:, None, :] == jnp.arange(C_MAX)[None, :, None], axis=-1)
+    slots = jnp.arange(C_MAX, dtype=jnp.int32)
+    occupied = jnp.any(labels[:, None, :] == slots[None, :, None], axis=-1)
     labels = lax.cond(  # nothing to merge unless a lane holds two clusters
         jnp.any(jnp.sum(occupied, axis=1) >= 2),
         lambda labels: jax.vmap(_merge)(u, labels),

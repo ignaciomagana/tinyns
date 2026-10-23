@@ -293,3 +293,28 @@ def test_internal_products_run_at_full_precision(k) -> None:
         assert all(p == lax.Precision.HIGHEST for p in pair), precision
 
 
+# --- strict promotion rules --------------------------------------------------
+
+
+def two_modes(x):
+    a = -0.5 * jnp.sum(((x - 0.3) / 0.05) ** 2)
+    b = -0.5 * jnp.sum(((x - 0.7) / 0.05) ** 2)
+    return jnp.logaddexp(a, b)
+
+
+def test_runs_under_strict_promotion_rules() -> None:
+    """tinyns runs with ``jax_numpy_rank_promotion="raise"`` and
+    ``jax_numpy_dtype_promotion="strict"`` (both are part of the compile
+    cache key, so the kernels are traced again under them): a batched
+    two-mode run, a run with ``num_delete=1``, and the result methods."""
+    with jax.numpy_rank_promotion("raise"), jax.numpy_dtype_promotion("strict"):
+        batch = NestedSampler(two_modes, identity, 2, 120).run(
+            random.split(random.PRNGKey(0), 2)
+        )
+        lone = NestedSampler(two_modes, identity, 2, 60, num_delete=1).run(1)
+        for result in (*batch, lone):
+            assert result.success and np.isfinite(result.logz)
+            result.summary()
+            result.diagnostics()
+            result.modes()
+        assert max(len(r.modes()) for r in batch) == 2
