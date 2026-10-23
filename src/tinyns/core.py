@@ -195,13 +195,13 @@ class State(NamedTuple):
     """The live set and the run scalars, threaded through :func:`step`.
 
     ``ncall`` counts the likelihood evaluations (out-of-cube proposals of a
-    vmapped step are evaluated, clipped, and counted) and ``ncall_valid`` the
-    in-cube ones; both are int32, and :func:`run` drains them into host
-    integers after every chunk. A hand-written loop that may exceed ``2**31``
-    calls must count on the host too (``ncall += int(new.ncall - old.ncall)``
-    stays right when the counter wraps) and pass the total to
-    :func:`finalise`. ``logz`` is the running evidence of the dead points,
-    used only to stop; :func:`finalise` recomputes it.
+    vmapped step are evaluated, at the chain's point, and counted) and
+    ``ncall_valid`` the in-cube ones; both are int32, and :func:`run` drains
+    them into host integers after every chunk. A hand-written loop that may
+    exceed ``2**31`` calls must count on the host too (``ncall +=
+    int(new.ncall - old.ncall)`` stays right when the counter wraps) and pass
+    the total to :func:`finalise`. ``logz`` is the running evidence of the
+    dead points, used only to stop; :func:`finalise` recomputes it.
 
     The log prior volume after the step is ``-it * S + log_x_ties``
     (:func:`_log_x`): ``-it * S`` is recomputed from ``it`` (no running sum
@@ -213,7 +213,7 @@ class State(NamedTuple):
     """
 
     key: Any  # PRNG key
-    u: Any  # (m, d) live points in the unit cube
+    u: Any  # (m, d) live points in the open unit cube
     logl: Any  # (m,)
     logl_birth: Any  # (m,) contour each live point was born above; -inf at init
     it: Any  # int32 steps done
@@ -303,17 +303,18 @@ def _live_chol(u, mask):
     m, d = u.shape
     w = mask.astype(u.dtype)
     n = jnp.maximum(jnp.sum(w), 1.0)
-    x = (u - (w @ u) / n) * w[:, None]
+    x = (u - _modes.matmul(w, u)[None] / n) * w[:, None]
     dof = jnp.maximum(n - 1.0, 1.0)
     std = jnp.sqrt(jnp.sum(x * x, axis=0) / dof)
-    z = x / jnp.where(std > 0, std, 1.0)
-    corr = z.T @ z / dof + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
+    z = x / jnp.where(std > 0, std, 1.0)[None]
+    corr = _modes.matmul(z.T, z) / dof
+    corr = corr + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
     chol = jnp.linalg.cholesky(corr)
     chol = jnp.where(jnp.all(jnp.isfinite(chol)), chol, jnp.eye(d, dtype=u.dtype))
     return std[:, None] * chol
 
 
-def _walk_mask(above, other, seeds, ndim):
+def _walk_mask(above, other, ndim):
     """The live points whose covariance shapes the walk of the chains seeded
     in one fold: the points ``other`` (outside the fold) above ``L*``.
 
@@ -327,14 +328,25 @@ def _walk_mask(above, other, seeds, ndim):
     order ``ndim / nlive``, which overestimated logZ unless the walks were
     long.
 
-    When fewer than ``ndim + 1`` such points remain (a nearly exhausted live
-    set) the points above ``L*`` other than the step's seeds are used, and
-    the seeds too if that is still too few, so the covariance has full rank.
+    When fewer than ``ndim + 1`` of them lie above ``L*`` (at the start of a
+    run whose likelihood is ``-inf`` or tied on most of the prior, or on a
+    nearly exhausted live set), every point outside the fold is used, those
+    at or below ``L*`` too: the covariance stays cross-fitted and of full
+    rank, and spans the region the few points above ``L*`` were drawn from.
+    (Falling back to the points above ``L*`` of every fold, the seeds among
+    them, kept the chains near the few finite points of a run's start, and
+    logZ came out several ``logzerr`` high in 10 and 20 dimensions.) Only
+    when the live set is too small for that (``nlive`` below about ``1.5
+    (ndim + 1)``) are all live points used.
+
+    The rule counts points, not directions: on an extreme support (a slab 1%
+    of the prior wide in 10-D) the ``ndim + 1`` or more points above ``L*``
+    of the next step can be copies of a few (a chain that did not move
+    returns its seed), and the covariance is rank-deficient for that step.
+    Testing its conditioning instead of the count left logZ unchanged.
     """
-    m = above.shape[0]
-    held_out = above & ~jnp.zeros((m,), bool).at[seeds].set(True)
-    mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, held_out)
-    return jnp.where(jnp.sum(mask) >= ndim + 1, mask, above)
+    mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, other)
+    return jnp.where(jnp.sum(mask) >= ndim + 1, mask, jnp.ones_like(mask))
 
 
 def _hop_steps(walks: int, n_hops: int) -> np.ndarray:
@@ -390,10 +402,12 @@ def _chain(
 ):
     """A fixed-length constrained Metropolis chain from ``(u, logl)``.
 
-    Proposals outside the unit cube or at or below ``lstar`` are rejected; an
-    unmoved chain returns its seed. With ``skip`` (one unbatched chain) a
-    proposal that fails the likelihood-free tests skips the likelihood
-    (``lax.cond``); otherwise the clipped proposal is evaluated and masked.
+    Proposals outside the open unit cube or at or below ``lstar`` are
+    rejected; an unmoved chain returns its seed. With ``skip`` (one unbatched
+    chain) a proposal that fails the likelihood-free tests skips the
+    likelihood (``lax.cond``); otherwise it is evaluated and masked (one
+    outside the cube at the chain's point), so the callables only ever see
+    points of the open cube.
 
     The steps are the random walk ``u + s L z``, except that with ``hop``
     every ``HOP_EVERY``-th step is the inter-mode hop from the chain's
@@ -445,13 +459,15 @@ def _chain(
         mine = near
 
         def live_step(z):
-            return chol @ z
+            return _modes.matmul(chol, z)
 
         def frame_chol(c):
             return near.chol[c]
 
         def offsets(v):
-            return jnp.einsum("cij,cj->ci", near.ichol, v - near.mu)
+            return jnp.einsum(
+                "cij,cj->ci", near.ichol, v[None] - near.mu, precision=_modes.PRECISION
+            )
 
     else:
         if tracked:
@@ -461,13 +477,16 @@ def _chain(
             ))
 
         def live_step(z):
-            return jnp.einsum("fij,j->fi", chol, z)[fold]
+            return jnp.einsum("fij,j->fi", chol, z, precision=_modes.PRECISION)[fold]
 
         def frame_chol(c):
             return near.chol[fold, c]
 
         def offsets(v):
-            y = jnp.einsum("fcij,fcj->fci", near.ichol, v - near.mu)
+            y = jnp.einsum(
+                "fcij,fcj->fci", near.ichol, v[None, None] - near.mu,
+                precision=_modes.PRECISION,
+            )
             return y[fold]
 
     if draws is None:
@@ -505,7 +524,7 @@ def _chain(
         z = random.normal(k_z, u.shape, u.dtype)
         move = live_step(z)
         if local:
-            move = jnp.where(use_local, frame_chol(c) @ z, move)
+            move = jnp.where(use_local, _modes.matmul(frame_chol(c), z), move)
         prop = u + scale * move
         hop = jnp.asarray(False)
         if tracked and n_hops > 0:
@@ -528,16 +547,19 @@ def _chain(
             h_ok = _modes.hop_accept(hop_uniforms[index], mine.eligible, r2_new, r2, d)
             ok = jnp.where(hop, h_ok, ok)
 
-        inside = jnp.all((prop >= 0.0) & (prop <= 1.0))
+        # The open cube: the faces have zero measure, and a transform such
+        # as ndtri(u) or -log(u) is infinite on them. A proposal outside is
+        # evaluated (vmapped) at the chain's point instead, and masked.
+        inside = jnp.all((prop > 0.0) & (prop < 1.0))
         call = inside & ok
-        clipped = jnp.clip(prop, 0.0, 1.0)
+        at = jnp.where(inside, prop, u)
         if skip:
             new = lax.cond(
-                call, evaluate, lambda v: jnp.asarray(-jnp.inf, dtype), clipped
+                call, evaluate, lambda v: jnp.asarray(-jnp.inf, dtype), at
             )
             nev = nev + call.astype(jnp.int32)
         else:
-            new = jnp.where(call, evaluate(clipped), -jnp.inf)
+            new = jnp.where(call, evaluate(at), -jnp.inf)
             nev = nev + 1
         accept = call & (new > lstar)
         u = jnp.where(accept, prop, u)
@@ -563,6 +585,9 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
     dtype = jnp.result_type(float)
     key, sub = random.split(key)
     u = random.uniform(sub, (m, d), dtype)
+    # A draw of exactly 0 (one in 2^23 per coordinate in float32) moves into
+    # the open cube, to half the spacing of the draws.
+    u = jnp.where(u > 0, u, jnp.finfo(dtype).eps / 2)
     logl = lax.map(
         lambda v: _loglike_u(loglike, prior_transform, v, dtype), u, batch_size=k
     )
@@ -582,8 +607,9 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         ncall=jnp.asarray(m, i32),
         ncall_valid=jnp.asarray(m, i32),
         status=jnp.asarray(RUNNING, i32),
-        label=jnp.where(_fold(m, folds)[None, :] == jnp.arange(folds)[:, None], -1, 0)
-        .astype(i32),
+        label=jnp.where(
+            _fold(m, folds)[None, :] == jnp.arange(folds, dtype=i32)[:, None], -1, 0
+        ).astype(i32),
         **_empty_frames(d, folds, dtype),
     )
 
@@ -718,7 +744,12 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     replacement only when that fold has too few (one uniform per new point:
     the rank of its seed among the fold's points above ``L*``), and from the
     whole live set only when it has none. A live point and its descendants
-    thus stay in one fold."""
+    thus stay in one fold.
+
+    The draws with replacement read the points above ``L*`` in slot order
+    from one sort of each fold, so a step costs ``O(m log m)``, not ``O(k
+    m)`` (a ``(k, m)`` mask took 28 of a 44 ms step at nlive 1e4 on a CPU,
+    and 7.6 GiB per run at nlive 1e5)."""
     m, k = above.shape[0], worst.shape[0]
     fold = _fold(m, folds)
     score = jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
@@ -728,14 +759,23 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     tops = jnp.stack([
         lax.top_k(jnp.where(fold == j, score, -jnp.inf), k)[1] for j in range(folds)
     ])
-    n_fold = jnp.stack([jnp.sum(above & (fold == j)) for j in range(folds)])
-    mine = above[None, :] & (fold[None, :] == dead_fold[:, None])
-    mine = jnp.where((n_fold[dead_fold] > 0)[:, None], mine, above[None, :])
-    count = jnp.sum(mine, axis=1)
-    pick = (random.uniform(key_fill, (k,), dtype) * count).astype(jnp.int32)
-    pick = jnp.minimum(pick, count - 1)
-    order = jnp.cumsum(mine, axis=1) - 1  # a row's rank among its candidates
-    fill = jnp.argmax(mine & (order == pick[:, None]), axis=1)
+    # Row j of a (folds, n) view holds slots j, j + folds, ... (padded at the
+    # end), so its points above L* come first, in slot order, after a stable
+    # sort of ~above; position p in row j is slot j + folds * p.
+    n = -(-m // folds)
+    by_fold = jnp.concatenate([above, jnp.zeros((n * folds - m,), bool)])
+    by_fold = by_fold.reshape(n, folds).T
+    first = jnp.argsort(~by_fold, axis=1, stable=True).astype(jnp.int32)
+    anywhere = jnp.argsort(~above, stable=True).astype(jnp.int32)
+    n_fold = jnp.sum(by_fold, axis=1, dtype=jnp.int32)
+    has = n_fold[dead_fold] > 0
+    count = jnp.where(has, n_fold[dead_fold], jnp.sum(above, dtype=jnp.int32))
+    pick = random.uniform(key_fill, (k,), dtype) * count.astype(dtype)
+    pick = jnp.maximum(jnp.minimum(pick.astype(jnp.int32), count - 1), 0)
+    fill = jnp.where(
+        has, dead_fold + folds * first[dead_fold, jnp.minimum(pick, n - 1)],
+        anywhere[pick],
+    )
     return jnp.where(rank < n_fold[dead_fold], tops[dead_fold, rank], fill)
 
 
@@ -827,7 +867,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # covariance, the cluster frames of the hop and of the local walk) is
     # built from the points outside fold j alone.
     chols = jnp.stack([
-        _live_chol(state.u, _walk_mask(above, fold != j, seeds, cfg.ndim))
+        _live_chol(state.u, _walk_mask(above, fold != j, cfg.ndim))
         for j in range(folds)
     ])
     frames = _frames(state)  # frames[j]: fitted outside fold j
@@ -895,11 +935,18 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # with exactly its likelihood (a plateau above L*, the seed of an unmoved
     # chain) are in a random order with it: the rank takes a uniform place
     # among them, from a key folded off k_seed (the other draws are as they
-    # were).
-    below = jnp.sum(above & (state.logl < new_logl[:, None]), axis=1, dtype=jnp.int32)
-    same = jnp.sum(above & (state.logl == new_logl[:, None]), axis=1, dtype=jnp.int32)
+    # were). The survivors' likelihoods are sorted once (the others padded
+    # with +inf, which only the count of equals could see). The two binary
+    # searches are unrolled: JAX's default runs each as a loop of log2(nlive)
+    # sequential steps, which a GPU pays for at every step (a CPU step takes
+    # the same time either way).
+    ranked = jnp.sort(jnp.where(above, state.logl, jnp.inf))
+    below = jnp.searchsorted(ranked, new_logl, side="left", method="scan_unrolled")
+    upto = jnp.searchsorted(ranked, new_logl, side="right", method="scan_unrolled")
+    below, upto = below.astype(jnp.int32), upto.astype(jnp.int32)
+    same = jnp.minimum(upto, n_above) - below
     place = random.uniform(random.fold_in(k_seed, 1), (k,), dtype)
-    place = jnp.minimum((place * (same + 1)).astype(jnp.int32), same)
+    place = jnp.minimum((place * (same + 1).astype(dtype)).astype(jnp.int32), same)
     insertion = below + place
     nlive, tied = _tie_counts(dead_logl, state, cfg)
     log_x = _log_x(state, cfg)
@@ -916,7 +963,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     log_x_ties = state.log_x_ties + jnp.sum(jnp.where(tied, log_t - plain_t, 0.0))
     # The step scale adapts to the random-walk acceptance alone.
     walk_moves = jnp.sum(moves - hops).astype(dtype)
-    acceptance = walk_moves / jnp.maximum(k * walks - jnp.sum(hop_tries), 1)
+    walk_tries = jnp.maximum(k * walks - jnp.sum(hop_tries), 1).astype(dtype)
+    acceptance = walk_moves / walk_tries
     rate = 0.5 * min(1.0, k / 32)
     log_scale = jnp.clip(
         state.log_scale + rate * jnp.clip(acceptance - _TARGET_ACCEPT, -0.5, 0.5),
@@ -950,7 +998,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     nearest = jax.vmap(  # over clusterings j: (folds, k)
         lambda fr: _modes.nearest(fr, new_u)
     )(frames)
-    nearest = jnp.where(jnp.arange(folds)[:, None] == dead_fold[None, :], -1, nearest)
+    clustering = jnp.arange(folds, dtype=i32)
+    nearest = jnp.where(clustering[:, None] == dead_fold[None, :], -1, nearest)
     new = new._replace(label=state.label.at[:, worst].set(nearest))
     n_clusters = jnp.max(jnp.sum(frames.active, axis=1))
     n_eligible = jnp.min(jnp.sum(frames.eligible, axis=1))

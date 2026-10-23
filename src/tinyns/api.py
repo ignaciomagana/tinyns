@@ -25,7 +25,9 @@ class NestedSampler:
         one shape share one compiled program.
     prior_transform:
         JAX-traceable function mapping one unit-cube point to parameter space.
-        May be a pytree callable, like ``loglike``.
+        It is only called on the open cube ``(0, 1)^ndim``, never on a face,
+        so transforms such as ``ndtri(u)`` or ``-log(u)`` stay finite. May be
+        a pytree callable, like ``loglike``.
     ndim:
         Number of dimensions.
     nlive:
