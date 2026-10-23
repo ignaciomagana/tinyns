@@ -318,3 +318,20 @@ def test_runs_under_strict_promotion_rules() -> None:
             result.diagnostics()
             result.modes()
         assert max(len(r.modes()) for r in batch) == 2
+
+
+def test_hop_proposal_indexes_frames_with_int32() -> None:
+    """The hop picks its frame with an int32 index, like the chains' fold
+    index it is paired with: under x64 an int64 one made JAX 0.4 raise on the
+    mixed integer index in strict mode (the test above, on the CI's oldest
+    JAX)."""
+    seen = []
+
+    def frame(c):
+        seen.append(c.dtype)
+        return jnp.zeros(2, FLOAT), jnp.eye(2, dtype=FLOAT)
+
+    eligible = jnp.arange(modes.C_MAX) < 3
+    logdet = jnp.zeros(modes.C_MAX, FLOAT)
+    modes.hop_proposal(random.PRNGKey(0), eligible, logdet, frame)
+    assert seen == [jnp.int32]

@@ -352,8 +352,10 @@ def hop_proposal(key, eligible, logdet, frame):
     uni = random.uniform(k_uni, (3,), dtype)
     logv = jnp.where(eligible, logdet, -jnp.inf)
     cdf = jnp.cumsum(jnp.where(eligible, jnp.exp(logv - jnp.max(logv)), 0.0))
-    c = jnp.sum(cdf <= uni[0] * cdf[-1])  # the first frame with cdf above
-    last = eligible.shape[0] - 1 - jnp.argmax(eligible[::-1])
+    # int32 like the callers' fold indices: JAX 0.4 refuses to promote mixed
+    # integer indices (int32 fold, int64 frame under x64) in strict mode.
+    c = jnp.sum(cdf <= uni[0] * cdf[-1], dtype=jnp.int32)  # first above
+    last = eligible.shape[0] - 1 - jnp.argmax(eligible[::-1]).astype(jnp.int32)
     mu, chol = frame(jnp.minimum(c, last))
     d = mu.shape[0]
     # The barrier keeps XLA from fusing the generator into the norm: on a
