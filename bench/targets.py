@@ -20,9 +20,12 @@ same function, applied to its weighted (or equal-weight) samples.
 
 Names: ``gauss_d{d}``, ``rosen_d{d}``, ``funnel_d{d}``, ``loggamma_d{d}``,
 ``eggbox_d2``, ``sepW_d{d}``, ``sepM_d{d}``, ``connW_d{d}`` and ``mix3_d10``;
-``sepWtw_d{d}`` is ``sepW`` with a banana-twisted main mode. ``needle_d{d}``
-and ``cauchy_d{d}`` are two-mode targets whose modes are not convex (a core
-with thin arms, and a star), on which the hop gives no gain.
+``sepWtw_d{d}`` is ``sepW`` with a banana-twisted main mode, and a ``box``
+suffix (``sepWbox_d{d}``) moves a two-mode mixture from the unit cube to the
+box ``BOX``. The mixtures have d = 4, 10, 18 or 32. ``needle_d{d}`` and
+``cauchy_d{d}`` are two-mode targets whose modes are not convex (a core with
+thin arms, and a star), on which the hop gives no gain. ``ndtri_d{d}`` is a
+Gaussian prior with the data 3 prior sd off centre in every coordinate.
 ``BENCH_TARGETS`` lists the ones in the standard sweep.
 """
 
@@ -81,7 +84,8 @@ def gaussian(d: int) -> Target:
     random rotation ``Q`` (fixed seed per d); mean uniform in [-1, 1]^d. The
     likelihood is a normalised density, so ``logZ = -d log 20``. Every marginal
     sd is <= 1 and every mean is within 1 of the origin, so the box edge is at
-    least 9 marginal sd away: the truncated mass is < d * 2.3e-19.
+    least 9 marginal sd away: the truncated mass is < d * 2.3e-19. So the
+    posterior is the Gaussian itself: ``meta`` holds its mean and covariance.
     """
     rng = np.random.default_rng(1000 + d)
     s = np.geomspace(0.1, 1.0, d) if d > 1 else np.ones(1)
@@ -120,9 +124,48 @@ def gaussian(d: int) -> Target:
         logz_source="analytic",
         meta=dict(
             mean=mu.tolist(),
+            cov=cov.tolist(),
             sd_eigen=[float(s.min()), float(s.max())],
             truncated_mass_bound=trunc,
         ),
+    )
+
+
+# -------------------------------------------- Gaussian prior, data off centre
+NDTRI_OFFSET, NDTRI_SIGMA = 3.0, 0.3
+
+
+def ndtri_corner(d: int) -> Target:
+    """A standard normal prior with the data 3 prior sd off centre in every
+    coordinate: ``x = ndtri(u)``, ``lnL = sum_i log N(x_i; 3, 0.3^2)``.
+
+    The posterior, ``N(3 / 1.09, 0.3^2 / 1.09)`` in each coordinate, lies in a
+    corner of the unit cube (``u_i`` from 0.985 to 0.9996 within 2 sd), where
+    the prior transform is far from affine. The target is written in the unit
+    cube: its box is [0, 1]^d and ``loglike`` applies ``ndtri`` itself, so
+    every sampler sees a box prior, and the samples are ``u``, not ``x``.
+    ``logZ = d [-9 / 2.18 - log(2 pi 1.09) / 2]`` exactly (the normal prior
+    has no box to truncate it).
+    """
+    import jax.numpy as jnp
+    from jax.scipy.special import ndtri
+
+    k, s = NDTRI_OFFSET, NDTRI_SIGMA
+    v = 1.0 + s * s
+    const = d * (-math.log(s) - 0.5 * LOG_2PI)
+
+    def loglike(u):
+        return const - 0.5 * jnp.sum(((ndtri(u) - k) / s) ** 2)
+
+    return Target(
+        name=f"ndtri_d{d}",
+        ndim=d,
+        loglike=loglike,
+        lo=np.zeros(d),
+        hi=np.ones(d),
+        logz=d * (-0.5 * k * k / v - 0.5 * math.log(2.0 * math.pi * v)),
+        logz_source="analytic",
+        meta=dict(prior="ndtri", offset=k, sigma=s),
     )
 
 
@@ -552,10 +595,16 @@ def build_needle(d):
 
 
 def mixture_target(name: str, t: dict) -> Target:
+    """The target of a mixture spec. With ``t["box"] = (lo, hi)`` the prior is
+    the box ``[lo, hi]^d`` instead of the unit cube, and the likelihood is the
+    mixture at ``u = (x - lo) / (hi - lo)``: the same target in the unit cube,
+    so logZ and the mode masses are unchanged, but the samples are scored in
+    the box's coordinates."""
     import jax.numpy as jnp
     from jax.scipy.special import logsumexp
 
     d = t["d"]
+    lo, hi = t.get("box", (0.0, 1.0))
     w = np.asarray(t["weights"], float)
     precs = np.stack([np.linalg.inv(S) for S in t["covs"]])
     consts = np.array(
@@ -579,7 +628,7 @@ def mixture_target(name: str, t: dict) -> Target:
     si, sj = float(t["sigs"][0][ti]), float(t["sigs"][0][tj])
 
     def comps(x):
-        y = x[None, :] - M
+        y = (x[None, :] - lo) / (hi - lo) - M
         if twist:  # banana shear of the main mode (component 0) only
             y = y.at[0, tj].add(-twist * sj * (y[0, ti] / si) ** 2)
         return A - 0.5 * jnp.einsum("ki,kij,kj->k", y, P, y)
@@ -599,8 +648,8 @@ def mixture_target(name: str, t: dict) -> Target:
         name=name,
         ndim=d,
         loglike=loglike,
-        lo=np.zeros(d),
-        hi=np.ones(d),
+        lo=np.full(d, lo),
+        hi=np.full(d, hi),
         logz=0.0,
         logz_source="analytic",
         mode_mass=tuple(float(w[groups == g].sum()) for g in range(groups.max() + 1)),
@@ -685,6 +734,7 @@ def cauchy(d: int) -> Target:
 # ----------------------------------------------------------------- registry
 MINOR_WEIGHT = 0.06
 TWIST = 0.3  # the banana-twisted variants, e.g. ``sepWtw_d10`` (prototype value)
+BOX = (-3.0, 5.0)  # the prior box of the ``box`` variants, e.g. ``sepWbox_d4``
 
 BENCH_TARGETS = (
     [f"gauss_d{d}" for d in (2, 8, 16, 32, 64)]
@@ -704,6 +754,7 @@ _FAMILIES = {
     "loggamma": loggamma,
     "eggbox": eggbox,
     "cauchy": cauchy,
+    "ndtri": ndtri_corner,
 }
 
 
@@ -717,10 +768,11 @@ def _split(name: str) -> tuple[str, int]:
 def mixture_spec(name: str) -> dict | None:
     """The component weights, means and covariances of a mixture target."""
     fam, d = _split(name)
-    mm = re.fullmatch(r"(sep|conn)([WMSX])(tw)?", fam)
+    mm = re.fullmatch(r"(sep|conn)([WMSX])(tw)?(box)?", fam)
     if mm:
         twist = TWIST if mm.group(3) else 0.0
-        return build_two_mode(d, MINOR_WEIGHT, mm.group(1), mm.group(2), twist=twist)
+        t = build_two_mode(d, MINOR_WEIGHT, mm.group(1), mm.group(2), twist=twist)
+        return dict(t, box=BOX) if mm.group(4) else t
     if fam == "mix3":
         return build_three_mode(d)
     if fam == "needle":
