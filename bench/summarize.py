@@ -6,8 +6,9 @@
 A cell is one (sampler, target, nlive); a sampler run with ``--opt`` settings is
 its own sampler, labelled ``name [key=value]``. A repeated seed keeps its last
 record. ``--sha SAMPLER=SHA`` keeps only the records of that sampler that were
-written at that commit (``git_sha``), so runs of an older build of the sampler
-do not enter the table. The report has four parts.
+written at that commit (``git_sha``) from an unmodified checkout, so runs of an
+older or a modified build of the sampler do not enter the table (``SHA-dirty``
+keeps those of a modified one). The report has four parts.
 
 **Cells**, one row each:
 
@@ -99,12 +100,23 @@ def parse_sha(items) -> dict:
     return out
 
 
+def sha_matches(recorded: str | None, want: str) -> bool:
+    """Whether a record's ``git_sha`` is the commit ``want``, a prefix of its
+    hash as git abbreviates it. A record written from a modified checkout
+    (``<sha>-dirty``, :func:`bench.run.git_sha`) matches only a ``want`` that
+    ends in ``-dirty`` too, and a clean one only a ``want`` that does not."""
+    sha, _, dirty = (recorded or "").partition("-")
+    want_sha, _, want_dirty = want.partition("-")
+    return bool(want_sha) and sha.startswith(want_sha) and dirty == want_dirty
+
+
 def load(paths, sha=None, dropped=None):
     """{(sampler label, target, cli nlive): [records]} from JSONL files.
 
     ``sha`` maps a sampler name (the spec without its variant) to a commit
-    prefix: a record of that sampler with another ``git_sha`` is left out,
-    and counted in ``dropped`` (a dict, sampler -> records) when one is given.
+    (:func:`sha_matches`): a record of that sampler with another ``git_sha``
+    is left out, and counted in ``dropped`` (a dict, sampler -> records) when
+    one is given.
     """
     recs = {}
     sha = sha or {}
@@ -118,7 +130,7 @@ def load(paths, sha=None, dropped=None):
                 if r.get("schema") != "tinyns-bench-1":
                     continue
                 want = sha.get(r["sampler"].split(":")[0])
-                if want and not (r.get("git_sha") or "").startswith(want):
+                if want and not sha_matches(r.get("git_sha"), want):
                     if dropped is not None:
                         dropped[r["sampler"]] = dropped.get(r["sampler"], 0) + 1
                     continue
@@ -598,7 +610,11 @@ def samplers_markdown(groups) -> str:
     for s in sorted(by):
         recs = by[s]
         vers = {(r.get("sampler_version") or "").split(" (")[0] for r in recs}
-        shas = {(r.get("git_sha") or "?")[:7] for r in recs}
+        shas = {
+            (r.get("git_sha") or "?")[:7]
+            + ("-dirty" if (r.get("git_sha") or "").endswith("-dirty") else "")
+            for r in recs
+        }
         cells = sum(k[0] == s for k in groups)
         out.append(
             f"| {s} | {', '.join(sorted(vers - {''})) or '-'} "
