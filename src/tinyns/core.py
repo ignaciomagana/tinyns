@@ -1535,7 +1535,7 @@ def run(
     do not give back: :func:`_check_resume`), and the run writes it
     atomically at a chunk boundary at most every ``_CHECKPOINT_SECONDS`` and
     at the end. A path that cannot be written raises ``OSError`` before
-    anything compiles.
+    anything compiles; a symbolic link (or ``..``) in it is resolved once.
     A resumed run is bit-identical to an uninterrupted one on the same JAX
     build and device (a checkpoint of another warns): each step splits
     ``state.key``, so the random stream depends on the step count only, never
@@ -1559,8 +1559,8 @@ def run(
     key, batch = _key_batch(key)
     if batched_data and batch is None:
         raise ValueError("batched_data=True needs a batch of keys")
-    if checkpoint is not None:
-        _checkpoint.check_writable(checkpoint)
+    if checkpoint is not None:  # the file read and written: links resolved
+        checkpoint = _checkpoint.check_writable(checkpoint)
     loglike = _device_leaves(loglike)
     prior_transform = _device_leaves(prior_transform)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(

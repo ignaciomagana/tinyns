@@ -1,7 +1,8 @@
-"""Checkpoint guards: a checkpoint of another problem is refused (its live
-points are evaluated again), the path is checked before the run, the JAX build
-is recorded and a change warns, the file keeps its mode and a link at the path
-is written through, and odd inputs fail early instead of at the last save."""
+"""Checkpoint guards: a checkpoint of another problem is refused (some of its
+live and dead points are evaluated again), the path is checked before the run
+and resolved once, the JAX build is recorded and a change warns, the file
+keeps its mode and a link at the path is written through, and odd inputs fail
+early instead of at the last save."""
 
 from __future__ import annotations
 
@@ -202,6 +203,31 @@ def test_a_path_that_names_no_file_fails_before_the_run(tmp_path,
             sampler.run(0, checkpoint=path)
     assert not calls
     assert os.listdir(tmp_path) == ["out"] and not os.listdir(tmp_path / "out")
+
+
+def test_a_path_through_a_missing_directory_is_resolved_once(tmp_path,
+                                                             monkeypatch) -> None:
+    """The probe tested the path as given but wrote where it resolves to:
+    ``"missing/.."`` (the current directory) passed and the run failed at its
+    last save, and ``"missing/../run.npz"`` did not exist for the resume test
+    but was saved as ``run.npz``, so the run never resumed."""
+    calls = []
+
+    def loglike(x):
+        calls.append(1)  # traced: the run has started
+        return gauss(x)
+
+    sampler = NestedSampler(loglike, identity, 2, 50, num_delete=5)
+    (tmp_path / "sub").mkdir()
+    monkeypatch.chdir(tmp_path / "sub")
+    with pytest.raises(IsADirectoryError, match="names no file"):
+        sampler.run(0, checkpoint="missing/..")
+    assert not calls and os.listdir(tmp_path) == ["sub"]
+    sampler = NestedSampler(gauss, identity, 2, 50, num_delete=5)
+    sampler.run(0, maxiter=50, checkpoint="missing/../run.npz")
+    assert os.listdir(tmp_path / "sub") == ["run.npz"]
+    result = sampler.run(0, maxiter=100, checkpoint="missing/../run.npz")
+    assert result.metadata["resumed"] and result.niter == 100
 
 
 @pytest.mark.skipif(os.name != "posix", reason="symbolic links")

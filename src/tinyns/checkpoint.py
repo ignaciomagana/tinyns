@@ -182,19 +182,21 @@ def save(path, ckpt: Checkpoint) -> None:
 
 
 def _file_path(path) -> str:
-    """``path`` with its symbolic links resolved, so that a link is written
-    through (replacing the link itself would leave its target stale).
-    Raises ``IsADirectoryError`` when it names no file: it is empty, ends in a
-    separator or is a directory (the parent directory was written to, or the
-    run failed at its last save)."""
+    """``path`` with its symbolic links (and ``..``) resolved, so that a link
+    is written through (replacing the link itself would leave its target
+    stale). Raises ``IsADirectoryError`` when it names no file: it is empty,
+    ends in a separator or resolves to a directory (``"out"``, ``"x/.."``;
+    the parent directory was written to, or the run failed at its last
+    save)."""
     path = os.fspath(path)
-    if not os.path.basename(path) or os.path.isdir(path):
+    real = os.path.realpath(path)
+    if not os.path.basename(path) or os.path.isdir(real):
         raise IsADirectoryError(
             errno.EISDIR,
             f"{path!r} names no file (it is empty, ends in a separator or is a "
             "directory)",
         )
-    return os.path.realpath(path)
+    return real
 
 
 def _temp_file(path: str) -> tuple[int, str]:
@@ -219,11 +221,12 @@ def _temp_file(path: str) -> tuple[int, str]:
     raise FileExistsError(f"no unused temporary file name next to {path}")
 
 
-def check_writable(path) -> None:
+def check_writable(path) -> str:
     """Raise ``OSError`` naming ``path`` unless a file can be written next to
     it, as :func:`save` does: a run checks its checkpoint path before it
     compiles and samples, not at its first save. A temporary file is created
-    and removed (``os.access`` is unreliable on network file systems)."""
+    and removed (``os.access`` is unreliable on network file systems).
+    Returns the file a run reads and writes, :func:`_file_path` of ``path``."""
     path = os.fspath(path)
     target = _file_path(path)
     try:
@@ -237,6 +240,7 @@ def check_writable(path) -> None:
         ) from exc
     os.close(fd)
     os.unlink(tmp)
+    return target
 
 
 def _atomic_savez(path, arrays: dict, compressed: bool = False) -> None:
