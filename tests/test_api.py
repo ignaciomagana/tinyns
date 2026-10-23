@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -95,6 +96,45 @@ def test_scalar_prior_transform_in_one_dimension() -> None:
                            lambda u: u[0], 1, 40).run(1)
     assert result.samples.shape == (result.niter + 40, 1)
     assert math.isfinite(result.logz)
+
+
+def tree_loglike(theta):
+    return sum(loglike(x) for x in jax.tree_util.tree_leaves(theta))
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [lambda u: {"a": u[0], "b": u[1]}, lambda u: (u[0], u[1]), lambda u: [u]],
+    ids=["dict", "tuple", "list"],
+)
+def test_prior_transform_must_return_one_array(prior) -> None:
+    # A pytree theta sampled to the end, then finalise crashed or, for some
+    # sample counts, scrambled the samples: it is refused before sampling.
+    match = "prior_transform must return one array"
+    with pytest.raises(TypeError, match=match):
+        NestedSampler(tree_loglike, prior, 2, 40).run(0)
+    with pytest.raises(TypeError, match=match):
+        tinyns.init(0, tree_loglike, prior, Config(2, 40))
+    batched = jax.tree_util.Partial(lambda b, u: prior(u + b), jnp.zeros((2, 2)))
+    with pytest.raises(TypeError, match=match):
+        NestedSampler(tree_loglike, batched, 2, 40).run(
+            jax.random.split(jax.random.key(0), 2), batched_data=True
+        )
+    cfg = Config(2, 40)
+    state = tinyns.init(0, loglike, identity, cfg)  # finalise checks it too
+    state, dead = tinyns.step(state, loglike, identity, cfg)
+    with pytest.raises(TypeError, match=match):
+        tinyns.finalise(state, dead, cfg, prior_transform=prior)
+
+
+def test_prior_transform_may_return_derived_parameters() -> None:
+    def prior(u):
+        return jnp.append(u, u[0] + u[1])  # a third, derived parameter
+
+    result = NestedSampler(lambda x: loglike(x[:2]), prior, 2, 40).run(0, maxiter=80)
+    samples = np.asarray(result.samples)
+    assert samples.shape == (result.niter + 40, 3)
+    np.testing.assert_allclose(samples[:, 2], samples[:, 0] + samples[:, 1])
 
 
 def test_out_of_memory_names_num_delete(monkeypatch) -> None:

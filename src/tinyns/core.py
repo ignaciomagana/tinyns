@@ -1124,7 +1124,9 @@ def init(key, loglike, prior_transform, cfg: Config) -> State:
 
     ``key`` is a PRNG key or an int seed. The points are evaluated with
     ``lax.map`` in batches of ``cfg.num_delete``, the batch a step uses.
+    ``prior_transform`` must return one array (``TypeError`` otherwise).
     """
+    _check_prior_transform(prior_transform, cfg.ndim)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
     )
@@ -1286,6 +1288,30 @@ def _transform_block(num_delete: int) -> int:
     return max(_TRANSFORM_BLOCK, 1 << (num_delete - 1).bit_length())
 
 
+def _check_theta(theta) -> None:
+    """Raise ``TypeError`` unless ``theta`` (the output of ``prior_transform``
+    or its shape) is one array; its shape is free (a scalar at ``ndim=1``,
+    derived parameters)."""
+    if not isinstance(theta, (jax.Array, jax.ShapeDtypeStruct)):
+        raise TypeError(
+            f"prior_transform must return one array, got {type(theta).__name__} "
+            f"{jax.tree_util.tree_structure(theta)}: stack the parameters into "
+            "a vector (jnp.stack) and unpack them in loglike"
+        )
+
+
+def _check_prior_transform(prior_transform, ndim: int) -> None:
+    """Check that ``prior_transform`` returns one array, before a run samples
+    (``finalise`` could not map the samples otherwise). A prior that cannot
+    be evaluated abstractly here is left to the compiled kernels."""
+    u = jax.ShapeDtypeStruct((int(ndim),), jnp.result_type(float))
+    try:
+        theta = jax.eval_shape(prior_transform, u)
+    except Exception:  # noqa: BLE001 - the kernels raise their own error
+        return
+    _check_theta(theta)
+
+
 @_kernel_cache
 def _transform_kernel(prior_spec):
     def kernel(u, *leaves):
@@ -1318,6 +1344,7 @@ def _transform(prior_transform, u: np.ndarray, dtype, block: int) -> np.ndarray:
             chunk = np.concatenate([chunk, np.full((block - rows, d), 0.5, dtype)])
         try:
             theta = kernel(chunk, *leaves)
+            _check_theta(theta)
             out.append(np.asarray(theta)[:rows].reshape(rows, -1))
         except Exception as err:
             if "RESOURCE_EXHAUSTED" not in str(err):
@@ -1499,6 +1526,10 @@ def run(
                     f"batched_data: every array leaf needs a leading axis of "
                     f"{batch} lanes, got shape {leaf.shape}"
                 )
+    _check_prior_transform(
+        _lane_callable(prior_transform, 0) if batched_data else prior_transform,
+        cfg.ndim,
+    )
     lanes = 1 if batch is None else batch
     dtype = jnp.result_type(float)
 
