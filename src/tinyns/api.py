@@ -110,10 +110,14 @@ class NestedSampler:
         the runs) and a list of ``B`` results is returned. Each is a draw from
         the same distribution as the run of its key alone but is not
         bit-identical to it (vmap changes the summation order; in float64 the
-        two agree to roundoff). With ``batched_data=True`` every array leaf of
-        a pytree ``loglike`` or ``prior_transform`` (e.g.
-        ``jax.tree_util.Partial(fn, data)`` with ``data`` stacked over runs)
-        carries the same leading axis of ``B``: run ``i`` sees slice ``i``.
+        two agree to roundoff). The batch computes every run until the last
+        one stops (a stopped run is frozen, not skipped), so the device
+        evaluates about ``B`` times the likelihood calls of the longest run;
+        each result's ``ncall`` counts its own run's calls. With
+        ``batched_data=True`` every array leaf of a pytree ``loglike`` or
+        ``prior_transform`` (e.g. ``jax.tree_util.Partial(fn, data)`` with
+        ``data`` stacked over runs) carries the same leading axis of ``B``:
+        run ``i`` sees slice ``i``.
         """
         try:
             return core.run(
