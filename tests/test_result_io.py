@@ -196,8 +196,9 @@ def test_resample_equal_returns_a_random_order() -> None:
 def test_resample_equal_needs_an_integer_n() -> None:
     """``n=5.0`` failed deep in NumPy (``AxisError`` of the permutation)."""
     result = make_result(40)
-    with pytest.raises(TypeError, match="n must be an integer"):
-        result.resample_equal(0, n=5.0)
+    for n in (5.0, True, np.True_, jnp.asarray(True)):  # a bool, as _check_int
+        with pytest.raises(TypeError, match="n must be an integer"):
+            result.resample_equal(0, n=n)
     for n in (5, np.int64(5), jnp.asarray(5)):
         assert result.resample_equal(0, n=n).shape == (5, 2)
 

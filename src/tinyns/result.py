@@ -1430,6 +1430,8 @@ class NestedSamplingResult:
         if n is None:
             n = max(1, int(self.posterior_ess()))
         try:
+            if isinstance(n, bool) or getattr(n, "dtype", None) == np.bool_:
+                raise TypeError
             n = operator.index(n)  # an int, NumPy or JAX integer; not 5.0
         except TypeError:
             raise TypeError("n must be an integer") from None
