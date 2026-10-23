@@ -157,8 +157,8 @@ def _blackjax_reference(target, seed, nlive, dlogz):
 
 def test_blackjax_stops_at_the_first_step_that_meets_dlogz():
     """The rule is tested after every step, as in a step-by-step loop; the
-    adapter used to test it once per 20-step chunk and ran on (+18-20% calls
-    on the 2-D targets at nlive 500)."""
+    adapter used to test it once per 20-step chunk and ran on (+19% calls on
+    gauss_d2 and +17% on eggbox_d2 at nlive 500)."""
     reason = adapters.unavailable_reason("blackjax_nss")
     if reason:
         pytest.skip(reason)

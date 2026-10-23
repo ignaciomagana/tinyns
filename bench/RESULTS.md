@@ -116,11 +116,11 @@ default 1000).**
     points) has a logZ bias of up to -0.22 that its own precision resolves.
   - dynesty's default and UltraNest's MLFriends need 1.5 to 13 times fewer
     calls than tinyns at d <= 10 on the unimodal targets.
-  - BlackJAX NSS needs 0.9 to 1.65 times the calls of tinyns. As recorded it
+  - BlackJAX NSS needs 0.9 to 1.6 times the calls of tinyns. As recorded it
     is 0.9 to 1.9, because its stop ran on to the end of a 20-step chunk:
-    with the fixed adapter (20 seeds on CPU; the calls do not depend on the
-    device) it is 0.98 on `gauss_d2` and 1.64 on `eggbox_d2`, not 1.17 and
-    1.92 (Known gaps).
+    with the fixed adapter (every run replayed on CPU; the calls do not
+    depend on the device) it is 0.98 on `gauss_d2` and 1.64 on `eggbox_d2`,
+    not 1.17 and 1.92, and at most 1.60 elsewhere (Known gaps).
   - JAXNS with 500 chains needs 2.2 (`loggamma_d2`) to 6.6 times the calls.
     In low dimensions part of that is its stricter stop: about 1.5 times the
     calls at d = 2 and 1.2 to 1.3 at d = 4 to 8 (Known gaps).
@@ -231,13 +231,21 @@ move, and CPU measurements the fifth.
     1.1 s on `gauss_d8` (0.13 and 0.71 s with the fix). On the H100 it is
     inside the 1.95 s of the fit.
   - *BlackJAX ran past its stop.* The rule was tested once per 20-step
-    chunk, and a run went on to the end of the chunk that crossed it.
-    Against the fixed adapter (20 seeds per target, on CPU; the calls do not
-    depend on the device) the recorded calls are high by 19% on `gauss_d2`,
-    17% on `eggbox_d2`, 9% on `loggamma_d2`, 6 to 7% on `sepW_d4` and
-    `connW_d4`, and 2 to 3% on `rosen_d2` and `gauss_d8`. Elsewhere it
-    averages half a chunk, 10 steps, which is 4.2% or less of a run's
-    steps. Its logZ is not biased by it.
+    chunk, so a run went on to the first chunk end at which it held: 0 to 19
+    steps past the first step that met it, or more where the remainder rose
+    above `dlogz` again (9 of the 20 `funnel_d10` runs, up to 66 steps, and
+    one `gauss_d64` run). Up to d = 10 (`funnel_d10` aside) the seeds of a
+    target first meet the rule within 3 to 15 steps of each other, so the
+    excess is set per target by where those steps fall in a chunk; it is not
+    half a chunk on average. Replayed on CPU (all 680 runs; the replay gives
+    each recorded call count exactly, as the calls do not depend on the
+    device), the recorded calls are high by 19% on `gauss_d2`, 17% on
+    `eggbox_d2`, 9% on `loggamma_d2`, `funnel_d10` and `loggamma_d10`, 6% on
+    `sepW_d4` and `connW_d4`, 2 to 5% on the other targets up to d = 10, and
+    under 3% from d = 16. Its logZ is not biased by it: stopping at the
+    first step moves logZ by under 0.001 on the seven targets up to d = 8
+    (20 seeds, paired) and by -0.03 ± 0.01 on `funnel_d10`, against a
+    logzerr of 0.07 to 0.21.
   - *The CPU samplers' batched likelihood compiled once per batch size.*
     UltraNest's MLFriends asked for 59 and 56 sizes in two runs of
     `gauss_d2`: 8.3 s against 2.9 s with the batches padded to a power of
