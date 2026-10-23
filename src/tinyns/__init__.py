@@ -16,4 +16,5 @@ __all__ = [
     "LogZBootstrap",
 ]
 
+# The single source of the version: pyproject.toml reads it (hatch dynamic).
 __version__ = "1.0.0"
