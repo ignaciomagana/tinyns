@@ -34,13 +34,21 @@ def test_two_mode_runs_find_both_modes() -> None:
     400, x64 off and on, minor mass 0.25 +- 0.012; the v0.3 heuristic missed
     11). Before modes() measured a small label's distance to the others at
     their own posterior medians, 3 of the 192 reported one mode: the
-    clustering had cut three points off the minor mode in its last steps."""
-    for seed in range(5):
-        result = NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(seed)
+    clustering had cut three points off the minor mode in its last steps.
+    The hop keeps the urn balanced, which the window on each run's minor
+    mass hardly sees: with the hop off (``_hop=False``) all 32 runs of one
+    batch fell in it, but over 16 runs the minor masses scatter by 0.037 to
+    0.078 (sd; 6 batches, x64 off and on) against 0.012 to 0.016 with it.
+    The sd must be under 0.03, and the mean (0.25 +- 0.004) within 0.02 of
+    the truth."""
+    keys = jax.random.split(jax.random.key(0), 16)
+    masses = []
+    for result in NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(keys):
         weights = np.asarray(result.weights())
         minor = np.asarray(result.samples)[:, 0] > 0.55
         mass = weights[minor].sum() / weights.sum()
-        assert 0.15 < mass < 0.35  # truth 0.25; the hop keeps the urn balanced
+        masses.append(mass)
+        assert 0.15 < mass < 0.35  # truth 0.25
         assert abs(result.logz) < 4 * result.logzerr + 0.1  # truth 0
         modes = result.modes()
         assert len(modes) == 2
@@ -48,6 +56,8 @@ def test_two_mode_runs_find_both_modes() -> None:
         assert modes[1]["mass"] == pytest.approx(mass, abs=0.005)
         assert all(0 < m["urn_sd"] < 1 for m in modes)
         assert not any(m["unresolved"] for m in modes)
+    assert np.std(masses, ddof=1) < 0.03, masses
+    assert abs(np.mean(masses) - W_MINOR) < 0.02, masses
 
 
 def test_unresolved_flags_a_mode_below_five_points_per_dimension() -> None:
