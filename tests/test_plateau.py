@@ -172,7 +172,7 @@ def test_functional_core_carries_the_tie_bookkeeping() -> None:
     cfg = Config(D, m, num_delete=k, walks=20)
     loglike = LOGLIKES["inf"]
     state = init(3, loglike, identity, cfg)
-    assert np.isnan(state.lstar_prev) and int(state.tie_run) == 0
+    assert float(state.lstar_prev) == -np.inf and int(state.tie_run) == 0
     rows = []
     while float(core.delta_logz(state, cfg)) > 0.1:
         state, dead = step(state, loglike, identity, cfg)

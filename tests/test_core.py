@@ -76,7 +76,7 @@ def fake_run(dead_logl, live_logl, m, k):
         it=np.int32(steps),
         logz=np.float64(0.0),
         log_x_ties=np.float64(0.0),
-        lstar_prev=np.float64(np.nan),
+        lstar_prev=np.float64(-np.inf),
         tie_run=np.int32(0),
         log_scale=np.float64(0.0),
         ncall=np.int32(0),
@@ -358,6 +358,18 @@ def test_constant_likelihood_is_a_plateau_with_exact_evidence() -> None:
     assert result.metadata["status"] == "plateau" and result.success
     assert result.niter == 0
     assert result.logz == pytest.approx(-2.5, abs=1e-6)
+
+
+def test_runs_under_jax_debug_nans() -> None:
+    """The contour of the last step starts at -inf (it was a NaN sentinel,
+    which made every run fail in init under jax_debug_nans)."""
+    cfg = Config(2, 30, num_delete=3, walks=10)
+    loglike = gauss(0.5, 0.1)
+    with jax.debug_nans(True):
+        state = init(0, loglike, identity, cfg)
+        assert float(state.lstar_prev) == -math.inf and int(state.tie_run) == 0
+        result = core.run(0, loglike, identity, cfg)
+    assert result.success and abs(result.logz) < 4 * result.logzerr + 0.05
 
 
 def test_flat_top_likelihood_stops_on_the_plateau() -> None:

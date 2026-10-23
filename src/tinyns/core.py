@@ -198,8 +198,9 @@ class State(NamedTuple):
     to lose precision in float32) and ``log_x_ties`` is the extra
     compression of the deaths tied with an earlier step's contour, exactly 0
     on a run without ties. ``lstar_prev`` is the contour of the last step
-    (NaN before the first) and ``tie_run`` the number of consecutive steps,
-    ending with the last, whose contour equals it (:func:`_tie_counts`).
+    (-inf before the first, with ``it = 0``) and ``tie_run`` the number of
+    consecutive steps, ending with the last, whose contour equals it
+    (:func:`_tie_counts`).
     """
 
     key: Any  # PRNG key
@@ -209,7 +210,7 @@ class State(NamedTuple):
     it: Any  # int32 steps done
     logz: Any  # running log evidence of the dead points
     log_x_ties: Any  # extra log prior volume removed by tied deaths (<= 0)
-    lstar_prev: Any  # contour of the last step; NaN before the first
+    lstar_prev: Any  # contour of the last step; -inf before the first
     tie_run: Any  # int32 consecutive steps, ending with the last, at lstar_prev
     log_scale: Any  # log of the walk-step multiplier
     ncall: Any  # int32 likelihood evaluations
@@ -566,7 +567,7 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         it=jnp.zeros((), i32),
         logz=jnp.asarray(-jnp.inf, dtype),
         log_x_ties=jnp.zeros((), dtype),
-        lstar_prev=jnp.asarray(jnp.nan, dtype),
+        lstar_prev=jnp.asarray(-jnp.inf, dtype),
         tie_run=jnp.zeros((), i32),
         log_scale=jnp.asarray(math.log(_INITIAL_SCALE), dtype),
         ncall=jnp.asarray(m, i32),
@@ -787,10 +788,11 @@ def _tie_counts(dead_logl, state: State, cfg: Config):
     the previous step's contour (``lstar_prev``) is tied, and the
     ``tie_run`` steps at that contour have taken ``k`` deaths each, so death
     ``j`` counts at ``m - j - k * tie_run``. Any other death counts at
-    ``m - j``.
+    ``m - j``, as does every death of the first step (``lstar_prev`` is -inf
+    there, a sentinel and not a contour).
     """
     m, k = cfg.nlive, cfg.num_delete
-    tied = dead_logl == state.lstar_prev
+    tied = (dead_logl == state.lstar_prev) & (state.it > 0)
     base = jnp.arange(m, m - k, -1, dtype=jnp.int32)
     nlive = jnp.where(tied, base - k * state.tie_run, base)
     return jnp.maximum(nlive, 1), tied
