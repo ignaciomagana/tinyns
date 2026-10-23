@@ -1,0 +1,146 @@
+"""Result files and weight statistics: ``load_npz`` keeps the saved dtypes,
+and the weights, ESS, information and resampling are computed in NumPy
+float64 (without compiling anything), with the resampled set in a random
+order."""
+
+from __future__ import annotations
+
+import logging
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from tinyns import NestedSamplingResult
+from tinyns.result import _RESULT_NPZ_ARRAYS
+
+
+def make_result(n: int, offset: float = 0.0) -> NestedSamplingResult:
+    """A float64 result of ``n`` samples by hand, at a log-likelihood offset:
+    equal prior volumes, so the weights rise with the likelihood (death
+    order)."""
+    u = np.linspace(0.05, 0.95, 2 * n).reshape(n, 2)
+    logl = offset + np.linspace(-5.0, 0.0, n)
+    logwt = logl - np.log(n)
+    return NestedSamplingResult(
+        samples_u=u,
+        samples=1000.0 + 1e-3 * u,  # values a float32 cannot hold
+        logl=logl,
+        logwt=logwt,
+        logl_birth=np.full(n, -np.inf),
+        nlive_i=np.full(n, n, np.int64),
+        labels=np.zeros(n, np.int32),
+        logz=float(np.logaddexp.reduce(logwt)),
+        logzerr=0.1,
+        ncall=10 * n,
+        niter=n // 2,
+        nlive=n // 2,
+        num_delete=1,
+        ndim=2,
+    )
+
+
+def reference_weights(logwt) -> np.ndarray:
+    logwt = np.asarray(logwt, np.float64)
+    return np.exp(logwt - np.logaddexp.reduce(logwt))
+
+
+def test_load_npz_keeps_the_saved_dtypes(tmp_path) -> None:
+    """Without x64, loading turned float64 into float32 (and int64 into int32)
+    through ``jnp.asarray``: a result saved under x64 lost its precision."""
+    result = make_result(400)
+    path = tmp_path / "result.npz"
+    result.save_npz(path)
+    loaded = NestedSamplingResult.load_npz(path)
+    for name in _RESULT_NPZ_ARRAYS:
+        saved, back = getattr(result, name), getattr(loaded, name)
+        assert isinstance(back, np.ndarray), name
+        assert back.dtype == saved.dtype, name
+        np.testing.assert_array_equal(back, saved, name)
+    assert len(np.unique(loaded.samples[:, 0])) == 400
+    np.testing.assert_array_equal(loaded.weights(), result.weights())
+
+
+def test_weight_statistics_are_float64() -> None:
+    """At |logl| ~ 1e6 the float32 normalization put the weights off by a few
+    percent, even for a result whose ``logwt`` is float64."""
+    result = make_result(1000, offset=-1e6)
+    w = reference_weights(result.logwt)
+    weights = result.weights()
+    assert isinstance(weights, np.ndarray) and weights.dtype == np.float64
+    np.testing.assert_allclose(weights, w, rtol=1e-9)
+    np.testing.assert_allclose(np.exp(result.log_weights()), w, rtol=1e-9)
+    assert result.posterior_ess() == pytest.approx(1.0 / np.sum(w * w), rel=1e-9)
+    live = int(result.niter)
+    assert result.live_weight_fraction() == pytest.approx(w[live:].sum(), rel=1e-9)
+    entropy = -np.sum(w * np.log(w))
+    assert result.posterior_weight_entropy() == pytest.approx(entropy, rel=1e-9)
+    logl = np.asarray(result.logl)
+    information = np.sum(w * (logl - result.logz))  # KL(w | uniform) > 0
+    assert result.information() == pytest.approx(information, rel=1e-9)
+
+
+def test_resample_equal_never_runs_past_the_last_weight() -> None:
+    """With float32 weights summing below 1, the positions past the end of the
+    CDF were clamped to the last sample: 1000 equal weights at an offset of
+    -1e6 gave it about 30 times its share."""
+    result = make_result(1000)
+    result.logwt = np.full(1000, -1e6)
+    result.samples = np.arange(1000.0)[:, None]
+    draws = result.resample_equal(0, n=4000)
+    counts = np.bincount(draws[:, 0].astype(int), minlength=1000)
+    np.testing.assert_array_equal(counts, 4)  # systematic: exactly n w_i each
+
+
+def test_resample_equal_returns_a_random_order() -> None:
+    """Systematic resampling picks the samples in death order (increasing
+    likelihood), so a prefix or a split of the set was biased."""
+    result = make_result(1000)
+    result.samples = np.arange(1000.0)[:, None]
+    draws = result.resample_equal(0, n=2000)[:, 0]
+    assert np.any(np.diff(draws) < 0)
+    w = reference_weights(result.logwt)
+    sd = np.sqrt(w @ (np.arange(1000.0) - w @ np.arange(1000.0)) ** 2)
+    first, second = draws[:1000].mean(), draws[1000:].mean()
+    assert abs(first - second) < 0.2 * sd  # their standard error is 0.045 sd
+    # The set itself is the systematic one: each sample floor or ceil(n w).
+    counts = np.bincount(draws.astype(int), minlength=1000)
+    assert np.all(np.abs(counts - 2000 * w) < 1.0)
+    np.testing.assert_array_equal(result.resample_equal(0, n=2000)[:, 0], draws)
+    assert not np.array_equal(result.resample_equal(1, n=2000)[:, 0], draws)
+
+
+def test_weight_statistics_compile_nothing_for_a_new_result() -> None:
+    """Each new sample count cost dozens of compiled eager ops (0.7 s per lane
+    of a batch in ``diagnostics()``)."""
+    warm = make_result(500)
+    warm.diagnostics()
+    warm.resample_equal(0)
+    warm.resample_equal(jax.random.key(0), n=50)
+
+    compiled = []
+
+    class Handler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage().startswith("Finished XLA compilation"):
+                compiled.append(record.getMessage())
+
+    logger, handler = logging.getLogger("jax"), Handler()
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        jax.jit(lambda x: x + 1.0)(jnp.zeros(377))  # the control compiles
+        assert compiled, "compilations are not logged"
+        compiled.clear()
+        fresh = make_result(733)
+        fresh.diagnostics()
+        fresh.summary()
+        fresh.information()
+        fresh.resample_equal(1)
+        fresh.resample_equal(jax.random.key(1), n=1234)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    assert compiled == []

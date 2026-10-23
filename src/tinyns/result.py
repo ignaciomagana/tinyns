@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
 
-import jax.numpy as jnp
 import numpy as np
+from jax import random
 
 from tinyns.math import (
+    as_key,
     effective_sample_size_from_log_weights,
     normalize_log_weights,
     systematic_resample,
@@ -115,20 +116,22 @@ def _npz_scalar(value):
     return array.reshape(()).item()
 
 
-def _information(logwt, logl, logz: float):
-    """Return the information ``H`` as a JAX scalar (NaN when undefined)."""
-    weights = jnp.exp(jnp.asarray(logwt) - logz)
-    logl = jnp.asarray(logl)
-    finite = jnp.isfinite(logl)
+def _information(logwt, logl, logz: float) -> float:
+    """Return the information ``H`` in float64 (NaN when undefined)."""
+    with np.errstate(over="ignore"):
+        weights = np.exp(np.asarray(logwt, dtype=np.float64) - logz)
+    logl = np.asarray(logl, dtype=np.float64)
+    finite = np.isfinite(logl)
     if (
         not math.isfinite(logz)
-        or not bool(jnp.all(jnp.isfinite(weights)))
-        or bool(jnp.any((weights > 0.0) & ~finite))
+        or not np.all(np.isfinite(weights))
+        or np.any((weights > 0.0) & ~finite)
     ):
-        return jnp.asarray(math.nan)
+        return math.nan
     contributing = (weights > 0.0) & finite
-    information = jnp.sum(jnp.where(contributing, weights * (logl - logz), 0.0))
-    return jnp.maximum(information, 0.0)
+    with np.errstate(invalid="ignore"):  # 0 * inf where nothing contributes
+        terms = np.where(contributing, weights * (logl - logz), 0.0)
+    return max(float(np.sum(terms)), 0.0)
 
 
 def _ridge(cov):
@@ -498,20 +501,24 @@ class NestedSamplingResult:
     ``wall_time_s``, ``compile_s``, ``sampling_s``, ``resumed`` and more (the
     CHANGELOG lists the keys)."""
 
-    def log_weights(self):
-        """Return posterior weights normalized in log space."""
+    def log_weights(self) -> np.ndarray:
+        """Return posterior weights normalized in log space.
+
+        This and the other weight statistics compute in NumPy float64 on the
+        host (:mod:`tinyns.math`), whatever JAX's precision.
+        """
 
         return normalize_log_weights(self.logwt)
 
-    def weights(self):
-        """Return normalized linear posterior weights."""
+    def weights(self) -> np.ndarray:
+        """Return normalized linear posterior weights (NumPy float64)."""
 
-        return jnp.exp(self.log_weights())
+        return np.exp(self.log_weights())
 
     def posterior_ess(self) -> float:
         """Return the effective sample size of the posterior weights."""
 
-        return float(effective_sample_size_from_log_weights(self.logwt))
+        return effective_sample_size_from_log_weights(self.logwt)
 
     def max_weight_fraction(self) -> float:
         """Return the largest normalized posterior weight fraction."""
@@ -519,7 +526,7 @@ class NestedSamplingResult:
         weights = self.weights()
         if weights.size == 0:
             return 0.0
-        return float(jnp.max(weights))
+        return float(np.max(weights))
 
     def posterior_weight_entropy(self) -> float:
         """Return the Shannon entropy of normalized posterior weights."""
@@ -527,27 +534,27 @@ class NestedSamplingResult:
         weights = self.weights()
         if weights.size == 0:
             return 0.0
-        positive = weights > 0.0
-        return float(-jnp.sum(weights[positive] * jnp.log(weights[positive])))
+        positive = weights[weights > 0.0]
+        return float(-np.sum(positive * np.log(positive)))
 
     def posterior_weight_entropy_fraction(self) -> float:
         """Return posterior weight entropy as a fraction of equal-weight entropy."""
 
-        n = int(jnp.asarray(self.logwt).size)
+        n = int(np.size(self.logwt))
         if n <= 1:
             return 0.0
-        fraction = self.posterior_weight_entropy() / float(jnp.log(n))
-        return float(jnp.clip(fraction, 0.0, 1.0))
+        fraction = self.posterior_weight_entropy() / math.log(n)
+        return float(np.clip(fraction, 0.0, 1.0))
 
     def live_weight_fraction(self) -> float:
         """Return the posterior weight fraction in the final live points."""
 
-        return float(jnp.sum(self.weights()[int(self.niter) :]))
+        return float(np.sum(self.weights()[int(self.niter) :]))
 
     def dead_weight_fraction(self) -> float:
         """Return the posterior weight fraction in the dead points."""
 
-        return float(jnp.clip(1.0 - self.live_weight_fraction(), 0.0, 1.0))
+        return float(np.clip(1.0 - self.live_weight_fraction(), 0.0, 1.0))
 
     @cached_property
     def _births(self) -> tuple[np.ndarray, np.ndarray]:
@@ -809,8 +816,8 @@ class NestedSamplingResult:
 
     @cached_property
     def _weights(self) -> np.ndarray:
-        """:meth:`weights` as a NumPy float64 array."""
-        return np.asarray(self.weights(), dtype=float)
+        """:meth:`weights`, computed once for :meth:`modes`."""
+        return self.weights()
 
     def _median(self, mask) -> int:
         """The posterior median iteration of the samples ``mask``."""
@@ -1329,7 +1336,7 @@ class NestedSamplingResult:
 
         metadata = {} if self.metadata is None else self.metadata
         posterior_ess = self.posterior_ess()
-        nposterior = int(jnp.asarray(self.logwt).size)
+        nposterior = int(np.size(self.logwt))
         max_weight_fraction = self.max_weight_fraction()
         entropy_fraction = self.posterior_weight_entropy_fraction()
         live_weight_fraction = self.live_weight_fraction()
@@ -1408,11 +1415,16 @@ class NestedSamplingResult:
             "warnings": warnings,
         }
 
-    def resample_equal(self, key, n: int | None = None):
+    def resample_equal(self, key, n: int | None = None) -> np.ndarray:
         """Return ``n`` equally weighted posterior samples (systematic resampling).
 
         ``key`` is a JAX PRNG key or an int seed; ``n`` defaults to the
-        posterior effective sample size.
+        posterior effective sample size. Sample ``i`` comes ``floor(n w_i)``
+        or ``ceil(n w_i)`` times (:func:`tinyns.math.systematic_resample`), so
+        the samples are not independent draws, and they are returned in a
+        random order: in the order of ``samples`` (by increasing likelihood)
+        a prefix or a split of them would not be a posterior sample. Returns a
+        NumPy array.
         """
 
         if n is None:
@@ -1420,8 +1432,11 @@ class NestedSamplingResult:
         if n < 1:
             raise ValueError("n must be at least 1")
 
-        indices = systematic_resample(key, self.logwt, n)
-        return jnp.asarray(self.samples)[indices]
+        key_start, key_order = random.split(as_key(key))
+        indices = systematic_resample(key_start, self.logwt, n)
+        seed = np.asarray(random.key_data(key_order))
+        order = np.random.default_rng(seed).permutation(n)
+        return np.asarray(self.samples)[indices[order]]
 
     def summary(self) -> str:
         """Return a human-readable multi-line summary of the result.
@@ -1487,7 +1502,11 @@ class NestedSamplingResult:
 
     @classmethod
     def load_npz(cls, path) -> NestedSamplingResult:
-        """Load a result previously written by :meth:`save_npz`."""
+        """Load a result previously written by :meth:`save_npz`.
+
+        The arrays are NumPy arrays of the dtypes saved, whatever JAX's
+        precision: a result saved under x64 keeps its float64 values.
+        """
 
         with np.load(path) as data:
             required = {*_RESULT_NPZ_ARRAYS, *_RESULT_NPZ_SCALARS}
@@ -1504,7 +1523,7 @@ class NestedSamplingResult:
                     f"{format_version!r}; expected {_RESULT_NPZ_FORMAT_VERSION!r}"
                 )
             return cls(
-                **{name: jnp.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
+                **{name: np.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
                 **{
                     name: np.asarray(data[name]) if name in data.files else None
                     for name in _RESULT_NPZ_OPTIONAL
