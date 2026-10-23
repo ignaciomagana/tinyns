@@ -13,7 +13,7 @@ import pytest
 from jax import random
 from jax.scipy.special import ndtri
 
-from tinyns import Config, NestedSampler, core, init, step
+from tinyns import Config, NestedSampler, core, init, modes, step
 
 FLOAT = jnp.result_type(float)
 
@@ -215,5 +215,53 @@ def test_chains_never_reach_a_face(k) -> None:
     assert result.success and len(faces) > 0
     assert np.all((u > 0) & (u < 1))
     assert sum(faces) == 0
+
+
+# --- float32 cluster frames --------------------------------------------------
+
+NARROW = 1e-5
+
+
+def _narrow_cluster(n=600, seed=0):
+    """A cluster ``NARROW`` wide along u2 and 0.1 and 0.29 along u0 and u1."""
+    rng = np.random.default_rng(seed)
+    x = np.empty((n, 3))
+    x[:, 0] = 0.5 + 0.1 * rng.standard_normal(n)
+    x[:, 1] = rng.uniform(size=n)
+    x[:, 2] = 0.5 + NARROW * rng.standard_normal(n)
+    return x
+
+
+def test_float32_frames_resolve_a_narrow_axis() -> None:
+    """The ridge of a frame is relative to each axis: one relative to the
+    mean variance made this float32 frame 19 times too wide along its axis
+    ``1e-5`` wide."""
+    x = _narrow_cluster()
+    u = jnp.asarray(x, jnp.float32)
+    st = modes.stats(u, jnp.zeros(len(x), jnp.int32), modes.C_MAX)
+    fr = modes.frames(st, len(x))
+    chol = np.asarray(fr.chol[0], np.float64)
+    sd = np.sqrt(np.diag(chol @ chol.T))
+    np.testing.assert_allclose(sd / x.std(axis=0, ddof=1), 1.0, rtol=0.05)
+
+
+def test_float32_separation_along_a_narrow_axis() -> None:
+    """Two clusters 10 sd apart along the narrow axis: the merge test's and
+    the split search's Fisher separation in float32 match float64."""
+    x = _narrow_cluster(seed=1)
+    side = np.arange(len(x)) % 2
+    x[:, 2] += np.where(side, 5.0, -5.0) * NARROW
+    u = jnp.asarray(x, jnp.float32)
+    a, b = x[side == 0], x[side == 1]
+    dev = np.concatenate([a - a.mean(0), b - b.mean(0)])
+    dm = b.mean(0) - a.mean(0)
+    j = dm @ np.linalg.solve(dev.T @ dev / (len(x) - 2), dm)
+    j = j * (len(x) - 3 - 3) / (len(x) - 2)  # modes._deflate
+    st = modes.stats(u, jnp.asarray(side, jnp.int32), modes.C_MAX)
+    pair = float(modes._pair_separation(st)[0, 1])
+    split, part = modes._split(u, jnp.ones(len(x), bool))
+    assert abs(pair / j - 1.0) < 0.02
+    assert abs(float(split) / j - 1.0) < 0.05
+    assert np.mean(np.asarray(part) == side) in (0.0, 1.0)
 
 

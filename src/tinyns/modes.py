@@ -202,12 +202,22 @@ def empty_stats(ndim: int, dtype) -> Stats:
 
 
 def _ridge(cov):
-    """Add a relative ridge of ``10 eps`` times the mean variance."""
+    """Add ``10 eps (v_i + eps v)`` to each variance ``v_i`` (``v``: their
+    mean; the second term is a floor for an axis of zero variance).
+
+    The ridge is relative to each axis, like the standardized jitter of
+    :func:`tinyns.core._live_chol`: one of ``10 eps v`` on every axis
+    swamped a narrow axis in float32 (the frame of a cluster ``1e-5`` wide
+    along one axis of the cube, and 0.02 and 0.29 along the others, came out
+    18 times too wide along it).
+    """
     d = cov.shape[-1]
-    eps = 10.0 * jnp.finfo(cov.dtype).eps
-    scale = jnp.trace(cov, axis1=-2, axis2=-1) / d
+    eps = jnp.finfo(cov.dtype).eps
+    var = jnp.diagonal(cov, axis1=-2, axis2=-1)
+    scale = jnp.mean(var, axis=-1, keepdims=True)
     scale = jnp.where(scale > 0, scale, jnp.finfo(cov.dtype).tiny)
-    return cov + (eps * scale)[..., None, None] * jnp.eye(d, dtype=cov.dtype)
+    ridge = 10.0 * eps * (var + eps * scale)
+    return cov + ridge[..., None] * jnp.eye(d, dtype=cov.dtype)
 
 
 def _cholesky(cov):
