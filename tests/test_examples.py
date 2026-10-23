@@ -63,9 +63,14 @@ def test_sbc_batched_example() -> None:
     assert len(results) == module.B
     assert all(result.success for result in results)
     assert quantiles.shape == (module.B, 2)
-    # 64 lanes: the 90% coverage is 0.90 +- 0.04 for a calibrated sampler.
-    inside = np.abs(np.asarray(quantiles) - 0.5) < 0.45
-    assert inside.mean() > 0.7
+    # 128 quantiles (64 lanes, 2 parameters): for a calibrated sampler the
+    # 90% coverage is 0.90 +- 0.027 and the 50% coverage 0.50 +- 0.044. Too
+    # narrow posteriors lower both; too wide ones raise both, which the 50%
+    # coverage sees first. (Here 0.875 and 0.39 in float32, 0.875 and 0.52
+    # in float64; over 8 master seeds 0.86-0.95 and 0.39-0.56.)
+    distance = np.abs(np.asarray(quantiles) - 0.5)
+    assert 0.80 <= np.mean(distance < 0.45) <= 0.98
+    assert 0.35 <= np.mean(distance < 0.25) <= 0.65
 
 
 def test_functional_core_example() -> None:
