@@ -41,21 +41,49 @@ def _warm_keys():
     jax.random.split(jax.random.PRNGKey(0))
 
 
-@pytest.mark.parametrize("name", ["blackjax_nss"])
-def test_compile_s_covers_every_compile_of_the_run(name):
-    """Every XLA compile of a run is inside ``compile_s``, so ``wall - compile``
-    is a compiled run. BlackJAX's eager post-processing used to compile in
+def test_blackjax_compile_s_covers_every_compile_of_the_run():
+    """Every XLA compile of a BlackJAX run is inside ``compile_s``, so ``wall -
+    compile`` is a compiled run. Its eager post-processing used to compile in
     ``run s`` (about 9 s of a BlackJAX run on the H100). ``nlive`` 120 keeps
-    the kernels of the other tests out of the way."""
-    reason = adapters.unavailable_reason(name)
+    the programs of the other tests out of the way."""
+    reason = adapters.unavailable_reason("blackjax_nss")
     if reason:
         pytest.skip(reason)
     _warm_keys()
     cfg = dict(nlive=120, dlogz=0.1, variant="default", opts={})
     with backend_compiles() as seen:
-        out = adapters.load(name).run(get_target("gauss_d2"), 3, cfg)
+        out = adapters.load("blackjax_nss").run(get_target("gauss_d2"), 3, cfg)
     assert seen, "nothing compiled: the test cannot see the split"
     assert sum(seen) <= out["compile_s"] + 0.05, (sum(seen), out["compile_s"])
+    assert out["compile_s"] < out["wall_s"]
+
+
+def test_tinyns_run_s_holds_no_compile(monkeypatch):
+    """The tinyns run that ``run s`` times compiles (almost) nothing: its init
+    and step kernels, its prior map and the driver's small ops compile in a
+    one-step warm-up run, which is ``compile_s``. They used to compile in the
+    timed run, of which ``metadata["compile_s"]`` covered only the step
+    kernel."""
+    import tinyns
+
+    if adapters.unavailable_reason("tinyns_v1"):
+        pytest.skip("tinyns v1 is not installed")
+    calls = []
+    run = tinyns.NestedSampler.run
+
+    def timed_run(self, *args, **kw):
+        with backend_compiles() as seen:
+            res = run(self, *args, **kw)
+        calls.append(sum(seen))
+        return res
+
+    monkeypatch.setattr(tinyns.NestedSampler, "run", timed_run)
+    _warm_keys()
+    cfg = dict(nlive=136, dlogz=0.1, variant="default", opts={})
+    out = adapters.load("tinyns_v1").run(get_target("gauss_d2"), 3, cfg)
+    assert sum(calls) > 0, "nothing compiled: the test cannot see the split"
+    # the result's run compiled under a tenth of what compile_s holds
+    assert calls[-1] <= 0.1 * out["compile_s"], (calls, out["compile_s"])
     assert out["compile_s"] < out["wall_s"]
 
 
@@ -143,5 +171,3 @@ def test_vectorized_likelihood_compiles_once_per_power_of_two():
         assert np.allclose(f(x), -0.5 * np.sum(x**2, axis=1))
     assert len(traces) == 7
     assert f(np.ones(3)).shape == (1,)  # one point, as UltraNest sends it
-
-

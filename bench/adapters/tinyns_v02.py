@@ -10,6 +10,9 @@ checkout's ``src`` directory (``git worktree add ../tinyns-0x release/0.x``);
 the adapter puts it first on ``sys.path`` before importing ``tinyns``.
 
 Variants: ``default`` (cluster swap on, the 0.2.5 default) and ``noswap``.
+``compile_s`` is 0.x's own ``metadata["compile_s"]``: the time until its first
+block of iterations ends, so its compiles and that block's work. There is no
+warm-up run as for ``tinyns_v1``.
 """
 
 from __future__ import annotations
