@@ -413,11 +413,23 @@ def test_modes_are_worked_out_once(two_mode_run, monkeypatch) -> None:
 
 
 def test_nearest_neighbours_are_found_in_blocks(monkeypatch) -> None:
-    """The nearest-neighbour search of pass 3 takes its distances in blocks:
-    a row of every pair at once took 6.2 GB at nlive 8000 in 18-D."""
+    """The nearest-neighbour search of pass 3 takes its distances in blocks,
+    of bounded memory, and finds the same neighbours: a row of every pair at
+    once took 6.2 GB at nlive 8000 in 18-D."""
+    import tracemalloc
+
     from tinyns import result as result_module
 
     rng = np.random.default_rng(0)
+    z = rng.normal(size=(2000, 18))
+    rows = np.flatnonzero(rng.random(2000) < 0.6)
+    tracemalloc.start()
+    try:
+        result_module._nearest_other(z, rows)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 100 * 2**20  # every pair at once: 350 MB
     z = rng.normal(size=(300, 4))
     rows = np.flatnonzero(rng.random(300) < 0.6)
     dist = np.sum((z[rows][:, None, :] - z[None, :, :]) ** 2, axis=-1)

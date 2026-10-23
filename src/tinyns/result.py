@@ -849,8 +849,11 @@ class NestedSamplingResult:
         (:data:`tinyns.modes.TREE_SIZE`), and ``metadata["mode_tree_dropped"]``
         counts the clusters made past them, whose parents are not recorded:
         pass 2 cannot tell that the clusters they were split from held
-        several modes. The modes are worked out once per result; each call
-        returns a copy.
+        several modes. The modes are worked out once per result, and each
+        call returns a copy: :meth:`diagnostics`, :meth:`summary` and
+        ``print(result)`` reuse them, so a result must not be changed in place
+        after any of these (``dataclasses.replace`` gives a new one, whose
+        modes are worked out afresh).
         """
 
         return copy.deepcopy(self._mode_list)
