@@ -265,6 +265,8 @@ def t_bound(ntests: int, dof: int) -> float:
     (Bonferroni)."""
     alpha = math.erfc(NSIGMA / math.sqrt(2.0)) / ntests
     lo, hi = 0.0, 1e3
+    while t_tail(hi, dof) > alpha:  # few seeds: the bound passes 1e4 at dof 1
+        lo, hi = hi, 2.0 * hi
     for _ in range(60):
         mid = 0.5 * (lo + hi)
         lo, hi = (mid, hi) if t_tail(mid, dof) > alpha else (lo, mid)

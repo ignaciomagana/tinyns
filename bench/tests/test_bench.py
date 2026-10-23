@@ -687,6 +687,22 @@ def test_gate_posterior_criterion():
     assert good["post_bound"] == pytest.approx(validate.t_bound(20, 15))
 
 
+def test_t_bound_has_no_ceiling():
+    """With 2 or 3 seeds the bound passes 1e3 and must not be cut there. At 1
+    and 2 dof the t tail has a closed form: ``2 / pi * atan(1 / t)`` and
+    ``1 - t / sqrt(2 + t^2)``."""
+    import math
+
+    from bench import validate
+
+    for ntests in (4, 20, 64):
+        alpha = math.erfc(validate.NSIGMA / math.sqrt(2.0)) / ntests
+        cauchy = 1.0 / math.tan(math.pi * alpha / 2.0)
+        assert validate.t_bound(ntests, 1) == pytest.approx(cauchy, rel=1e-4)
+        dof2 = math.sqrt(2.0 / ((1.0 - alpha) ** -2 - 1.0))
+        assert validate.t_bound(ntests, 2) == pytest.approx(dof2, rel=1e-4)
+
+
 def test_validation_gate_runs_on_tiny_settings(tmp_path, capsys, monkeypatch):
     """The quick tier's code path: batched seeds, the table, the JSON, the exit
     code; a mixture's mode and hop columns, and a hop switched off."""
