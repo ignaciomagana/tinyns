@@ -713,7 +713,12 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     replacement only when that fold has too few (one uniform per new point:
     the rank of its seed among the fold's points above ``L*``), and from the
     whole live set only when it has none. A live point and its descendants
-    thus stay in one fold."""
+    thus stay in one fold.
+
+    The draws with replacement read the points above ``L*`` in slot order
+    from one sort of each fold, so a step costs ``O(m log m)``, not ``O(k
+    m)`` (a ``(k, m)`` mask took 28 of a 44 ms step at nlive 1e4 on a CPU,
+    and 7.6 GiB per run at nlive 1e5)."""
     m, k = above.shape[0], worst.shape[0]
     fold = _fold(m, folds)
     score = jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
@@ -723,14 +728,23 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     tops = jnp.stack([
         lax.top_k(jnp.where(fold == j, score, -jnp.inf), k)[1] for j in range(folds)
     ])
-    n_fold = jnp.stack([jnp.sum(above & (fold == j)) for j in range(folds)])
-    mine = above[None, :] & (fold[None, :] == dead_fold[:, None])
-    mine = jnp.where((n_fold[dead_fold] > 0)[:, None], mine, above[None, :])
-    count = jnp.sum(mine, axis=1)
-    pick = (random.uniform(key_fill, (k,), dtype) * count).astype(jnp.int32)
-    pick = jnp.minimum(pick, count - 1)
-    order = jnp.cumsum(mine, axis=1) - 1  # a row's rank among its candidates
-    fill = jnp.argmax(mine & (order == pick[:, None]), axis=1)
+    # Row j of a (folds, n) view holds slots j, j + folds, ... (padded at the
+    # end), so its points above L* come first, in slot order, after a stable
+    # sort of ~above; position p in row j is slot j + folds * p.
+    n = -(-m // folds)
+    by_fold = jnp.concatenate([above, jnp.zeros((n * folds - m,), bool)])
+    by_fold = by_fold.reshape(n, folds).T
+    first = jnp.argsort(~by_fold, axis=1, stable=True).astype(jnp.int32)
+    anywhere = jnp.argsort(~above, stable=True).astype(jnp.int32)
+    n_fold = jnp.sum(by_fold, axis=1, dtype=jnp.int32)
+    has = n_fold[dead_fold] > 0
+    count = jnp.where(has, n_fold[dead_fold], jnp.sum(above, dtype=jnp.int32))
+    pick = random.uniform(key_fill, (k,), dtype) * count.astype(dtype)
+    pick = jnp.maximum(jnp.minimum(pick.astype(jnp.int32), count - 1), 0)
+    fill = jnp.where(
+        has, dead_fold + folds * first[dead_fold, jnp.minimum(pick, n - 1)],
+        anywhere[pick],
+    )
     return jnp.where(rank < n_fold[dead_fold], tops[dead_fold, rank], fill)
 
 
@@ -890,11 +904,14 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # with exactly its likelihood (a plateau above L*, the seed of an unmoved
     # chain) are in a random order with it: the rank takes a uniform place
     # among them, from a key folded off k_seed (the other draws are as they
-    # were).
-    below = jnp.sum(above & (state.logl < new_logl[:, None]), axis=1, dtype=jnp.int32)
-    same = jnp.sum(above & (state.logl == new_logl[:, None]), axis=1, dtype=jnp.int32)
+    # were). The survivors' likelihoods are sorted once (the others padded
+    # with +inf, which only the count of equals could see).
+    ranked = jnp.sort(jnp.where(above, state.logl, jnp.inf))
+    below = jnp.searchsorted(ranked, new_logl, side="left").astype(jnp.int32)
+    upto = jnp.searchsorted(ranked, new_logl, side="right").astype(jnp.int32)
+    same = jnp.minimum(upto, n_above) - below
     place = random.uniform(random.fold_in(k_seed, 1), (k,), dtype)
-    place = jnp.minimum((place * (same + 1)).astype(jnp.int32), same)
+    place = jnp.minimum((place * (same + 1).astype(dtype)).astype(jnp.int32), same)
     insertion = below + place
     nlive, tied = _tie_counts(dead_logl, state, cfg)
     log_x = _log_x(state, cfg)
