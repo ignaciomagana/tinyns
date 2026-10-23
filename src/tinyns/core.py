@@ -1422,8 +1422,12 @@ def _check_resume(path, state: State, cfg: Config, kernel, leaves) -> None:
     for another likelihood, prior or dataset, which would otherwise be
     resumed (a finished one returned as it is). ``kernel`` is the run's
     :func:`_logl_kernel`. It compiles apart from the run's kernels, so the
-    values may differ in the last bits: they match to a relative
-    ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``.
+    values may differ in the last bits: finite ones match to a relative
+    ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``,
+    and infinite ones (a NaN is stored as ``-inf``) exactly. In float32 a
+    change smaller than that (``3.5e-4 |logL|``) is not seen. Setting
+    ``_RESUME_CHECKS = 0`` skips the check, for a likelihood that does not
+    give back its own values to that tolerance.
     """
     n = min(_RESUME_CHECKS, cfg.nlive)
     if n == 0:
@@ -1437,19 +1441,28 @@ def _check_resume(path, state: State, cfg: Config, kernel, leaves) -> None:
     old = np.take_along_axis(logl, top, axis=1).astype(np.float64)
     new = kernel(jnp.asarray(u if batched else u[0]), *leaves)
     new = np.asarray(new, np.float64).reshape(old.shape)
-    tol = math.sqrt(np.finfo(state.u.dtype).eps) * (1.0 + np.abs(old))
+    rtol = math.sqrt(np.finfo(state.u.dtype).eps)
+    finite = np.isfinite(old)
     with np.errstate(invalid="ignore"):  # inf - inf
-        bad = ~((new == old) | (np.abs(new - old) <= tol))
+        diff = np.abs(new - old) / (1.0 + np.abs(old))
+    bad = ~np.where(finite, diff <= rtol, new == old)
     if np.any(bad):
         lane, i = np.argwhere(bad)[0]
         where = f" (lane {lane})" if batched else ""
+        how = (
+            f"a relative difference of {float(diff[lane, i]):.3g} where "
+            f"{rtol:.3g} is allowed" if finite[lane, i]
+            else "an infinite value must come back exactly"
+        )
         raise ValueError(
             f"{path}: this loglike and prior_transform do not give back the "
             f"likelihoods of the checkpoint's live points{where}: "
-            f"{float(new[lane, i])!r} against {float(old[lane, i])!r} stored, at "
-            f"{int(bad[lane].sum())} of the {n} points checked. A checkpoint "
-            "of another likelihood, prior or dataset is not resumed: use one "
-            "checkpoint path per problem"
+            f"{float(new[lane, i])!r} against {float(old[lane, i])!r} stored "
+            f"({how}), at {int(bad[lane].sum())} of the {n} points checked. A "
+            "checkpoint of another likelihood, prior or dataset is not "
+            "resumed: use one checkpoint path per problem. If this is the "
+            "same problem and its likelihood does not give back its own "
+            "values, tinyns.core._RESUME_CHECKS = 0 skips this check"
         )
 
 

@@ -89,13 +89,16 @@ class NestedSampler:
         (of each run of a batch) are evaluated again, and a checkpoint whose
         stored likelihoods they do not give back (another likelihood, prior
         or dataset) is refused too, so use one checkpoint path per problem.
-        A path that cannot be written raises ``OSError`` before the run
-        starts. The run writes the file atomically at a chunk boundary at
-        most every 10 minutes and at the end. A resumed run is bit-identical to an
-        uninterrupted one on the same JAX build and device (a checkpoint of
-        another warns), and ``metadata["wall_time_s"]`` adds up the time of
-        every session. A checkpoint stopped by ``maxiter``, ``maxcall`` or
-        ``dlogz`` continues under this call's limits.
+        They must match to a relative ``sqrt(eps)`` of the float dtype (in
+        float32 a change below ``3.5e-4 |logL|`` is not seen), and infinite
+        values exactly. A path that cannot be written raises ``OSError``
+        before the run starts. The run writes the file atomically at a chunk
+        boundary at most every 10 minutes and at the end. A resumed run is
+        bit-identical to an uninterrupted one on the same JAX build and
+        device (a checkpoint of another warns), and ``metadata["wall_time_s"]``
+        adds up the time of every session. A checkpoint stopped by
+        ``maxiter``, ``maxcall`` or ``dlogz`` continues under this call's
+        limits.
 
         Running out of device memory raises ``MemoryError`` with the
         ``num_delete`` to lower.

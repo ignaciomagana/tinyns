@@ -78,6 +78,50 @@ def test_a_batched_checkpoint_is_checked_lane_by_lane(tmp_path) -> None:
     assert all(result.metadata["resumed"] for result in results)
 
 
+def test_an_infinite_stored_likelihood_must_come_back_exactly(tmp_path) -> None:
+    """The relative tolerance was infinite at a stored ``-inf``, so any value
+    matched it: a likelihood that gave NaN everywhere, fixed and rerun on the
+    same path, returned the finished ``logz=-inf`` run, and a model that is
+    finite where the old one was ``-inf`` resumed an early checkpoint."""
+    path = tmp_path / "nan.npz"
+    NestedSampler(lambda x: jnp.nan * x[0], identity, 2, 50, num_delete=5).run(
+        0, checkpoint=path
+    )
+    fixed = NestedSampler(gauss, identity, 2, 50, num_delete=5)
+    with pytest.raises(ValueError, match="an infinite value must come back exactly"):
+        fixed.run(0, checkpoint=path)
+
+    def sliver(x):
+        return jnp.where(x[0] < 0.1, gauss(x), -jnp.inf)
+
+    path = tmp_path / "sliver.npz"
+    sampler = NestedSampler(sliver, identity, 2, 40, num_delete=4)
+    sampler.run(0, maxiter=4, checkpoint=path)
+    with np.load(path) as data:
+        assert 0 < np.isfinite(data["state/logl"]).sum() < core._RESUME_CHECKS
+    widened = NestedSampler(gauss, identity, 2, 40, num_delete=4)
+    with pytest.raises(ValueError, match="an infinite value must come back exactly"):
+        widened.run(0, checkpoint=path)
+    assert sampler.run(0, maxiter=8, checkpoint=path).metadata["resumed"]
+
+
+def test_the_refusal_gives_the_relative_difference(tmp_path) -> None:
+    path = tmp_path / "run.npz"
+    NestedSampler(gauss, identity, 2, 50, num_delete=5).run(
+        0, maxiter=100, checkpoint=path
+    )
+    shifted = NestedSampler(lambda x: gauss(x) - 1.0, identity, 2, 50, num_delete=5)
+    with pytest.raises(ValueError) as info:
+        shifted.run(0, checkpoint=path)
+    found = re.search(r"a relative difference of (\S+) where (\S+) is allowed",
+                      str(info.value))
+    eps = np.finfo(jnp.result_type(float)).eps
+    assert float(found[1]) > 1e-3 and float(found[2]) == pytest.approx(
+        np.sqrt(eps), rel=1e-2
+    )
+    assert "tinyns.core._RESUME_CHECKS = 0 skips this check" in str(info.value)
+
+
 def test_a_likelihood_equal_up_to_roundoff_resumes(tmp_path) -> None:
     """The live points are evaluated by a kernel compiled apart from the run's,
     which may differ in the last bits: a few ulps are not a mismatch."""
