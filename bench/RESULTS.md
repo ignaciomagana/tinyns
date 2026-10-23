@@ -242,17 +242,18 @@ move, and CPU measurements the fifth.
     UltraNest's MLFriends asked for 59 and 56 sizes in two runs of
     `gauss_d2`: 8.3 s against 2.9 s with the batches padded to a power of
     two in a fresh process, 5.0 s against 3.0 s in a warm one, with the same
-    calls and logZ. Its walls of 15 to 39 s at d <= 8 hold several seconds
+    calls and logZ. Its walls of 15 to 40 s at d <= 8 hold several seconds
     of compilation each; the walls of minutes to hours are hardly affected.
 - **Stopping rules differ.** JAXNS's default stop is a remaining-evidence
   fraction of 1e-3 at the contour likelihood, and UltraNest's
   `frac_remain=0.01` leaves 1% of the evidence in the live points, against
   about 9.5% for `dlogz = 0.1`. In low dimensions both stop later than
-  tinyns: JAXNS needs about 1.5 times the calls at d = 2 (1.0 to 2.4 per
-  seed), 1.2 to 1.3 at d = 4 to 8 and under 10% more from d = 16, and
-  UltraNest about 1.25 times on `gauss_d2`, with the same logZ and
-  logzerr. A JAXNS fraction of `1 - exp(-0.1)` would not match tinyns
-  either: at the contour likelihood it stops earlier from d = 8.
+  tinyns, with the same logZ: JAXNS needs about 1.5 times the calls at
+  d = 2 (1.0 to 2.4 per seed), 1.2 to 1.3 at d = 4 to 8 and under 10% more
+  from d = 16, with the same logzerr, and UltraNest about 1.25 times on
+  `gauss_d2`, with a logzerr 9 to 20% smaller (5 seeds). A JAXNS fraction
+  of `1 - exp(-0.1)` would not match tinyns either: at the contour
+  likelihood it stops earlier from d = 8.
 - **Seeds.** 20 or 40 per cell (10 for the CPU samplers at d >= 32, 5 or 10
   in the probe): a logit sd has a relative error of 11 to 16%, and a lost
   fraction of 5% is one or two seeds.

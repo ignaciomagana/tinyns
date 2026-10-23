@@ -11,9 +11,10 @@ nlive 100 on gauss_d2); use ``--opt dlogz=...`` to set it. Its
 ``frac_remain=0.01`` (stop once the live points hold under 1% of the
 evidence) is stricter than tinyns's ``dlogz = 0.1`` (about 9.5%): on gauss_d2
 it costs about 1.25 times the calls of ``frac_remain = 1 - exp(-0.1)``, with
-the same logZ. Vectorised likelihood (jit+vmap on CPU, batches padded to a
-power of two: see ``numpy_callables``), no output files; seeded through
-``np.random.seed`` (UltraNest draws from the global state).
+the same logZ and a logzerr 9 to 20% smaller (5 seeds). Vectorised likelihood
+(jit+vmap on CPU, batches padded to a power of two: see ``numpy_callables``),
+no output files; seeded through ``np.random.seed`` (UltraNest draws from the
+global state).
 Options: ``nsteps`` (slice), ``max_ncalls``.
 """
 
