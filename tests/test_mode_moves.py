@@ -238,7 +238,7 @@ def test_hop_keeps_the_constrained_prior_where_the_ellipsoids_overlap(local) -> 
     the proposal is twice as dense. With the ratio the chains keep the
     uniform law (a share of them in the overlap equal to its volume share);
     a hop that took ``q`` for the indicator of the union of the ellipsoids
-    would pile them up there (z ~ +26)."""
+    would pile them up there (z ~ +25)."""
     lo, hi = 0.2, 0.8
     dtype = jnp.result_type(float)
     r2max = modes.ELL_R2_PER_DIM * (D + 2.0)
