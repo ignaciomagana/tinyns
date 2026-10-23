@@ -89,7 +89,8 @@ def normalize_log_weights(logw: ArrayLike) -> np.ndarray:
     maximum = np.max(logw)
     if np.isneginf(maximum):
         raise ValueError("log weights must contain at least one finite value")
-    return logw - (maximum + np.log(np.sum(np.exp(logw - maximum))))
+    shifted = logw - maximum  # max + log(sum) would round to an ulp of |max|
+    return shifted - np.log(np.sum(np.exp(shifted)))
 
 
 def effective_sample_size_from_log_weights(logw: ArrayLike) -> float:

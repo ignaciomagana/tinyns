@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import stat
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ import numpy as np
 import pytest
 
 from tinyns import NestedSamplingResult
+from tinyns.math import normalize_log_weights
 from tinyns.result import _RESULT_NPZ_ARRAYS
 
 
@@ -130,6 +132,27 @@ def test_weight_statistics_are_float64() -> None:
     assert result.information() == pytest.approx(information, rel=1e-9)
 
 
+def test_weights_sum_to_one_at_a_large_offset() -> None:
+    """``logw - (max + log(sum))`` rounds the normalizer to an ulp of
+    ``|max|``: in float64 the weights summed to 1 within only ~1e-11 at
+    ``|logwt| ~ 1e6``."""
+    z = np.random.default_rng(0).standard_normal(1000)
+    for offset in -1e6 - 0.137 * np.arange(20):
+        weights = np.exp(normalize_log_weights(offset - 0.5 * z**2))
+        assert abs(float(np.sum(weights)) - 1.0) < 1e-14
+
+
+def test_information_of_an_infinite_logz_is_nan_without_a_warning() -> None:
+    """``logwt - logz`` warned (``inf - inf``) where JAX was silent."""
+    result = make_result(40)
+    result.logwt = np.full(40, -np.inf)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for logz in (-np.inf, np.inf):
+            result.logz = logz
+            assert np.isnan(result.information())
+
+
 def test_resample_equal_never_runs_past_the_last_weight() -> None:
     """With float32 weights summing below 1, the positions past the end of the
     CDF were clamped to the last sample: 1000 equal weights at an offset of
@@ -158,6 +181,15 @@ def test_resample_equal_returns_a_random_order() -> None:
     assert np.all(np.abs(counts - 2000 * w) < 1.0)
     np.testing.assert_array_equal(result.resample_equal(0, n=2000)[:, 0], draws)
     assert not np.array_equal(result.resample_equal(1, n=2000)[:, 0], draws)
+
+
+def test_resample_equal_needs_an_integer_n() -> None:
+    """``n=5.0`` failed deep in NumPy (``AxisError`` of the permutation)."""
+    result = make_result(40)
+    with pytest.raises(TypeError, match="n must be an integer"):
+        result.resample_equal(0, n=5.0)
+    for n in (5, np.int64(5), jnp.asarray(5)):
+        assert result.resample_equal(0, n=n).shape == (5, 2)
 
 
 def test_weight_statistics_compile_nothing_for_a_new_result() -> None:

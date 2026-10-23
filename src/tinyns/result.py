@@ -6,6 +6,7 @@ import bisect
 import itertools
 import json
 import math
+import operator
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
@@ -119,15 +120,13 @@ def _npz_scalar(value):
 
 def _information(logwt, logl, logz: float) -> float:
     """Return the information ``H`` in float64 (NaN when undefined)."""
+    if not math.isfinite(logz):
+        return math.nan
     with np.errstate(over="ignore"):
         weights = np.exp(np.asarray(logwt, dtype=np.float64) - logz)
     logl = np.asarray(logl, dtype=np.float64)
     finite = np.isfinite(logl)
-    if (
-        not math.isfinite(logz)
-        or not np.all(np.isfinite(weights))
-        or np.any((weights > 0.0) & ~finite)
-    ):
+    if not np.all(np.isfinite(weights)) or np.any((weights > 0.0) & ~finite):
         return math.nan
     contributing = (weights > 0.0) & finite
     with np.errstate(invalid="ignore"):  # 0 * inf where nothing contributes
@@ -1430,6 +1429,10 @@ class NestedSamplingResult:
 
         if n is None:
             n = max(1, int(self.posterior_ess()))
+        try:
+            n = operator.index(n)  # an int, NumPy or JAX integer; not 5.0
+        except TypeError:
+            raise TypeError("n must be an integer") from None
         if n < 1:
             raise ValueError("n must be at least 1")
 
