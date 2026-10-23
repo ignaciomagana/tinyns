@@ -7,8 +7,12 @@ UltraNest recommends above ~10 D). ``min_num_live_points = nlive``; every
 other run setting stays at its default (``dlogz=0.5``, ``frac_remain=0.01``,
 ``min_ess=400``). The CLI ``--dlogz`` is NOT passed: UltraNest's ``dlogz`` is a
 target evidence *uncertainty*, and 0.1 makes it add live points (613-1027 at
-nlive 100 on gauss_d2); use ``--opt dlogz=...`` to set it. Vectorised
-likelihood (jit+vmap on CPU), no output files; seeded through
+nlive 100 on gauss_d2); use ``--opt dlogz=...`` to set it. Its
+``frac_remain=0.01`` (stop once the live points hold under 1% of the
+evidence) is stricter than tinyns's ``dlogz = 0.1`` (about 9.5%): on gauss_d2
+it costs about 1.25 times the calls of ``frac_remain = 1 - exp(-0.1)``, with
+the same logZ. Vectorised likelihood (jit+vmap on CPU, batches padded to a
+power of two: see ``numpy_callables``), no output files; seeded through
 ``np.random.seed`` (UltraNest draws from the global state).
 Options: ``nsteps`` (slice), ``max_ncalls``.
 """
