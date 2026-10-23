@@ -503,7 +503,9 @@ class NestedSamplingResult:
     metadata: dict[str, Any] | None = None
     """Run settings and telemetry: ``status``, ``walks``, ``dlogz``,
     ``final_delta_logz``, ``acceptance`` (of the walk steps), ``scale``,
-    ``ncall_valid`` (in-cube likelihood calls), ``x64``, the hop counters,
+    ``ncall_valid`` (the proposals that passed the likelihood-free tests;
+    :class:`tinyns.core.State`), ``unmoved_fraction`` (of the replacement
+    chains), ``x64``, the hop counters,
     ``wall_time_s``, ``compile_s``, ``sampling_s``, ``resumed`` and more (the
     CHANGELOG lists the keys)."""
 
