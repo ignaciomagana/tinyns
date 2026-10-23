@@ -4,6 +4,7 @@ stops, the padded batches of the CPU likelihood, and the headline's cells."""
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 from types import SimpleNamespace
 
@@ -171,3 +172,35 @@ def test_vectorized_likelihood_compiles_once_per_power_of_two():
         assert np.allclose(f(x), -0.5 * np.sum(x**2, axis=1))
     assert len(traces) == 7
     assert f(np.ones(3)).shape == (1,)  # one point, as UltraNest sends it
+
+
+def _record(sampler, target, seed, nlive):
+    return dict(
+        schema="tinyns-bench-1", sampler=sampler, target=target, seed=seed,
+        ndim=2, status="ok", truth=dict(logz=0.0, mode_mass=None),
+        config=dict(cli=dict(nlive=nlive, dlogz=0.1, opts={})),
+        hw=dict(gpu=None, cpu_model="cpu", cpu_threads=4),
+        logz=0.01 * (seed % 5 - 2), logzerr=0.1, ncall=1000 * nlive, wall_s=1.0,
+        compile_s=None, mode_mass=None,
+    )
+
+
+def test_headline_counts_reference_cells(tmp_path):
+    """With the reference at two nlive, one target is two reference cells,
+    and the headline says it counts cells, not targets."""
+    from bench import summarize
+
+    recs = [
+        _record(s, "gauss_d2", seed, n)
+        for seed in range(10)
+        for s, n in (("ref", 500), ("ref", 1000), ("other", 500))
+    ]
+    path = tmp_path / "r.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    rows = summarize.summarize(summarize.load([path]))
+    ratios, _ = summarize.headline(rows, "ref")
+    assert (ratios[0]["common"], ratios[0]["ran"]) == (2, 2)
+    md = summarize.headline_markdown(rows, "ref")
+    assert "| common / ran cells |" in md
+    assert "| gauss | other | CPU 4c | 2/2 |" in md
+    assert "over the common accurate targets" not in md
