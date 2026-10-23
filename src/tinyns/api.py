@@ -91,8 +91,8 @@ class NestedSampler:
         checkpoint stopped by ``maxiter``, ``maxcall`` or ``dlogz`` continues
         under this call's limits. The callables are not stored or checked.
 
-        Running out of device memory raises ``MemoryError`` with the
-        ``num_delete`` to lower.
+        Running out of device memory raises ``MemoryError`` with what to
+        lower: ``num_delete``, or the number of keys of a batched run.
 
         ``key`` may be a batch of keys (``jax.random.split(key, B)``): the
         ``B`` runs go through one compiled program (the step is vmapped over
@@ -121,8 +121,21 @@ class NestedSampler:
             if "RESOURCE_EXHAUSTED" not in str(err):
                 raise
             k = self.config.num_delete
+            batch = core._key_batch(key)[1] or 1
+            what = (
+                f"num_delete={k} likelihoods at once"
+                if k > 1
+                else "one likelihood (num_delete=1)"
+            )
+            hints = []
+            if k > 1:
+                hints.append(f"lower num_delete, e.g. num_delete={max(1, k // 4)}")
+            if batch > 1:
+                what += f" in each of {batch} runs"
+                hints.append(f"run fewer than {batch} keys per call")
+            hint = " or ".join(hints) or (
+                "num_delete cannot go lower: reduce the memory of one likelihood call"
+            )
             raise MemoryError(
-                f"out of device memory: a step evaluates num_delete={k} "
-                "likelihoods at once (times the batch of a batched run); "
-                f"lower num_delete, e.g. num_delete={max(1, k // 4)}"
+                f"out of device memory: a step evaluates {what}; {hint}"
             ) from err

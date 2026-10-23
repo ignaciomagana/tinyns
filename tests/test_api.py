@@ -137,10 +137,11 @@ def test_prior_transform_may_return_derived_parameters() -> None:
     np.testing.assert_allclose(samples[:, 2], samples[:, 0] + samples[:, 1])
 
 
-def test_out_of_memory_names_num_delete(monkeypatch) -> None:
-    def exhausted(*args, **kwargs):
-        raise RuntimeError("RESOURCE_EXHAUSTED: Out of memory while allocating")
+def exhausted(*args, **kwargs):
+    raise RuntimeError("RESOURCE_EXHAUSTED: Out of memory while allocating")
 
+
+def test_out_of_memory_names_num_delete(monkeypatch) -> None:
     monkeypatch.setattr(tinyns.core, "run", exhausted)
     sampler = NestedSampler(loglike, identity, ndim=2, nlive=400)
     with pytest.raises(MemoryError, match="num_delete=40.*num_delete=10"):
@@ -152,3 +153,22 @@ def test_out_of_memory_names_num_delete(monkeypatch) -> None:
     monkeypatch.setattr(tinyns.core, "run", other)
     with pytest.raises(RuntimeError, match="something else"):
         sampler.run(0)
+
+
+def test_out_of_memory_at_num_delete_1_does_not_suggest_it(monkeypatch) -> None:
+    monkeypatch.setattr(tinyns.core, "run", exhausted)
+    sampler = NestedSampler(loglike, identity, ndim=2, nlive=12)
+    assert sampler.config.num_delete == 1
+    with pytest.raises(MemoryError) as err:
+        sampler.run(0)
+    message = str(err.value)
+    assert "e.g. num_delete=1" not in message
+    assert "reduce the memory of one likelihood call" in message
+    keys = jax.random.split(jax.random.key(0), 4)
+    with pytest.raises(MemoryError, match="in each of 4 runs; run fewer than 4 keys"):
+        sampler.run(keys)
+    sampler = NestedSampler(loglike, identity, ndim=2, nlive=400)
+    with pytest.raises(
+        MemoryError, match="num_delete=10 or run fewer than 4 keys per call"
+    ):
+        sampler.run(keys)
