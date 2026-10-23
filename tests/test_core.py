@@ -70,8 +70,10 @@ def reference_evidence(logl, nlive_i):
 FOLDS = Config(1)._folds
 
 
-def fake_run(dead_logl, live_logl, m, k):
-    """A final State and Dead rows (numpy) with the given likelihoods."""
+def fake_run(dead_logl, live_logl, m, k, nlive=None, **fields):
+    """A final State and Dead rows (numpy) with the given likelihoods; the
+    dead rows' live counts are ``nlive`` (default: ``m - j``), and ``fields``
+    override fields of the state."""
     dead_logl = np.asarray(dead_logl, np.float64).reshape(-1, k)
     steps = dead_logl.shape[0]
     rng = np.random.default_rng(0)
@@ -91,7 +93,9 @@ def fake_run(dead_logl, live_logl, m, k):
         status=np.int32(core.CONVERGED),
         label=np.zeros((FOLDS, m), np.int32),
         **core._empty_frames(1, FOLDS, FLOAT),
-    )
+    )._replace(**fields)
+    if nlive is None:
+        nlive = np.tile(m - np.arange(k, dtype=np.int32), (steps, 1))
     zeros = np.zeros((steps, k), np.int32)
     dead = core.Dead(
         u=rng.uniform(size=(steps, k, 1)),
@@ -104,7 +108,7 @@ def fake_run(dead_logl, live_logl, m, k):
         hop_tries=zeros,
         nclusters=zeros,
         neligible=zeros,
-        nlive=np.tile(m - np.arange(k, dtype=np.int32), (steps, 1)),
+        nlive=np.asarray(nlive, np.int32).reshape(steps, k),
         nslots=np.full((steps, k), m - k + 1, np.int32),
     )
     return state, dead
@@ -123,6 +127,39 @@ def test_constant_likelihood_bookkeeping_is_exact(k) -> None:
     np.testing.assert_allclose(result.logwt, logwt, rtol=0, atol=1e-6)
     expected = np.concatenate([np.tile(m - np.arange(k), 6), m - np.arange(m)])
     np.testing.assert_array_equal(result.nlive_i, expected)
+
+
+def test_live_points_tied_at_the_last_contour_count_on_from_the_plateau() -> None:
+    """An indicator likelihood (0 on part of the cube, -inf elsewhere) that
+    ended on its plateau: 3 steps of k = 4 tied deaths at -inf, and the r = 2
+    points still tied there stay live (the step that would delete them finds
+    nothing above L* = 0). They die at counts 8, 7, after the 12 dead rows at
+    20..9, not at 20, 19 (logZ was log((m - kT)(m - r) / m^2) for the
+    truth log((m - kT - r) / m), up to 1.5 nats high at the defaults). The
+    q = 14 tied deaths leave the volume X_q, held by the 18 points at L = 1,
+    so Z = X_q exactly, and the shrinkages of the tied deaths alone carry
+    the error: logzerr^2 = sum 1 / n^2 over their counts (it was 0)."""
+    m, k = 20, 4
+    cfg = Config(1, m, num_delete=k)
+    counts = m - np.arange(12)  # the FHS counts of the 12 tied dead rows
+    live = np.concatenate([[-np.inf, -np.inf], np.zeros(m - 2)])
+    state, dead = fake_run(
+        np.full(12, -np.inf), live, m, k, nlive=counts,
+        lstar_prev=np.float64(-np.inf), tie_run=np.int32(3),
+    )
+    result = finalise(state, dead, cfg)
+    tied = np.arange(m, m - 14, -1)
+    np.testing.assert_array_equal(
+        result.nlive_i, np.concatenate([tied, m - 2 - np.arange(m - 2)])
+    )
+    assert result.logz == pytest.approx(-np.sum(1.0 / tied), abs=1e-12)
+    assert result.logzerr == pytest.approx(math.sqrt(np.sum(1.0 / tied**2)), rel=1e-9)
+    logwt, logz, logzerr = reference_evidence(result.logl, result.nlive_i)
+    assert abs(result.logz - logz) < 1e-9 and abs(result.logzerr - logzerr) < 1e-9
+    # Before the first step (tie_run 0) nothing counts as tied, whatever the
+    # live likelihoods.
+    state, dead = fake_run(np.zeros(0), live, m, k, it=np.int32(0))
+    np.testing.assert_array_equal(finalise(state, dead, cfg).nlive_i, m - np.arange(m))
 
 
 def test_logzerr_is_the_first_order_volume_spread() -> None:
@@ -543,6 +580,9 @@ def test_finalise_reports_convergence_of_a_hand_written_loop() -> None:
     assert not early.success and early.metadata["status"] == "running"
     with pytest.raises(ValueError, match="dlogz"):
         finalise(state, dead, cfg, dlogz=-1.0)
+    # The rows must be those of the state's steps.
+    with pytest.raises(ValueError, match="state has done"):
+        finalise(state, jax.tree_util.tree_map(lambda x: x[:-1], dead), cfg)
 
     # A status the loop or the driver set is kept: dlogz never overrides it.
     for code in (core.MAXITER, core.MAXCALL, core.PLATEAU):

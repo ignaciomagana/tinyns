@@ -1139,13 +1139,27 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     """Delete the ``k`` lowest live points and replace them; return the new
     state and the step's :class:`Dead` rows.
 
-    It does not test termination: loop while :func:`delta_logz` is above
-    your ``dlogz`` and pass that ``dlogz`` to :func:`finalise`. On a plateau
-    (no live point above the deleted ones) the live set is unchanged, the rows
-    are not valid and ``status`` becomes ``PLATEAU``
-    (``STATUS[int(state.status)] == "plateau"``); otherwise ``status`` is left
-    as it is (``RUNNING`` after :func:`init`). Before the step, the live
-    points are reclustered if a recluster is due (``cfg.recluster_every``).
+    It does not test dlogz: loop while :func:`delta_logz` is at or above
+    your ``dlogz`` and the status is ``"running"``, and pass that ``dlogz``
+    to :func:`finalise`. On a plateau (no live point above the deleted ones)
+    the state is returned as it was (``it`` too) but for ``status``, which
+    becomes ``PLATEAU`` (``STATUS[int(state.status)] == "plateau"``), and the
+    rows are not valid. Otherwise ``status`` is left as it is (``RUNNING``
+    after :func:`init`). So the rows of the first ``int(state.it)`` steps
+    are the valid ones::
+
+        rows = []
+        while delta_logz(state, cfg) >= dlogz:
+            state, dead = step(state, loglike, prior_transform, cfg)
+            rows.append(dead)
+            if STATUS[int(state.status)] != "running":  # a plateau
+                break
+        dead = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs)[: int(state.it)], *rows
+        )
+
+    Before the step, the live points are reclustered if a recluster is due
+    (``cfg.recluster_every``).
     """
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
@@ -1165,12 +1179,17 @@ def finalise(
 ) -> NestedSamplingResult:
     """Build the :class:`NestedSamplingResult` from the final state and the rows.
 
-    ``dead`` holds the valid rows of every step in order, with any leading
-    shape (``(steps, k)`` or flat). Each dead row dies at its recorded live
-    count (``dead.nlive``: ``m - j`` for death ``j`` of a step, fewer on a
-    likelihood plateau) and the final live points are appended by
-    increasing likelihood at live counts ``m, m-1, ..., 1``; the weights,
-    ``logz`` and ``logzerr`` (first order) are recomputed in float64
+    ``dead`` holds the valid rows of the ``state.it`` steps in order, with
+    any leading shape (``(steps, k)`` or flat; other row counts raise
+    ``ValueError``: drop the rows of a step on a plateau, see :func:`step`).
+    Each dead row dies at its recorded live count (``dead.nlive``: ``m - j``
+    for death ``j`` of a step, fewer on a likelihood plateau) and the final
+    live points are appended by increasing likelihood at live counts ``m,
+    m-1, ..., 1``, but those still tied at the last step's contour (a run
+    that stopped on a plateau, or during one), which count on from the
+    plateau's last dead row as :func:`_tie_counts` does: ``m - j - k *
+    tie_run``. The weights, ``logz`` and ``logzerr`` (first order in the
+    prior-volume shrinkages) are recomputed in float64
     (:func:`tinyns.result._evidence`). ``result.labels`` holds each
     sample's cluster label when it died (the final live points: their last
     labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads, and
@@ -1198,8 +1217,12 @@ def finalise(
     m, d, k = cfg.nlive, cfg.ndim, cfg.num_delete
     dead_logl = np.asarray(dead.logl, np.float64).reshape(-1)
     niter = dead_logl.size
-    if niter % k:
-        raise ValueError(f"{niter} dead rows are not whole steps of {k}")
+    if niter != int(state.it) * k:
+        raise ValueError(
+            f"{niter} dead rows, but the state has done {int(state.it)} steps of "
+            f"{k}: pass the rows of the first state.it steps (a step on a "
+            "plateau returns rows that are not valid)"
+        )
     order = np.argsort(np.asarray(state.logl), kind="stable")
     u = np.concatenate([np.asarray(dead.u).reshape(-1, d), np.asarray(state.u)[order]])
     logl = np.concatenate([dead_logl, np.asarray(state.logl, np.float64)[order]])
@@ -1214,9 +1237,13 @@ def finalise(
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)
-    nlive_i = np.concatenate([
-        np.asarray(dead.nlive, np.int64).reshape(-1), m - np.arange(m)
-    ])
+    # The live points still tied at the last step's contour (a prefix: every
+    # live point is at or above it) die after the tie_run steps of k tied
+    # deaths there (_tie_counts; tie_run is 0 before the first step).
+    live_n = m - np.arange(m)
+    tied = logl[niter:] == float(state.lstar_prev)
+    live_n = np.maximum(np.where(tied, live_n - k * int(state.tie_run), live_n), 1)
+    nlive_i = np.concatenate([np.asarray(dead.nlive, np.int64).reshape(-1), live_n])
     logwt, logz, logzerr = _evidence(logl, nlive_i)
 
     log_x = -(niter // k) * cfg.log_shrink + float(state.log_x_ties)

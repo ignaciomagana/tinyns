@@ -207,3 +207,43 @@ def test_ties_under_vmap() -> None:
         tied.append(int(np.sum(nlive < m - k)))
         assert lane.success
     assert min(tied) > 0 and len(set(tied)) > 1, tied
+
+
+def disc(area):
+    """L = 1 on a disc of ``area`` at the centre of the 2-D cube, 0 elsewhere."""
+    r2 = area / math.pi
+
+    def loglike(u):
+        return jnp.where(jnp.sum((u - 0.5) ** 2) < r2, 0.0, -jnp.inf)
+
+    return loglike
+
+
+def test_indicator_likelihood_ends_on_its_plateau_unbiased() -> None:
+    """An indicator likelihood ends on its plateau: the step that would delete
+    the last r < k points at L = 0 reaches L* = 1 and finds nothing above it,
+    so they stay live, tied at the last contour. They count on from the tied
+    deaths (they were counted at m, m-1, ...: logZ +0.130 +- 0.004 here, a
+    bias that grows as the area shrinks), and logzerr, which was 0, is the
+    binomial sd sqrt((1 - V) / (m V)) of the volume estimate."""
+    area, m = 0.25, 1000
+    batch = NestedSampler(disc(area), identity, 2, m).run(
+        jax.random.split(jax.random.key(4), 16)
+    )
+    err = np.array([r.logz for r in batch]) - math.log(area)
+    se = err.std(ddof=1) / math.sqrt(len(err))
+    assert abs(err.mean()) < 3 * se, (err.mean(), se)
+    binomial = math.sqrt((1 - area) / (m * area))
+    for r in batch:
+        assert r.metadata["status"] == "plateau" and r.success
+        q = int(np.sum(np.isneginf(np.asarray(r.logl))))
+        assert 0 < q - r.niter < r.num_delete  # tied points left live
+        # The q tied deaths, dead rows and live points, count at m, ..., m-q+1.
+        np.testing.assert_array_equal(np.asarray(r.nlive_i)[:q], m - np.arange(q))
+        assert r.logzerr == pytest.approx(binomial, rel=0.15)  # q is random
+    assert 0.6 < err.std(ddof=1) / binomial < 1.6
+    # Stopped by maxiter during the tie run: the same counts.
+    r = NestedSampler(disc(area), identity, 2, m).run(1, maxiter=300)
+    assert r.metadata["status"] == "maxiter" and r.niter == 300
+    q = int(np.sum(np.isneginf(np.asarray(r.logl))))
+    np.testing.assert_array_equal(np.asarray(r.nlive_i)[:q], m - np.arange(q))

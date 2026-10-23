@@ -50,8 +50,8 @@ def main():
     # its increments on the host (a difference stays right across a wrap).
     ncall = int(state.ncall)
     # delta_logz is the evidence the live points could still add, in log
-    # units. step sets the status only on a likelihood plateau; the rows of a
-    # chunk that hits one are not valid, and this loop would stop there.
+    # units. step sets the status only on a likelihood plateau, and the loop
+    # stops there.
     while delta_logz(state, cfg) >= DLOGZ and STATUS[int(state.status)] == "running":
         before = state.ncall
         state, dead = chunk(state)  # leaves of shape (STEPS_PER_CHUNK, k, ...)
@@ -62,7 +62,12 @@ def main():
             f"remaining {float(delta_logz(state, cfg)):.3g}"
         )
 
-    dead = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs), *chunks)
+    # A step on a plateau returns the state as it was and rows that are not
+    # valid, and so do the steps of the chunk after it: the rows of the first
+    # state.it steps are the valid ones.
+    dead = jax.tree_util.tree_map(
+        lambda *xs: jnp.concatenate(xs)[: int(state.it)], *chunks
+    )
     # With the loop's dlogz, finalise applies the driver's stopping rule and
     # reports "converged"; without it the result would say "running".
     result = finalise(

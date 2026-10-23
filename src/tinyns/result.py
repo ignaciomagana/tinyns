@@ -434,7 +434,9 @@ class NestedSamplingResult:
     ``nlive, ..., 1`` over the final live points. On a likelihood plateau
     (live points tied at one likelihood) the tied deaths count at
     ``nlive, nlive - 1, ...`` across the steps they take (Fowlie, Handley and
-    Su 2021), so ``nlive_i`` is lower there.
+    Su 2021), so ``nlive_i`` is lower there, and so it is for the final live
+    points still tied at the last step's contour (a run that ended on a
+    plateau, or stopped during one).
     """
 
     samples_u: ArrayLike
