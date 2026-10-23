@@ -12,6 +12,7 @@ from jax import random
 
 import tinyns
 from tinyns import Config, NestedSampler, core, finalise, init, step
+from tinyns.result import _evidence
 
 FLOAT = jnp.result_type(float)
 
@@ -35,13 +36,15 @@ def identity(u):
 
 
 def reference_evidence(logl, nlive_i):
-    """Sample by sample (dynesty-style running Z and H), plain Python floats.
+    """Sample by sample, plain Python floats.
 
     Sample i shrinks log X by 1 / n_i and takes X_{i-1} - X_i; the last sample
-    takes all of X_{N-2}. Var(log Z) accumulates dH_i / n_i.
+    takes all of X_{N-2}. Var(log Z) is first order in the shrinkages: log t_i
+    has variance 1 / n_i^2 and moves log Z by (Z_{>i} - L_i X_i) / Z, with
+    Z_{>i} the evidence of the samples after i (the last sample: 0).
     """
-    logz, h, var, log_x = -math.inf, 0.0, 0.0, 0.0
-    logwts = []
+    logz, log_x = -math.inf, 0.0
+    logwts, log_xs = [], []
     for i, (ll, n) in enumerate(zip(logl, nlive_i, strict=True)):
         log_x_new = log_x - 1.0 / n
         if i == len(logl) - 1:
@@ -50,14 +53,18 @@ def reference_evidence(logl, nlive_i):
             width = math.exp(log_x) - math.exp(log_x_new)
         logwt = ll + math.log(width) if ll > -math.inf else -math.inf
         logwts.append(logwt)
+        log_xs.append(log_x_new)
         if logwt > -math.inf:
-            logz_new = np.logaddexp(logz, logwt)
-            old = 0.0 if logz == -math.inf else math.exp(logz - logz_new) * (h + logz)
-            h_new = math.exp(logwt - logz_new) * ll + old - logz_new
-            var += (h_new - h) / n
-            h, logz = h_new, logz_new
+            logz = float(np.logaddexp(logz, logwt))
         log_x = log_x_new
-    return np.array(logwts), float(logz), math.sqrt(max(var, 0.0))
+    var, after = 0.0, 0.0  # after: Z_{>i} / Z
+    for i in reversed(range(len(logl))):
+        if i < len(logl) - 1:
+            own = math.exp(logl[i] + log_xs[i] - logz) if logl[i] > -math.inf else 0.0
+            var += ((after - own) / nlive_i[i]) ** 2
+        if logwts[i] > -math.inf:
+            after += math.exp(logwts[i] - logz)
+    return np.array(logwts), logz, math.sqrt(var)
 
 
 FOLDS = Config(1)._folds
@@ -116,6 +123,34 @@ def test_constant_likelihood_bookkeeping_is_exact(k) -> None:
     np.testing.assert_allclose(result.logwt, logwt, rtol=0, atol=1e-6)
     expected = np.concatenate([np.tile(m - np.arange(k), 6), m - np.arange(m)])
     np.testing.assert_array_equal(result.nlive_i, expected)
+
+
+def test_logzerr_is_the_first_order_volume_spread() -> None:
+    """logzerr^2 = sum_j (S_j / n_j)^2, S_j = d logZ / d log t_j: the
+    shrinkages of tied deaths below the posterior mass (zero weight) count,
+    and it is never negative. The sum of information increments gave 0 on an
+    indicator likelihood (clipped from a negative sum) while logZ scattered
+    by the binomial sd sqrt((1 - V) / (m V))."""
+    m, q = 400, 300  # 300 tied deaths at -inf, 100 points left on the plateau
+    logl = np.concatenate([np.full(q, -np.inf), np.zeros(m - q)])
+    nlive = np.concatenate([m - np.arange(q), m - q - np.arange(m - q)])
+    _, logz, logzerr = _evidence(logl, nlive)
+    n = m - np.arange(q)
+    assert logz == pytest.approx(-np.sum(1.0 / n), abs=1e-12)
+    assert logzerr == pytest.approx(math.sqrt(np.sum(1.0 / n**2)), rel=1e-12)
+    assert logzerr == pytest.approx(math.sqrt((1 - 0.25) / (m * 0.25)), rel=0.01)
+    # The same deaths with a finite plateau below the mass: L = -30 there.
+    _, _, err_low = _evidence(np.where(logl == -np.inf, -30.0, 0.0), nlive)
+    assert err_low == pytest.approx(logzerr, rel=1e-6)
+    # Without ties, at a constant count (an ideal run, deterministic volumes),
+    # it is close to Skilling's sqrt(H / n).
+    m = 500
+    log_x = -np.arange(1, 20 * m + 1) / m
+    logl = -0.5 * np.exp(2 * log_x / 3) / 1e-2  # a 3-D Gaussian of sd 0.1
+    logwt, logz, logzerr = _evidence(logl, np.full(logl.size, m))
+    p = np.exp(logwt - logz)
+    info = float(np.sum(p * (logl - logz)))
+    assert logzerr == pytest.approx(math.sqrt(info / m), rel=0.05)
 
 
 @pytest.mark.parametrize("k", [1, 10])
@@ -358,6 +393,7 @@ def test_constant_likelihood_is_a_plateau_with_exact_evidence() -> None:
     assert result.metadata["status"] == "plateau" and result.success
     assert result.niter == 0
     assert result.logz == pytest.approx(-2.5, abs=1e-6)
+    assert result.logzerr < 1e-12  # the widths sum to 1 exactly
 
 
 def test_runs_under_jax_debug_nans() -> None:
@@ -387,8 +423,10 @@ def test_flat_top_likelihood_stops_on_the_plateau() -> None:
         # k live points lie below the plateau.
         assert np.sum(result.logl[result.niter :] < 0.0) < 10
         close += abs(result.logz - truth) < 4 * result.logzerr + 0.05
-    # logzerr understates the scatter on a plateau ((logz - truth) / logzerr
-    # has sd ~1.6, with rare 6-8 sigma runs), so a majority of five must pass.
+    # The first-order logzerr matches the scatter here ((logz - truth) /
+    # logzerr has sd 1.02 and 1.07 over two sets of 64 runs; it was 1.6-1.7
+    # with the sum of information increments, with rare 6-8 sigma runs), and
+    # a majority of five must pass.
     assert close >= 3
 
 

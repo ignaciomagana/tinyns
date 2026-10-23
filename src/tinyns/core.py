@@ -1170,8 +1170,8 @@ def finalise(
     count (``dead.nlive``: ``m - j`` for death ``j`` of a step, fewer on a
     likelihood plateau) and the final live points are appended by
     increasing likelihood at live counts ``m, m-1, ..., 1``; the weights,
-    ``logz`` and ``logzerr = sqrt(sum_i dH_i / n_i)`` are recomputed in
-    float64 (:func:`tinyns.result._evidence`). ``result.labels`` holds each
+    ``logz`` and ``logzerr`` (first order) are recomputed in float64
+    (:func:`tinyns.result._evidence`). ``result.labels`` holds each
     sample's cluster label when it died (the final live points: their last
     labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads, and
     ``result.insertion_ranks`` / ``insertion_slots`` the in-sampler insertion

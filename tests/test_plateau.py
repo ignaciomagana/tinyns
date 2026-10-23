@@ -140,10 +140,11 @@ def test_finite_plateau() -> None:
     # median is the test.
     first = [r.insertion_test()["windows"][0]["pvalue"] for r in batch]
     assert np.median(first) > 0.05 and min(first) > 1e-8, first
-    # logzerr misses the uncertainty of the plateau's volume; the bootstrap,
-    # which draws every shrinkage, has it (0.36 against a scatter of 0.35).
+    # logzerr counts the uncertainty of the plateau's volume, as the
+    # bootstrap does (0.36 against a scatter of 0.35); the sum of information
+    # increments missed it (0.09).
     ratio = [r.logz_bootstrap(n_realizations=200).logzerr / r.logzerr for r in batch]
-    assert np.median(ratio) > 2, ratio
+    assert 0.7 < np.median(ratio) < 1.4, ratio
 
 
 def test_no_plateau_control() -> None:

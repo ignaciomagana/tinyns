@@ -393,22 +393,34 @@ def _log_weights(logl, nlive_i, log_t=None):
 def _evidence(logl, nlive_i):
     """Return ``(logwt, logz, logzerr)`` in float64 (see :func:`_log_weights`).
 
-    ``logzerr = sqrt(sum_i dH_i / n_i)``, with ``dH_i`` the increment of the
-    running information at sample ``i`` and ``n_i = nlive_i[i]``; at a
-    constant live count ``n`` it is Skilling's ``sqrt(H / n)``.
+    ``logzerr`` is the spread of ``logz`` over the prior-volume path, to
+    first order: the shrinkage of sample ``j`` has ``Var(log t_j) = 1 /
+    n_j^2`` (``t_j ~ Beta(n_j, 1)``, ``n_j = nlive_i[j]``) and moves ``logz``
+    by ``S_j = d logz / d log t_j = sum_{i>j} p_i - L_j X_j / Z`` (``p_i``
+    the normalized weights; ``S = 0`` for the last sample, which takes all
+    the volume left), so ``logzerr^2 = sum_j (S_j / n_j)^2``. At a constant
+    live count ``n`` it is close to Skilling's ``sqrt(H / n)``. Unlike a sum
+    of information increments it keeps the volume uncertainty of the deaths
+    on a plateau below the posterior mass (zero-weight deaths, ``S_j``
+    near 1) and is never negative; the deaths of a plateau that holds the
+    remaining mass (``S_j = 0``) add none, since their widths sum to the
+    volume left exactly. With few live points above a plateau the spread of
+    ``logz`` is skewed, which :meth:`NestedSamplingResult.logz_bootstrap`
+    (it draws the shrinkages) shows.
     """
     logl = np.asarray(logl, dtype=np.float64)
-    logwt = _log_weights(logl, nlive_i)
+    n = np.asarray(nlive_i, dtype=np.float64)
+    logwt = _log_weights(logl, n)
     logz = float(_np_logsumexp(logwt, axis=0))
     if not math.isfinite(logz):
         return logwt, logz, math.nan
     p = np.exp(logwt - logz)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        c = np.cumsum(p)
-        a = np.cumsum(np.where(p > 0.0, p * logl, 0.0))
-        h = np.where(c > 0.0, a / c - np.log(c) - logz, 0.0)
-    var = np.sum(np.diff(h, prepend=0.0) / np.asarray(nlive_i, dtype=np.float64))
-    return logwt, logz, math.sqrt(max(float(var), 0.0))
+    after = np.concatenate([np.cumsum(p[::-1])[::-1][1:], [0.0]])  # sum_{i>j} p_i
+    with np.errstate(divide="ignore"):
+        own = np.exp(logl + np.cumsum(-1.0 / n) - logz)  # L_j X_j / Z; 0 at -inf
+    s = after - own
+    s[-1] = 0.0
+    return logwt, logz, math.sqrt(float(np.sum((s / n) ** 2)))
 
 
 @dataclass(kw_only=True)
