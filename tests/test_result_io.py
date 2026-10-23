@@ -1,7 +1,7 @@
-"""Result files and weight statistics: ``save_npz`` writes the exact path,
-``load_npz`` keeps the saved dtypes, and the weights, ESS, information and
-resampling are computed in NumPy float64 (without compiling anything), with
-the resampled set in a random order."""
+"""Result files and weight statistics: ``save_npz`` writes the exact path
+(through a link), ``load_npz`` keeps the saved dtypes, and the weights, ESS,
+information and resampling are computed in NumPy float64 (without compiling
+anything), with the resampled set in a random order."""
 
 from __future__ import annotations
 
@@ -62,6 +62,21 @@ def test_save_npz_writes_the_exact_path(tmp_path) -> None:
     result.save_npz(buffer)
     buffer.seek(0)
     assert NestedSamplingResult.load_npz(buffer).niter == result.niter
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symbolic links")
+def test_save_npz_writes_through_a_symbolic_link(tmp_path) -> None:
+    """As ``np.savez_compressed`` did: the atomic write must not replace the
+    link with a file and leave the linked one stale."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    link = tmp_path / "result.npz"
+    link.symlink_to(shared / "result.npz")
+    make_result(40).save_npz(link)  # creates the target
+    result = make_result(60)
+    result.save_npz(link)  # replaces it
+    assert link.is_symlink() and os.listdir(shared) == ["result.npz"]
+    assert NestedSamplingResult.load_npz(shared / "result.npz").niter == result.niter
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")

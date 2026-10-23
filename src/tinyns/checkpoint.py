@@ -19,21 +19,25 @@ previous checkpoint or the new one, never a torn file. It holds
 - ``meta_json``: the format, the tinyns version, the resolved ``Config``, the
   x64 flag and float dtype, the lane count and ``batched_data``, the host call
   counters (Python ints, one per lane), the accumulated ``wall_time_s``,
-  ``compile_s`` and ``sampling_s``, the number of chunks, and the JAX build
-  and device the run is bit-identical on (:func:`_environment`).
+  ``compile_s`` and ``sampling_s``, the number of chunks, the JAX build
+  and device the run is bit-identical on (:func:`_environment`), and
+  ``mixed_build``, true once the run has been resumed under another one.
 
 Files of any other format are refused; there is no reader for older formats.
 A different JAX build or device is not refused but warned about: the resumed
 run is a valid run, but it may not be bit-identical to an uninterrupted one.
-The file keeps the mode of the checkpoint it replaces (a new one gets the mode
-of any new file, ``0o666`` less the umask), so a ``chmod`` that shares it with
-a group survives the rewrites.
+The warning is repeated at every later resume (``mixed_build``), although the
+checkpoints written after it record the new build. The file keeps the mode of
+the checkpoint it replaces (a new one gets the mode of any new file, ``0o666``
+less the umask), so a ``chmod`` that shares it with a group survives the
+rewrites. A symbolic link at the path is followed, as ``open`` does.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import os
 import secrets
@@ -90,7 +94,9 @@ class Checkpoint:
     ``state`` is a :class:`tinyns.core.State` whose key is a JAX key; ``dead``
     holds one :class:`tinyns.core.Dead` of numpy rows per lane (a single lane
     for an unbatched run); ``ncall`` and ``ncall_valid`` are per-lane Python
-    ints; ``batch`` is the lane count of a batched run (``None`` unbatched).
+    ints; ``batch`` is the lane count of a batched run (``None`` unbatched);
+    ``mixed_build`` is true once the run has been resumed under another
+    tinyns version, JAX build or device.
     """
 
     state: Any
@@ -105,25 +111,33 @@ class Checkpoint:
     config: dict
     batch: int | None
     batched_data: bool
+    mixed_build: bool = False
 
 
 def _dtype_name() -> str:
     return jnp.dtype(jnp.result_type(float)).name
 
 
-def _environment() -> dict:
+def _device(array):
+    """The device that ``array`` (a state leaf) is on; the first device for a
+    host array."""
+    devices = getattr(array, "devices", None)
+    return next(iter(devices())) if callable(devices) else jax.devices()[0]
+
+
+def _environment(device) -> dict:
     """The JAX build and device that a resume is bit-identical on: the JAX
     and jaxlib versions, ``jax_threefry_partitionable`` (it changes the random
-    stream; its default changed in JAX 0.5), the backend and the kind of the
-    default device."""
+    stream; its default changed in JAX 0.5), and the platform and kind of
+    ``device``, the one the run's state is on."""
     return {
         "jax_version": jax.__version__,
         "jaxlib_version": jaxlib.__version__,
         "threefry_partitionable": getattr(
             jax.config, "jax_threefry_partitionable", None
         ),
-        "backend": jax.default_backend(),
-        "device_kind": jax.devices()[0].device_kind,
+        "backend": device.platform,
+        "device_kind": device.device_kind,
     }
 
 
@@ -160,10 +174,27 @@ def save(path, ckpt: Checkpoint) -> None:
         "compile_s": float(ckpt.compile_s),
         "sampling_s": float(ckpt.sampling_s),
         "chunks": int(ckpt.chunks),
-        **_environment(),
+        **_environment(_device(state.u)),
+        "mixed_build": bool(ckpt.mixed_build),
     }
     arrays["meta_json"] = np.asarray(json.dumps(meta, sort_keys=True))
     _atomic_savez(path, arrays)
+
+
+def _file_path(path) -> str:
+    """``path`` with its symbolic links resolved, so that a link is written
+    through (replacing the link itself would leave its target stale).
+    Raises ``IsADirectoryError`` when it names no file: it is empty, ends in a
+    separator or is a directory (the parent directory was written to, or the
+    run failed at its last save)."""
+    path = os.fspath(path)
+    if not os.path.basename(path) or os.path.isdir(path):
+        raise IsADirectoryError(
+            errno.EISDIR,
+            f"{path!r} names no file (it is empty, ends in a separator or is a "
+            "directory)",
+        )
+    return os.path.realpath(path)
 
 
 def _temp_file(path: str) -> tuple[int, str]:
@@ -194,10 +225,11 @@ def check_writable(path) -> None:
     compiles and samples, not at its first save. A temporary file is created
     and removed (``os.access`` is unreliable on network file systems)."""
     path = os.fspath(path)
+    target = _file_path(path)
     try:
-        fd, tmp = _temp_file(path)
+        fd, tmp = _temp_file(target)
     except OSError as exc:
-        directory = os.path.dirname(os.path.abspath(path))
+        directory = os.path.dirname(target)
         raise type(exc)(
             exc.errno,
             f"cannot write the checkpoint {path} in the directory {directory}: "
@@ -211,9 +243,10 @@ def _atomic_savez(path, arrays: dict, compressed: bool = False) -> None:
     """Write ``arrays`` to the ``.npz`` file ``path`` (exactly that name):
     a temporary file in the same directory, ``fsync``, then ``os.replace``,
     so that a crash leaves the old file or the new one. The file keeps the
-    mode of the file it replaces (:func:`_temp_file`)."""
-    path = os.fspath(path)
-    directory = os.path.dirname(os.path.abspath(path))
+    mode of the file it replaces (:func:`_temp_file`), and a symbolic link at
+    ``path`` is written through (:func:`_file_path`)."""
+    path = _file_path(path)
+    directory = os.path.dirname(path)
     fd, tmp = _temp_file(path)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -240,7 +273,8 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
     ``tinyns-ckpt-7`` checkpoint, or when its config, x64 flag, float dtype,
     lane count, ``batched_data`` or starting key differ from this run's.
     Warns when it was written by another tinyns version, JAX build or device
-    (:func:`_environment`): the resumed run may not be bit-identical.
+    (:func:`_environment`), or was resumed under another before
+    (``mixed_build``): the resumed run may not be bit-identical.
     Returns a :class:`Checkpoint`.
     """
     from tinyns import __version__
@@ -286,7 +320,15 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 f"{path}: the checkpoint was started from a different key; pass "
                 "the original key or a new checkpoint path"
             )
-        now = {"tinyns_version": __version__, **_environment()}
+        fields = {}
+        for name in State._fields:
+            if name == "key":
+                fields[name] = key_from_numpy(
+                    data["state/key"], str(data["state/key_impl"][()])
+                )
+            else:
+                fields[name] = jnp.asarray(data[f"state/{name}"])
+        now = {"tinyns_version": __version__, **_environment(_device(fields["u"]))}
         changed = [
             name for name, value in now.items() if meta.get(name, value) != value
         ]
@@ -300,14 +342,13 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 "uninterrupted one",
                 stacklevel=3,
             )
-        fields = {}
-        for name in State._fields:
-            if name == "key":
-                fields[name] = key_from_numpy(
-                    data["state/key"], str(data["state/key_impl"][()])
-                )
-            else:
-                fields[name] = jnp.asarray(data[f"state/{name}"])
+        elif meta.get("mixed_build"):
+            warnings.warn(
+                f"{path} was resumed under another tinyns version, JAX build "
+                "or device before: the run may not be bit-identical to an "
+                "uninterrupted one",
+                stacklevel=3,
+            )
         lanes = 1 if batch is None else batch
         dead = [
             Dead(**{
@@ -329,6 +370,7 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
         config=meta["config"],
         batch=meta["batch"],
         batched_data=bool(meta["batched_data"]),
+        mixed_build=bool(changed or meta.get("mixed_build")),
     )
 
 

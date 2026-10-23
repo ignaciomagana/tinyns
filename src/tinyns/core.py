@@ -1586,12 +1586,14 @@ def run(
         ncall, ncall_valid = list(ckpt.ncall), list(ckpt.ncall_valid)
         wall0, compile_s, nchunks = ckpt.wall_time_s, ckpt.compile_s, ckpt.chunks
         sampling_s = ckpt.sampling_s
+        mixed_build = ckpt.mixed_build
     else:
         state = _init_kernel(ll_spec, pt_spec, cfg, axes)(key, *leaves)
         rows_by_lane = [[_empty_dead(cfg, dtype)] for _ in range(lanes)]
         ncall, ncall_valid = [0] * lanes, [0] * lanes
         wall0 = compile_s = sampling_s = 0.0
         nchunks = 0
+        mixed_build = False
 
     capacity = max(1, math.ceil(_CHUNK_EFOLDS / cfg.log_shrink))
     kernel = _chunk_kernel(ll_spec, pt_spec, cfg, capacity, axes)
@@ -1625,6 +1627,7 @@ def run(
                 config=dataclasses.asdict(cfg),
                 batch=batch,
                 batched_data=batched_data,
+                mixed_build=mixed_build,
             ),
         )
 

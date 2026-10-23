@@ -98,7 +98,7 @@ class NestedSampler:
         device (a checkpoint of another warns), and ``metadata["wall_time_s"]``
         adds up the time of every session. A checkpoint stopped by
         ``maxiter``, ``maxcall`` or ``dlogz`` continues under this call's
-        limits.
+        limits. A symbolic link at the path is written through.
 
         Running out of device memory raises ``MemoryError`` with the
         ``num_delete`` to lower.

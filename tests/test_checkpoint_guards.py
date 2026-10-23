@@ -1,7 +1,7 @@
 """Checkpoint guards: a checkpoint of another problem is refused (its live
 points are evaluated again), the path is checked before the run, the JAX build
-is recorded and a change warns, the file keeps its mode, and odd inputs fail
-early instead of at the last save."""
+is recorded and a change warns, the file keeps its mode and a link at the path
+is written through, and odd inputs fail early instead of at the last save."""
 
 from __future__ import annotations
 
@@ -162,6 +162,44 @@ def test_an_unwritable_checkpoint_path_fails_before_the_run(tmp_path) -> None:
         assert not calls and not os.listdir(locked)
 
 
+def test_a_path_that_names_no_file_fails_before_the_run(tmp_path,
+                                                        monkeypatch) -> None:
+    """For ``""`` or ``"missing/"`` the probe wrote in the parent directory
+    and passed: the run sampled to the end and failed at its last save."""
+    calls = []
+
+    def loglike(x):
+        calls.append(1)  # traced: the run has started
+        return gauss(x)
+
+    sampler = NestedSampler(loglike, identity, 2, 50, num_delete=5)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    for path in ("", "missing/", "out", "out/"):
+        with pytest.raises(IsADirectoryError, match="names no file"):
+            sampler.run(0, checkpoint=path)
+    assert not calls
+    assert os.listdir(tmp_path) == ["out"] and not os.listdir(tmp_path / "out")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symbolic links")
+def test_a_checkpoint_behind_a_symbolic_link_is_written_through(tmp_path) -> None:
+    """The atomic write replaced a link at the path with a file, so the linked
+    checkpoint (in a shared directory, say) was never updated."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    link = tmp_path / "run.npz"
+    link.symlink_to(shared / "run.npz")  # dangling until the first save
+    sampler = NestedSampler(gauss, identity, 2, 50, num_delete=5)
+    sampler.run(0, maxiter=50, checkpoint=link)
+    assert link.is_symlink() and os.listdir(shared) == ["run.npz"]
+    result = sampler.run(0, maxiter=100, checkpoint=link)
+    assert result.metadata["resumed"] and link.is_symlink()
+    assert os.listdir(shared) == ["run.npz"]
+    with np.load(shared / "run.npz") as data:
+        assert json.loads(str(data["meta_json"][()]))["ncall"] == [result.ncall]
+
+
 def test_the_jax_build_is_recorded_and_a_change_warns(tmp_path) -> None:
     path = tmp_path / "run.npz"
     sampler = NestedSampler(gauss, identity, 2, 50, num_delete=5)
@@ -174,6 +212,7 @@ def test_the_jax_build_is_recorded_and_a_change_warns(tmp_path) -> None:
     _, written = meta()
     assert written["jax_version"] == jax.__version__
     assert written["backend"] == jax.default_backend()
+    assert written["mixed_build"] is False
     for name in ("jaxlib_version", "threefry_partitionable", "device_kind"):
         assert name in written
     with warnings.catch_warnings(record=True) as caught:  # same build: no warning
@@ -188,8 +227,14 @@ def test_the_jax_build_is_recorded_and_a_change_warns(tmp_path) -> None:
     np.savez(path, **arrays)
     with pytest.warns(UserWarning, match=r"jax_version='0\.4\.0', threefry_part"
                       r".*may not be bit-identical"):
-        result = sampler.run(0, checkpoint=path)
+        result = sampler.run(0, maxiter=200, checkpoint=path)
     assert result.metadata["resumed"]
+    # The next save records this build, but the run stays mixed: it warns on.
+    _, written = meta()
+    assert written["jax_version"] == jax.__version__ and written["mixed_build"]
+    with pytest.warns(UserWarning, match=r"was resumed under another tinyns "
+                      r"version, JAX build or device before"):
+        sampler.run(0, checkpoint=path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")

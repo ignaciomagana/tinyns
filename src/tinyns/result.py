@@ -1484,9 +1484,10 @@ class NestedSamplingResult:
         """Save the final result to a compressed NumPy ``.npz`` file (with
         :attr:`labels` and the insertion ranks when present).
 
-        The file is ``path`` itself (no ``.npz`` is appended), written
-        atomically like a checkpoint (:mod:`tinyns.checkpoint`). ``path`` may
-        also be a writable binary file object.
+        The file is ``path`` itself (no ``.npz`` is appended; a symbolic
+        link is written through), written atomically like a checkpoint
+        (:mod:`tinyns.checkpoint`). ``path`` may also be a writable binary
+        file object.
         """
 
         optional = {
