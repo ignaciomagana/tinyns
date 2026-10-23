@@ -247,3 +247,18 @@ def test_indicator_likelihood_ends_on_its_plateau_unbiased() -> None:
     assert r.metadata["status"] == "maxiter" and r.niter == 300
     q = int(np.sum(np.isneginf(np.asarray(r.logl))))
     np.testing.assert_array_equal(np.asarray(r.nlive_i)[:q], m - np.arange(q))
+
+
+def test_plateau_stop_is_not_an_early_stop_in_the_diagnostics() -> None:
+    """A run that ends on a plateau stopped where it should: no advice to
+    tighten dlogz (which does not change it), no warning on the weight of
+    the final live points (they are the plateau), and one note with the
+    plateau's posterior mass."""
+    r = NestedSampler(disc(0.25), identity, 2, 200).run(5)
+    assert r.metadata["status"] == "plateau"
+    assert r.metadata["final_delta_logz"] > r.metadata["dlogz"]
+    warnings = r.diagnostics()["warnings"]
+    stopping = ("consider tighter dlogz", "final-live", "final_delta_logz")
+    assert not any(text in w for w in warnings for text in stopping), warnings
+    (note,) = [w for w in warnings if "plateau" in w]
+    assert note.startswith("the run ended on a likelihood plateau, which holds 1 ")

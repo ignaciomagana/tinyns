@@ -1358,11 +1358,18 @@ class NestedSamplingResult:
         ``LUMPS_WARN``, ``mode_hop_off`` at least ``HOP_OFF_WARN`` or
         ``hop_acceptance`` below ``HOP_ACCEPT_WARN``), with the folds' masses
         of each mode, and when the slots were full in a run of several modes.
-        A result without posterior weight (``logz = -inf``) has
+
+        A run that ended on a likelihood plateau (``metadata["status"]`` is
+        ``"plateau"``) stopped where it should: the final live points are
+        the plateau and carry its posterior mass whatever ``dlogz`` and
+        ``nlive``, so the checks of the final live weight and of
+        ``final_delta_logz`` are skipped and one note gives that mass. A
+        result without posterior weight (``logz = -inf``) has
         ``posterior_ess`` 0 and NaN weight fractions.
         """
 
         metadata = {} if self.metadata is None else self.metadata
+        plateau = metadata.get("status") == "plateau"
         weighted = not self._no_weight()
         posterior_ess = self.posterior_ess()
         nposterior = int(jnp.asarray(self.logwt).size)
@@ -1389,22 +1396,30 @@ class NestedSamplingResult:
             warnings.append("posterior dominated by a small number of weighted samples")
         if entropy_fraction < 0.5:
             warnings.append("low posterior weight entropy")
-        if live_weight_fraction > 0.5:
+        if live_weight_fraction > 0.5 and not plateau:
             warnings.append(
                 "final live points carry most posterior weight; consider tighter "
                 "dlogz or more live points"
             )
-        if live_weight_fraction > 0.25 and dlogz is not None and dlogz >= 0.1:
+        if (
+            live_weight_fraction > 0.25
+            and dlogz is not None
+            and dlogz >= 0.1
+            and not plateau
+        ):
             warnings.append(
                 "large final-live weight fraction; evidence may be sensitive to "
                 "stopping"
             )
         if (
             self.success
+            and not plateau
             and None not in (final_delta_logz, dlogz)
             and final_delta_logz > dlogz
         ):
             warnings.append("successful run has final_delta_logz above requested dlogz")
+        if plateau and weighted:
+            warnings.append(self._plateau_note())
         if not math.isfinite(float(self.logzerr)):
             warnings.append("logzerr is not finite")
         if acceptance is not None and acceptance < 0.01:
@@ -1447,6 +1462,20 @@ class NestedSamplingResult:
             "hop_acceptance": metadata.get("hop_acceptance"),
             "warnings": warnings,
         }
+
+    def _plateau_note(self) -> str:
+        """The note of :meth:`diagnostics` on a run that ended on a plateau:
+        the posterior mass of the final live points tied at the highest
+        likelihood (the plateau)."""
+        niter = int(self.niter)
+        live = np.asarray(self.logl, dtype=float)[niter:]
+        top = live == live.max() if live.size else live.astype(bool)
+        mass = float(np.sum(self._weights[niter:][top]))
+        return (
+            f"the run ended on a likelihood plateau, which holds {mass:.3g} of "
+            "the posterior in the final live points on it (dlogz and nlive do "
+            "not change that)"
+        )
 
     def resample_equal(self, key, n: int | None = None):
         """Return ``n`` equally weighted posterior samples (systematic resampling).
