@@ -462,7 +462,9 @@ def test_hop_warning_reads_the_recorded_history(two_mode_run) -> None:
         assert ("lumps" in hop[0]) == ("clusters per mode" in text), text
         assert ("was off" in hop[0]) == ("was off" in text), text
         assert ("accepted" in hop[0]) == ("accepted" in text), text
-    assert "the inter-mode hop accepted 0.1%" in hop[0]
+        # The acceptance is a whole-run figure, the others are not.
+        assert ("while two of them" in hop[0]) == ("accepted" not in text), text
+    assert hop[0].startswith("over the run the inter-mode hop accepted 0.1%")
 
 
 def test_hop_warning_ignores_the_stretch_after_the_other_modes_died() -> None:

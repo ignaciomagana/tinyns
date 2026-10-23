@@ -97,27 +97,35 @@ PURE_LABEL, SEPARATED_SHARE = 0.9, 0.5
 # separated and while two of them held live points, the clustering held
 # LUMPS_WARN clusters per mode or more on average over the posterior mass,
 # when a clustering had fewer than two eligible clusters for HOP_OFF_WARN of
-# that mass or more, or when the hop accepted less than HOP_ACCEPT_WARN of
-# its proposals. Measured on the targets of ``bench`` (nlive 200 to 2000, 330
-# runs, averages up to the end of the run): the needle (d >= 10) and Cauchy
-# targets held 1.54 to 3.7 clusters per mode and an 18-D posterior whose
-# modes have a funnel neck 2.5 to 3.6. On those three the hop cut the
-# run-to-run scatter of the minor mass in logit only 1.6 to 3 times
-# (needle_d18: 0.57 to 0.19), against 16 to 19 times on the plain targets
-# (0.37 to 0.019 at 18-D), and it accepted at least 0.19 of its proposals on
-# every target but the 18-D posterior (0.6 to 0.8%). Once one mode is left
-# the hop is off by necessity; averaged up to the end, that stretch fired
-# the warning on correct runs whose heaviest mode is also the tallest (hop
-# off for 0.47 to 0.68 of the mass: all 16 runs of a 4-D mixture of masses
-# 0.7 and 0.3 and widths 0.5 and 1, 13 of 16 of two 2-D Gaussians of masses
-# 0.8 and 0.2). Up to the death of the second-last mode (CPU, nlive 400 to
-# 1000, about 400 runs of two- and three-mode Gaussian mixtures in 2 to 18
-# dimensions, LogGamma and the needle and Cauchy targets), the mixtures and
-# LogGamma held at most 1.13 clusters per mode, against 2.0 to 3.6 for the
-# needle and 1.8 to 2.5 for Cauchy targets; the hop was off for at most 0.35
-# of the mass on the mixtures and LogGamma at nlive 1000, but for 0.5 to
-# 0.88 in 4 of 8 loggamma_d10 runs and 1 of 8 runs of a 10-D plain two-mode
-# target at nlive 500, and it accepted at least 0.2 of its proposals.
+# that mass or more, or when over the whole run the hop accepted less than
+# HOP_ACCEPT_WARN of its proposals. Measured on the targets of ``bench``
+# (nlive 200 to 2000, 330 runs, averages up to the end of the run): the
+# needle (d >= 10) and Cauchy targets held 1.54 to 3.7 clusters per mode and
+# an 18-D posterior whose modes have a funnel neck 2.5 to 3.6. On those
+# three the hop cut the run-to-run scatter of the minor mass in logit only
+# 1.6 to 3 times (needle_d18: 0.57 to 0.19), against 16 to 19 times on the
+# plain targets (0.37 to 0.019 at 18-D), and it accepted at least 0.19 of
+# its proposals on every target but the 18-D posterior (0.6 to 0.8%). Once
+# one mode is left the hop is off by necessity; averaged up to the end, that
+# stretch fired the warning on correct runs whose heaviest mode is also the
+# tallest (hop off for 0.47 to 0.68 of the mass: all 16 runs of a 4-D
+# mixture of masses 0.7 and 0.3 and widths 0.5 and 1, 13 of 16 of two 2-D
+# Gaussians of masses 0.8 and 0.2). Up to the death of the second-last mode
+# (CPU, nlive 400 to 1000, about 400 runs of two- and three-mode Gaussian
+# mixtures in 2 to 18 dimensions, LogGamma and the needle and Cauchy
+# targets), the mixtures and LogGamma held at most 1.13 clusters per mode,
+# against 2.0 to 3.6 for the needle and 1.8 to 2.5 for Cauchy targets; the
+# hop was off for at most 0.35 of the mass on the mixtures and LogGamma at
+# nlive 1000, but for 0.5 to 0.88 in 4 of 8 loggamma_d10 runs and 1 of 8
+# runs of a 10-D plain two-mode target at nlive 500, and it accepted at
+# least 0.2 of its proposals. A run that lost a mode, or the narrow core of
+# one, ends like a correct run with one mode alive, and the warning does not
+# flag it: up to the end of the run the hop was off for 0.51 to 0.61 of the
+# mass on 6 such runs (2 of 32 of a 4-D mixture of masses 0.6, 0.3 and 0.1
+# lost the 0.6 mode; 3 of 8 and 1 of 8 of a 4-D and a 6-D pair of masses 0.8
+# and 0.2, each mode a narrow core in a wide needle, lost most of the minor
+# core), against 0.38 to 0.84 on correct runs, so the old average flagged
+# them by accident.
 LUMPS_WARN, HOP_OFF_WARN, HOP_ACCEPT_WARN = 1.5, 0.5, 0.02
 # The nearest-neighbour search of modes() takes its distances in blocks of
 # about this many coordinate differences (float64: 32 MB, at any nlive).
@@ -1349,11 +1357,11 @@ class NestedSamplingResult:
         the clustering held at least ``LUMPS_WARN`` clusters per mode on
         average over the posterior mass (it cut modes into lumps, and the
         hop's ellipsoids cover such modes poorly), or the hop was off for at
-        least ``HOP_OFF_WARN`` of that mass, or it accepted less than
-        ``HOP_ACCEPT_WARN`` of its proposals. The warning names only the
-        causes that passed their threshold. The masses then scatter from run
-        to run more than where the hop works, and the spread of the folds'
-        masses measures by how much (``run_sd``)."""
+        least ``HOP_OFF_WARN`` of that mass, or, over the whole run, it
+        accepted less than ``HOP_ACCEPT_WARN`` of its proposals. The warning
+        names only the causes that passed their threshold. The masses then
+        scatter from run to run more than where the hop works, and the spread
+        of the folds' masses measures by how much (``run_sd``)."""
         if sum(mode["tracked"] for mode in modes) < 2:
             return []  # the warning about untracked modes says it
         start, stop = self._hop_window(modes)
@@ -1374,14 +1382,21 @@ class NestedSamplingResult:
                 "the inter-mode hop was off (fewer than two eligible clusters) "
                 f"for {100 * off:.0f}% of the posterior mass"
             )
-        if rare:
+        if parts:
+            parts[0] = (
+                "after the modes separated and while two of them held live "
+                "points, " + parts[0]
+            )
+        if rare:  # the acceptance is counted over the whole run
             hop = "it" if idle else "the inter-mode hop"
-            parts.append(f"{hop} accepted {100 * acceptance:.2g}% of its proposals")
+            parts.append(
+                f"over the run {hop} accepted {100 * acceptance:.2g}% of its "
+                "proposals"
+            )
         if not parts:
             return []
         text = (
-            "after the modes separated and while two of them held live points, "
-            + ", ".join(parts[:-1])
+            ", ".join(parts[:-1])
             + (", and " if len(parts) > 1 else "") + parts[-1]
             + ": the hop balanced the modes only in part, so their masses may "
             "scatter from run to run more than where it works"
