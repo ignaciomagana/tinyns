@@ -101,8 +101,16 @@ LUMPS_WARN, HOP_OFF_WARN, HOP_ACCEPT_WARN = 1.5, 0.5, 0.02
 # uniform, so the insertion test barely sees it, but on 5-D and 10-D
 # Gaussians (32 to 48 runs per walks) logZ scattered 1.2 to 2.9 times
 # logzerr at a fraction of 0.32 to 0.74; in 16-D it was 0.25 +- 0.09 too high
-# at 0.36 (walks 4) and 1.4 +- 0.2 at 0.58. At the default walks the fraction
-# was at most 0.07 on the targets of ``bench`` (the eggbox; nlive 500).
+# at 0.36 (walks 4) and 1.4 +- 0.2 at 0.58. It catches gross shortfalls only:
+# at 0.12 to 0.27 the scatter was 0.9 to 1.5 times logzerr (1.3 to 1.5,
+# +- 0.14 to 0.19, in 3 of 6 cases), and in 16-D logZ was 0.20 +- 0.10 high
+# at 0.15 (walks 8). At the default walks and nlive 500 the fraction was at
+# most 0.07 on the targets of ``bench`` (the eggbox). The eggbox at nlive 100
+# comes close (two sets of 32 runs): 0.25 and 0.28 on average, a warning in
+# 16% and 31% of the runs, and a scatter of 1.3 and 2.0 times logzerr (at
+# twice the walks: 0.20 unmoved, a scatter of 1.0 to 1.2). A lower threshold
+# would flag correct runs: at nlive 200 the eggbox averaged 0.19 with a
+# scatter of 0.95 and 1.1.
 UNMOVED_WARN = 0.3
 
 
@@ -1338,7 +1346,8 @@ class NestedSamplingResult:
         of each mode, and when the slots were full in a run of several modes.
         Another warns when ``UNMOVED_WARN`` of the replacement chains or more
         did not move (``metadata["unmoved_fraction"]``): ``walks`` is too
-        short.
+        short. It catches gross shortfalls only; rerunning with twice the
+        walks remains the check.
         """
 
         metadata = {} if self.metadata is None else self.metadata
