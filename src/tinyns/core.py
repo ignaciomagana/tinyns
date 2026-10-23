@@ -79,6 +79,9 @@ _MAX_SCALE = 10.0
 _CHUNK_EFOLDS = 4.0
 _CHUNK_SECONDS = 45.0
 _CHECKPOINT_SECONDS = 600.0
+# On resume, the live points of highest likelihood of each lane that are
+# evaluated again (:func:`_check_resume`).
+_RESUME_CHECKS = 16
 _INT32_MAX = 2**31 - 1
 # The frames a chain looks up at every step when no clustering has more in use
 # (kernel 1 of :func:`_kernel_level`).
@@ -1037,6 +1040,27 @@ def _init_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
 
 
 @_kernel_cache
+def _logl_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
+    """Jitted ``loglike(prior_transform(u))`` of the rows of ``u``, ``(n, d)``,
+    in batches of ``num_delete`` like :func:`_init`; ``axes`` (a batched run;
+    see :func:`_init_kernel`) vmaps it over a leading lane axis of ``u``."""
+
+    def lane(u, leaves):
+        loglike, prior_transform = _rebuild(loglike_spec, prior_spec, leaves)
+        return lax.map(
+            lambda v: _loglike_u(loglike, prior_transform, v, u.dtype), u,
+            batch_size=min(cfg.num_delete, u.shape[0]),
+        )
+
+    def kernel(u, *leaves):
+        if axes is None:
+            return lane(u, leaves)
+        return jax.vmap(lane, in_axes=(0, axes))(u, leaves)
+
+    return jax.jit(kernel)
+
+
+@_kernel_cache
 def _step_kernel(loglike_spec, prior_spec, cfg: Config):
     def kernel(state, *leaves):
         state = _maybe_recluster(state, cfg)
@@ -1389,6 +1413,46 @@ def _lane_callable(fn, lane: int):
     )
 
 
+def _check_resume(path, state: State, cfg: Config, kernel, leaves) -> None:
+    """Raise ``ValueError`` unless ``loglike(prior_transform(u))`` gives back
+    the stored likelihoods of the ``_RESUME_CHECKS`` live points of highest
+    likelihood of every lane of a checkpoint, each lane with its own data.
+
+    The callables are not stored in a checkpoint: this refuses one written
+    for another likelihood, prior or dataset, which would otherwise be
+    resumed (a finished one returned as it is). ``kernel`` is the run's
+    :func:`_logl_kernel`. It compiles apart from the run's kernels, so the
+    values may differ in the last bits: they match to a relative
+    ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``.
+    """
+    n = min(_RESUME_CHECKS, cfg.nlive)
+    if n == 0:
+        return
+    batched = state.u.ndim == 3
+    u, logl = np.asarray(state.u), np.asarray(state.logl)
+    if not batched:  # one lane: give it a lane axis
+        u, logl = u[None], logl[None]
+    top = np.argsort(-logl, axis=1, kind="stable")[:, :n]
+    u = np.take_along_axis(u, top[..., None], axis=1)
+    old = np.take_along_axis(logl, top, axis=1).astype(np.float64)
+    new = kernel(jnp.asarray(u if batched else u[0]), *leaves)
+    new = np.asarray(new, np.float64).reshape(old.shape)
+    tol = math.sqrt(np.finfo(state.u.dtype).eps) * (1.0 + np.abs(old))
+    with np.errstate(invalid="ignore"):  # inf - inf
+        bad = ~((new == old) | (np.abs(new - old) <= tol))
+    if np.any(bad):
+        lane, i = np.argwhere(bad)[0]
+        where = f" (lane {lane})" if batched else ""
+        raise ValueError(
+            f"{path}: this loglike and prior_transform do not give back the "
+            f"likelihoods of the checkpoint's live points{where}: "
+            f"{float(new[lane, i])!r} against {float(old[lane, i])!r} stored, at "
+            f"{int(bad[lane].sum())} of the {n} points checked. A checkpoint "
+            "of another likelihood, prior or dataset is not resumed: use one "
+            "checkpoint path per problem"
+        )
+
+
 def _dead_template(cfg: Config, dtype) -> Dead:
     """The rows of one step as zeros."""
     k, d = cfg.num_delete, cfg.ndim
@@ -1433,13 +1497,17 @@ def run(
     ``progress``, prints one line per chunk.
 
     ``checkpoint`` is a path: if the file exists the run resumes from it
-    (refusing a different config, x64 flag, float dtype, key or batch), and
-    the run writes it atomically at a chunk boundary at most every
-    ``_CHECKPOINT_SECONDS`` and at the end. A resumed run is bit-identical to
-    an uninterrupted one: each step splits ``state.key``, so the random stream
-    depends on the step count only, never on where the chunks end. A status of
-    ``converged``, ``maxiter`` or ``maxcall`` in the checkpoint is re-tested
-    against this call's limits, so a run stopped by ``maxiter`` continues.
+    (refusing a different config, x64 flag, float dtype, key or batch, and
+    live points whose likelihoods ``loglike`` and ``prior_transform`` do not
+    give back: :func:`_check_resume`), and the run writes it atomically at a
+    chunk boundary at most every ``_CHECKPOINT_SECONDS`` and at the end. A
+    path that cannot be written raises ``OSError`` before anything compiles.
+    A resumed run is bit-identical to an uninterrupted one on the same JAX
+    build and device (a checkpoint of another warns): each step splits
+    ``state.key``, so the random stream depends on the step count only, never
+    on where the chunks end. A status of ``converged``, ``maxiter`` or
+    ``maxcall`` in the checkpoint is re-tested against this call's limits, so
+    a run stopped by ``maxiter`` continues.
 
     A batch of keys (a leading axis of ``B``) runs ``B`` independent runs in
     one compiled program and returns a list of ``B`` results. With
@@ -1491,6 +1559,10 @@ def run(
             batch=batch,
             batched_data=batched_data,
             key=key,
+        )
+        _check_resume(
+            checkpoint, ckpt.state, cfg,
+            _logl_kernel(ll_spec, pt_spec, cfg, axes), leaves,
         )
         state = ckpt.state
         status = np.asarray(state.status)

@@ -1,5 +1,6 @@
-"""Checkpoint guards: the path is checked before the run, the JAX build is
-recorded and a change warns, the file keeps its mode, and odd inputs fail
+"""Checkpoint guards: a checkpoint of another problem is refused (its live
+points are evaluated again), the path is checked before the run, the JAX build
+is recorded and a change warns, the file keeps its mode, and odd inputs fail
 early instead of at the last save."""
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.tree_util import Partial
 
 from tinyns import Config, NestedSampler, core
 
@@ -24,6 +26,74 @@ def gauss(x):
 
 def identity(u):
     return u
+
+
+def loglike_data(data, theta):
+    return -0.5 * jnp.sum((data - theta[0]) ** 2)
+
+
+def prior(u):
+    return -5.0 + 10.0 * u
+
+
+def test_a_finished_checkpoint_of_other_data_is_refused(tmp_path) -> None:
+    """A loop over datasets that reuses one path and key got the first
+    dataset's result for every dataset."""
+    path = tmp_path / "run.npz"
+    first = NestedSampler(Partial(loglike_data, jnp.full((20,), -2.0)), prior, 1, 100)
+    done = first.run(0, checkpoint=path)
+    other = NestedSampler(Partial(loglike_data, jnp.zeros(20)), prior, 1, 100)
+    with pytest.raises(ValueError, match="use one checkpoint path per problem"):
+        other.run(0, checkpoint=path)
+    again = first.run(0, checkpoint=path)  # the same problem comes back
+    assert again.metadata["resumed"] and again.logz == done.logz
+
+
+@pytest.mark.parametrize("change", ["loglike", "prior"])
+def test_an_unfinished_checkpoint_of_another_model_is_refused(tmp_path,
+                                                              change) -> None:
+    path = tmp_path / "run.npz"
+    NestedSampler(gauss, identity, 2, 50, num_delete=5).run(
+        0, maxiter=100, checkpoint=path
+    )
+    loglike = (lambda x: gauss(x) / 4.0) if change == "loglike" else gauss
+    prior_transform = (lambda u: 0.9 * u) if change == "prior" else identity
+    sampler = NestedSampler(loglike, prior_transform, 2, 50, num_delete=5)
+    with pytest.raises(ValueError, match="do not give back the likelihoods"):
+        sampler.run(0, checkpoint=path)
+
+
+def test_a_batched_checkpoint_is_checked_lane_by_lane(tmp_path) -> None:
+    path = tmp_path / "run.npz"
+    data = jnp.stack([jnp.full((20,), mean) for mean in (-2.0, 0.0, 2.0)])
+    keys = jax.random.split(jax.random.key(1), 3)
+    sampler = NestedSampler(Partial(loglike_data, data), prior, 1, 50, num_delete=5)
+    sampler.run(keys, batched_data=True, maxiter=100, checkpoint=path)
+    changed = NestedSampler(
+        Partial(loglike_data, data.at[2].add(0.5)), prior, 1, 50, num_delete=5
+    )
+    with pytest.raises(ValueError, match=r"live points \(lane 2\)"):
+        changed.run(keys, batched_data=True, checkpoint=path)
+    results = sampler.run(keys, batched_data=True, checkpoint=path)
+    assert all(result.metadata["resumed"] for result in results)
+
+
+def test_a_likelihood_equal_up_to_roundoff_resumes(tmp_path) -> None:
+    """The live points are evaluated by a kernel compiled apart from the run's,
+    which may differ in the last bits: a few ulps are not a mismatch."""
+    path = tmp_path / "run.npz"
+    NestedSampler(gauss, identity, 2, 50, num_delete=5).run(
+        0, maxiter=100, checkpoint=path
+    )
+
+    def same(x):
+        z = (x - 0.5) / 0.1
+        return -0.5 * jnp.dot(z, z) * (1.0 + 4.0 * jnp.finfo(z.dtype).eps)
+
+    result = NestedSampler(same, identity, 2, 50, num_delete=5).run(
+        0, checkpoint=path
+    )
+    assert result.metadata["resumed"]
 
 
 def test_an_unwritable_checkpoint_path_fails_before_the_run(tmp_path) -> None:
