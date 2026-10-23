@@ -3,7 +3,9 @@ name: CI
 on:
   push:
   pull_request:
-  # Weekly, so a new JAX release is tested before a user meets it.
+  # Weekly, so a new JAX release is tested before a user meets it. GitHub
+  # disables this schedule after 60 days without activity in the repository
+  # (a push): if Actions shows CI as disabled, enable it there again.
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:

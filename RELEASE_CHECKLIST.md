@@ -29,6 +29,9 @@ get uploaded, and the tag goes on last.
 - [ ] CI is green on the release commit, every job: the newest Python on
       unpinned JAX and the `wheel` job too. If a JAX release came out after the
       last run, rerun it (Actions, CI, "Run workflow")
+- [ ] the weekly CI run is still on: GitHub disables a public repository's
+      scheduled workflows after 60 days without activity. If Actions shows CI
+      as disabled, enable it ("Enable workflow", or `gh workflow enable CI`)
 
 `bench/README.md` describes the gate's cases and criteria. A failed case is a
 3-sigma event under a correct sampler about once in a hundred cases: rerun it
