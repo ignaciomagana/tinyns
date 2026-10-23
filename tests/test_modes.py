@@ -98,16 +98,36 @@ def test_unimodal_run_reports_one_mode() -> None:
             "urn_sd": 0.0,
             "fold_mass": [1.0, 1.0, 1.0],
             "fold_sd": 0.0,
+            "run_sd": 0.0,
             "min_live": 100,
             "isolation_iteration": 0,
+            "extinction_iteration": result.niter,
             "unresolved": False,
             "tracked": True,
         }
     ]
-    assert "logit sd" not in result.summary()
+    assert "run sd" not in result.summary() and "warning" not in result.summary()
     diagnostics = result.diagnostics()
     assert diagnostics["mode_slots_full"] == 0.0
     assert not any("mode" in w for w in diagnostics["warnings"])
+
+
+def test_a_single_mode_below_five_points_per_dimension_is_unresolved() -> None:
+    """One mode with fewer than ``5 ndim`` live points is flagged like any
+    other (32-D Gaussian: logZ 16 to 19 nats high at nlive 20, 9 at 40 and
+    about 1 at 64, against a logzerr of 0.5 to 0.9, with no flag before)."""
+
+    def gauss4(theta):
+        return -0.5 * jnp.sum(((theta - 0.5) / 0.1) ** 2)
+
+    result = NestedSampler(gauss4, lambda u: u, 4, nlive=12).run(0)
+    (mode,) = result.modes()
+    assert mode["unresolved"] and mode["min_live"] == 12
+    warned = [w for w in result.diagnostics()["warnings"] if "unresolved" in w]
+    assert len(warned) == 1 and "fewer than the 20 (5 * ndim)" in warned[0]
+    assert "warning: mode 0 (mass 1) is unresolved" in result.summary()
+    built = dataclasses.replace(result, labels=None)  # a result built by hand
+    assert built.modes()[0]["unresolved"]
 
 
 @pytest.fixture(scope="module")
@@ -328,6 +348,48 @@ def test_folds_measure_the_scatter_of_the_mode_masses(two_mode_run) -> None:
     assert "fold sd" in result.summary()
 
 
+def test_run_sd_adds_the_prior_volume_error_the_folds_share(two_mode_run) -> None:
+    """Every fold weighs its samples with the run's prior volumes, so
+    ``fold_sd`` misses their error, which moves every fold's mass together:
+    ``run_sd`` adds it, propagated to first order from the shrinkage of each
+    death. Here that term matches the scatter of the mass over redraws of
+    the log shrinkages (exponential, of mean and sd ``1 / n_i``)."""
+    result = two_mode_run
+    folds = result.metadata["folds"]
+    minor = np.asarray(result.samples)[:, 0] > 0.55
+    n = np.asarray(result.nlive_i, dtype=float)
+    rng = np.random.default_rng(0)
+    error = 1.0 / n - rng.exponential(1.0 / n, (400, len(n)))
+    error = np.concatenate([np.zeros((400, 1)), np.cumsum(error, axis=1)[:, :-1]], 1)
+    weights = np.asarray(result.weights(), dtype=float) * np.exp(error)
+    mass = weights[:, minor].sum(axis=1) / weights.sum(axis=1)
+    redrawn = np.std(np.log(mass / (1 - mass)), ddof=1)
+    modes = result.modes()
+    for mode in modes:
+        volume = math.sqrt(mode["run_sd"] ** 2 - mode["fold_sd"] ** 2 / folds)
+        assert volume == pytest.approx(redrawn, rel=0.15)
+    assert modes[0]["run_sd"] == pytest.approx(modes[1]["run_sd"])
+    assert modes[1]["run_sd"] > modes[1]["fold_sd"] / math.sqrt(folds)
+
+
+def test_summary_table_names_its_three_scatters(two_mode_run) -> None:
+    """``urn_sd`` is the scatter without the hop, not of this run: the table
+    prints it as ``sd w/o hop``, next to ``run sd`` and ``fold sd``."""
+    text = two_mode_run.summary()
+    header = "mode      mass    run sd   fold sd  sd w/o hop  min live"
+    assert header in text and "logit sd" not in text
+    mode = two_mode_run.modes()[1]
+    row = text.split(header)[1].splitlines()[2].split()
+    assert row == [
+        "1",
+        f"{mode['mass']:.4f}",
+        f"{mode['run_sd']:.2f}",
+        f"{mode['fold_sd']:.2f}",
+        f"{mode['urn_sd']:.2f}",
+        str(mode["min_live"]),
+    ]
+
+
 def test_modes_are_worked_out_once(two_mode_run, monkeypatch) -> None:
     """``modes()``, ``diagnostics()`` and ``summary()`` share one pass over
     the samples; each caller gets its own copy."""
@@ -396,6 +458,51 @@ def test_hop_warning_reads_the_recorded_history(two_mode_run) -> None:
         hop = [w for w in warned["warnings"] if "only in part" in w]
         assert len(hop) == 1 and text in hop[0], text
         assert "cross-fitted folds gave mode 1 the masses" in hop[0]
+        # Only the causes that passed their thresholds are named.
+        assert ("lumps" in hop[0]) == ("clusters per mode" in text), text
+        assert ("was off" in hop[0]) == ("was off" in text), text
+        assert ("accepted" in hop[0]) == ("accepted" in text), text
+    assert "the inter-mode hop accepted 0.1%" in hop[0]
+
+
+def test_hop_warning_ignores_the_stretch_after_the_other_modes_died() -> None:
+    """Once one mode is left, the hop is off by necessity. Where the heaviest
+    mode is also the tallest, that stretch holds most of the posterior mass,
+    and averaging over it fired the warning on correct runs (16 of 16 runs of
+    this target at nlive 1000, whose masses were right; none now): the
+    averages end where the second-last mode dies out."""
+    from tinyns import result as result_module
+
+    def heavy_and_tall(theta):
+        x = -10.0 + 20.0 * theta
+        r2 = jnp.stack([
+            jnp.sum((x - jnp.array([-5.0, 0, 0, 0])) ** 2) / 0.25,
+            jnp.sum((x - jnp.array([5.0, 0, 0, 0])) ** 2),
+        ])
+        norm = jnp.log(jnp.array([0.7, 0.3])) - 4 * jnp.log(jnp.array([0.5, 1.0]))
+        return jax.scipy.special.logsumexp(norm - 0.5 * r2)
+
+    result = NestedSampler(heavy_and_tall, lambda u: u, 4, nlive=500).run(0)
+    diagnostics = result.diagnostics()
+    assert diagnostics["mode_hop_off"] < 0.2
+    assert not any("only in part" in w for w in diagnostics["warnings"])
+    modes = result.modes()
+    assert len(modes) == 2 and all(m["tracked"] for m in modes)
+    assert modes[1]["mass"] == pytest.approx(0.3, abs=0.03)
+    heavy, light = modes
+    # The heavy mode holds the last live points; the light one died before.
+    assert heavy["extinction_iteration"] == result.niter
+    assert light["extinction_iteration"] < result.niter
+    in_light = np.asarray(result.samples_u)[:, 0] > 0.5
+    died = light["extinction_iteration"]
+    assert np.any(result._alive(died - 1) & in_light)
+    assert not np.any(result._alive(died) & in_light)
+    start = min(m["isolation_iteration"] for m in modes)
+    assert result._hop_window(modes) == (start, light["extinction_iteration"])
+    # From isolation to the end the hop was off for most of the mass, but
+    # not while both modes held live points.
+    off_to_end = result._hop_off(start, int(result.niter))
+    assert off_to_end >= result_module.HOP_OFF_WARN
 
 
 def test_tracked_when_the_clustering_separated_the_modes(two_mode_run) -> None:
@@ -517,6 +624,7 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
                 acceptance is not None and acceptance < result_module.HOP_ACCEPT_WARN
             )
             assert off or not warned
+            assert not any("lumps" in w for w in warned)
 
 
 @pytest.mark.slow

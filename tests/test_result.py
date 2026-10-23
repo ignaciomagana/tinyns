@@ -167,7 +167,9 @@ def test_str_is_the_summary() -> None:
 
     assert str(result) == result.summary()
     assert "niter: 2" in str(result)
-    assert "mode" not in str(result)  # the table only for several modes
+    assert "run sd" not in str(result)  # the table only for several modes
+    # Two live points in 2-D: the one mode is unresolved, and summary() says so.
+    assert "warning: mode 0 (mass 1) is unresolved" in str(result)
 
 
 def test_information_is_finite_and_non_negative() -> None:

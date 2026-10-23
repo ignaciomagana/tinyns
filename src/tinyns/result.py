@@ -94,20 +94,30 @@ SADDLE_BINS = 16
 # least PURE_LABEL of their own mass in that mode.
 PURE_LABEL, SEPARATED_SHARE = 0.9, 0.5
 # The hop balanced the modes only in part (a warning) when, after they
-# separated, the clustering held LUMPS_WARN clusters per mode or more on
-# average over the posterior mass, when a clustering had fewer than two
-# eligible clusters for HOP_OFF_WARN of that mass or more, or when the hop
-# accepted less than HOP_ACCEPT_WARN of its proposals. Measured on the
-# targets of ``bench`` (nlive 200 to 2000, 330 runs): the Gaussian mixtures,
-# LogGamma and the plain two-mode targets held at most 1.29 clusters per
-# mode (1.11 above nlive 200), against 1.54 to 3.7 for the needle (d >= 10)
-# and Cauchy targets and 2.5 to 3.6 for an 18-D posterior whose modes have
-# a funnel neck. On those three the hop cut the run-to-run scatter of the
-# minor mass in logit only 1.6 to 3 times (needle_d18: 0.57 to 0.19), against
-# 16 to 19 times on the plain targets (0.37 to 0.019 at 18-D). The hop was
-# off for at most 0.30 of the mass where it balanced the modes, but for 0.55
-# and 0.82 in 2 of 8 LogGamma runs, and it accepted at least 0.19 of its
-# proposals on every target but the 18-D posterior (0.6 to 0.8%).
+# separated and while two of them held live points, the clustering held
+# LUMPS_WARN clusters per mode or more on average over the posterior mass,
+# when a clustering had fewer than two eligible clusters for HOP_OFF_WARN of
+# that mass or more, or when the hop accepted less than HOP_ACCEPT_WARN of
+# its proposals. Measured on the targets of ``bench`` (nlive 200 to 2000, 330
+# runs, averages up to the end of the run): the needle (d >= 10) and Cauchy
+# targets held 1.54 to 3.7 clusters per mode and an 18-D posterior whose
+# modes have a funnel neck 2.5 to 3.6. On those three the hop cut the
+# run-to-run scatter of the minor mass in logit only 1.6 to 3 times
+# (needle_d18: 0.57 to 0.19), against 16 to 19 times on the plain targets
+# (0.37 to 0.019 at 18-D), and it accepted at least 0.19 of its proposals on
+# every target but the 18-D posterior (0.6 to 0.8%). Once one mode is left
+# the hop is off by necessity; averaged up to the end, that stretch fired
+# the warning on correct runs whose heaviest mode is also the tallest (hop
+# off for 0.47 to 0.68 of the mass: all 16 runs of a 4-D mixture of masses
+# 0.7 and 0.3 and widths 0.5 and 1, 13 of 16 of two 2-D Gaussians of masses
+# 0.8 and 0.2). Up to the death of the second-last mode (CPU, nlive 400 to
+# 1000, about 400 runs of two- and three-mode Gaussian mixtures in 2 to 18
+# dimensions, LogGamma and the needle and Cauchy targets), the mixtures and
+# LogGamma held at most 1.13 clusters per mode, against 2.0 to 3.6 for the
+# needle and 1.8 to 2.5 for Cauchy targets; the hop was off for at most 0.35
+# of the mass on the mixtures and LogGamma at nlive 1000, but for 0.5 to
+# 0.88 in 4 of 8 loggamma_d10 runs and 1 of 8 runs of a 10-D plain two-mode
+# target at nlive 500, and it accepted at least 0.2 of its proposals.
 LUMPS_WARN, HOP_OFF_WARN, HOP_ACCEPT_WARN = 1.5, 0.5, 0.02
 # The nearest-neighbour search of modes() takes its distances in blocks of
 # about this many coordinate differences (float64: 32 MB, at any nlive).
@@ -687,7 +697,7 @@ class NestedSamplingResult:
         return out
 
     def modes(self) -> list[dict[str, Any]]:
-        """Return the posterior modes, heaviest first, with their urn error bar.
+        """Return the posterior modes, heaviest first, with their mass scatter.
 
         Post-processing of the run's samples: it reads the cluster labels the
         run recorded (:attr:`labels`: the id of each sample's cluster when it
@@ -760,7 +770,9 @@ class NestedSamplingResult:
         median and ``2 g / (N^2 (1 - g))`` up to the rest's, with ``g = n /
         N``. The hop removes most of that drift (about 7x less scatter in the
         v1 bake-off), so ``urn_sd`` is an upper bound for a mode the sampler
-        tracked.
+        tracked. It treats the rest as one urn, which holds for two modes or
+        modes of one shape: without the hop, three modes of different widths
+        in 2 to 4 dimensions scattered 1.5 to 4 times more than ``urn_sd``.
 
         The live slots form ``metadata["folds"]`` cross-fitted folds, and a
         point and all its descendants stay in one fold, so each fold samples
@@ -771,30 +783,55 @@ class NestedSamplingResult:
         (``fold_sd`` 0.04 to 0.1 on the Gaussian mixtures of ``bench``);
         where it does not, each fold drifts on its own (0.4 on the 18-D
         needle target, 1 to 1.6 on an 18-D posterior whose modes have a
-        funnel neck). The run's mass, their average, then scatters from run
-        to run by about ``fold_sd / sqrt(folds)`` (within a factor of 2 on
-        those targets).
+        funnel neck). Every fold weighs its samples with the run's prior
+        volumes, so ``fold_sd`` misses their error, which moves the masses of
+        all folds together (:meth:`_volume_variance`): it vanishes for modes
+        of one height and grows with the prior volume between the bulk of the
+        mode and that of the rest, as when the heaviest mode is also the
+        narrowest. ``run_sd = sqrt(fold_sd^2 / folds + V)``, with ``V`` that
+        error's variance, is the run-to-run scatter of the mass in logit,
+        measured within the run. On a 4-D mixture of masses 0.75, 0.2 and
+        0.05 and widths 0.25, 0.5 and 0.75 (16 runs at nlive 1000) the masses
+        scattered by 0.056, 0.053 and 0.079, against a median ``run_sd`` of
+        0.053, 0.046 and 0.065 and ``fold_sd / sqrt(3)`` of 0.015, 0.012 and
+        0.027; for modes of one height ``run_sd`` is ``fold_sd / sqrt(3)``.
+        Three folds give two degrees of freedom, so one run's value is good
+        to a factor of about 2.
 
         Per mode: ``mass``, ``urn_sd``, ``fold_mass``, ``fold_sd``,
-        ``isolation_iteration``, ``min_live`` (the smallest ``n`` between
-        isolation and the mode's median), ``unresolved`` (``min_live`` below
+        ``run_sd`` (``None`` without folds), ``min_live`` (the smallest ``n``
+        between isolation and the mode's median), ``isolation_iteration``,
+        ``extinction_iteration`` (the first iteration from which the mode
+        holds no live point; ``niter`` for a mode that holds some of the
+        final live points), ``unresolved`` (``min_live`` below
         ``UNRESOLVED_PER_DIM * ndim``: the mass is not reliable, raise
         ``nlive``) and ``tracked``: False for a mode that the sampler's
         clustering did not separate from its neighbours, that is, one that
         pass 4 cut out of a larger one while less than ``SEPARATED_SHARE`` of
         its mass carries labels that put ``PURE_LABEL`` of their own mass in
-        it. The hop did not balance such a mode, its mass scatters by about
-        ``urn_sd``, and the count of such modes is a lower bound (modes with
-        fewer than ``SLAB_NEIGHBOURS`` live points, or that no axis-aligned
-        plane separates, stay merged). :meth:`diagnostics` also reports for
-        how much of the run the clustering's slots were full
+        it. The hop did not balance such a mode, its mass scatters as
+        without the hop (``run_sd`` measures by how much: each fold drifts
+        on its own), and the count of such modes is a lower bound (modes
+        with fewer than ``SLAB_NEIGHBOURS`` live points, or that no
+        axis-aligned plane separates, stay merged). :meth:`diagnostics` also
+        reports for how much of the run the clustering's slots were full
         (``mode_slots_full``: no further mode could be split off then) and
-        for how much of the posterior mass the hop was off
-        (``mode_hop_off``). A mode lost before the end leaves no trace in its
-        own run, and neither does one that never held more than about
-        ``ndim`` live points per fold. A unimodal run (or a result without
-        :attr:`labels`) gives one mode of mass 1. The modes are worked out
-        once per result; each call returns a copy.
+        for how much of the posterior mass the hop was off while two modes
+        held live points (``mode_hop_off``). A mode lost before the end
+        leaves no trace in its own run, and neither does one that never held
+        more than about ``ndim`` live points per fold. A unimodal run (or a
+        result without :attr:`labels`) gives one mode of mass 1, flagged
+        ``unresolved`` if ``nlive`` is below ``UNRESOLVED_PER_DIM * ndim``:
+        too few live points for a covariance-adapted walk to learn the shape
+        of a mode (a near-Gaussian one can do with fewer: on a 32-D Gaussian
+        logZ was 9 nats high at nlive 40, 1 at 64 and right at 100).
+        ``metadata["mode_tree"]`` holds the parents of the first
+        ``TREE_SIZE - 1`` cluster ids of each clustering
+        (:data:`tinyns.modes.TREE_SIZE`), and ``metadata["mode_tree_dropped"]``
+        counts the clusters made past them, whose parents are not recorded:
+        pass 2 cannot tell that the clusters they were split from held
+        several modes. The modes are worked out once per result; each call
+        returns a copy.
         """
 
         return copy.deepcopy(self._mode_list)
@@ -804,12 +841,16 @@ class NestedSamplingResult:
         """:meth:`modes`, worked out once per result."""
         fold = self._sample_folds()
         folds = None if fold is None else int(fold.max()) + 1
+        nlive, niter = int(self.nlive), int(self.niter)
         one = [{"mass": 1.0, "urn_sd": 0.0,
                 "fold_mass": None if folds is None else [1.0] * folds,
                 "fold_sd": None if folds is None else 0.0,
-                "min_live": int(self.nlive), "isolation_iteration": 0,
-                "unresolved": False, "tracked": True}]
-        if int(self.niter) == 0 or self.labels is None:
+                "run_sd": None if folds is None else 0.0,
+                "min_live": nlive, "isolation_iteration": 0,
+                "extinction_iteration": niter,
+                "unresolved": bool(nlive < UNRESOLVED_PER_DIM * int(self.ndim)),
+                "tracked": True}]
+        if niter == 0 or self.labels is None:
             return one
         try:
             return self._modes(one)
@@ -926,13 +967,20 @@ class NestedSamplingResult:
             )
             min_live = int(n[lo : max(stop, lo + 1)].min())
             fold_mass, fold_sd = self._fold_spread(mine)
+            run_sd = None
+            if fold_sd is not None:
+                volume = self._volume_variance(mine)
+                run_sd = math.sqrt(fold_sd**2 / len(fold_mass) + volume)
+            living = np.flatnonzero(n > 0)
             out.append({
                 "mass": float(weights[mine].sum() / cumulative[-1]),
                 "urn_sd": float(math.sqrt(variance)),
                 "fold_mass": fold_mass,
                 "fold_sd": fold_sd,
+                "run_sd": run_sd,
                 "min_live": min_live,
                 "isolation_iteration": int(lo),
+                "extinction_iteration": int(living[-1]) + 1 if len(living) else 0,
                 "unresolved": bool(min_live < UNRESOLVED_PER_DIM * ndim),
                 "tracked": tracked[c],
             })
@@ -978,6 +1026,23 @@ class NestedSamplingResult:
         half = 0.5 * folds / int(self.nlive)
         g = np.clip(mass, half, 1.0 - half)
         return mass.tolist(), float(np.std(np.log(g / (1.0 - g)), ddof=1))
+
+    def _volume_variance(self, mine) -> float:
+        """The variance of the logit of the mass of the samples ``mine`` from
+        the prior volumes, which every fold shares (first order in the
+        ``Beta(n_i, 1)`` shrinkages of :meth:`logz_bootstrap`). An error ``e``
+        in the log shrinkage of death ``i`` scales the weights of every later
+        sample by ``exp(e)``, which moves the logit by ``e (F_rest - F)``,
+        with ``F`` and ``F_rest`` the shares of the mass of the mode and of
+        the rest in the samples up to ``i``; ``e`` has variance ``1 /
+        n_i^2``. It vanishes where the mode and the rest die together (modes
+        of one height) and grows with the prior volume between their bulks.
+        The widths of single samples are left out: their scatter is that of
+        the posterior samples, which the folds measure."""
+        weights = self._weights
+        mode, rest = np.cumsum(weights * mine), np.cumsum(weights * ~mine)
+        gap = rest / max(rest[-1], 1e-300) - mode / max(mode[-1], 1e-300)
+        return float(np.sum((gap / np.asarray(self.nlive_i, dtype=float)) ** 2))
 
     def _merge_labels(self, label, ids, u, median, alive):
         """Passes 2 and 3 of :meth:`modes`: the mode of every sample (-1:
@@ -1184,33 +1249,50 @@ class NestedSamplingResult:
         )
         return max(int(row[1]) for row in history), full / int(self.niter)
 
-    def _history_mean(self, start: int, value) -> float | None:
+    def _history_mean(self, start: int, stop: int, value) -> float | None:
         """The posterior-weighted mean of ``value(clusters, eligible)`` over
-        the dead points from iteration ``start`` on, from the record of the
-        step at which each died (``metadata["mode_history"]``: the most
-        clusters and the fewest eligible ones of a clustering); ``None``
-        without that record."""
+        the dead points of iterations ``start`` to ``stop - 1``, from the
+        record of the step at which each died (``metadata["mode_history"]``:
+        the most clusters and the fewest eligible ones of a clustering);
+        ``None`` without that record."""
         history = (self.metadata or {}).get("mode_history")
         niter = int(self.niter)
         if not history or niter == 0:
             return None
         start = min(max(int(start), 0), niter - 1)
+        stop = min(max(int(stop), start + 1), niter)
         starts = [int(row[0]) for row in history]
         at = np.maximum(np.searchsorted(starts, np.arange(niter), side="right") - 1, 0)
         values = np.array([float(value(int(row[1]), int(row[2]))) for row in history])
-        weights = self._weights[start:niter]
-        return float(weights @ values[at][start:] / max(weights.sum(), 1e-300))
+        weights = self._weights[start:stop]
+        return float(weights @ values[at][start:stop] / max(weights.sum(), 1e-300))
 
-    def _hop_off(self, start: int = 0) -> float | None:
-        """The fraction of the posterior mass from iteration ``start`` on
-        during which a clustering had fewer than two eligible clusters, so
-        that the hop was off in its fold."""
-        return self._history_mean(start, lambda clusters, eligible: eligible < 2)
+    def _hop_window(self, modes) -> tuple[int, int]:
+        """The iterations ``[start, stop)`` during which the hop had modes to
+        balance: from the first isolation of one of ``modes`` to the last
+        iteration at which two tracked modes (two modes, if fewer are
+        tracked) still held live points. After that, one mode is left and
+        the hop is off by necessity; where the heaviest mode is also the
+        tallest, that stretch holds most of the posterior mass."""
+        start = min(mode["isolation_iteration"] for mode in modes)
+        ends = [mode["extinction_iteration"] for mode in modes if mode["tracked"]]
+        if len(ends) < 2:
+            ends = [mode["extinction_iteration"] for mode in modes]
+        stop = sorted(ends)[-2] if len(ends) > 1 else int(self.niter)
+        return start, stop
 
-    def _lumps(self, start: int, nmodes: int) -> float | None:
+    def _hop_off(self, start: int, stop: int) -> float | None:
+        """The fraction of the posterior mass of iterations ``start`` to
+        ``stop - 1`` during which a clustering had fewer than two eligible
+        clusters, so that the hop was off in its fold."""
+        return self._history_mean(start, stop, lambda clusters, eligible: eligible < 2)
+
+    def _lumps(self, start: int, stop: int, nmodes: int) -> float | None:
         """The posterior-weighted mean number of clusters per mode, of the
-        clustering with the most, from iteration ``start`` on."""
-        return self._history_mean(start, lambda clusters, eligible: clusters / nmodes)
+        clustering with the most, over iterations ``start`` to ``stop - 1``."""
+        return self._history_mean(
+            start, stop, lambda clusters, eligible: clusters / nmodes
+        )
 
     def _mode_warnings(self, modes) -> list[str]:
         """The warnings of :meth:`diagnostics` about ``modes``."""
@@ -1218,8 +1300,17 @@ class NestedSamplingResult:
             f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
             f"{mode['min_live']} live points; raise nlive"
             for i, mode in enumerate(modes)
-            if mode["unresolved"]
+            if mode["unresolved"] and len(modes) > 1
         ]
+        if len(modes) == 1 and modes[0]["unresolved"]:
+            least = math.ceil(UNRESOLVED_PER_DIM * int(self.ndim))
+            warnings.append(
+                f"mode 0 (mass 1) is unresolved: the run held {modes[0]['min_live']} "
+                f"live points, fewer than the {least} ({UNRESOLVED_PER_DIM:g} * "
+                "ndim) a covariance-adapted walk may need to learn the shape of "
+                "a mode, and logZ may be biased beyond logzerr (a near-Gaussian "
+                "mode can do with fewer); raise nlive"
+            )
         most, full = self._mode_slots()
         loose = sum(not mode["tracked"] for mode in modes)
         if loose:
@@ -1227,8 +1318,9 @@ class NestedSamplingResult:
             warnings.append(
                 f"{loose} of the {len(modes)} modes were not separated by the "
                 f"sampler's clustering{held}: the inter-mode hop did not balance "
-                "them, so their masses scatter from run to run by about urn_sd, "
-                "and there may be more modes than were found"
+                "them, so their masses scatter from run to run as without the "
+                "hop (by about run_sd), and there may be more modes than were "
+                "found"
             )
         warnings += self._hop_warnings(modes)
         if full and len(modes) > 1:
@@ -1252,41 +1344,44 @@ class NestedSamplingResult:
 
     def _hop_warnings(self, modes) -> list[str]:
         """The warning of :meth:`diagnostics` when the hop balanced two or
-        more modes that the clustering separated only in part: after they
-        separated, the clustering held at least ``LUMPS_WARN`` clusters per
-        mode on average over the posterior mass (it cut modes into lumps, and
-        the hop's ellipsoids cover such modes poorly), or the hop was off for
-        at least ``HOP_OFF_WARN`` of that mass, or it accepted less than
-        ``HOP_ACCEPT_WARN`` of its proposals. The masses then scatter from run
+        more modes that the clustering separated only in part: while two of
+        them held live points after they separated (:meth:`_hop_window`),
+        the clustering held at least ``LUMPS_WARN`` clusters per mode on
+        average over the posterior mass (it cut modes into lumps, and the
+        hop's ellipsoids cover such modes poorly), or the hop was off for at
+        least ``HOP_OFF_WARN`` of that mass, or it accepted less than
+        ``HOP_ACCEPT_WARN`` of its proposals. The warning names only the
+        causes that passed their threshold. The masses then scatter from run
         to run more than where the hop works, and the spread of the folds'
-        masses measures by how much."""
+        masses measures by how much (``run_sd``)."""
         if sum(mode["tracked"] for mode in modes) < 2:
             return []  # the warning about untracked modes says it
-        start = min(mode["isolation_iteration"] for mode in modes)
-        lumps, off = self._lumps(start, len(modes)), self._hop_off(start)
+        start, stop = self._hop_window(modes)
+        lumps = self._lumps(start, stop, len(modes))
+        off = self._hop_off(start, stop)
         acceptance = (self.metadata or {}).get("hop_acceptance")
-        if not (
-            (lumps is not None and lumps >= LUMPS_WARN)
-            or (off is not None and off >= HOP_OFF_WARN)
-            or (acceptance is not None and acceptance < HOP_ACCEPT_WARN)
-        ):
-            return []
+        lumpy = lumps is not None and lumps >= LUMPS_WARN
+        idle = off is not None and off >= HOP_OFF_WARN
+        rare = acceptance is not None and acceptance < HOP_ACCEPT_WARN
         parts = []
-        if lumps is not None:
+        if lumpy:
             parts.append(
                 f"the sampler's clustering held {lumps:.2g} clusters per mode "
                 "on average (it cut modes into lumps)"
             )
-        if off is not None:
+        if idle:
             parts.append(
                 "the inter-mode hop was off (fewer than two eligible clusters) "
                 f"for {100 * off:.0f}% of the posterior mass"
             )
-        if acceptance is not None:
-            hop = "it" if off is not None else "the inter-mode hop"
+        if rare:
+            hop = "it" if idle else "the inter-mode hop"
             parts.append(f"{hop} accepted {100 * acceptance:.2g}% of its proposals")
+        if not parts:
+            return []
         text = (
-            "after the modes separated, " + ", ".join(parts[:-1])
+            "after the modes separated and while two of them held live points, "
+            + ", ".join(parts[:-1])
             + (", and " if len(parts) > 1 else "") + parts[-1]
             + ": the hop balanced the modes only in part, so their masses may "
             "scatter from run to run more than where it works"
@@ -1301,7 +1396,7 @@ class NestedSamplingResult:
                 f"mode {i} the masses "
                 + ", ".join(f"{m:.3g}" for m in mode["fold_mass"])
                 + f" (fold_sd {mode['fold_sd']:.2f} in logit: a run-to-run "
-                f"scatter of about {mode['fold_sd'] / math.sqrt(folds):.2g})"
+                f"scatter, run_sd, of about {mode['run_sd']:.2g})"
                 for i, mode in spread
             )
         return [text]
@@ -1366,18 +1461,21 @@ class NestedSamplingResult:
         windows), the posterior ``modes`` (:meth:`modes`),
         ``mode_slots_full``, the fraction of the run during which every
         cluster slot of the sampler's clustering was in use, two averages
-        over the posterior mass after the modes separated: ``mode_lumps``,
+        over the posterior mass after the modes separated and while two of
+        them held live points (the whole run for one mode): ``mode_lumps``,
         the number of clusters per mode found (of the clustering with the
         most), and ``mode_hop_off``, the fraction during which a clustering
         had fewer than two eligible clusters (the hop was off in its fold),
         and ``hop_acceptance`` (``None`` for a result without those
         records).
-        The warnings name each unresolved mode and the modes the clustering
-        did not separate (their number is a lower bound); they say when the
-        hop balanced the modes only in part (``mode_lumps`` at least
-        ``LUMPS_WARN``, ``mode_hop_off`` at least ``HOP_OFF_WARN`` or
-        ``hop_acceptance`` below ``HOP_ACCEPT_WARN``), with the folds' masses
-        of each mode, and when the slots were full in a run of several modes.
+        The warnings name each unresolved mode (a single mode too) and the
+        modes the clustering did not separate (their number is a lower
+        bound); they say when the hop balanced the modes only in part
+        (``mode_lumps`` at least ``LUMPS_WARN``, ``mode_hop_off`` at least
+        ``HOP_OFF_WARN`` or ``hop_acceptance`` below ``HOP_ACCEPT_WARN``;
+        each cause is named only when it passed its threshold), with the
+        folds' masses and the ``run_sd`` of each mode, and when the slots were
+        full in a run of several modes.
         """
 
         metadata = {} if self.metadata is None else self.metadata
@@ -1388,7 +1486,7 @@ class NestedSamplingResult:
         live_weight_fraction = self.live_weight_fraction()
         insertion = self.insertion_test()
         modes = self.modes()
-        separated = min(mode["isolation_iteration"] for mode in modes)
+        start, stop = self._hop_window(modes)
         dlogz = metadata.get("dlogz")
         final_delta_logz = metadata.get("final_delta_logz")
         acceptance = metadata.get("acceptance")
@@ -1455,8 +1553,8 @@ class NestedSamplingResult:
             "insertion_pvalue": insertion["pvalue"],
             "modes": modes,
             "mode_slots_full": self._mode_slots()[1],
-            "mode_lumps": self._lumps(separated, len(modes)),
-            "mode_hop_off": self._hop_off(separated),
+            "mode_lumps": self._lumps(start, stop, len(modes)),
+            "mode_hop_off": self._hop_off(start, stop),
             "hop_acceptance": metadata.get("hop_acceptance"),
             "warnings": warnings,
         }
@@ -1480,7 +1578,14 @@ class NestedSamplingResult:
         """Return a human-readable multi-line summary of the result.
 
         With more than one posterior mode it ends with a per-mode table
-        (:meth:`modes`) and the warnings about the mode count.
+        (:meth:`modes`) and the warnings about the modes; the columns are the
+        mode's ``mass``, three standard deviations of its logit, and
+        ``min_live``. ``run sd`` (``run_sd``) is the run-to-run scatter of the
+        mass, measured within the run; ``fold sd`` (``fold_sd``) its spread
+        over the cross-fitted folds; ``sd w/o hop`` (``urn_sd``) the scatter of
+        a run without the inter-mode hop, from the live counts (for two modes;
+        with three or more of different shapes it is too low). The warning
+        about an unresolved mode is printed for a single mode too.
         """
 
         insertion = self.insertion_test()
@@ -1496,22 +1601,22 @@ class NestedSamplingResult:
             f"message: {self.message}",
         ]
         modes = self.modes()
+        warnings = self._mode_warnings(modes)
         if len(modes) > 1:
-            lines.append("mode      mass  logit sd   fold sd  min live")
+            lines.append("mode      mass    run sd   fold sd  sd w/o hop  min live")
             for i, mode in enumerate(modes):
                 flag = "  unresolved: raise nlive" if mode["unresolved"] else ""
                 flag += "" if mode["tracked"] else "  not tracked"
-                fold_sd = mode["fold_sd"]
-                fold_sd = "       -" if fold_sd is None else f"{fold_sd:8.2f}"
-                lines.append(
-                    f"{i:4d}  {mode['mass']:8.4f}  {mode['urn_sd']:8.2f}  "
-                    f"{fold_sd}  {mode['min_live']:8d}{flag}"
+                run_sd, fold_sd = (
+                    "       -" if mode[name] is None else f"{mode[name]:8.2f}"
+                    for name in ("run_sd", "fold_sd")
                 )
-            lines += [
-                "warning: " + text
-                for text in self._mode_warnings(modes)
-                if "is unresolved" not in text
-            ]
+                lines.append(
+                    f"{i:4d}  {mode['mass']:8.4f}  {run_sd}  {fold_sd}  "
+                    f"{mode['urn_sd']:10.2f}  {mode['min_live']:8d}{flag}"
+                )
+            warnings = [text for text in warnings if "is unresolved" not in text]
+        lines += ["warning: " + text for text in warnings]
         return "\n".join(lines)
 
     def __str__(self) -> str:
