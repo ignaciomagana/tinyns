@@ -75,17 +75,39 @@ def _weak_ref(obj, callback):
 
 
 def _is_dynamic_leaf(leaf) -> bool:
-    return isinstance(leaf, (jax.Array, np.ndarray))
+    return isinstance(leaf, (jax.Array, np.ndarray, np.floating, np.complexfloating))
+
+
+def _static_key(leaf):
+    """A static leaf as part of a spec key: its type and value, a float by its
+    bits, so that ``-0.0`` is not ``0.0`` and a NaN matches a NaN."""
+    if isinstance(leaf, float):
+        return type(leaf), leaf.hex()
+    if isinstance(leaf, complex):
+        return type(leaf), leaf.real.hex(), leaf.imag.hex()
+    return type(leaf), leaf
 
 
 def _partition_callable(fn):
     """Split a pytree callable into ``(dynamic, static)`` (eqx.partition-style).
 
-    ``dynamic`` is the tuple of array leaves (``jax.Array`` / ``np.ndarray``) of
-    ``jax.tree_util.tree_flatten(fn)``; ``static`` holds the treedef and every
-    other leaf. The compiled kernels take ``dynamic`` as explicit jit
-    arguments and rebuild ``fn`` inside the trace with
-    :func:`_combine_callable`, so large data are not embedded as constants.
+    ``dynamic`` is the tuple of array leaves of
+    ``jax.tree_util.tree_flatten(fn)``: ``jax.Array``, ``np.ndarray`` and
+    NumPy floating and complex scalars (``sigmas[i]`` of a NumPy array).
+    ``static`` holds the treedef and every other leaf: Python scalars, NumPy
+    integers and booleans (equinox traces these; here they may size shapes
+    and steer Python control flow) and any other object. They are part of
+    the compiled program, so each new value compiles again: wrap a
+    per-dataset Python float in ``jnp.asarray``. The compiled kernels take
+    ``dynamic`` as explicit jit arguments and rebuild ``fn`` inside the trace
+    with :func:`_combine_callable`, so large data are not embedded as
+    constants.
+
+    An array that the treedef holds is not a leaf. The function of a
+    ``Partial`` is part of its structure, so an array that function captures
+    is embedded in the compiled program, and the kernel caches keep it alive
+    until they drop the spec: pass shared arrays as arguments of the
+    ``Partial``.
 
     A plain function or closure flattens to ``[fn]``: ``dynamic`` is empty and
     :func:`_combine_callable` returns ``fn`` itself (closure semantics). Such
@@ -207,7 +229,9 @@ def _split_callable(fn, key, example):
     A pytree callable with array leaves splits into those leaves
     (:func:`_partition_callable`) and a spec keyed on everything else,
     including the types of the static leaves (``1`` and ``1.0`` trace
-    differently). Nothing is cached, so the leaves are not retained.
+    differently) and the bits of the static floats (:func:`_static_key`).
+    Nothing is cached, so the leaves are not retained. The treedef compares
+    as JAX defines it (the function of a ``Partial`` by ``==``).
 
     A callable without array leaves (a plain function or closure) is traced on
     ``example()`` (unless it returns ``None``) and its large jaxpr constants
@@ -219,7 +243,8 @@ def _split_callable(fn, key, example):
     """
     dynamic, static = _partition_callable(fn)
     if dynamic:
-        spec_key = (*static, tuple(type(leaf) for leaf in static[2]))
+        treedef, mask, static_leaves = static
+        spec_key = (treedef, mask, tuple(map(_static_key, static_leaves)))
         try:
             hash(spec_key)
         except TypeError:
@@ -311,6 +336,10 @@ def _clear_caches() -> None:
     _IDENTITY_SPLITS.clear()
 
 
+def _on_host(leaf) -> bool:
+    return _is_dynamic_leaf(leaf) and not isinstance(leaf, jax.Array)
+
+
 def _device_leaves(fn):
     """Return ``fn`` with its numpy array leaves placed on the device.
 
@@ -318,7 +347,7 @@ def _device_leaves(fn):
     not handed a host array (and a transfer) at every chunk.
     """
     leaves, treedef = jax.tree_util.tree_flatten(fn)
-    if not any(isinstance(leaf, np.ndarray) for leaf in leaves):
+    if not any(_on_host(leaf) for leaf in leaves):
         return fn
-    leaves = [jnp.asarray(x) if isinstance(x, np.ndarray) else x for x in leaves]
+    leaves = [jnp.asarray(x) if _on_host(x) else x for x in leaves]
     return jax.tree_util.tree_unflatten(treedef, leaves)

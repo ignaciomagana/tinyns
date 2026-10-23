@@ -101,6 +101,62 @@ def test_partition_round_trips_partial_leaves() -> None:
         _combine_callable((), static)
 
 
+def scaled_loglike_fn(data, scale, theta):
+    return loglike_fn(data, theta) * scale
+
+
+def test_numpy_float_scalars_are_dynamic_and_other_scalars_static() -> None:
+    # A NumPy float scalar (``sigmas[i]``) is an array leaf, as in equinox, so
+    # each new value shares the compiled kernels; Python scalars and NumPy
+    # integers and booleans (shapes, control flow) are part of the program.
+    data = make_data(10)
+    for scale in (np.float64(2.0), np.float32(2.0), np.complex64(2.0)):
+        dynamic, _ = _partition_callable(
+            jax.tree_util.Partial(scaled_loglike_fn, data, scale)
+        )
+        assert len(dynamic) == 2 and dynamic[1] is scale
+    for scale in (2.0, 2, True, np.int64(2), np.bool_(True), "2"):
+        dynamic, _ = _partition_callable(
+            jax.tree_util.Partial(scaled_loglike_fn, data, scale)
+        )
+        assert len(dynamic) == 1
+
+    def spec(scale):
+        loglike = jax.tree_util.Partial(scaled_loglike_fn, data, scale)
+        return _callable_specs(loglike, plain_prior, NDIM)[0]
+
+    assert spec(np.float64(1.0)) == spec(np.float64(3.0))
+    assert spec(1.0) != spec(3.0)
+
+
+def test_static_float_leaves_are_keyed_on_their_bits() -> None:
+    # 0.0 == -0.0 and nan != nan: a key on the values would reuse the kernel
+    # traced with 0.0 for -0.0 and compile again for every new NaN.
+    data = make_data(10)
+
+    def spec(z):
+        loglike = jax.tree_util.Partial(scaled_loglike_fn, data, z)
+        return _callable_specs(loglike, plain_prior, NDIM)[0]
+
+    assert spec(0.0) != spec(-0.0)
+    assert spec(float("nan")) == spec(float("nan"))
+    assert spec(complex(0.0, 0.0)) != spec(complex(0.0, -0.0))
+    assert spec(0.5) == spec(0.5) and spec(1) != spec(1.0)
+
+    def signed(data, z, theta):
+        return loglike_fn(data, theta) + jnp.copysign(1.0, z)
+
+    _clear_caches()
+    try:
+        logl = [
+            core.init(0, jax.tree_util.Partial(signed, data, z), plain_prior, CFG).logl
+            for z in (0.0, -0.0)
+        ]
+    finally:
+        _clear_caches()
+    np.testing.assert_allclose(logl[0] - logl[1], 2.0, atol=1e-3)
+
+
 def test_plain_function_and_equivalent_closure_are_bit_identical() -> None:
     # A plain function and a closure both flatten to [fn]: neither has array
     # leaves, so the kernels take no extra arguments and trace exactly as on
@@ -442,6 +498,22 @@ def test_same_shape_partials_share_one_compiled_block_kernel(backend_compiles) -
         _clear_caches()  # an independent fresh run compiles its own kernels
         loglike = jax.tree_util.Partial(loglike_fn, shifted_data(i))
         assert_same_result(result, run(loglike, plain_prior))
+
+
+@pytest.mark.usefixtures("fresh_caches")
+def test_numpy_float_leaves_share_one_compile(backend_compiles) -> None:
+    # Partial(fn, data_i, sigmas[i]): the NumPy scalar is traced, so a new
+    # value compiles nothing, and the run matches the jnp.asarray form.
+    data = make_data(100)
+    results, compiles = [], []
+    for scale in np.asarray([0.5, 0.25]):
+        before = len(backend_compiles)
+        loglike = jax.tree_util.Partial(scaled_loglike_fn, data, scale)
+        results.append(run(loglike, plain_prior, maxiter=40))
+        compiles.append(len(backend_compiles) - before)
+    assert compiles[0] > 0 and compiles[1] == 0
+    loglike = jax.tree_util.Partial(scaled_loglike_fn, data, jnp.asarray(scale))
+    assert_same_result(results[1], run(loglike, plain_prior, maxiter=40))
 
 
 def make_closure_prior(bounds):
