@@ -59,11 +59,11 @@ is `--seeds` independent runs of one target, run as one batch of keys.
   the unit cube, where the prior transform is far from affine. It runs at 4
   times the default walks. At the default (36) the chains do not decorrelate
   there, and the case fails `scatter` in both tiers and `bias` in the full
-  tier: logZ about 0.5 to 0.64 (+- 0.18) low with a scatter of 3.0 times
-  `logzerr` in the quick tier (0.53 +- 0.18, z -2.9, at key 0 in x64 on the
-  release code), and 0.24 +- 0.08 low, 3.6 times, in the full tier (x64). At
-  72 walks the scatter was still 1.7 times `logzerr` (32 runs at
-  `nlive=1000`); at 144 it is 1.05 at `nlive=1000` and 1.2 at 500.
+  tier: logZ 0.53 +- 0.18 low (z -2.9) with a scatter of 3.0 times `logzerr`
+  in the quick tier (key 0, x64, on the release code), and 0.24 +- 0.08 low,
+  3.6 times, in the full tier (x64). At 72 walks the scatter was still 1.7
+  times `logzerr` (32 runs at `nlive=1000`); at 144 it is 1.05 at
+  `nlive=1000` and 1.2 at 500.
 - The mixtures run at an `nlive` that gives the 6% minor mode more than
   `5 * ndim` live points, which is what it takes to resolve it.
   `sepWbox_d4` is `sepW_d4` moved from the unit cube to the box [-3, 5]^4, so
@@ -135,8 +135,8 @@ A case passes when all of these hold (se is the standard error over seeds):
   `posterior` test in 0.27% (measured on `gauss_d2` and `gauss_d10`, float32
   and x64: `posterior` failed 1 of 144 batches of 16 seeds, `bias` 3). Over
   a tier that is a false FAIL in about 1 run in 8 of the quick tier and 1 in
-  14 of the full one. Single cases fail more often than that average: the
-  calibration runs put them at 1% to 4% at 16 seeds, and the x64 quick
+  14 of the full one. Some cases fail more often: the calibration runs put
+  single cases at up to 4% at 16 seeds, and the x64 quick
   `gauss_d2` case failed on 3 of 24 keys (the default key 0 among them, on
   the release code; key 1 at 128 seeds passed with t 1.0). Rerun a failed
   case with another key and more seeds (`--cases NAME --seed 1 --seeds 128`)

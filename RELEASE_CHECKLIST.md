@@ -39,7 +39,7 @@ get uploaded, and the tag goes on last.
 fails a case about once in 70 cases at 16 seeds and once in 170 at 64, because
 the bias tests use the se of the seeds. So about one quick-tier run in 8 has a
 false FAIL, and one full-tier run in 14. Some cases fail more often: the
-calibration runs put single cases at 1% to 4% at 16 seeds, and the x64 quick
+calibration runs put single cases at up to 4% at 16 seeds, and the x64 quick
 `gauss_d2` case failed on 3 of 24 keys (the default key 0 among them, at the
 1.0.0 release commit), so a false FAIL may come more often than that. Rerun
 the case with another key and more seeds (`--cases NAME --seed 1 --seeds 128`)
