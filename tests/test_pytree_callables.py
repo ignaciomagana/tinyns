@@ -172,10 +172,13 @@ def test_plain_function_and_equivalent_closure_are_bit_identical() -> None:
 @pytest.mark.parametrize("num_delete", [1, 4])
 def test_partial_loglike_with_large_array_matches_closure(num_delete) -> None:
     # The closure's 200k-element constant is hoisted to a jit argument, so the
-    # two forms compile the same program and agree bit for bit.
+    # two forms compile the same program and agree bit for bit. Both runs use
+    # the same prior: a Partial prior passes BOUNDS as an argument, which the
+    # closure embeds as a constant (it is too small to hoist), and on JAX
+    # 0.11.2 XLA folds that constant into other float32 roundoff at
+    # num_delete 4.
     data = make_data(200_000)
     partial_loglike = jax.tree_util.Partial(loglike_fn, data)
-    partial_prior = jax.tree_util.Partial(prior_fn, BOUNDS)
 
     def closure_loglike(theta):
         return loglike_fn(data, theta)
@@ -185,7 +188,7 @@ def test_partial_loglike_with_large_array_matches_closure(num_delete) -> None:
 
     kwargs = {"maxiter": 96, "dlogz": 0.0, "num_delete": num_delete}
     partial_result = run_ns(
-        random.PRNGKey(11), partial_loglike, partial_prior, NDIM, 40, **kwargs
+        random.PRNGKey(11), partial_loglike, closure_prior, NDIM, 40, **kwargs
     )
     closure_result = run_ns(
         random.PRNGKey(11), closure_loglike, closure_prior, NDIM, 40, **kwargs
@@ -448,7 +451,13 @@ def test_make_jaxpr_failure_falls_back_to_closure_semantics(
     with caplog.at_level(logging.DEBUG, logger="tinyns.callables"):
         assert _callable_leaves(loglike, closure_prior, NDIM) == ()
         result = run(loglike, maxiter=40)
-    assert_same_result(result, expected)
+    # The same points, with the likelihoods to roundoff: the embedded
+    # constant compiles another program than the hoisted one, which XLA may
+    # round differently (on JAX 0.11.2, by up to 1.5e-5 in a float32 logl).
+    np.testing.assert_array_equal(result.samples_u, expected.samples_u)
+    np.testing.assert_allclose(result.logl, expected.logl, rtol=1e-6)
+    assert result.logz == pytest.approx(expected.logz, rel=1e-6)
+    assert result.ncall == expected.ncall
     messages = [r for r in caplog.records if "not hoisting" in r.getMessage()]
     # One message per callable (loglike and prior), not one per iteration.
     assert len(messages) == 2
