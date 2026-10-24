@@ -1323,10 +1323,12 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     per call in an eager loop whose compiled step takes milliseconds. A bound
     method is a new object at every access: store ``ll = model.loglike``
     once, or use a module-level function or a pytree callable with array
-    leaves. A step inside ``lax.scan``, or in one jitted function called
-    repeatedly, is traced once and is not affected. A Python loop under
-    ``jax.jit`` that passes a new object at every step traces each step
-    anew, though the jitted function still compiles once.
+    leaves. A stored method, like any closure, keeps the values it was traced
+    with: after ``model.mu = 5`` store it again (or put ``mu`` in a pytree
+    callable's leaves). A step inside ``lax.scan``, or in one jitted
+    function called repeatedly, is traced once and is not affected. A Python
+    loop under ``jax.jit`` that passes a new object at every step traces
+    each step anew, though the jitted function still compiles once.
     """
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim

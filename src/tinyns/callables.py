@@ -253,7 +253,9 @@ def _split_callable(fn, key, example):
     object compiles the kernels again: a new lambda, or a bound method
     (``model.loglike`` is a new object at each access; store it once). They
     are not cached by equality, which would reuse a kernel built for an
-    object after the object changed (``model.mu = 5``).
+    object after the object changed (``model.mu = 5``); the same stored
+    method, or a closure over state that changes, does keep the kernel it was
+    traced with, as under ``jax.jit``.
     """
     dynamic, static = _partition_callable(fn)
     if dynamic:
