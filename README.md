@@ -527,7 +527,7 @@ does.
   Choosing `walks`).
 - **Posteriors pressed against the faces of the unit cube** by a nonlinear
   prior transform need more `walks`: at the default, logZ comes out low and
-  `logzerr` 2 to 3.5 times too small (see Choosing `walks`).
+  `logzerr` 3 to 3.6 times too small (see Choosing `walks`).
 - **Expensive likelihoods.** Parallel chains do not reduce the number of
   likelihood calls, and the proposals a single `num_delete=1` run skips
   (outside the cube, or rejected by a Hastings test) are evaluated with
