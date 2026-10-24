@@ -561,11 +561,13 @@ does.
   of a run: with 1 to 10 of 500 initial points finite in a 10-D box, logZ came
   out within -0.10 to +0.08 of the truth (half a `logzerr`) once that volume
   noise is removed. When the support is much smaller than `1 / nlive` of the
-  prior and only one initial point falls in it, logZ can stay about 1 nat
-  high (a 5-D ball of 1.6e-6 of the prior placed around one initial point:
-  +1.14 ± 0.06 at nlive 100 and +0.95 ± 0.13 at 500, 16 runs each, with the
-  volume noise removed). The insertion test flags those runs and `logzerr`
-  comes out near 0.8; raise `nlive` until a few initial points fall in the
+  prior and only one initial point falls in it, logZ comes out far too high:
+  the run takes the support's volume from that one point. In a 5-D ball of
+  1.6e-6 of the prior placed around one initial point, logZ was 10.3 nats
+  high at nlive 100 and 8.5 at 500 (16 runs each) with `logzerr` near 0.8;
+  the volume estimate was 9.1 and 7.5 nats too large, and about 1 nat
+  remains without it (+1.14 ± 0.06 and +0.95 ± 0.13). The insertion test
+  flags those runs; raise `nlive` until a few initial points fall in the
   support. A zero-likelihood region with a fair share of the live points
   above it is unbiased, with the right `logzerr`, and so is a likelihood
   that ends on a plateau.
