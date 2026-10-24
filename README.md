@@ -180,7 +180,9 @@ A mode needs about `5 * ndim` live points for its own walk to mix. In the
 validation cells where every mode held that many, the weights showed no bias
 within the measurement error. Below it a mode's weight is biased or scatters
 widely, and the mode can be lost; `result.modes()` (and `summary()`) flag it
-`unresolved: raise nlive`. The mode tracking is a fixed cost per step, which
+`unresolved: raise nlive` in a run that kept it. A run that lost it has no
+flag and, in every such run measured, no warning (see Choosing `nlive` and
+Limitations). The mode tracking is a fixed cost per step, which
 unimodal runs pay too: about 6% of the run time at 1 ms per likelihood call,
 but about 40% of a compiled run of the 13-D Gaussian of Speed (0.93 s against
 0.56 s before the mode tracking).
@@ -264,20 +266,35 @@ grow in proportion to it: at 1000, `logzerr` is 0.17, 0.31 and 0.44 on 10-,
 cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
 0.85 s at 4000 on a 10-D Gaussian), so raise it freely there. Raise it when:
 
-- *a small mode matters.* A mode needs `5 * ndim` live points to be weighted
-  correctly, twice that if it is much thinner than the main mode. For a mode
-  holding a fraction `f` of the posterior that is `nlive` of about
-  `5 * ndim / f` to `10 * ndim / f`. A 6% mode was weighted without bias and
-  never lost from `nlive` 500, 1000 and 2000 at 10, 18 and 32 dimensions
-  (1000, 2000 and 4000 for a thin one, still lost in 1 run of 40 at 32). At
-  half of that the thin mode was lost in 5 to 40% of the runs.
+- *a small or narrow mode matters.* A mode needs `5 * ndim` live points to be
+  weighted correctly, twice that if it is much thinner than the main mode.
+  Its share of the live points when it separates from the others is its
+  share of the prior volume there, not its share `f` of the posterior. For
+  modes of similar widths the two are close, and `nlive` of about
+  `5 * ndim / f` to `10 * ndim / f` gives the mode enough points: a 6% mode
+  was weighted without bias and never lost from `nlive` 500, 1000 and 2000 at
+  10, 18 and 32 dimensions (1000, 2000 and 4000 for a thin one, still lost in
+  1 run of 40 at 32). At half of that the thin mode was lost in 5 to 40% of
+  the runs. A narrow mode can hold 1 to 2% of the live points when it
+  separates, even if it holds most of the posterior, and the rule is then far
+  too low. On a 4-D mixture of masses 0.6, 0.3 and 0.1 and widths 0.25, 0.5
+  and 0.75 (rotated Gaussians in `[-12, 12]^4`) the 0.6 mode held a median of
+  8 to 9 of 500 live points when it separated, and 11 to 12 of 1000. The rule
+  gives an `nlive` of 33 to 67. At 500 the 0.6 mode was lost in 7 of 32 runs
+  in float32 and 4 of 32 in x64, at 1000 in 0 and 1 of 32, and on the same
+  mixture in 6-D at 1000 in 21 and 22 of 24. The prior-volume share is not
+  known in advance: raise `nlive` and compare runs.
 - *`modes()` flags a mode unresolved.* The flag is a reason to raise `nlive`,
   but its absence is not proof. A mode that is lost leaves no trace in its own
-  run: every run that lost the 6% mode reported one mode and no warning. At
-  `nlive=1000` the flag was raised in 7 of the 57 runs (of 360) whose minor
-  weight was lost or off by more than 0.4 in the logit, all of them at 18 and
-  32 dimensions. If a small mode matters, run again at twice the `nlive` and
-  compare the modes.
+  run: every run that lost the 6% mode reported one mode and no warning, and
+  every run that lost the 0.6 mode above reported the other two and no
+  warning, with logZ 0.62 to 1.13 too low (4.6 to 10 `logzerr`; without the
+  mode logZ is `log(1 - 0.6) = -0.92` lower). A flag on a heavy mode in any
+  run means other runs may have lost it: 119 of the 121 runs that kept the
+  0.6 mode flagged it unresolved. At `nlive=1000` the flag was raised in 7 of
+  the 57 runs (of 360) whose minor weight was lost or off by more than 0.4 in
+  the logit, all of them at 18 and 32 dimensions. If a small mode matters,
+  run again at twice the `nlive` and compare the modes.
 - *the posterior has many modes.* Each of the eggbox's two smallest peaks (2%
   of the posterior) fell below a tenth of its weight in 32% of the runs at
   `nlive=500`, 15% at 1000, 4% at 2000 and none at 4000; its 8% peaks were
@@ -459,7 +476,27 @@ does.
 ## Limitations
 
 - **Small modes.** A mode with fewer than about `5 * ndim` live points is not
-  sampled reliably. `modes()` flags it; raise `nlive`.
+  sampled reliably. `modes()` flags it `unresolved` in a run that kept it;
+  raise `nlive`.
+- **A mode can be lost with no warning.** A run that loses a mode reports the
+  modes left, with no flag and, in every such run measured, no warning. The
+  18-D two-mode target `build_two_mode(18, 0.2)` of `bench.targets` has a 20%
+  mode whose volume is 0.035 of the main mode's. At the default `nlive` of
+  1000 that mode was lost on an H100 at commit 8851058 in 4 of 32 runs in
+  float32, 4 of 32 in x64 and 1 of 32 in float32 at matmul precision
+  `"highest"`; on a CPU in x64 in 3 of 24 runs at 8851058 and 2 of 16 on the
+  release code, where 2 more kept a minor mass of only 0.09 and 0.13 and
+  warned that the hop balanced the modes only in part. A lost run reports one
+  mode, with the hop off, and its logZ lies within 2.6 `logzerr` of the truth
+  (0.67 low to 0.05 high, 14 runs): without the mode logZ is
+  `log(1 - 0.2) = -0.22` lower, less than its `logzerr` of 0.26. A heavy
+  narrow mode can be lost at small `nlive` (see Choosing `nlive`), and logZ
+  is then low by about `log(1 - mass)`, beyond `logzerr`: on a 4-D mixture a
+  0.6 mode was lost in 7 of 32 runs in float32 and 4 of 32 in x64 at
+  `nlive=500`, with logZ 0.62 to 1.02 low (4.6 to 7.4 `logzerr`), and on the
+  same mixture in 6-D in 21 and 22 of 24 runs at the default `nlive`. If any
+  run flags a heavy mode unresolved, others may have lost it: raise `nlive`
+  and compare runs.
 - **Modes with thin arms or a funnel neck.** When a mode's contours are a core
   with thin arms, or narrow into a neck (a scale parameter pressed against its
   prior edge and coupled to a location), its live points are heavy-tailed
