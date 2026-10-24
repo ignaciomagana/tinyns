@@ -266,9 +266,11 @@ when you read the table:
     covers only the step kernel.
   - BlackJAX compiles `init` and its loop ahead of time; its post-processing
     (`finalise`, `log_weights`, the prior map) runs op by op, and each op
-    compiles on its first call in a process and is too small for the
-    persistent cache. The adapter runs the post-processing twice and counts
-    the difference as compilation.
+    compiles on its first call for a run of a new length, which is in effect
+    every run: most are too small for the persistent cache, and the cached
+    ones serve only a run of the same length. The adapter runs the
+    post-processing twice and counts the difference as compilation (4.1 to
+    6.9 s a run on an H100 NVL, `RESULTS.md`).
   - tinyns 0.x's `compile_s` is what 0.x times itself: the time until its
     first block of iterations ends.
 - **Devices.** The CPU samplers call the jitted JAX likelihood on CPU
@@ -428,8 +430,10 @@ next to the accurate-cells table.
   d >= 32.
 - **Records of the v1 sweep.** `RESULTS.md` was measured before the adapter
   fixes above (BlackJAX's stop and `compile_s`, tinyns's warm-up, the padded
-  CPU batches). Its Known gaps say what each changes; the H100 cells have
-  not been measured again.
+  CPU batches). Its Known gaps say what each changes. The sweep's cells
+  have not been measured again; BlackJAX NSS and tinyns v1 were timed again
+  with the fixed adapters on 9 targets, on an H100 NVL (`RESULTS.md`,
+  *BlackJAX NSS and tinyns re-timed*).
 
 ## Multimodality bake-off (`bench/bakeoff/`)
 

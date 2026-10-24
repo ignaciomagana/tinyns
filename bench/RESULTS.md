@@ -19,8 +19,11 @@ The records were written with the adapters as they were before four fixes
 (Known gaps): BlackJAX's post-processing and tinyns's init kernel compiled
 inside their `run s`, BlackJAX's stop ran on to the end of a 20-step chunk,
 and the CPU samplers' batched likelihood compiled once per batch size. The
-H100 cells were not measured again; the text below states what the fixes
-change, from the records and from CPU measurements.
+cells below were not measured again. BlackJAX NSS and tinyns v1 were timed
+again with the fixed adapters on 9 of the targets, on another GPU (an H100
+NVL), after the release: see *BlackJAX NSS and tinyns re-timed* below. The
+text states what the fixes change, from those runs, from the records and
+from CPU measurements.
 
 The tinyns v1 rows were measured at afa58dd, one merge before b67b458 (which
 lowers the JAX floor to 0.4.31 and removes three optimization barriers). The
@@ -62,9 +65,10 @@ both, with the same printed digits. The rows were not rerun.
   `run s` is wall minus `compile s`, where the sampler times its
   compilation apart (tinyns and BlackJAX; JAXNS does not). In these records
   it still holds some compilation: the first-call compiles of BlackJAX's
-  eager ops, inside a fixed cost of about 9 s per run, and the init kernel
-  and prior map of tinyns (Known gaps). `first s` is the first seed of the
-  cell, which compiled everything: a cold start.
+  eager ops, a fixed cost of about 9 s per run, and the init kernel and
+  prior map of tinyns (Known gaps; the re-timing below measures both
+  without them). `first s` is the first seed of the cell, which compiled
+  everything: a cold start.
 - **Likelihood calls** are what each sampler counts. tinyns counts every
   evaluation, the out-of-cube lanes of its vmapped chains included; BlackJAX
   and JAXNS do not count the lanes that idle inside a vmap. BlackJAX's
@@ -94,22 +98,24 @@ default 1000).**
   release is 3% smaller at 10-D to about 11% larger at 2-D without ties, and
   the new formula does not change logZ.
 - No run of tinyns v1 timed out or raised an error (2240 runs).
-- **Time.** A compiled run takes 1.1 to 20 s on the H100 and a first run 9 to
-  31 s. BlackJAX NSS's `run s` is 9.0 to 77 s, but about 9 s of every run is
-  a fixed cost: over its 24 cells at nlive 500, `run s` = 9.3 s + 62 us per
-  call of a chain (ncall / num_delete; R² = 0.998), against 1.95 s + 14.7 us
-  for tinyns (R² = 0.95). On CPU the old adapter's fixed cost is almost all
-  first-call compilation of its eager ops, mostly its post-processing. The
-  H100's was not split; that it is the same compilation is an inference
-  (Known gaps). Its ratio to tinyns's compiled time, 4.0 to 8.1 as recorded,
-  is therefore mostly that fixed cost at low d; the ratio of the slopes is
-  4.2, and past both fixed costs it is 3.9 to 5.2 on the four cells where
-  BlackJAX's run is more than three times its fixed cost (`gauss_d64` and the
-  three 32-D mixtures). JAXNS takes 16 to 360 s with its programs cached (7 s
+- **Time.** In the sweep a compiled run takes 1.1 to 20 s on the H100 and a
+  first run 9 to 31 s. BlackJAX NSS's `run s` is 9.0 to 77 s as recorded, 4.0
+  to 8.1 times tinyns's, but about 9 s of every one of its runs is a fixed
+  cost: over its 24 cells at nlive 500, `run s` = 9.3 s + 62 us per call of a
+  chain (ncall / num_delete; R² = 0.998), against 1.95 s + 14.7 us for
+  tinyns (R² = 0.95). The re-timing with the fixed adapters (an H100 NVL, 9
+  targets, 16 seeds; *BlackJAX NSS and tinyns re-timed* below) shows that
+  this fixed cost was first-call compilation: on that GPU the old adapter's
+  runs take 3.9 to 5.1 s longer than the fixed one's on the same seeds (the
+  calls of its late stop taken out), and the fixed one's compiled runs have
+  none left. There BlackJAX's compiled run takes 0.17 to 69 s against 0.11
+  to 23 s for tinyns: 1.3 to 3.5 times as long (2.9 to 3.5 from d = 16),
+  and its time grows 3.5 times as fast with the calls of a chain as tinyns's
+  (4.2 in the sweep). JAXNS takes 16 to 360 s with its programs cached (7 s
   to 19 min at its default chain count), and tinyns 0.x 6 to 510 s. The CPU
-  samplers take from 6 s (dynesty, 2-D) to more than 4 h on 4 cores; that is
-  a different machine and a likelihood called from Python, so it measures a
-  workflow and not an algorithm.
+  samplers take from 6 s (dynesty, 2-D) to more than 4 h on 4 cores; that
+  is a different machine and a likelihood called from Python, so it
+  measures a workflow and not an algorithm.
 - **Likelihood calls.** tinyns v1 is not the sampler with the fewest calls.
   - Nautilus needs 1.7 to 24 times fewer calls than tinyns at nlive 500, and
     reaches an rms 2 to 28 times smaller with them. Where it is accurate it
@@ -123,7 +129,9 @@ default 1000).**
     is 0.9 to 1.9, because its stop ran on to the end of a 20-step chunk:
     with the fixed adapter (every run replayed on CPU; the calls do not
     depend on the device) it is 0.98 on `gauss_d2` and 1.64 on `eggbox_d2`,
-    not 1.17 and 1.92, and at most 1.60 elsewhere (Known gaps).
+    not 1.17 and 1.92, and at most 1.60 elsewhere (Known gaps). The
+    re-timing on the GPU agrees: 0.98 and 1.63 (16 seeds), and 0.88 to 1.58
+    on its other seven targets.
   - JAXNS with 500 chains needs 2.2 (`loggamma_d2`) to 6.6 times the calls.
     In low dimensions part of that is its stricter stop: about 1.5 times the
     calls at d = 2 and 1.2 to 1.3 at d = 4 to 8 (Known gaps).
@@ -212,27 +220,31 @@ move, and CPU measurements the fifth.
   nlive 500 (but for dynesty at 1600 on `gauss_d32`, still high by 0.36,
   and Nautilus's own 2000). The headline ratios use tinyns at 500 and 1000
   and correct for the difference with the costs at equal rms.
-- **Adapter faults in these records, fixed since.** The H100 cells were
-  not measured again with the fixed adapters; that rerun is a follow-up,
-  and it would also measure how much of BlackJAX's fixed cost is
-  compilation.
+- **Adapter faults in these records, fixed since.** The cells were not
+  measured again with the fixed adapters. BlackJAX NSS and tinyns v1 were
+  re-timed with them on 9 targets on an H100 NVL, which also splits
+  BlackJAX's fixed cost (*BlackJAX NSS and tinyns re-timed* below).
   - *BlackJAX's `run s` holds the compiles of its eager ops.* Its
     post-processing (`finalise`, `log_weights`, the prior map) runs op by
     op on arrays whose length depends on the run, as did the key splits,
     reshapes and sums between its chunks and the draw of its initial
     points, so each op compiled on its first call in every process,
-    outside `compile s`, and each is too small for the persistent cache. On
-    CPU, in a fresh process with a warm cache, these compiles are 2.3 to
-    2.4 s of a `run s` of 2.4 s on `gauss_d2` and 2.8 s on `gauss_d8`; with
-    the fix the two take 0.07 and 0.38 s. On the H100 the fit above puts a
-    fixed cost of 9.3 s in every run (tinyns's is 1.95 s), but the records
-    do not split it: that it is mostly these compiles is inferred from the
-    CPU measurement.
+    outside `compile s`. Most are too small for the persistent cache; the
+    larger ones are cached, but only a run of the same length uses them
+    again. On CPU, in a fresh process with a warm cache, these compiles are
+    2.3 to 2.4 s of a `run s` of 2.4 s on `gauss_d2` and 2.8 s on
+    `gauss_d8`; with the fix the two take 0.07 and 0.38 s. On the H100 the
+    fit above puts a fixed cost of 9.3 s in every run (tinyns's is 1.95 s).
+    On the H100 NVL the old adapter's runs take 3.9 to 5.1 s longer than
+    the fixed adapter's on the same seeds, once the calls of its late stop
+    are taken out, and the fixed adapter's runs have no fixed cost left:
+    the fixed cost was these compiles, about 4 s a run on that machine.
   - *tinyns's `run s` holds its init kernel and prior map*, which compiled
     (or loaded) inside the timed run; `compile s` was the step kernel only.
     On CPU that is 0.35 to 0.39 s of a `run s` of 0.5 s on `gauss_d2` and
     1.1 s on `gauss_d8` (0.13 and 0.71 s with the fix). On the H100 it is
-    inside the 1.95 s of the fit.
+    inside the 1.95 s of the fit; on the H100 NVL, with the fix, a compiled
+    run of `gauss_d2` takes 0.13 s (1.1 s in the sweep's records).
   - *BlackJAX ran past its stop.* The rule was tested once per 20-step
     chunk, so a run went on to the first chunk end at which it held: 0 to 19
     steps past the first step that met it, or more where the remainder rose
@@ -245,10 +257,13 @@ move, and CPU measurements the fifth.
     device), the recorded calls are high by 19% on `gauss_d2`, 17% on
     `eggbox_d2`, 9% on `loggamma_d2`, `funnel_d10` and `loggamma_d10`, 6% on
     `sepW_d4` and `connW_d4`, 2 to 5% on the other targets up to d = 10, and
-    under 3% from d = 16. Its logZ is not biased by it: stopping at the
-    first step moves logZ by under 0.001 on the seven targets up to d = 8
-    (20 seeds, paired) and by -0.03 ± 0.01 on `funnel_d10`, against a
-    logzerr of 0.07 to 0.21.
+    under 3% from d = 16. The re-timing on the H100 NVL, which stops at the
+    first such step, finds the same on its 9 targets: the sweep's calls are
+    high by 19% on `gauss_d2`, 17% on `eggbox_d2`, 8% on `loggamma_d10` and
+    1 to 4% on the others (median over 16 seeds, paired by seed). Its logZ
+    is not biased by it: stopping at the first step moves logZ by under
+    0.001 on the seven targets up to d = 8 (20 seeds, paired) and by
+    -0.03 ± 0.01 on `funnel_d10`, against a logzerr of 0.07 to 0.21.
   - *The CPU samplers' batched likelihood compiled once per batch size.*
     UltraNest's MLFriends asked for 59 and 56 sizes in two runs of
     `gauss_d2`: 8.3 s against 2.9 s with the batches padded to a power of
@@ -271,6 +286,91 @@ move, and CPU measurements the fifth.
 - **One likelihood cost.** Every target costs microseconds. The ranking by
   wall time would change for a likelihood that fills the device by itself,
   where the count of calls is what matters.
+
+## BlackJAX NSS and tinyns re-timed
+
+BlackJAX NSS and tinyns v1 timed again with the fixed adapters on
+2026-10-24, after the release: blackjax 1.7.1 and tinyns at the release
+commit (a3c77c4), nlive 500, `dlogz = 0.1`, x64, seeds 0 to 15 of the
+sweep's on 9 of its 24 targets. They ran on one NVIDIA H100 NVL (miko at
+PSC: 8 cores of a Xeon Gold 6526Y host, shared with other jobs), JAX 0.10.2
+with its CUDA 12 wheels, one cell at a time. As in the sweep, every seed ran
+in a fresh process with a persistent compilation cache, new for each batch
+of cells, so `first s` is a cold start. **This is another GPU and host than
+the sweep's** (an H100 80GB HBM3 on a Xeon Platinum 8468): compare the
+times within this section. The headline and the cells below are the
+sweep's.
+
+The records are `results_gpu_miko_h100nvl.jsonl` (288 runs) and
+`results_gpu_miko_old_adapter_620ca72.jsonl` (32 runs of the adapter of the
+sweep, 620ca72, on the same GPU), outside the repository. Each value is the
+median over the seeds, as `bench/summarize.py` gives it; a ratio is a ratio
+of medians. The post-processing is BlackJAX's `post_first_s - post_s`, the
+part of its `compile s` that is the first call of `finalise`, `log_weights`
+and the prior map. The sweep's ratio is that of the cells below.
+
+| target | BlackJAX compile s (post-processing) | BlackJAX run s | BlackJAX first s | tinyns compile s | tinyns run s | tinyns first s | run s, BlackJAX / tinyns (sweep) | calls, BlackJAX / tinyns |
+|---|---|---|---|---|---|---|---|---|
+| `gauss_d2` | 5.4 (4.4) | 0.17 | 10 | 2.6 | 0.13 | 11 | 1.3 (8.1) | 0.98 |
+| `eggbox_d2` | 5.3 (4.2) | 0.24 | 11 | 2.9 | 0.11 | 10 | 2.1 (5.6) | 1.63 |
+| `loggamma_d10` | 5.5 (4.1) | 1.5 | 14 | 2.6 | 0.60 | 13 | 2.5 (5.1) | 1.51 |
+| `rosen_d10` | 7.9 (6.9) | 2.3 | 13 | 2.6 | 1.1 | 10 | 2.1 (4.3) | 1.55 |
+| `sepW_d10` | 5.4 (4.4) | 2.6 | 13 | 2.6 | 1.0 | 10 | 2.5 (6.4) | 1.57 |
+| `gauss_d16` | 7.3 (6.4) | 4.2 | 15 | 2.6 | 1.2 | 13 | 3.5 (6.4) | 1.58 |
+| `sepW_d18` | 6.7 (6.1) | 8.3 | 19 | 2.3 | 2.9 | 17 | 2.9 (4.8) | 1.55 |
+| `sepW_d32` | 6.9 (6.0) | 25 | 35 | 2.3 | 7.3 | 21 | 3.5 (4.4) | 1.53 |
+| `gauss_d64` | 6.9 (6.4) | 69 | 82 | 2.4 | 23 | 40 | 3.0 (4.0) | 0.88 |
+
+- **BlackJAX's fixed cost was compilation.** Its compiled run of `gauss_d2`
+  takes 0.17 s, against 9.0 s in the sweep. The sweep's adapter on the same
+  GPU and seeds (8 per target) takes 4.1, 7.7, 8.4 and 12.6 s on
+  `gauss_d2`, `sepW_d10`, `gauss_d16` and `sepW_d18`, against 0.17, 2.6,
+  4.2 and 8.2 s for the fixed one: 3.9 to 5.1 s more per run once the calls
+  of its late stop are taken out (at the fixed adapter's 63 us per call of
+  a chain). A line through the 9 cells gives `run s` = 0.31 s + 63 us per
+  call of a chain (ncall / num_delete; R² = 0.998), against 9.3 s + 62 us
+  in the sweep. The fixed cost is therefore the first-call compilation of
+  the old adapter's eager ops: about 4 s a run on this machine, 9.3 s on
+  the sweep's.
+- **Compiled runs.** BlackJAX's takes 0.17 to 69 s and tinyns's 0.11 to
+  23 s: BlackJAX takes 1.3 to 3.5 times as long, 2.9 to 3.5 times from
+  d = 16 and 1.3 to 2.5 times below, where the sweep's records give 4.0 to
+  8.1 on these targets. tinyns's line is 0.78 s + 18 us per call of a chain
+  (R² = 0.98; its intercept is not a fixed cost: its 2-D runs take 0.11
+  and 0.13 s), so BlackJAX's time grows 3.5 times as fast with the calls of
+  a chain (4.2 over the sweep's 24 cells, 4.4 over these 9).
+- **Compilation.** BlackJAX's `compile s` is now 5.3 to 7.9 s, of which
+  4.1 to 6.9 s is the first call of its post-processing. That compiles
+  again for every run of a new length, which is in effect every run, even
+  in a process that ran the target before. With the old adapter's chunked
+  stop most runs of a target had the same length, so they loaded the
+  larger of these programs from the persistent cache: on this GPU a run of
+  a length no earlier seed of its cell had took 1.3 to 4.0 s longer than
+  the others. tinyns's `compile s` (its one-step warm-up, which loads its
+  programs from the cache) is 2.3 to 2.9 s. A first run takes 10 to 82 s
+  for BlackJAX and 10 to 40 s for tinyns.
+- **One run in a fresh process.** With the programs cached, a seed's
+  `wall s` is 5.5 to 76 s for BlackJAX and 2.8 to 25 s for tinyns: 1.8 to
+  3.3 times as long, where the sweep's records give 2.5 to 3.6.
+- **Calls and accuracy.** With the stop at the first step that meets
+  `dlogz`, BlackJAX makes 0.98 times tinyns's calls on `gauss_d2`, 1.63 on
+  `eggbox_d2` and 0.88 to 1.58 elsewhere (Likelihood calls, above). The
+  calls of tinyns at a3c77c4 equal those of the sweep's afa58dd in 94 of
+  the 144 runs and differ by at most 1.8% (each cell's median by at most
+  0.5%). The logZ biases of both agree with the sweep's within their errors
+  (BlackJAX on `gauss_d64`: +3.29 ± 0.17, +3.27 ± 0.16 in the sweep).
+
+```bash
+# one fresh cache per batch of cells; per target, both samplers in turn
+python bench/run.py --sampler blackjax_nss --target gauss_d2 --seeds 0-15 \
+    --nlive 500 --out results_gpu_miko_h100nvl.jsonl --jax-cache CACHE
+python bench/run.py --sampler tinyns_v1 --target gauss_d2 --seeds 0-15 \
+    --nlive 500 --out results_gpu_miko_h100nvl.jsonl --jax-cache CACHE
+python bench/summarize.py results_gpu_miko_h100nvl.jsonl
+```
+
+The old adapter's runs are the same `blackjax_nss` lines (seeds 0 to 7) from
+a checkout of 620ca72.
 
 ## Validation gate
 
