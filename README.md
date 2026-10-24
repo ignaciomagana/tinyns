@@ -512,9 +512,10 @@ does.
   for the true split is at most about 24.5 on average, just under the
   threshold of 25, and only sampling noise lifts it above. On the
   Feroz-Hobson 2-D shells (nlive 500) both rings were tracked in 195 of 320
-  runs, 309 of 320 runs warn, the hop barely balances the rings (minor-ring
-  logit sd 0.09 to 0.13 with it, 0.14 to 0.15 without, 32 runs each), and 2
-  of 320 runs reported one mode without a warning. logZ is unaffected.
+  runs, 309 of 320 runs warn, the hop barely balances the rings (the mass of
+  one ring, half the total, scatters by 0.09 to 0.13 in logit with it and
+  0.14 to 0.15 without, 32 runs each), and 2 of 320 runs reported one mode
+  without a warning. logZ is unaffected.
 - **Many modes.** The clustering has 8 slots and splits two ways, so it does
   not separate more modes than that, or modes on a lattice (an eggbox). The
   evidence is still right, but the hop does not balance those modes: their
