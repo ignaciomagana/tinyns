@@ -347,11 +347,15 @@ x64:
 
 On the same GPU `pytest -m slow` passed 6 of 6 in x64. In float32 it failed
 `test_modes_that_are_not_convex_18d`: all 8 runs of its plain 18-D target
-(a 20% mode without arms) found both modes, but in one the minor mode split
-off late and was partly lost, and that run warned that the hop ran only in
-part; the 8 runs gave a minor mass of 0.174 against 0.200 (logit sd 1.0), and
-the test allows no warning on that target. At 8851058 the same test passed in
-float32 (one of the 8 runs lost the mode entirely, with no warning).
+(then shape M, `build_two_mode(18, 0.2)`: a 20% mode without arms, with
+0.035 of the main mode's volume) found both modes, but in one the minor mode
+split off late and was partly lost, and that run warned that the hop ran only
+in part; the 8 runs gave a minor mass of 0.174 against 0.200 (logit sd 1.0),
+and the test allows no warning on that target. At 8851058 the same test passed in
+float32 (one of the 8 runs lost the mode entirely, with no warning). The
+test's plain control is now shape W, `build_two_mode(18, 0.2, "sep", "W")`
+(the same two modes as `needle_d18` without its arms), and the test checks
+every run's oracle minor mass against the truth.
 
 ## tinyns v1 on the mixtures, by nlive
 
