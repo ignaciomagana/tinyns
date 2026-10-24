@@ -24,10 +24,12 @@ the slowest chain finishes are not counted.
 ``compile_s`` is the ahead-of-time compile of ``init`` and of the chunk, plus
 the first-call compiles of the post-processing (``finalise``, ``log_weights``,
 the prior map). Those run eagerly, op by op, on arrays whose length depends on
-the run, so each compiles on its first call in a process, and each is too small
-for the persistent compilation cache: the post-processing is run once more
-after the timed run, and the difference of the two times is counted as
-compilation. ``config`` keeps both (``post_first_s``, ``post_s``).
+the run, so each compiles again for a run of a new length (in effect every run:
+about 80 small programs and 2 to 3 s on ``gauss_d2`` for a second seed in the
+same process; ``bench/run.py`` runs each seed in a process of its own), and
+each is too small for the persistent compilation cache: the post-processing is
+run once more after the timed run, and the difference of the two times is
+counted as compilation. ``config`` keeps both (``post_first_s``, ``post_s``).
 
 Options: ``num_delete``, ``num_inner_steps``, ``maxiter`` (NS steps, clamped
 to ``2**31 - 1``).

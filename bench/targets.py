@@ -56,7 +56,14 @@ class Target:
     responsibility: Callable | None = None
     meta: dict = field(default_factory=dict)
 
-    def prior_transform(self, u):
+    def __post_init__(self):
+        # One prior_transform per target: a bound method is a new object at
+        # every access, and tinyns caches a sampler's kernels on a callable's
+        # identity, so every new sampler on target.prior_transform compiled
+        # them again.
+        object.__setattr__(self, "prior_transform", self._prior_transform)
+
+    def _prior_transform(self, u):
         import jax.numpy as jnp
 
         return jnp.asarray(self.lo) + jnp.asarray(self.hi - self.lo) * u

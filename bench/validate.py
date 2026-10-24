@@ -91,11 +91,12 @@ class Case(NamedTuple):
 #   cases, none of them curved.
 # - ndtri_d6 puts a Gaussian posterior in a corner of the unit cube, through a
 #   nonlinear prior transform (``bench.targets.ndtri_corner``). The default
-#   walks (36) do not decorrelate the chains there, and the case fails bias
-#   and scatter in both tiers (key 0: logZ 0.60 +- 0.19 low, scatter 3.0
-#   times logzerr, quick; 0.24 +- 0.08 and 3.5 times, full; x64). At 72 walks
-#   the scatter is 1.7 times logzerr; at 144 (4 times the default) it is 1.05
-#   at nlive 1000 and 1.2 at 500, with no bias (128 runs each, f32 and x64).
+#   walks (36) do not decorrelate the chains there: the case fails scatter in
+#   both tiers and bias in the full one (key 0, x64: logZ 0.53 +- 0.18 low,
+#   z -2.9, and a scatter of 3.0 times logzerr, quick; 0.24 +- 0.08 low and
+#   3.6 times, full). At 72 walks the scatter is 1.7 times logzerr; at 144
+#   (4 times the default) it is 1.05 at nlive 1000 and 1.2 at 500, with no
+#   bias (128 runs each, f32 and x64).
 # - The 6% minor mode of sepW needs 5 * ndim live points through its bulk to be
 #   resolved (tinyns.result.UNRESOLVED_PER_DIM): 0.06 * nlive is 120 against
 #   50 at d = 10, 240 against 90 at d = 18 and 60 against 20 at d = 4.

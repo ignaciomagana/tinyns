@@ -50,6 +50,16 @@ def test_every_bench_target_builds():
             assert r.shape == (len(t.mode_mass),) and abs(r.sum() - 1.0) < 1e-5, name
 
 
+def test_a_target_keeps_one_prior_transform():
+    """``target.prior_transform`` was a new bound method at every access, so
+    each new ``NestedSampler`` on it compiled its kernels again (tinyns
+    caches them on a callable's identity)."""
+    t = get_target("gauss_d2")
+    assert t.prior_transform is t.prior_transform
+    x = np.asarray(t.prior_transform(np.full(2, 0.25)))
+    np.testing.assert_allclose(x, t.prior_transform_np(np.full(2, 0.25)))
+
+
 @pytest.mark.parametrize("name", ["gauss_d2", "loggamma_d2", "rosen_d2"])
 def test_2d_logz_matches_grid(name):
     t = get_target(name)
@@ -166,14 +176,22 @@ DEFAULT_SPECS = sorted(adapters.REGISTRY)
 
 @pytest.mark.parametrize("name", DEFAULT_SPECS)
 def test_adapter_on_2d_gaussian(name):
-    reason = adapters.unavailable_reason(name)
-    if reason:
-        pytest.skip(reason)
-    t = get_target("gauss_d2")
-    opts = {"n_live": "200"} if name == "nautilus" else {}
-    out = adapters.load(name).run(
-        t, 0, dict(nlive=100, dlogz=0.1, variant="default", opts=opts)
-    )
+    import jax
+
+    # jaxns turns x64 on when it is imported (by unavailable_reason, too): the
+    # tests after this one must run in the x64 mode of the session.
+    x64 = jax.config.jax_enable_x64
+    try:
+        reason = adapters.unavailable_reason(name)
+        if reason:
+            pytest.skip(reason)
+        t = get_target("gauss_d2")
+        opts = {"n_live": "200"} if name == "nautilus" else {}
+        out = adapters.load(name).run(
+            t, 0, dict(nlive=100, dlogz=0.1, variant="default", opts=opts)
+        )
+    finally:
+        jax.config.update("jax_enable_x64", x64)
     for key in ("samples", "logz", "ncall", "wall_s", "sampler_version"):
         assert key in out
     assert out["samples"].shape[1] == 2 and out["ncall"] > 0
