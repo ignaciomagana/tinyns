@@ -195,10 +195,21 @@ def _information(logwt, logl, logz: float) -> float:
 
 
 def _ridge(cov):
-    """Add a relative ridge of ``1e-12`` times the mean variance."""
-    ndim = cov.shape[-1]
-    scale = max(float(np.trace(cov)) / ndim, 1e-300)
-    return cov + 1e-12 * scale * np.eye(ndim)
+    """Add ``1e-12 (v_i + 1e-12 v)`` to each variance ``v_i`` (``v``: their
+    mean; the second term is a floor for an axis of zero variance, and the
+    floor of ``v`` leaves ``1e-312`` on a set without any spread).
+
+    The ridge is relative to each axis, like that of the frames on the
+    device (:func:`tinyns.modes._ridge`): one of ``1e-12 v`` on every axis
+    swamped an axis below about ``1e-6`` of the others' width, which an x64
+    run resolves: two clusters 6 sd apart along an axis ``1e-7`` wide (and
+    0.1 and 0.29 wide along the others) kept a quarter of their Fisher
+    separation, and two modes 12 sd apart along one ``3e-8`` wide were
+    merged by pass 2 of :meth:`NestedSamplingResult.modes`.
+    """
+    var = np.diagonal(cov)
+    scale = max(float(np.mean(var)), 1e-288)
+    return cov + np.diag(1e-12 * (var + 1e-12 * scale))
 
 
 def _fisher(x, side) -> float:
@@ -816,7 +827,8 @@ class NestedSamplingResult:
            leave a slab across a coordinate axis of the unit cube empty
            (``SLAB_SCORE``): this finds the modes the sampler's clustering
            did not separate, such as the 18 of an eggbox, when planes across
-           the axes of the cube separate them;
+           the axes of the cube separate them and they still hold live
+           points at that median;
         5. every sample is relabelled by its nearest mode (hard-EM
            classification with each mode's posterior-weighted mean and
            covariance), so that a mode has its points from before it was
@@ -875,7 +887,9 @@ class NestedSamplingResult:
         narrowest. ``run_sd = sqrt(fold_sd^2 / folds + V)``, with ``V`` that
         error's variance, is the run-to-run scatter of the mass in logit,
         measured within the run. On a 4-D mixture of masses 0.75, 0.2 and
-        0.05 and widths 0.25, 0.5 and 0.75 (16 runs at nlive 1000) the masses
+        0.05 and widths 0.25, 0.5 and 0.75 (rotated Gaussians in
+        ``[-12, 12]^4``, about 10 apart in a triangle; 16 runs at nlive 1000)
+        the masses
         scattered by 0.056, 0.053 and 0.079, against a median ``run_sd`` of
         0.053, 0.046 and 0.065 and ``fold_sd / sqrt(3)`` of 0.015, 0.012 and
         0.027; for modes of one height ``run_sd`` is ``fold_sd / sqrt(3)``.
@@ -900,14 +914,28 @@ class NestedSamplingResult:
         pass 4 cut out of a larger one while less than ``SEPARATED_SHARE`` of
         its mass carries labels that put ``PURE_LABEL`` of their own mass in
         it. The hop did not balance such a mode, its mass scatters as
-        without the hop (``run_sd`` measures by how much: each fold drifts
-        on its own), and the count of such modes is a lower bound (modes
-        with fewer than ``SLAB_NEIGHBOURS`` live points, or that no
-        axis-aligned plane separates, stay merged). :meth:`diagnostics` also
-        reports for how much of the run the clustering's slots were full
-        (``mode_slots_full``: no further mode could be split off then) and
-        for how much of the posterior mass the hop was off while two modes
-        held live points (``mode_hop_off``). A mode lost before the end
+        without the hop (by at least about ``run_sd``: each fold drifts on
+        its own; without the hop three modes of a mixture in 2-D and 3-D
+        scattered 1.4 to 3 times their ``run_sd``), and the count of such
+        modes is a lower bound (modes with fewer than ``SLAB_NEIGHBOURS``
+        live points, or that no axis-aligned plane separates, stay merged).
+        A mode can also be merged into a tracked one: a mode whose live
+        points were gone before the clustering first split the cluster it
+        shared with its neighbours carries only that cluster's labels,
+        which passes 1 to 3 set aside, and pass 5 gives its samples to the
+        nearest mode found. The lowest of three modes in a line can be such
+        a mode: on a 4-D mixture of masses 0.75, 0.2 and 0.05 along the
+        diagonal of the cube, 8 to 12 standard deviations apart and the 0.05
+        mode at an end, 26 of 32 runs at nlive 1000 reported two modes
+        (about 0.75 and 0.25), both tracked, and no warning, while the same
+        modes in a triangle, or with the 0.05 mode in the middle, gave three
+        in every run. So the count is a lower bound for tracked modes too;
+        logZ and the summed mass of the merged modes are right.
+        :meth:`diagnostics` also reports for how much of the run the
+        clustering's slots were full (``mode_slots_full``: no further mode
+        could be split off then) and for how much of the posterior mass the
+        hop was off while two modes held live points (``mode_hop_off``). A
+        mode lost before the end
         leaves no trace in its own run, and neither does one that never held
         more than about ``ndim`` live points per fold. A unimodal run (or a
         result without :attr:`labels`, or without posterior weight) gives one
@@ -1413,8 +1441,8 @@ class NestedSamplingResult:
                 f"{loose} of the {len(modes)} modes were not separated by the "
                 f"sampler's clustering{held}: the inter-mode hop did not balance "
                 "them, so their masses scatter from run to run as without the "
-                "hop (by about run_sd), and there may be more modes than were "
-                "found"
+                "hop (by at least about run_sd), and there may be more modes "
+                "than were found"
             )
         warnings += self._hop_warnings(modes)
         if full and len(modes) > 1:

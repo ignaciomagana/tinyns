@@ -298,6 +298,32 @@ def test_float32_separation_along_a_narrow_axis() -> None:
     assert np.mean(np.asarray(part) == side) in (0.0, 1.0)
 
 
+@pytest.mark.parametrize("width", [1e-7, 3e-8])
+def test_host_separation_along_a_very_narrow_axis(width) -> None:
+    """The host's ridge (``modes()``, float64) is relative to each axis too:
+    one of ``1e-12`` times the mean variance cut the Fisher separation of
+    two clusters 6 sd apart along an axis ``1e-7`` wide to a quarter, and
+    the gap of two 12 sd apart along one ``3e-8`` wide below the
+    ``SEPARATION_SIGMA`` that keeps two labels apart."""
+    from tinyns.result import SEPARATION_SIGMA, _fisher, _gap
+
+    for sep in (6.0, 12.0):
+        x = _narrow_cluster(n=4000, seed=2)
+        x[:, 2] = 0.5 + (x[:, 2] - 0.5) * (width / NARROW)
+        side = np.arange(len(x)) % 2 == 1
+        x[:, 2] += np.where(side, 0.5, -0.5) * sep * width
+        # The exact separation, from the axes scaled to unit variance (it
+        # does not depend on the scale of an axis).
+        z = (x - x.mean(0)) / x.std(0)
+        a, b = z[~side], z[side]
+        dev = np.concatenate([a - a.mean(0), b - b.mean(0)])
+        dm = b.mean(0) - a.mean(0)
+        exact = dm @ np.linalg.solve(dev.T @ dev / (len(z) - 2), dm)
+        assert _fisher(x, side) == pytest.approx(exact, rel=1e-6)
+        assert _gap(x, side) == pytest.approx(_gap(z, side), rel=1e-6)
+    assert _gap(x, side) > SEPARATION_SIGMA
+
+
 # --- the precision of the internal products ----------------------------------
 
 
