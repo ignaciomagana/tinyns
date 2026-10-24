@@ -5,6 +5,7 @@ the internal products, and JAX's strict promotion rules."""
 from __future__ import annotations
 
 import math
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -83,8 +84,10 @@ def test_few_finite_points_spread_over_the_support(which) -> None:
 def test_two_live_points_do_not_stop_on_a_false_plateau() -> None:
     """With one point above L* the walk covariance was that point's alone,
     zero: the chain returned an exact copy of its seed (counted as moves),
-    and a run with nlive 2 stopped on a "plateau" after one step."""
-    with pytest.warns(UserWarning, match="nlive=2 is too few for ndim=1"):
+    and a run with nlive 2 stopped on a "plateau" after one step. (Config
+    warns that 2 live points are too few; another test checks that.)"""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "nlive=2 is too few", UserWarning)
         sampler = NestedSampler(gauss, identity, 1, 2)
     result = sampler.run(0)
     assert result.metadata["status"] == "converged" and result.niter > 2
