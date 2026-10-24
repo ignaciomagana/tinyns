@@ -937,9 +937,21 @@ class NestedSamplingResult:
         clustering's slots were full (``mode_slots_full``: no further mode
         could be split off then) and for how much of the posterior mass the
         hop was off while two modes held live points (``mode_hop_off``). A
-        mode lost before the end
-        leaves no trace in its own run, and neither does one that never held
-        more than about ``ndim`` live points per fold. A unimodal run (or a
+        mode lost before the end leaves no trace in its own run (no
+        ``unresolved`` flag and, in the runs measured, no warning), and
+        neither does one that never held more than about ``ndim`` live points
+        per fold. A mode's share of the live points when it separates from
+        the others is its share of the prior volume there, not its posterior
+        mass, so a narrow mode can be lost although it holds most of the
+        mass, and logZ then comes out low by about ``log(1 - mass)``, beyond
+        ``logzerr``. On a 4-D mixture of masses 0.6, 0.3 and 0.1 and widths
+        0.25, 0.5 and 0.75 (rotated Gaussians in ``[-12, 12]^4``) the 0.6
+        mode held a median of 8 to 9 of 500 live points when it separated; at
+        nlive 500 it was lost in 7 of 32 runs in float32 and 4 of 32 in x64,
+        all without a warning and with logZ 0.62 to 1.02 low (4.6 to 7.4
+        ``logzerr``), while every run that kept it flagged it unresolved. So
+        if any run flags a heavy mode unresolved, other runs may have lost
+        it: raise ``nlive`` and compare runs. A unimodal run (or a
         result without :attr:`labels`, or without posterior weight) gives one
         mode of mass 1, flagged ``unresolved`` if ``nlive`` is below
         ``UNRESOLVED_PER_DIM * ndim``: too few live points for a
@@ -1422,7 +1434,9 @@ class NestedSamplingResult:
         """The warnings of :meth:`diagnostics` about ``modes``."""
         warnings = [
             f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
-            f"{mode['min_live']} live points; raise nlive"
+            f"{mode['min_live']} live points, and in other runs such a mode "
+            "may be lost entirely, with no warning; raise nlive and compare "
+            "runs"
             for i, mode in enumerate(modes)
             if mode["unresolved"] and len(modes) > 1
         ]
@@ -1599,7 +1613,9 @@ class NestedSamplingResult:
         had fewer than two eligible clusters (the hop was off in its fold),
         and ``hop_acceptance`` (``None`` for a result without those
         records).
-        The warnings name each unresolved mode (a single mode too) and the
+        The warnings name each unresolved mode (a single mode too; for one of
+        several modes the warning adds that in other runs such a mode may be
+        lost entirely, which leaves no flag in the run that lost it) and the
         modes the clustering did not separate (their number is a lower
         bound); they say when the hop balanced the modes only in part
         (``mode_lumps`` at least ``LUMPS_WARN``, ``mode_hop_off`` at least
