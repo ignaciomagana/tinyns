@@ -20,7 +20,8 @@ previous checkpoint or the new one, never a torn file. It holds
   x64 flag and float dtype, the lane count and ``batched_data``, the host call
   counters (Python ints, one per lane), the accumulated ``wall_time_s``,
   ``compile_s`` and ``sampling_s``, the number of chunks, the JAX build
-  and device the run is bit-identical on (:func:`_environment`), and
+  and device that a resume needs to be bit-identical (:func:`_environment`;
+  on a CPU, where a fixed seed is bit-reproducible between processes), and
   ``mixed_build``, true once the run has been resumed under another one.
 
 Files of any other format are refused; there is no reader for older formats.
@@ -126,10 +127,11 @@ def _device(array):
 
 
 def _environment(device) -> dict:
-    """The JAX build and device that a resume is bit-identical on: the JAX
-    and jaxlib versions, ``jax_threefry_partitionable`` (it changes the random
-    stream; its default changed in JAX 0.5), and the platform and kind of
-    ``device``, the one the run's state is on."""
+    """The JAX build and device that a resume needs to be bit-identical to
+    an uninterrupted run (on a CPU; on a GPU in float32 they are needed but
+    not enough): the JAX and jaxlib versions, ``jax_threefry_partitionable``
+    (it changes the random stream; its default changed in JAX 0.5), and the
+    platform and kind of ``device``, the one the run's state is on."""
     return {
         "jax_version": jax.__version__,
         "jaxlib_version": jaxlib.__version__,

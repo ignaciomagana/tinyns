@@ -145,8 +145,9 @@ _NEAREST_BLOCK = 2**22
 # or more returned their seed (``metadata["unmoved_fraction"]``; at the 25%
 # walk acceptance, walks of 4 or fewer). The copies keep the insertion ranks
 # uniform, so the insertion test barely sees it, but on 5-D and 10-D
-# Gaussians (32 to 48 runs per walks) logZ scattered 1.2 to 2.9 times
-# logzerr at a fraction of 0.32 to 0.74; in 16-D it was 0.25 +- 0.09 too high
+# Gaussians (24 to 48 runs per walks) logZ scattered 1.2 to 3.8 times
+# logzerr at a fraction of 0.32 to 0.74 (3.8 +- 0.55 on the 5-D one at 0.74,
+# walks 1, nlive 400); in 16-D it was 0.25 +- 0.09 too high
 # at 0.36 (walks 4) and 1.4 +- 0.2 at 0.58. It catches gross shortfalls only:
 # at 0.12 to 0.27 the scatter was 0.9 to 1.5 times logzerr (1.3 to 1.5,
 # +- 0.14 to 0.19, in 3 of 6 cases), and in 16-D logZ was 0.20 +- 0.10 high
