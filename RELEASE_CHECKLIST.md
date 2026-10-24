@@ -11,8 +11,9 @@ get uploaded, and the tag goes on last.
       and `tinyns.__version__` agree
 - [ ] the CHANGELOG heading is `## vX.Y.Z (YYYY-MM-DD)`, dated the release day
 - [ ] the README install line pins the tag:
-      `git+https://github.com/ignaciomagana/tinyns.git@vX.Y.Z` (once tinyns is
-      on PyPI, it leads with `pip install tinyns` instead)
+      `git+https://github.com/ignaciomagana/tinyns.git@vX.Y.Z`. For a version
+      that goes to PyPI it leads with `pip install tinyns` instead, and the
+      git line is the development version (see section 5)
 - [ ] the Python classifiers in `pyproject.toml` match the CI matrix
       (`tests/test_packaging.py` checks it)
 
@@ -90,6 +91,14 @@ hashes.
 
 ## 5. PyPI (later)
 
+The README inside the uploaded files is the project's page on PyPI, and an
+upload cannot be replaced. The README of v1.0.0 says tinyns is not on PyPI
+yet, so an upload of 1.0.0 would say that on PyPI. Make the first upload a
+new patch version instead, whose README leads with `pip install tinyns` (the
+git line becomes the development version,
+`git+https://github.com/ignaciomagana/tinyns.git`), released through sections
+1 to 4; or accept that page for 1.0.0.
+
 If the upload comes long after the tag, rebuild from the tag (`git checkout
 vX.Y.Z`, `make dist`) and repeat section 3 on the new files.
 
@@ -102,8 +111,6 @@ vX.Y.Z`, `make dist`) and repeat section 3 on the new files.
 - [ ] `python -m twine upload dist/*`: the same files that section 3 checked
 - [ ] in a fresh venv, `python -m pip install tinyns==X.Y.Z` and run the
       quickstart
-- [ ] README: lead with `pip install tinyns`; the git line becomes the
-      development version (`git+https://github.com/ignaciomagana/tinyns.git`)
 
 A tag-triggered workflow with PyPI trusted publishing would move the upload
 from a laptop to CI; it needs a pending publisher configured on PyPI first.
