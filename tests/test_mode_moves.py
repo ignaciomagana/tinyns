@@ -481,3 +481,54 @@ def test_checkpoint_round_trip_with_cluster_state(tmp_path, monkeypatch) -> None
     other = Config(D, 60, 6, 10, _hop=False)
     with pytest.raises(ValueError, match="_hop"):
         core.run(4, two_gaussians, lambda u: u, other, checkpoint=path)
+
+
+def test_eligibility_by_volume_share_or_population() -> None:
+    """A frame takes part in the hop if it has more than ``d`` members and
+    either its volume share predicts ``2 d`` live points or it has ``2 d``
+    members: a compact cluster with many points is eligible although its
+    volume share is tiny (a mode whose contours are not ellipsoids)."""
+    dtype = jnp.result_type(float)
+    rng = np.random.default_rng(0)
+    d, nlive = D, 120
+    sizes = {"bulk": 100, "compact": 2 * D + 2, "few": 2 * D - 1, "wide": D + 2}
+    scales = {"bulk": 0.1, "compact": 1e-3, "few": 1e-3, "wide": 0.3}
+    x = np.concatenate([
+        c + s * rng.standard_normal((sizes[name], d))
+        for (name, s), c in zip(scales.items(), (0.2, 0.5, 0.8, 0.5), strict=True)
+    ])
+    labels = np.repeat(np.arange(4), list(sizes.values()))
+    st = modes.stats(jnp.asarray(x, dtype), jnp.asarray(labels, jnp.int32), modes.C_MAX)
+    fr = modes.frames(st, nlive)
+    logv = np.where(np.asarray(fr.active), np.asarray(fr.logdet), -np.inf)
+    predicted = nlive * np.exp(logv - np.logaddexp.reduce(logv))
+    # the compact cluster fails the volume rule alone; "few" fails both rules
+    assert predicted[1] < modes.ELIGIBLE_PER_DIM * d
+    assert predicted[3] >= modes.ELIGIBLE_PER_DIM * d  # "wide": by volume
+    assert np.asarray(fr.eligible)[:4].tolist() == [True, True, False, True]
+
+
+def test_eligibility_never_reads_the_folds_own_points() -> None:
+    """The frames of clustering j, their eligibility included, are fitted to
+    the points outside fold j: moving every point of fold j leaves them (and
+    the labels of clustering j) exactly as they were."""
+    cfg = Config(D, 120, 12, 20)
+    folds = cfg._folds
+    rng = np.random.default_rng(4)
+    state = core.init(0, region_loglike, lambda u: u, cfg)
+    dtype = state.u.dtype
+    state = state._replace(u=jnp.asarray(uniform_region(rng, cfg.nlive), dtype))
+    recluster = jax.jit(core._recluster)
+    before = recluster(state)
+    assert int(jnp.sum(before.mode_eligible[0])) >= 2
+    fold = np.arange(cfg.nlive) % folds
+    moved = np.asarray(state.u).copy()
+    moved[fold == 0] = CENTERS[1] + 0.01 * rng.standard_normal(((fold == 0).sum(), D))
+    after = recluster(state._replace(u=jnp.asarray(moved, dtype)))
+    for name in ("label", *("mode_" + f for f in modes.Frames._fields)):
+        a, b = np.asarray(getattr(before, name)[0]), np.asarray(getattr(after, name)[0])
+        assert np.array_equal(a, b), name
+    # the other clusterings see the moved points
+    assert not np.array_equal(
+        np.asarray(before.mode_count[1]), np.asarray(after.mode_count[1])
+    )
