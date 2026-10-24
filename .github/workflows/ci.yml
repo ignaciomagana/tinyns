@@ -17,13 +17,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The minimum supported JAX (pyproject.toml), on the minimum Python.
+          # The minimum supported JAX (pyproject.toml), on the minimum Python;
+          # one of the two on NumPy 1.x, which pyproject allows but pip does
+          # not pick there.
           - python-version: "3.10"
             x64: "0"
             jax: "0.4.31"
           - python-version: "3.10"
             x64: "1"
             jax: "0.4.31"
+            numpy: "1.26.4"
           # The newest JAX on Python 3.10 and 3.11, pinned: JAX >= 0.7 needs
           # Python 3.11 and JAX >= 0.11 needs Python 3.12.
           - python-version: "3.10"
@@ -51,7 +54,7 @@ jobs:
           - python-version: "3.15"
             x64: "0"
             jax: "latest"
-    name: test (py${{ matrix.python-version }}, x64=${{ matrix.x64 }}, jax ${{ matrix.jax }})
+    name: test (py${{ matrix.python-version }}, x64=${{ matrix.x64 }}, jax ${{ matrix.jax }}${{ matrix.numpy && format(', numpy {0}', matrix.numpy) || '' }})
     env:
       JAX_ENABLE_X64: ${{ matrix.x64 }}
 
@@ -70,6 +73,11 @@ jobs:
       - name: Pin JAX
         if: matrix.jax != 'latest'
         run: python -m pip install "jax==${{ matrix.jax }}" "jaxlib==${{ matrix.jax }}"
+
+      # ml_dtypes >= 0.6 needs NumPy 2.
+      - name: Pin NumPy
+        if: matrix.numpy
+        run: python -m pip install "numpy==${{ matrix.numpy }}" "ml_dtypes<0.6"
 
       - name: Show versions
         run: |
