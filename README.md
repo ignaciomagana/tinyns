@@ -208,11 +208,12 @@ three modes of different widths scattered 1.5 to 4 times more) and two flags.
   run too: a 32-D Gaussian was 9 nats high at nlive 40 and right at 100).
 - `tracked`: `False` if the sampler's clustering never separated the mode from
   its neighbours. The hop then did not balance it, its mass scatters as
-  without the hop (by about `run_sd`: each fold drifts on its own), and the
-  number of such modes is a lower bound. An eggbox is the example: its 18
-  modes sit on a lattice that no two-way split separates, and `modes()` finds
-  13 to 18 of them from the gaps between their live points (nlive 1000, 192
-  runs), none tracked.
+  without the hop (by at least about `run_sd`: each fold drifts on its own;
+  without the hop three modes of a mixture in 2-D and 3-D scattered 1.4 to 3
+  times their median `run_sd`), and the number of such modes is a lower
+  bound. An eggbox is the example: its 18 modes sit on a lattice that no
+  two-way split separates, and `modes()` finds 13 to 18 of them from the gaps
+  between their live points (nlive 1000, 192 runs), none tracked.
 
 `diagnostics()` and `summary()` turn both flags into warnings. They also warn
 when the hop balanced the modes only in part: after the modes separated and
