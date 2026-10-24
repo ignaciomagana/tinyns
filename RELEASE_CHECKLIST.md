@@ -22,7 +22,8 @@ get uploaded, and the tag goes on last.
 - [ ] `pytest` with `JAX_ENABLE_X64=0` and with `JAX_ENABLE_X64=1`
 - [ ] `pytest -m slow` (the heavy statistical gates of the mode moves)
 - [ ] `python bench/validate.py`: the quick tier of the validation gate passes
-      (about 6 minutes on 4 CPU cores), and again with `--no-x64`
+      (about 7 minutes on 4 CPU cores in x64, 5.5 in float32), and again with
+      `--no-x64`
 - [ ] `python bench/validate.py --tier full` passes on a GPU or a Slurm node,
       and again with `--no-x64`
 - [ ] every script in `examples/` runs
@@ -33,10 +34,12 @@ get uploaded, and the tag goes on last.
       scheduled workflows after 60 days without activity. If Actions shows CI
       as disabled, enable it ("Enable workflow", or `gh workflow enable CI`)
 
-`bench/README.md` describes the gate's cases and criteria. A failed case is a
-3-sigma event under a correct sampler about once in a hundred cases: rerun it
-with another key and more seeds (`--cases NAME --seed 1 --seeds 128`) before
-calling it a regression.
+`bench/README.md` describes the gate's cases and criteria. A correct sampler
+fails a case about once in 70 cases at 16 seeds and once in 170 at 64, because
+the bias tests use the se of the seeds. So about one quick-tier run in 8 has a
+false FAIL, and one full-tier run in 14. Rerun the case with another key and
+more seeds (`--cases NAME --seed 1 --seeds 128`) before calling it a
+regression, and record the rerun in the release notes.
 
 ## 3. Build and inspect
 
