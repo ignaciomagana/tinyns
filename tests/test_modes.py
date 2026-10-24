@@ -675,20 +675,30 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
 @pytest.mark.slow
 def test_modes_that_are_not_convex_18d() -> None:
     """The gate of the needle and Cauchy targets of ``bench.targets`` against
-    the same two modes without arms (18-D, nlive 1000, 8 batched runs each).
-    Over 16 single runs each: the needle reported 2 modes and the warning
+    the same two modes without arms (``build_two_mode(18, 0.2, "sep", "W")``,
+    the base of ``needle_d18``; 18-D, nlive 1000, 8 batched runs each).
+    Over 16 single runs each, the needle reported 2 modes and the warning
     every time (minor mass 0.198, logit sd 0.19 over the runs; 0.57 without
-    the hop), the Cauchy target 2 modes in 14 runs and the warning in all 14
-    (0.192, sd 0.32; truth 0.203), the plain modes 2 and no warning (sd
-    0.019). In float32 two of these 8 batched plain runs report one mode,
-    as before this check existed, and one may separate the modes late."""
+    the hop), and the Cauchy target 2 modes in 14 runs and the warning in
+    all 14 (0.192, sd 0.32; truth 0.203). Every plain run must keep its
+    minor mode, with an oracle mass (the target's responsibility averaged
+    over the posterior) within 0.03 of the truth. In 120 plain runs on the
+    release code (CPU; JAX 0.10.2 in float32 and x64, 0.4.34 in float32)
+    every run reported 2 modes and none warned that the hop ran in part; the
+    oracle mass was within 0.011 of the truth, with an sd of 0.004 (a logit
+    sd of 0.026). The plain control used to be ``build_two_mode(18, 0.2)``
+    (shape M, a minor mode whose volume is 0.035 of the main one's). It lost
+    its 20% mode with no warning in about 1 run in 8, in x64 as well as
+    float32 (4 of 32 runs in each on an H100), and the test, which averaged
+    the masses of the runs that reported two modes, passed such runs."""
     from bench.targets import build_two_mode, get_target, mixture_target
 
     keys = jax.random.split(jax.random.key(0), 8)
-    plain = mixture_target("plain_d18", build_two_mode(18, 0.2))
+    plain = mixture_target("plainW_d18", build_two_mode(18, 0.2, "sep", "W"))
     for target in (get_target("needle_d18"), get_target("cauchy_d18"), plain):
         sampler = NestedSampler(target.loglike, target.prior_transform, 18)
-        found, warned, minor = 0, 0, []
+        responsibility = jax.jit(jax.vmap(target.responsibility))
+        found, warned, minor, oracle = 0, 0, [], []
         for result in sampler.run(keys):
             diagnostics = result.diagnostics()
             modes = diagnostics["modes"]
@@ -696,14 +706,14 @@ def test_modes_that_are_not_convex_18d() -> None:
                 found += 1
                 minor.append(modes[1]["mass"])
             warned += any("only in part" in w for w in diagnostics["warnings"])
+            share = np.asarray(responsibility(result.samples))[:, 1]
+            oracle.append(float(result.weights() @ share))
         logit = np.log(np.array(minor) / (1 - np.array(minor)))
-        print(target.name, found, warned, np.mean(minor), np.std(logit))
+        print(target.name, found, warned, np.mean(minor), np.std(logit), oracle)
         truth = target.mode_mass[1]
         assert abs(np.mean(minor) - truth) < 0.05
         if target is plain:
-            # In float32 one run in 8 may separate the modes late (its minor
-            # mass 0.14 at 88c572b): all but one run within 0.1 of the truth.
-            near = np.abs(logit - np.log(truth / (1 - truth))) < 0.1
-            assert found >= 6 and warned == 0 and near.sum() >= found - 1
+            assert np.all(np.abs(np.array(oracle) - truth) < 0.03), oracle
+            assert found >= 6 and warned == 0
         else:
             assert found >= 6 and warned >= found
