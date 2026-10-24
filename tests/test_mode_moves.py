@@ -61,7 +61,7 @@ def invariance(nchains: int, cross_fit: bool = True, seed: int = 0, local=True):
     others = jnp.asarray(uniform_region(rng, nother), dtype)
     labels, st = modes.recluster(others, jnp.zeros(nother, jnp.int32))
     assert int(jnp.sum(st.count > 0)) == 2, "the fixed live set must split"
-    fit_others = modes.frames(st, 2 * NFIT)
+    fit_others = modes.frames(st, hop=True)
     chol = core._live_chol(others, jnp.ones(nother, bool))
 
     def one(key, s):
@@ -72,7 +72,7 @@ def invariance(nchains: int, cross_fit: bool = True, seed: int = 0, local=True):
                 jnp.concatenate([others, s[None]]),
                 jnp.concatenate([labels, label[None]]),
                 modes.C_MAX,
-            ), 2 * NFIT)
+            ), hop=True)
         u, _, _, _, _, hops, tries = core._chain(
             key, s, jnp.zeros((), dtype), jnp.asarray(-0.5, dtype), chol,
             jnp.asarray(SCALE, dtype), region_loglike, lambda v: v, WALKS, False,
@@ -113,7 +113,7 @@ def test_chain_reads_its_own_fold_and_the_compact_frames() -> None:
         ball = np.argmin(((others[:, None] - CENTERS) ** 2).sum(-1), axis=1)
         others = jnp.asarray(others, dtype)
         st = modes.stats(others, jnp.asarray(ball, jnp.int32), modes.C_MAX)
-        return modes.frames(st, n), core._live_chol(others, jnp.ones(n, bool))
+        return modes.frames(st, hop=True), core._live_chol(others, jnp.ones(n, bool))
 
     kernels = [fit(n) for n in (2 * NFIT, 3 * NFIT, 4 * NFIT)]  # one per fold
     assert [int(jnp.sum(fr.eligible)) for fr, _ in kernels] == [2, 2, 2]
@@ -254,7 +254,7 @@ def test_hop_keeps_the_constrained_prior_where_the_ellipsoids_overlap(local) -> 
     x = rng.uniform(lo, hi, (200, D))
     lab = jnp.asarray(x[:, 0] > 0.5, jnp.int32)
     x = jnp.asarray(x, dtype)
-    fr = modes.frames(modes.stats(x, lab, modes.C_MAX), 400)
+    fr = modes.frames(modes.stats(x, lab, modes.C_MAX), hop=True)
     assert int(jnp.sum(fr.eligible)) == 2
     chol = core._live_chol(x, jnp.ones(200, bool))
 
@@ -328,7 +328,7 @@ def test_local_walk_keeps_the_constrained_prior() -> None:
     narrow = lab == 0
     x[narrow] = x[narrow].mean(0) + 0.3 * (x[narrow] - x[narrow].mean(0))
     fr = modes.frames(modes.stats(jnp.asarray(x, dtype), jnp.asarray(lab),
-                                  modes.C_MAX), 200)
+                                  modes.C_MAX), hop=True)
     assert int(jnp.sum(modes.walk_frames(fr))) == 2
     chol = core._live_chol(jnp.asarray(x, dtype), jnp.ones(200, bool))
     n, walks = 20_000, 40

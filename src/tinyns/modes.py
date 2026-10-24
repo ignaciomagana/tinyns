@@ -36,9 +36,9 @@ if it is at least ``max(25, 1.5 (d + 2))`` and both parts have at least 3
 points. A single convex mode gives ``J`` of 10 to 16 however it is cut. Each
 cluster has a frame: its mean and the Cholesky factor of its covariance shrunk
 toward the pooled within-cluster covariance (prior weight ``0.1 d`` points).
-A frame is *eligible* for the hop if its volume share predicts at least ``2
-d`` live points (``m V_c / sum V >= 2 d``) and it has more than ``d``
-members; the most populated cluster always is. A frame *walks*
+A frame is *eligible* for the hop if it has at least ``ELIGIBLE_MIN_POINTS =
+3`` members (2 in one dimension), whatever its volume share; the most
+populated cluster always is. A frame *walks*
 (:func:`walk_frames`) if it has at least ``WALK_MIN_POINTS = 3`` members (a
 small mode keeps its own covariance, shrunk toward the pooled one, until it
 is nearly gone). The frames are factorized once, at the recluster, and kept
@@ -136,7 +136,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax, random
 from jax.scipy.linalg import solve_triangular
-from jax.scipy.special import logsumexp
 
 from tinyns._compat import optimization_barrier
 
@@ -147,7 +146,7 @@ SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
 WALK_MIN_POINTS = 3  # a cluster gives the walk its covariance from this size
 SHRINK = 0.1  # frame covariances: prior weight 0.1 d points on the pooled one
-ELIGIBLE_PER_DIM = 2.0  # a frame hops if its volume share predicts 2 d points
+ELIGIBLE_MIN_POINTS = 3  # a frame takes part in the hop from this many members
 ELL_R2_PER_DIM = 1.0  # hop ellipsoids: Mahalanobis^2 <= (d + 2) * this
 LLOYD_ITERS = 30  # 2-means iterations of a split
 SPLIT_EM_ITERS = 8  # hard-EM iterations refining a split
@@ -253,8 +252,9 @@ def stats(x, labels, nslots: int) -> Stats:
     return Stats(mu, scat, count)
 
 
-def frames(st: Stats, nlive: int | None = None) -> Frames:
-    """Frames of the clusters in ``st`` (``nlive``: eligibility, else none).
+def frames(st: Stats, hop: bool = False) -> Frames:
+    """Frames of the clusters in ``st`` (``hop``: mark those eligible for the
+    hop, :func:`_eligible`; else none).
 
     Each covariance is ``(1 - rho) S / (n - 1) + rho kappa P`` with ``S`` the
     scatter, ``P`` the pooled within-cluster covariance, ``kappa`` its scale
@@ -283,10 +283,10 @@ def frames(st: Stats, nlive: int | None = None) -> Frames:
     active = nonempty & ok
     ichol = solve_triangular(chol, jnp.broadcast_to(eye, chol.shape), lower=True)
     logdet = jnp.sum(jnp.log(jnp.diagonal(chol, axis1=-2, axis2=-1)), axis=-1)
-    if nlive is None:
-        eligible = jnp.zeros_like(active)
+    if hop:
+        eligible = _eligible(count, active, d)
     else:
-        eligible = _eligible(logdet, count, active, nlive, d)
+        eligible = jnp.zeros_like(active)
     return Frames(mu, chol, ichol, logdet, count, active, eligible)
 
 
@@ -298,12 +298,26 @@ def empty_frames(ndim: int, dtype) -> Frames:
     return Frames(jnp.zeros((C_MAX, ndim), dtype), eye, eye, zero, zero, off, off)
 
 
-def _eligible(logdet, count, active, nlive, d):
-    """Volume share predicts ``2 d`` live points, more than ``d`` members; the
-    most populated cluster always takes part."""
-    logv = jnp.where(active, logdet, -jnp.inf)
-    share = jnp.exp(logv - logsumexp(logv))
-    eligible = active & (nlive * share >= ELIGIBLE_PER_DIM * d) & (count > d)
+def eligible_min_points(ndim: int) -> int:
+    """The members a frame needs to take part in the hop:
+    ``ELIGIBLE_MIN_POINTS``, or ``ndim + 1`` if that is fewer (2 in one
+    dimension, which the 1.0 rule admitted too)."""
+    return min(ELIGIBLE_MIN_POINTS, ndim + 1)
+
+
+def _eligible(count, active, d):
+    """At least :func:`eligible_min_points` members, whatever the volume
+    share; the most populated cluster always takes part.
+
+    The 1.0 rule also asked for more than ``d`` members and a volume share
+    that predicts ``2 d`` live points, which left out the thin clusters that
+    need the hop most: a cluster whose share is below ``2 d / m`` can never
+    pass it, and the volume of a frame fitted to few points is biased low
+    (by several nats for 20 to 30 points at d = 18). Every cluster that rule
+    admitted is admitted here. ``count`` is of the points outside the fold
+    at the recluster, so the rule, like the frames, does not read the
+    chain's own fold."""
+    eligible = active & (count >= eligible_min_points(d))
     largest = jnp.argmax(jnp.where(active, count, -1.0))
     return eligible.at[largest].set(active[largest])
 

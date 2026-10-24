@@ -758,7 +758,7 @@ def _recluster(state: State, batched: bool = False) -> State:
     cols = jnp.where(valid, at, m)
     label = jnp.full((lanes, folds, m + 1), -1, jnp.int32)
     label = label.at[:, jnp.arange(folds)[:, None], cols].set(lab)[..., :m]
-    frames = jax.vmap(lambda st: _modes.frames(st, m))(st)
+    frames = jax.vmap(lambda st: _modes.frames(st, hop=True))(st)
     new = {
         "mode_" + name: x.reshape(lanes, folds, *x.shape[1:])
         for name, x in frames._asdict().items()
