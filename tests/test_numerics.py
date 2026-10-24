@@ -84,7 +84,9 @@ def test_two_live_points_do_not_stop_on_a_false_plateau() -> None:
     """With one point above L* the walk covariance was that point's alone,
     zero: the chain returned an exact copy of its seed (counted as moves),
     and a run with nlive 2 stopped on a "plateau" after one step."""
-    result = NestedSampler(gauss, identity, 1, 2).run(0)
+    with pytest.warns(UserWarning, match="nlive=2 is too few for ndim=1"):
+        sampler = NestedSampler(gauss, identity, 1, 2)
+    result = sampler.run(0)
     assert result.metadata["status"] == "converged" and result.niter > 2
 
 
