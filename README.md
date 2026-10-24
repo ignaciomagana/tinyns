@@ -119,8 +119,8 @@ likelihood contour `L*`; proposals that leave the open unit cube or fall to
   `t ~ Beta(n, 1)`), tied deaths included: `sd(logz) / logzerr` was 1.00 to
   1.28 on 2-D Gaussians and 1.02 to 1.07 on a flat-topped likelihood (128
   runs). The `logzerr` figures of the sweeps and benchmarks below used the
-  sum of information increments it replaced, which differs from it by -3%
-  (10-D) to +11% (2-D) without ties.
+  sum of information increments it replaced; without ties the first-order
+  `logzerr` is 3% smaller (10-D) to 11% larger (2-D).
 - **Plateaus.** New points land strictly above `L*`, so live points tied at
   one likelihood (a zero-likelihood region, a finite plateau, a floor) are
   left behind and die over several steps. Following Fowlie, Handley & Su
