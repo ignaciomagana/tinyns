@@ -245,7 +245,7 @@ Too few walks bias logZ and inflate its scatter, which the insertion test
 barely sees (an unmoved chain returns its seed, and the copies keep the ranks
 uniform). `diagnostics()` warns when 30% of the chains or more did not move
 (`metadata["unmoved_fraction"]`; at most 7% on the targets of `bench` at the
-default walks and `nlive=500`): there logZ scattered 1.2 to 2.9 times
+default walks and `nlive=500`): there logZ scattered 1.2 to 3.8 times
 `logzerr` on 5-D and 10-D Gaussians. It catches gross shortfalls only. If in
 doubt, rerun with twice the walks and check that logZ moves by less than
 `logzerr` (that check flagged every bad run of `ndtri_d6`).
