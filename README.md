@@ -484,6 +484,16 @@ does.
   mode was missed in 0 of 40 runs with x64 and 2 of 40 in float32. If the
   number of modes matters, raise `nlive` until every mode holds `5 * ndim`
   live points.
+- **A mode the clustering never split off.** A mode whose live points are
+  gone before the clustering first splits it from its neighbours is merged
+  into the nearest reported mode, with no warning. The lowest of three modes
+  in a line can be such a mode: on a 4-D mixture of masses 0.75, 0.2 and
+  0.05 along a line, 8 to 12 standard deviations apart with the 0.05 mode at
+  an end, 26 of 32 runs (nlive 1000) reported two modes (about 0.75 and
+  0.25), both tracked; the same modes in a triangle, or with the 0.05 mode in
+  the middle, gave three in every run. The mode count is then a lower bound
+  for tracked modes too; the samples, logZ and the summed mass of the merged
+  modes are right.
 - **Close modes.** `modes()` reports two modes as one when the likelihood dips
   by less than 3 between them and the bottom of the dip lies above the
   posterior median likelihood of at least one of them: two equal Gaussians
