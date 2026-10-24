@@ -302,14 +302,15 @@ larger at 2-D without ties, and the new formula does not change logZ.
 ### The release code
 
 `python bench/validate.py --tier full` on the release code (e556387; the
-commits after it change only docs, docstrings and tests) on an H100 NVL with
-JAX 0.4.34 and its CUDA 12 plugin, 64 runs per case, key 0. All 12 cases pass
-in float32 and in x64. The worst z is +2.2 in float32 and -2.0 in x64, both
-`gauss_d32`. The largest minor-mode logit bias is `sepW_d18`'s +0.007 ±
-0.002 in float32, a shift of its 6% mass by about 0.0004 (+0.004 ± 0.003 in
-x64). The `hop` column is the smallest acceptance over the runs: 0.25 to 0.28
-on `loggamma_d10` and 0.72 to 0.79 on the two-mode mixtures. The first case's
-`wall s` in float32 includes compiling in a cold process.
+commits after it change only docs, docstrings, tests and the wording of one
+warning) on an H100 NVL with JAX 0.4.34 and its CUDA 12 plugin, 64 runs per
+case, key 0. All 12 cases pass in float32 and in x64. The worst z is +2.2 in
+float32 and -2.0 in x64, both `gauss_d32`. The largest minor-mode logit bias
+is `sepW_d18`'s +0.007 ± 0.002 in float32, a shift of its 6% mass by about
+0.0004 (+0.004 ± 0.003 in x64). The `hop` column is the smallest acceptance
+over the runs: 0.25 to 0.28 on `loggamma_d10` and 0.72 to 0.79 on the
+two-mode mixtures. The first case's `wall s` in float32 includes compiling in
+a cold process.
 
 Float32:
 
@@ -351,11 +352,12 @@ On the same GPU `pytest -m slow` passed 6 of 6 in x64. In float32 it failed
 0.035 of the main mode's volume) found both modes, but in one the minor mode
 split off late and was partly lost, and that run warned that the hop ran only
 in part; the 8 runs gave a minor mass of 0.174 against 0.200 (logit sd 1.0),
-and the test allows no warning on that target. At 8851058 the same test passed in
-float32 (one of the 8 runs lost the mode entirely, with no warning). The
-test's plain control is now shape W, `build_two_mode(18, 0.2, "sep", "W")`
-(the same two modes as `needle_d18` without its arms), and the test checks
-every run's oracle minor mass against the truth.
+and the test allows no warning on that target. At 8851058 the same test
+passed in float32 (one of the 8 runs lost the mode entirely, with no
+warning). The test's plain control is now shape W,
+`build_two_mode(18, 0.2, "sep", "W")` (the same two modes as `needle_d18`
+without its arms), and the test checks every run's oracle minor mass against
+the truth.
 
 ## tinyns v1 on the mixtures, by nlive
 
