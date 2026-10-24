@@ -234,7 +234,7 @@ posteriors that are roughly Gaussian in the unit cube. A nonlinear prior
 transform that presses most coordinates against faces of the cube needs
 more: with a normal prior and the data 3 prior sd off centre in all 6
 coordinates (`ndtri_d6` in `bench/validate.py`), the default 36 walks left
-logZ 0.24 +- 0.08 low with a scatter 3.5 times `logzerr` (64 runs), and it
+logZ 0.24 +- 0.08 low with a scatter 3.6 times `logzerr` (64 runs), and it
 took 144 (4 times the default) to remove both. The default was enough for a
 curved target once there were enough live points: the logZ of a 10-D
 Rosenbrock (60 walks) was 0.16 +- 0.05 low at `nlive=500`, 0.05 +- 0.04 at
