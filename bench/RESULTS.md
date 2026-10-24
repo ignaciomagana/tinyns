@@ -357,7 +357,11 @@ passed in float32 (one of the 8 runs lost the mode entirely, with no
 warning). The test's plain control is now shape W,
 `build_two_mode(18, 0.2, "sep", "W")` (the same two modes as `needle_d18`
 without its arms), and the test checks every run's oracle minor mass against
-the truth.
+the truth. With it, on the same H100 at 8100150 (src as at e556387 but for
+the wording of one warning), `pytest -m slow` passes 6 of 6 in float32 and
+in x64: every plain run found both modes with no warning and an oracle minor
+mass of 0.192 to 0.208, and all 8 runs of `needle_d18` and of `cauchy_d18`
+reported two modes and warned.
 
 ## tinyns v1 on the mixtures, by nlive
 
