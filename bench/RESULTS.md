@@ -92,7 +92,7 @@ default 1000).**
   all 72 cells (nlive 2000 and 4000 included). That is the logzerr of these
   runs, a sum of information increments; the first-order logzerr of the
   release is 3% smaller at 10-D to about 11% larger at 2-D without ties, and
-  logZ is unchanged.
+  the new formula does not change logZ.
 - No run of tinyns v1 timed out or raised an error (2240 runs).
 - **Time.** A compiled run takes 1.1 to 20 s on the H100 and a first run 9 to
   31 s. BlackJAX NSS's `run s` is 9.0 to 77 s, but about 9 s of every run is
@@ -297,7 +297,7 @@ column.
 
 `scat/err` uses the `logzerr` of afa58dd, a sum of information increments;
 the first-order `logzerr` of the release is 3% smaller at 10-D to about 11%
-larger at 2-D without ties, and logZ is unchanged.
+larger at 2-D without ties, and the new formula does not change logZ.
 
 ## tinyns v1 on the mixtures, by nlive
 
@@ -521,7 +521,7 @@ Hardware (wall times compare only within one label):
 The `logzerr`, `scat/err` and `in 3s` of the tinyns_v1 rows use the
 `logzerr` of afa58dd, a sum of information increments; the first-order
 `logzerr` of the release is 3% smaller at 10-D to about 11% larger at 2-D
-without ties, and logZ is unchanged.
+without ties, and the new formula does not change logZ.
 
 | target | sampler | hw | nlive | ok | dlogZ | rms | sd | logzerr | scat/err | in 3s | logit bias | logit sd [95% CI] | lost | ncall | wall s | compile s | run s | first s | acc |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
