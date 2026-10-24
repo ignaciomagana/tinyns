@@ -283,7 +283,7 @@ cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
   kept from 1000. Its logZ was right at every `nlive`, and its peak weights
   scatter as `1 / sqrt(nlive)` (see Limitations).
 - *the target is curved.* The logZ of the 10-D Rosenbrock was 0.16 too low at
-  500, 0.05 at 1000 and unbiased from 2000 (at the default `walks`).
+  500, 0.05 to 0.09 at 1000 and unbiased from 2000 (at the default `walks`).
 - *`ndim` is above about `nlive / 10`.* At `nlive=250` logZ was 0.2 to 0.4 too
   high at 32 and 64 dimensions; 1000 was unbiased up to 64.
 - *`NestedSampler` warns that `nlive` is too few for `ndim`* (below
@@ -484,9 +484,12 @@ ncall=total)`, as `examples/functional_core.py` does.
   by less than 3 between them and the bottom of the dip lies above the
   posterior median likelihood of at least one of them: two equal Gaussians
   closer than about 3.3 standard deviations in 2-D, 4.8 in 5-D and 5.4 from
-  7-D on. A close mode of less mass merges further out (in 2-D, a 0.1 or 0.2
-  mode at 4.5 to 5.5 standard deviations in 70 of 72 runs), with no warning.
-  The samples, logZ and the total mass are unaffected.
+  7-D on. Farther apart they are two modes only where the clustering split
+  them: two equal Gaussians 5 standard deviations apart in 5-D were one mode
+  in 25 of 32 runs (nlive 500). A close mode of less mass merges further out
+  (in 2-D, a 0.1 or 0.2 mode at 4.5 to 5.5 standard deviations in 70 of 72
+  runs). Neither draws a warning; the samples, logZ and the total mass are
+  unaffected.
 - **Separated rings in two dimensions.** The clustering's split test cannot
   separate two well-separated rings in 2-D (its statistic is at most 24.5,
   against a threshold of 25): on the Feroz-Hobson 2-D shells most runs warn,
