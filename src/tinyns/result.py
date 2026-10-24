@@ -159,6 +159,28 @@ _NEAREST_BLOCK = 2**22
 # would flag correct runs: at nlive 200 the eggbox averaged 0.19 with a
 # scatter of 0.95 and 1.1.
 UNMOVED_WARN = 0.3
+# compare() flags a run whose logZ lies more than COMPARE_SIGMA combined
+# logzerr below the highest of the runs, or which holds less than
+# COMPARE_LOST_SHARE of the mass of a mode that another run found with a mass
+# of at least COMPARE_MIN_MASS (COMPARE_LOST_SHARE_UNTRACKED if that run's
+# clustering did not separate the mode). A lost mode lowers logZ by about
+# log(1 - mass) only: 5 to 10 logzerr for the 0.6 mode of a 4-D mixture at
+# nlive 500, but -2 to +0.2 logzerr for the 0.2 mode of the 18-D target
+# build_two_mode(18, 0.2) at nlive 1000, which the mode test finds. On the
+# release runs of the 1.1 lost-mode study (the mixture in 4-D at nlive 500
+# and 1000 and in 6-D at 1000, the 18-D target in x64; 216 runs), a run that
+# had lost the mode held at most 0.082 of the mass that a run which kept it
+# found there (1251 pairs; below 0.01 on the mixture, up to 0.082 on the 18-D
+# target, whose mode died later), and a run that kept it at least 0.13
+# (30,700 pairs, with the controls sepW_d10, rosen_d10 and the shape-W
+# control of the 18-D target). An untracked mode is not balanced by the hop,
+# and its mass scatters from run to run as without it: the peaks of the
+# eggbox differed up to 26-fold between runs that kept them all.
+# _COMPARE_TAIL is the posterior mass of a run's lightest samples that the
+# mode test leaves out.
+COMPARE_SIGMA, COMPARE_MIN_MASS = 4.0, 0.05
+COMPARE_LOST_SHARE, COMPARE_LOST_SHARE_UNTRACKED = 0.1, 0.01
+_COMPARE_TAIL = 1e-6
 
 
 def _jsonable(value):
@@ -234,14 +256,12 @@ def _mahalanobis2(x, point) -> float:
     return float(dm @ np.linalg.solve(cov, dm))
 
 
-def _nearest_mode(u, weights, label, k):
-    """Hard-EM classification of the rows ``u`` among ``k`` modes.
-
-    Each mode's frame is the posterior-weighted mean and covariance of its
-    samples, shrunk toward the pooled one with a weight of ``ndim`` effective
-    samples; a row goes to the mode of least ``r^2 + 2 log det L - 2 log
-    mass``.
-    """
+def _mode_frames(u, weights, label, k) -> list[tuple]:
+    """The frame of each of ``k`` modes of the samples ``u`` (``label``: the
+    mode of each), for :func:`_nearest_mode`: the posterior-weighted mean and
+    covariance of its samples, shrunk toward the pooled one with a weight of
+    ``ndim`` effective samples, as ``(mean, Cholesky factor L, log det L,
+    mass)``."""
     ndim = u.shape[1]
     fits, pooled, total = [], np.zeros((ndim, ndim)), 0.0
     for c in range(k):
@@ -255,14 +275,30 @@ def _nearest_mode(u, weights, label, k):
         pooled += cov * ess
         total += ess
     pooled /= total
-    score = []
+    frames = []
     for mass, mu, cov, ess in fits:
         rho = ndim / (ess + ndim)
         chol = np.linalg.cholesky(_ridge((1 - rho) * cov + rho * pooled))
+        frames.append((mu, chol, np.sum(np.log(np.diag(chol))), mass))
+    return frames
+
+
+def _nearest_frame(u, frames) -> np.ndarray:
+    """The frame of least ``r^2 + 2 log det L - 2 log mass`` for each of the
+    rows ``u`` (:func:`_mode_frames`)."""
+    score = []
+    for mu, chol, logdet, mass in frames:
         z = np.linalg.solve(chol, (u - mu).T)
-        logdet = np.sum(np.log(np.diag(chol)))
         score.append(np.sum(z * z, axis=0) + 2 * logdet - 2 * math.log(mass))
     return np.argmin(np.asarray(score), axis=0)
+
+
+def _nearest_mode(u, weights, label, k):
+    """Hard-EM classification of the rows ``u`` among ``k`` modes (the frames
+    of :func:`_mode_frames`): a row goes to the mode of least ``r^2 + 2 log
+    det L - 2 log mass``.
+    """
+    return _nearest_frame(u, _mode_frames(u, weights, label, k))
 
 
 def _nearest_other(z, rows) -> np.ndarray:
@@ -954,9 +990,10 @@ class NestedSamplingResult:
         too: on the 18-D target ``build_two_mode(18, 0.2)`` of
         ``bench.targets`` 2 of 16 runs in x64 lost its 20% mode, and all 14
         that kept it flagged it. So if any run flags a mode unresolved, other
-        runs may have lost it: raise ``nlive`` and compare runs. A unimodal
-        run (or a result without :attr:`labels`, or without posterior
-        weight) gives one mode of mass 1, flagged ``unresolved`` if ``nlive``
+        runs may have lost it: raise ``nlive`` and compare runs
+        (:func:`tinyns.compare`). A unimodal run (or a result without
+        :attr:`labels`, or without posterior weight) gives one mode of mass
+        1, flagged ``unresolved`` if ``nlive``
         is below ``UNRESOLVED_PER_DIM * ndim``: too few live points for a
         covariance-adapted walk to learn the shape of a mode (a near-Gaussian
         one can do with fewer: on a 32-D Gaussian logZ was 9 nats high at
@@ -978,6 +1015,12 @@ class NestedSamplingResult:
     @cached_property
     def _mode_list(self) -> list[dict[str, Any]]:
         """:meth:`modes`, worked out once per result."""
+        return self._mode_fit[0]
+
+    @cached_property
+    def _mode_fit(self) -> tuple[list[dict[str, Any]], np.ndarray | None]:
+        """:meth:`modes` and the mode of every sample (its index in that
+        list; ``None`` for one mode), worked out once per result."""
         fold = self._sample_folds()
         folds = None if fold is None else int(fold.max()) + 1
         nlive, niter = int(self.nlive), int(self.niter)
@@ -990,11 +1033,11 @@ class NestedSamplingResult:
                 "unresolved": bool(nlive < UNRESOLVED_PER_DIM * int(self.ndim)),
                 "tracked": True}]
         if niter == 0 or self.labels is None or self._no_weight():
-            return one
+            return one, None
         try:
             return self._modes(one)
         except np.linalg.LinAlgError:  # a degenerate set of samples
-            return one
+            return one, None
 
     def _mode_samples(self):
         """Passes 1 to 6 of :meth:`modes`: the mode of every sample and, for
@@ -1056,10 +1099,10 @@ class NestedSamplingResult:
         born = self._births[0]
         return (born < t) & (np.arange(len(born)) >= t)
 
-    def _modes(self, one: list) -> list[dict[str, Any]]:
+    def _modes(self, one: list) -> tuple[list[dict[str, Any]], np.ndarray | None]:
         found = self._mode_samples()
         if found is None:
-            return one
+            return one, None
         label, whole = found
         k = len(whole)
         nlive, niter, ndim = int(self.nlive), int(self.niter), int(self.ndim)
@@ -1123,7 +1166,8 @@ class NestedSamplingResult:
                 "unresolved": bool(min_live < UNRESOLVED_PER_DIM * ndim),
                 "tracked": tracked[c],
             })
-        return sorted(out, key=lambda mode: -mode["mass"])
+        order = sorted(range(k), key=lambda c: -out[c]["mass"])
+        return [out[c] for c in order], np.argsort(order)[label]
 
     def _separated(self, label, k: int) -> list[bool]:
         """Whether the recorded labels separate each of the ``k`` modes
@@ -1439,7 +1483,7 @@ class NestedSamplingResult:
             f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
             f"{mode['min_live']} live points, and in other runs such a mode "
             "may be lost entirely, with no warning; raise nlive and compare "
-            "runs"
+            "runs (tinyns.compare)"
             for i, mode in enumerate(modes)
             if mode["unresolved"] and len(modes) > 1
         ]
@@ -1953,3 +1997,267 @@ class NestedSamplingResult:
             "samples_n": np.asarray(self.nlive_i),
             "eff": 100.0 * int(self.niter) / max(int(self.ncall), 1),
         }
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """The runs that :func:`compare` flagged, and why.
+
+    ``runs`` holds one dictionary per run, in the order given: ``run`` (its
+    index), ``flagged``, ``reason`` (why it is flagged; empty if it is not),
+    ``compared`` (False for a run that did not succeed or has no posterior
+    weight: it is flagged and plays no part in the comparison of the others),
+    ``logz``, ``logzerr``, ``nlive``, ``nmodes`` (the number of its
+    :meth:`~NestedSamplingResult.modes`), ``logz_shortfall`` (how far its
+    logZ lies below the highest, in combined logzerr ``sqrt(e_best^2 +
+    e_run^2)``; ``None`` if not compared) and ``missing_modes``, the modes of
+    other runs that it lacks, each as ``run``, ``mode`` (its index in that
+    run's :meth:`~NestedSamplingResult.modes`), ``mass`` (there) and
+    ``mass_here`` (the posterior mass of this run's samples nearest that
+    mode). ``flagged`` lists the flagged runs, and ``best`` is the run of
+    highest logZ (``None`` if no run was compared). :meth:`summary` (and
+    ``print``) gives a table.
+    """
+
+    runs: list[dict[str, Any]]
+    flagged: list[int]
+    best: int | None
+
+    def summary(self) -> str:
+        """Return a table of the runs (``shortfall``: ``logz_shortfall``)
+        and the reason for each flag."""
+
+        n, compared = len(self.runs), sum(row["compared"] for row in self.runs)
+        if n == 1:
+            head = (
+                "1 run: nothing to compare it with; run several seeds of the "
+                "problem (e.g. jax.random.split(key, 4))"
+            )
+        else:
+            head = f"{n} runs, {compared} compared: {len(self.flagged)} flagged"
+            if self.best is not None:
+                head += f" (highest logz: run {self.best})"
+        lines = [head, "run        logz   logzerr  shortfall  modes  nlive"]
+        for row in self.runs:
+            shortfall = row["logz_shortfall"]
+            lines.append(
+                f"{row['run']:3d}  {row['logz']:10.4f}  {row['logzerr']:8.4f}  "
+                + ("        -" if shortfall is None else f"{shortfall:9.1f}")
+                + f"  {row['nmodes']:5d}  {row['nlive']:5d}"
+                + ("  flagged" if row["flagged"] else "")
+            )
+        lines += [f"run {row['run']}: {row['reason']}" for row in self.runs
+                  if row["flagged"]]
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.summary()
+
+
+def _bulk(result: NestedSamplingResult) -> tuple[np.ndarray, np.ndarray]:
+    """The samples of ``result`` (unit cube) that carry all but
+    ``_COMPARE_TAIL`` of its posterior mass, and their weights."""
+    weights = result._weights
+    order = np.argsort(weights)
+    keep = np.ones(len(weights), dtype=bool)
+    keep[order[np.cumsum(weights[order]) <= _COMPARE_TAIL]] = False
+    return np.asarray(result.samples_u, dtype=float)[keep], weights[keep]
+
+
+def compare(results) -> Comparison:
+    """Compare runs of one problem and flag those that lost a mode.
+
+    A mode can die out of a run before its posterior bulk (the live points
+    of a mode drift, and a thin mode can reach zero), and the run that lost
+    it gives no sign: :meth:`NestedSamplingResult.modes` does not list it, no
+    warning fires, and logZ is low by about ``log(1 - mass)``, which can lie
+    within ``logzerr``. Runs of other seeds keep the mode in most cases, so a
+    batch of runs shows the loss. A run is flagged if
+
+    - its logZ lies more than ``COMPARE_SIGMA`` (4) combined logzerr,
+      ``sqrt(e_best^2 + e_run^2)``, below the highest logZ of the runs; or
+    - it lacks a mode that another run found: a mode of mass at least
+      ``COMPARE_MIN_MASS`` (0.05) in that run's :meth:`modes
+      <NestedSamplingResult.modes>`, of which this run holds less than
+      ``COMPARE_LOST_SHARE`` (a tenth). For a mode that the other run's
+      clustering did not separate (``tracked`` False) the bar is
+      ``COMPARE_LOST_SHARE_UNTRACKED`` (a hundredth): the hop did not balance
+      such a mode, and its mass scatters from run to run as without the hop.
+      This run's samples are given to the nearest of the other run's modes
+      (the posterior-weighted mean and covariance of each, as in pass 5 of
+      :meth:`modes <NestedSamplingResult.modes>`), so the test does not
+      depend on how this run's own modes were counted: a run that merged two
+      modes into one, or cut one into lumps, still holds their mass where
+      the other run found it.
+
+    A run that did not succeed (``maxiter``, ``maxcall``, ``invalid``) or has
+    no posterior weight is flagged with its message and takes no part in the
+    comparison of the others. Runs at different ``nlive`` (or ``walks``,
+    ``num_delete``) can be compared; the run at lower ``nlive`` is the more
+    likely to lose a mode. The comparison runs no likelihood and compiles
+    nothing: it works out :meth:`modes <NestedSamplingResult.modes>` of each
+    run (cached on the result) and gives the samples of each run to the
+    modes of each other one.
+
+    ``results`` is a list of results of one problem: the list that a batched
+    run, ``NestedSampler(...).run(jax.random.split(key, 4))``, returns, runs
+    of several calls, or results read by
+    :meth:`NestedSamplingResult.load_npz`. The runs of ``run(keys,
+    batched_data=True)`` are of different datasets, so they are refused
+    (``ValueError``), as are runs of different ``ndim``; a result saved
+    before 1.1 or built by hand does not record ``batched_data``, and the
+    caller must make sure that such runs are of one likelihood and prior.
+
+    What it finds, in batches of 4 drawn from the saved runs of the 1.0.0
+    sampler in the lost-mode study of 1.1. A 4-D mixture of masses 0.6, 0.3
+    and 0.1 whose narrow 0.6 mode holds about 6 of 500 live points when it
+    separates: at nlive 500 (13 of 64 runs lost the mode) it flagged 1217 of
+    the 1219 batches that held a lost run (the other two held only lost
+    runs) and none of the 781 without; at nlive 1000 (3 of 64 lost it) all
+    362 with a lost run, and 43 of the 1638 without, each of which held the
+    one run that kept every mode but whose logZ lay 0.48 (4.6 logzerr) below
+    the truth, its 0.6 mode at a mass of 0.50. The 18-D target
+    ``build_two_mode(18, 0.2)`` of ``bench.targets`` at nlive 1000 (x64): its
+    0.2 mode was lost in 11 of 128 runs, with logZ within 2 logzerr of the
+    truth, and the mode test flagged all 636 batches with a lost run and
+    none of the 1364 without. Controls, 32 runs each at nlive 1000
+    (Gaussians in 8-D and 16-D, ``sepW_d10``, the shape-W control
+    ``build_two_mode(18, 0.2, 'sep', 'W')``, ``rosen_d10`` and the eggbox):
+    no run flagged in 2000 batches of each. Of 128 new eggbox runs (4
+    batches of 32), 37 had lost a peak of 2.2% or 4.2% of the posterior
+    (below a tenth of its mass); it flagged 14 of those when the 32 runs
+    were compared at once (another run had put that peak at 0.05 or more)
+    and 3 in batches of 4, and none of the 91 runs that kept every peak.
+
+    A mode that every run lost is not found: if a fraction ``p`` of the runs
+    lose it, a batch of ``B`` runs misses it with probability ``p^B``. The
+    6-D version of the mixture, whose 0.6 mode holds 1 or 2 of 1000 live
+    points when it separates, lost it in 23 of 24 runs, and only the batches
+    that held the one run that kept it were flagged. The highest logZ of
+    many runs is high by chance, so in a large batch the logZ test can flag
+    a run whose logZ scatters beyond logzerr: of 32 runs of the 4-D mixture
+    at nlive 300 (x64) it flagged one that kept every mode, and none in
+    batches of 4.
+
+    Example::
+
+        results = NestedSampler(loglike, prior_transform, ndim).run(
+            jax.random.split(jax.random.key(0), 4)
+        )
+        report = tinyns.compare(results)
+        print(report)  # a table, and why each flagged run is flagged
+        kept = [r for i, r in enumerate(results) if i not in report.flagged]
+
+    Returns a :class:`Comparison`.
+    """
+
+    if isinstance(results, NestedSamplingResult):
+        raise TypeError(
+            "compare() takes a list of results of one problem, such as the "
+            "list that NestedSampler.run(jax.random.split(key, 4)) returns"
+        )
+    results = list(results)
+    if not results:
+        raise ValueError("compare() needs at least one result")
+    if not all(isinstance(result, NestedSamplingResult) for result in results):
+        raise TypeError("compare() takes NestedSamplingResult objects")
+    ndims = ", ".join(map(str, sorted({int(result.ndim) for result in results})))
+    if "," in ndims:
+        raise ValueError(
+            f"the runs are of different problems (ndim {ndims}): compare runs "
+            "of one likelihood and prior"
+        )
+    if any((result.metadata or {}).get("batched_data") for result in results):
+        raise ValueError(
+            "the runs of run(keys, batched_data=True) are of different "
+            "datasets, so their logZ and modes differ by design: compare runs "
+            "of one problem (several keys on one dataset)"
+        )
+
+    why = []
+    for result in results:
+        if not result.success:
+            why.append(f"not compared: {result.message or 'the run did not succeed'}")
+        elif result._no_weight() or not math.isfinite(float(result.logz)):
+            why.append("not compared: logz is not finite")
+        else:
+            why.append(None)
+    ok = [i for i, text in enumerate(why) if text is None]
+    logz = [float(result.logz) for result in results]
+    logzerr = [float(result.logzerr) for result in results]
+    best = max(ok, key=lambda i: logz[i]) if ok else None
+    shortfall = {}
+    for j in ok:
+        gap, scale = logz[best] - logz[j], math.hypot(logzerr[best], logzerr[j])
+        shortfall[j] = gap / scale if scale > 0 else (math.inf if gap > 0 else 0.0)
+
+    # The mode test: the samples of every other run, given to the nearest of
+    # the modes of run i.
+    missing = {j: [] for j in ok}
+    bulk = {}
+    for i in ok:
+        modes, label = results[i]._mode_fit
+        heavy = [m for m, mode in enumerate(modes) if mode["mass"] >= COMPARE_MIN_MASS]
+        if label is None or not heavy or len(ok) < 2:
+            continue
+        mass = np.array([mode["mass"] for mode in modes])
+        index = np.full(len(modes), -1)
+        index[mass > 0] = np.arange(np.sum(mass > 0))
+        try:
+            frames = _mode_frames(
+                np.asarray(results[i].samples_u, dtype=float),
+                results[i]._weights, index[label], int(np.sum(mass > 0)),
+            )
+        except np.linalg.LinAlgError:  # a degenerate mode: no frame
+            continue
+        for j in ok:
+            if j == i:
+                continue
+            if j not in bulk:
+                bulk[j] = _bulk(results[j])
+            u, weights = bulk[j]
+            here = np.bincount(
+                _nearest_frame(u, frames), weights, minlength=len(frames)
+            )
+            missing[j] += [
+                {"run": i, "mode": m, "mass": float(mass[m]),
+                 "mass_here": float(here[index[m]])}
+                for m in heavy
+                if here[index[m]] < mass[m] * (
+                    COMPARE_LOST_SHARE if modes[m]["tracked"]
+                    else COMPARE_LOST_SHARE_UNTRACKED
+                )
+            ]
+
+    runs = []
+    for j, result in enumerate(results):
+        reasons = [] if why[j] is None else [why[j]]
+        if why[j] is None and shortfall[j] > COMPARE_SIGMA:
+            reasons.append(
+                f"logz {logz[j]:.4g} lies {shortfall[j]:.1f} combined logzerr "
+                f"below the {logz[best]:.4g} of run {best}"
+            )
+        lacks = missing.get(j, [])
+        if lacks:
+            worst = max(lacks, key=lambda item: item["mass"])
+            found = len({item["run"] for item in lacks})
+            reasons.append(
+                "it lacks a mode that "
+                + (f"run {worst['run']}" if found == 1 else f"{found} other runs")
+                + f" found (mode {worst['mode']} of run {worst['run']}: mass "
+                f"{worst['mass']:.3g} there, {worst['mass_here']:.2g} here)"
+            )
+        runs.append({
+            "run": j,
+            "flagged": bool(reasons),
+            "reason": "; ".join(reasons),
+            "compared": why[j] is None,
+            "logz": logz[j],
+            "logzerr": logzerr[j],
+            "nlive": int(result.nlive),
+            "nmodes": len(result._mode_list),
+            "logz_shortfall": shortfall.get(j),
+            "missing_modes": lacks,
+        })
+    flagged = [row["run"] for row in runs if row["flagged"]]
+    return Comparison(runs=runs, flagged=flagged, best=best)
