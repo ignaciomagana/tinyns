@@ -422,10 +422,10 @@ rows = []
 while delta_logz(state, cfg) >= 0.1:  # evidence left in the live points
     state, dead = step(state, loglike, prior_transform, cfg)
     rows.append(dead)
-    if STATUS[int(state.status)] != "running":  # a plateau, or +inf
+    if STATUS[int(state.status)] != "running":  # plateau or invalid
         break
 # The rows of the first state.it steps are valid (a step on a plateau leaves
-# the state as it was and returns rows that are not).
+# the live points and state.it as they were and returns rows that are not).
 dead = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs)[: int(state.it)], *rows)
 result = finalise(state, dead, cfg, prior_transform=prior_transform, dlogz=0.1)
 ```
@@ -439,11 +439,15 @@ keyed on its structure). `step` does not test termination; the loop does.
 Given the loop's `dlogz`, `finalise` applies the stopping rule of `run` and
 reports `converged` (without it: `success=False`, `running`).
 `tinyns.STATUS[int(state.status)]` names the status, which `step` changes only
-on a likelihood plateau (`"plateau"`) or at a likelihood of `+inf`
-(`"invalid"`): stop there. `finalise` takes the rows of exactly the first
-`state.it` steps. `state.ncall` is an int32: a loop that may pass `2**31`
-likelihood calls counts them on the host and gives `finalise(...,
-ncall=total)`, as `examples/functional_core.py` does.
+on a likelihood plateau (`"plateau"`), or at a likelihood of `+inf` or with no
+finite one (`"invalid"`): stop there. A step on a plateau, and every step
+after it, still runs its chains, and `state.ncall` counts their calls: a
+`lax.scan` chunk that goes on past a plateau calls the likelihood at each
+remaining step, so keep chunks short for a costly likelihood. `finalise`
+takes the rows of exactly the first `state.it` steps. `state.ncall` is an
+int32: a loop that may pass `2**31` likelihood calls counts them on the host
+and gives `finalise(..., ncall=total)`, as `examples/functional_core.py`
+does.
 
 `examples/` has five scripts, each under a minute on a CPU: `quickstart.py`,
 `multimodal.py`, `checkpoint_resume.py`, `sbc_batched.py` and
