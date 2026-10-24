@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import stat
+import subprocess
+import sys
 import warnings
 
 import jax
@@ -121,6 +123,46 @@ def test_load_npz_keeps_the_saved_dtypes(tmp_path) -> None:
         np.testing.assert_array_equal(back, saved, name)
     assert len(np.unique(loaded.samples[:, 0])) == 400
     np.testing.assert_array_equal(loaded.weights(), result.weights())
+
+
+def _python(code: str, path, x64: bool) -> None:
+    """Run ``code`` (``sys.argv[1]`` is ``path``) in a new Python on the CPU,
+    with x64 on or off and this test's ``tinyns``."""
+    env = dict(
+        os.environ,
+        JAX_ENABLE_X64="1" if x64 else "0",
+        JAX_PLATFORMS="cpu",
+        PYTHONPATH=os.pathsep.join(p for p in sys.path if p),
+    )
+    subprocess.run([sys.executable, "-c", code, str(path)], env=env, check=True)
+
+
+def test_a_result_saved_under_x64_loads_unchanged_without_x64(tmp_path) -> None:
+    """The case behind the test above, end to end (a session runs in one x64
+    mode, so each side is a new process): a run saved under x64 came back
+    from ``load_npz`` without x64 as float32."""
+    path = tmp_path / "result.npz"
+    _python(
+        "import sys, jax.numpy as jnp\n"
+        "from tinyns import NestedSampler\n"
+        "def loglike(x):\n"
+        "    return -0.5 * jnp.sum(((x - 1000.005) / 1e-3) ** 2)\n"
+        "result = NestedSampler(loglike, lambda u: 1000.0 + 1e-2 * u, 2, 50).run(0)\n"
+        "assert result.samples.dtype == jnp.float64\n"
+        "result.save_npz(sys.argv[1])\n",
+        path, x64=True,
+    )
+    _python(
+        "import sys, jax, numpy as np\n"
+        "from tinyns import NestedSamplingResult\n"
+        "assert not jax.config.jax_enable_x64\n"
+        "result = NestedSamplingResult.load_npz(sys.argv[1])\n"
+        "with np.load(sys.argv[1]) as saved:\n"
+        "    for name in ('samples_u', 'samples', 'logl', 'logwt'):\n"
+        "        assert getattr(result, name).dtype == np.float64, name\n"
+        "        np.testing.assert_array_equal(getattr(result, name), saved[name])\n",
+        path, x64=False,
+    )
 
 
 def test_weight_statistics_are_float64() -> None:
