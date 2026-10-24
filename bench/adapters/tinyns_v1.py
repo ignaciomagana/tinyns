@@ -5,11 +5,14 @@
 
 Defaults resolve in ``Config``: ``num_delete = max(1, nlive // 10)`` chains run
 vmapped per step, ``walks = max(25, 6 * ndim, ndim**2 // 6)`` steps each
-(``tinyns.core.default_walks``). ``ncall`` counts every evaluation, including
-the out-of-cube proposals that the vmapped chains evaluate and reject;
-``metadata["ncall_valid"]`` counts only the proposals that pass the
-likelihood-free tests (inside the cube and, for a local-walk or hop step, its
-Hastings test).
+(``tinyns.core.default_walks``). ``ncall`` counts every likelihood
+evaluation. The vmapped chains (``num_delete > 1``) evaluate every proposal,
+also those rejected without the likelihood (an out-of-cube one at the
+chain's point), and waste those calls; ``metadata["ncall_valid"]`` counts
+only the proposals that pass the likelihood-free tests (inside the cube and,
+for a local-walk or hop step, its Hastings test; ``tinyns.core.State``).
+With ``num_delete = 1`` (variant ``k1``) the other proposals skip the
+likelihood, so the two counts are equal.
 
 ``compile_s`` is the time of a one-step warm-up run (``maxiter = num_delete``)
 of the same sampler before the timed one, plus the timed run's
