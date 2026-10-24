@@ -133,8 +133,9 @@ def default_walks(ndim: int) -> int:
     the cube needs more: ``ndtri_d6`` in ``bench/validate.py`` (a normal
     prior, the data 3 prior sd off centre in all 6 coordinates) needs 4 times
     as many, and a stronger conflict can need more still, so check that
-    doubling ``walks`` moves logZ by less than ``logzerr``. It is also enough
-    for a 10-D Rosenbrock from ``nlive=1000``.
+    doubling ``walks`` moves logZ by less than ``logzerr``. On a 10-D
+    Rosenbrock it leaves logZ 0.05 to 0.09 low at ``nlive=1000`` and
+    unbiased from 2000.
     """
     return max(25, 6 * ndim, ndim * ndim // 6)
 
@@ -1302,8 +1303,9 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     Pass the same ``loglike`` and ``prior_transform`` objects at every call.
     The compiled step is cached on a pytree callable's structure (such as
     ``jax.tree_util.Partial(fn, data)``) and on any other callable's identity
-    (:mod:`tinyns.callables`), so a new object compiles it again: seconds per
-    call in an eager loop whose compiled step takes milliseconds. A bound
+    (:mod:`tinyns.callables`), so a new function, closure or bound method
+    compiles it again (a new pytree of the same structure does not): seconds
+    per call in an eager loop whose compiled step takes milliseconds. A bound
     method is a new object at every access: store ``ll = model.loglike``
     once, or use a module-level function or a pytree callable with array
     leaves. A step inside ``lax.scan``, or in one jitted function called
@@ -1651,11 +1653,11 @@ def _check_resume(path, state: State, dead: list, cfg: Config, kernel,
     values may differ in the last bits: finite ones match to a relative
     ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``,
     and infinite ones (a NaN is stored as ``-inf``) exactly. In float32 a
-    change smaller than that (``3.5e-4 |logL|``) is not seen: a new noise
-    realisation of the same model, for example, once ``|logL|`` is above
-    about ``1e5`` (the change goes like ``sqrt(|logL|)``). Setting
-    ``_RESUME_CHECKS = 0`` skips the check, for a likelihood that does not
-    give back its own values to that tolerance.
+    change smaller than that (``3.5e-4 |logL|``) is not seen: possibly a new
+    noise realisation of the same model, from about ``1e5`` data points (the
+    change goes like ``sqrt(|logL|)``; at ``1e5`` it was still 1.2 times the
+    tolerance). Setting ``_RESUME_CHECKS = 0`` skips the check, for a
+    likelihood that does not give back its own values to that tolerance.
     """
     n = min(_RESUME_CHECKS, cfg.nlive)
     if n == 0:

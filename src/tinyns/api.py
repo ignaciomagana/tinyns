@@ -47,8 +47,9 @@ class NestedSampler:
         Steps per replacement chain, default ``max(25, 6 * ndim, ndim**2 // 6)``
         (:func:`tinyns.core.default_walks`): 6 steps per dimension up to 36
         dimensions, ``ndim / 6`` per dimension beyond. Calibrated on correlated
-        Gaussians up to 64 dimensions, and enough for a 10-D Rosenbrock from
-        ``nlive=1000``. If in doubt, rerun with twice the walks and compare.
+        Gaussians up to 64 dimensions; on a 10-D Rosenbrock logZ is 0.05 to
+        0.09 low at ``nlive=1000`` and unbiased from 2000. If in doubt, rerun
+        with twice the walks and compare.
     """
 
     def __init__(
@@ -104,9 +105,9 @@ class NestedSampler:
         not give back (another likelihood, prior or dataset) is refused too,
         so use one checkpoint path per problem. They must match to a relative
         ``sqrt(eps)`` of the float dtype, and infinite values exactly. In
-        float32 a change below ``3.5e-4 |logL|`` is not seen (a new noise
-        realisation of the same model once ``|logL|`` is above about
-        ``1e5``), nor one at none of the points checked. A path that cannot
+        float32 a change below ``3.5e-4 |logL|`` is not seen (from about
+        ``1e5`` data points possibly a new noise realisation of the same
+        model), nor one at none of the points checked. A path that cannot
         be written raises ``OSError`` before the run starts. The run writes
         the file atomically at a chunk boundary at most every 10 minutes and
         at the end. The random stream depends on the step count only: on a
