@@ -287,12 +287,13 @@ def eggbox(theta):
 def test_more_modes_than_the_clustering_separates_are_flagged() -> None:
     """The eggbox has 18 modes, which no two-way split of the sampler's
     clustering separates. modes() counts the ones its live points still hold
-    apart (15 to 18 of them in 64 runs at nlive 1000) and marks them as not
-    tracked; diagnostics() and summary() say that the count is a lower bound
-    and that the masses were not balanced."""
+    apart (13 to 18 of them at nlive 1000: 13 once in 192 CPU runs, float32
+    and x64, and 13 to 18 over 256 runs of the gate on an H100) and marks them
+    as not tracked; diagnostics() and summary() say that the count is a lower
+    bound and that the masses were not balanced."""
     result = NestedSampler(eggbox, lambda u: u, 2, nlive=1000).run(0)
     modes = result.modes()
-    assert 14 <= len(modes) <= 18
+    assert 11 <= len(modes) <= 18
     assert not any(m["tracked"] for m in modes)
     assert sum(m["mass"] for m in modes) == pytest.approx(1.0)
     # The run is not the same on every CPU in float32, so the bounds hold for
