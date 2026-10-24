@@ -657,6 +657,7 @@ def test_the_progress_line_counts_a_lane_without_a_finite_likelihood_as_invalid(
     assert not any("plateau" in line for line in lines), lines
     assert lines[-1].endswith("[converged=2 invalid=1]"), lines[-1]
 
+
 def test_the_warning_of_an_invalid_run_names_the_users_line() -> None:
     """It named the ``finalise`` call in ``tinyns/core.py``, so under the
     default filters (once per line named) only the first invalid run of a

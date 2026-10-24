@@ -209,7 +209,7 @@ def _lower_block_kernel_text(loglike, prior):
         it=i32(0),
         logz=jnp.asarray(-jnp.inf, f),
         log_x_ties=jnp.zeros((), f),
-        lstar_prev=jnp.asarray(jnp.nan, f),
+        lstar_prev=jnp.asarray(-jnp.inf, f),
         tie_run=i32(0),
         log_scale=jnp.zeros((), f),
         ncall=i32(0),
@@ -282,7 +282,6 @@ def run(loglike, prior=closure_prior, ndim=NDIM, **kwargs):
     kwargs.setdefault("maxiter", 96)
     kwargs.setdefault("dlogz", 0.0)
     return run_ns(random.PRNGKey(11), loglike, prior, ndim, 40, **kwargs)
-
 
 
 @pytest.mark.usefixtures("fresh_caches")
