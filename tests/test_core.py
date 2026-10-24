@@ -493,7 +493,8 @@ def test_out_of_cube_proposals_are_skipped_at_k1_and_counted_at_k_gt_1() -> None
         ncall, valid = int(state.ncall) - 40, int(state.ncall_valid) - 40
         if k == 1:  # lax.cond: an out-of-cube proposal costs nothing
             assert ncall == valid < steps * 12
-        else:  # vmapped: every lane is evaluated, the in-cube ones counted apart
+        else:  # vmapped: every lane is evaluated; ncall_valid counts those
+            # passing the likelihood-free tests (here the in-cube ones)
             assert ncall == steps * k * 12 and valid < ncall
 
 

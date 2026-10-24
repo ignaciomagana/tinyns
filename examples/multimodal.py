@@ -1,9 +1,10 @@
 """A two-mode Gaussian mixture in 4-D, with per-mode masses from ``modes()``.
 
-The modes hold 75% and 25% of the posterior mass, are 14 standard deviations
-apart and differ in width. A random walk cannot cross between them; the
-sampler's inter-mode hop keeps the number of live points in each mode in
-proportion to its volume, so the masses come out right.
+The modes hold 75% and 25% of the posterior mass, are 14 apart (7 along each
+coordinate: 28 and 47 times their standard deviations) and differ in width.
+A random walk cannot cross between them; the sampler's inter-mode hop keeps
+the number of live points in each mode in proportion to its volume, so the
+masses come out right.
 """
 
 import math

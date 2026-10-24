@@ -549,9 +549,12 @@ class NestedSamplingResult:
     counting plateaus as above."""
 
     labels: ArrayLike | None = None
-    """Cluster slot of each sample when it died (the final live points: at the
-    end of the run), from the on-device clustering (:mod:`tinyns.modes`);
-    :meth:`modes` reads it. ``None`` for a result built by hand."""
+    """Cluster label of each sample when it died (the final live points: at
+    the end of the run), from the on-device clustering (:mod:`tinyns.modes`):
+    ``id * folds + j``, with ``id`` the id of its cluster in clustering ``j =
+    (fold + 1) mod folds``, one that contains it, so a run without splits
+    gives ``0``, ``1`` and ``2``. :meth:`modes` reads it. ``None`` for a
+    result built by hand."""
 
     insertion_ranks: ArrayLike | None = None
     """In-sampler insertion rank of every point born during the run (``niter``
