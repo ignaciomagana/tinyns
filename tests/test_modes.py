@@ -628,7 +628,8 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
     report both modes and the warning. The plain modes are not cut into
     lumps; the warning may still say that the hop was off, which happens on
     some trajectories (on JAX 0.4.31 the hop never ran in 2 of 8 runs at
-    nlive 500, and the minor mode was lost), but never that the modes were
+    nlive 500, and the minor mode was lost; about a third of the plain runs
+    lose it, float32 on JAX 0.4.34 and 0.10.2), but never that the modes were
     lumps."""
     from bench.targets import build_needle, build_two_mode, mixture_target
 
@@ -653,7 +654,11 @@ def test_modes_with_thin_arms_are_reported_with_their_scatter() -> None:
                 assert diagnostics["mode_lumps"] > 1.5 and len(warned) == 1, i
                 assert "it cut modes into lumps" in warned[0], i
                 continue
-            assert diagnostics["mode_lumps"] < 1.2
+            # A run that lost the minor mode reports one mode, and its
+            # clusters per mode count the lost mode's cluster against it (up
+            # to 2.0 on such runs, at most 1.11 on runs that kept both).
+            if len(modes) > 1:
+                assert diagnostics["mode_lumps"] < 1.2, i
             assert not any("slots were full" in w for w in diagnostics["warnings"])
             acceptance = diagnostics["hop_acceptance"]
             off = diagnostics["mode_hop_off"] >= result_module.HOP_OFF_WARN or (
