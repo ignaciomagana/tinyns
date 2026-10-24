@@ -410,7 +410,9 @@ program, so wrap a per-dataset Python float in `jnp.asarray`. An array that
 and stays alive while it is cached. A plain function or closure is cached by
 identity, and a bound method (`model.loglike`) is a new object at each
 access, so each `NestedSampler(model.loglike, ...)` compiles again: store it
-once (`ll = model.loglike`).
+once (`ll = model.loglike`). A stored method keeps the values it was traced
+with, like any closure under `jax.jit`: after `model.mu = 5` store it again,
+or make `mu` a leaf of a pytree callable.
 
 ## The functional core
 
