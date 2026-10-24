@@ -205,8 +205,9 @@ def _ridge(cov):
     swamped an axis below about ``1e-6`` of the others' width, which an x64
     run resolves: two clusters 6 sd apart along an axis ``1e-7`` wide (and
     0.1 and 0.29 wide along the others) kept a quarter of their Fisher
-    separation, and two modes 12 sd apart along one ``3e-8`` wide were
-    merged by pass 2 of :meth:`NestedSamplingResult.modes`.
+    separation, and the labels of two modes 12 sd apart along one ``3e-8``
+    wide were merged by pass 2 of :meth:`NestedSamplingResult.modes` (pass 4
+    cut them apart again, with an ``urn_sd`` half the right one).
     """
     var = np.diagonal(cov)
     scale = max(float(np.mean(var)), 1e-288)
