@@ -50,8 +50,9 @@ def main():
     # its increments on the host (a difference stays right across a wrap).
     ncall = int(state.ncall)
     # delta_logz is the evidence the live points could still add, in log
-    # units. step sets the status only on a likelihood plateau or at a
-    # likelihood of +inf, and the loop stops there.
+    # units. step sets the status only on a likelihood plateau or on an
+    # invalid run (a likelihood of +inf, or no finite one), and the loop
+    # stops there.
     while delta_logz(state, cfg) >= DLOGZ and STATUS[int(state.status)] == "running":
         before = state.ncall
         state, dead = chunk(state)  # leaves of shape (STEPS_PER_CHUNK, k, ...)
@@ -62,9 +63,10 @@ def main():
             f"remaining {float(delta_logz(state, cfg)):.3g}"
         )
 
-    # A step on a plateau returns the state as it was and rows that are not
-    # valid, and so do the steps of the chunk after it: the rows of the first
-    # state.it steps are the valid ones.
+    # A step on a plateau returns the live points and state.it as they were
+    # and rows that are not valid, and so do the steps of the chunk after it:
+    # the rows of the first state.it steps are the valid ones. Those steps
+    # still run their chains, and state.ncall counts their calls.
     dead = jax.tree_util.tree_map(
         lambda *xs: jnp.concatenate(xs)[: int(state.it)], *chunks
     )

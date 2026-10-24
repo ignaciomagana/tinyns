@@ -611,6 +611,53 @@ def test_an_invalid_lane_stops_alone() -> None:
     assert {nowhere.message, inf.message} <= messages
 
 
+@pytest.mark.parametrize("value", [-jnp.inf, jnp.nan, jnp.inf])
+def test_a_live_set_without_a_finite_likelihood_is_invalid_at_once(
+    value, tmp_path, capsys
+) -> None:
+    """Every live point at -inf (or NaN) or at +inf: nothing lies above L*,
+    and the step set ``"plateau"``. The functional core, the progress line
+    and the checkpoint called the run a plateau stop; only ``finalise``
+    said ``"invalid"``."""
+    cfg = Config(2, 50, num_delete=5)
+
+    def loglike(x):
+        return value + 0.0 * x[0]
+
+    state, _ = step(init(0, loglike, identity, cfg), loglike, identity, cfg)
+    assert STATUS[int(state.status)] == "invalid" and int(state.it) == 0
+    path = tmp_path / "run.npz"
+    with pytest.warns(RuntimeWarning):
+        result = core.run(0, loglike, identity, cfg, progress=True, checkpoint=path)
+    assert result.metadata["status"] == "invalid" and result.niter == 0
+    assert capsys.readouterr().out.splitlines()[-1].endswith("[invalid]")
+    with np.load(path) as data:
+        assert STATUS[int(data["state/status"])] == "invalid"
+
+
+def test_the_progress_line_counts_a_lane_without_a_finite_likelihood_as_invalid(
+    capsys,
+) -> None:
+    """The batched progress line ended ``[converged=2 plateau=1]`` over
+    results that were converged, invalid and converged."""
+
+    def loglike(data, x):
+        return data[0] - 0.5 * jnp.sum((x - 0.5) ** 2) / 0.1**2
+
+    data = jnp.asarray([[0.0], [-jnp.inf], [0.0]])
+    sampler = NestedSampler(jax.tree_util.Partial(loglike, data), identity, 2, 50,
+                            num_delete=5)
+    with pytest.warns(RuntimeWarning, match="no live point has a finite likelihood"):
+        results = sampler.run(jax.random.split(jax.random.key(0), 3),
+                              batched_data=True, progress=True)
+    assert [r.metadata["status"] for r in results] == [
+        "converged", "invalid", "converged"
+    ]
+    lines = capsys.readouterr().out.splitlines()
+    assert not any("plateau" in line for line in lines), lines
+    assert lines[-1].endswith("[converged=2 invalid=1]"), lines[-1]
+
+
 def test_runs_under_jax_debug_nans() -> None:
     """The contour of the last step starts at -inf (it was a NaN sentinel,
     which made every run fail in init under jax_debug_nans), and the

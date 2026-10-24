@@ -1073,8 +1073,12 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         nlive=nlive,
         nslots=jnp.full((k,), n_above + 1, i32),
     )
-    # A plateau (nothing above L*) leaves the live set as it was.
-    stuck = state._replace(status=jnp.asarray(PLATEAU, jnp.int32))
+    # A plateau (nothing above L*) leaves the live set as it was. At L* =
+    # -inf no live point has a finite likelihood, and at L* = +inf the live
+    # points above the deleted ones are all +inf: neither run is valid.
+    stuck = state._replace(
+        status=jnp.where(jnp.isfinite(lstar), PLATEAU, INVALID).astype(jnp.int32)
+    )
     new = new._replace(**{
         name: jnp.where(n_above == 0, getattr(stuck, name), getattr(new, name))
         for name in State._fields
@@ -1239,12 +1243,14 @@ def _chunk_kernel(loglike_spec, prior_spec, cfg: Config, capacity: int, axes=Non
 
         def body(carry):
             state, rows, count, i = carry
-            running = state.status == RUNNING
+            it = state.it
             state, dead = step_all(state)
             rows = jax.tree_util.tree_map(
                 lambda r, x: lax.dynamic_update_index_in_dim(r, x, i, 0), rows, dead
             )
-            count = count + (running & (state.status != PLATEAU)).astype(i32)
+            # The rows are valid when the step counted (not on a plateau, and
+            # not for a lane that had stopped).
+            count = count + (state.it - it).astype(i32)
             return terminate(state, call_budget), rows, count, i + 1
 
         start = terminate(state, call_budget)
@@ -1280,18 +1286,25 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     It does not test dlogz: loop while :func:`delta_logz` is at or above
     your ``dlogz`` and the status is ``"running"``, and pass that ``dlogz``
     to :func:`finalise`. On a plateau (no live point above the deleted ones)
-    the state is returned as it was (``it`` too) but for ``status``, which
-    becomes ``PLATEAU`` (``STATUS[int(state.status)] == "plateau"``), and the
-    rows are not valid; a step after which a live point has a likelihood of
-    +inf sets ``INVALID`` (``"invalid"``; its rows are valid). Otherwise
-    ``status`` is left as it is (``RUNNING`` after :func:`init`). So the
-    rows of the first ``int(state.it)`` steps are the valid ones::
+    the live points and the run's scalars (``it``, ``logz``, ...) are
+    returned as they were, the rows are not valid, and ``status`` becomes
+    ``PLATEAU`` (``STATUS[int(state.status)] == "plateau"``), or ``INVALID``
+    (``"invalid"``) where L*, the highest deleted likelihood, is not finite:
+    no live point has a finite likelihood, or the others are +inf. Such a
+    step still runs its chains: the key advances, and ``ncall`` and
+    ``ncall_valid`` count their likelihood calls, so a ``lax.scan`` chunk
+    that goes on after a plateau calls the likelihood at each of its
+    remaining steps (keep the chunks short for a costly likelihood). A step
+    after which a live point has a likelihood of +inf sets ``INVALID`` too
+    (its rows are valid). Otherwise ``status`` is left as it is
+    (``RUNNING`` after :func:`init`). So the rows of the first
+    ``int(state.it)`` steps are the valid ones::
 
         rows = []
         while delta_logz(state, cfg) >= dlogz:
             state, dead = step(state, loglike, prior_transform, cfg)
             rows.append(dead)
-            if STATUS[int(state.status)] != "running":  # a plateau, or +inf
+            if STATUS[int(state.status)] != "running":  # plateau or invalid
                 break
         dead = jax.tree_util.tree_map(
             lambda *xs: jnp.stack(xs)[: int(state.it)], *rows
@@ -1746,10 +1759,11 @@ def run(
 
     Stops when ``delta_logz < dlogz``, before ``maxiter`` dead points would be
     exceeded, once ``maxcall`` likelihood evaluations are reached (checked
-    after each step), on a plateau, or at a live likelihood of +inf (status
-    ``"invalid"``, ``success=False``; a lane of a batch stops alone). Chunks
-    of steps run on the device; the host syncs once per chunk, sizes the next
-    one to about 45 s and, with ``progress``, prints one line per chunk.
+    after each step), on a plateau, or at a live likelihood of +inf or with
+    no finite one (status ``"invalid"``, ``success=False``; a lane of a batch
+    stops alone). Chunks of steps run on the device; the host syncs once per
+    chunk, sizes the next one to about 45 s and, with ``progress``, prints
+    one line per chunk.
 
     ``checkpoint`` is a path: if the file exists the run resumes from it
     (refusing a different config, x64 flag, float dtype, key or batch, and
