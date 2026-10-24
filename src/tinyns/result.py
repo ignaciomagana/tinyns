@@ -946,15 +946,18 @@ class NestedSamplingResult:
         mass, and logZ then comes out low by about ``log(1 - mass)``, beyond
         ``logzerr``. On a 4-D mixture of masses 0.6, 0.3 and 0.1 and widths
         0.25, 0.5 and 0.75 (rotated Gaussians in ``[-12, 12]^4``) the 0.6
-        mode held a median of 8 to 9 of 500 live points when it separated; at
-        nlive 500 it was lost in 7 of 32 runs in float32 and 4 of 32 in x64,
-        all without a warning and with logZ 0.62 to 1.02 low (4.6 to 7.4
-        ``logzerr``), while every run that kept it flagged it unresolved. So
-        if any run flags a heavy mode unresolved, other runs may have lost
-        it: raise ``nlive`` and compare runs. A unimodal run (or a
-        result without :attr:`labels`, or without posterior weight) gives one
-        mode of mass 1, flagged ``unresolved`` if ``nlive`` is below
-        ``UNRESOLVED_PER_DIM * ndim``: too few live points for a
+        mode held a median of 8 to 9 of 500 live points when it separated; it
+        was lost in 7 of 32 runs in float32 and 4 of 32 in x64 at nlive 500,
+        and in 3 and 4 of 64 at nlive 1000, all without a warning and with
+        logZ 0.62 to 1.03 low (4.6 to 10.4 ``logzerr``), while 172 of the 174
+        runs that kept it flagged it unresolved. A light mode can be lost
+        too: on the 18-D target ``build_two_mode(18, 0.2)`` of
+        ``bench.targets`` 2 of 16 runs in x64 lost its 20% mode, and all 14
+        that kept it flagged it. So if any run flags a mode unresolved, other
+        runs may have lost it: raise ``nlive`` and compare runs. A unimodal
+        run (or a result without :attr:`labels`, or without posterior
+        weight) gives one mode of mass 1, flagged ``unresolved`` if ``nlive``
+        is below ``UNRESOLVED_PER_DIM * ndim``: too few live points for a
         covariance-adapted walk to learn the shape of a mode (a near-Gaussian
         one can do with fewer: on a 32-D Gaussian logZ was 9 nats high at
         nlive 40, 1 at 64 and right at 100).
