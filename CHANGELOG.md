@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Algorithm
+
+- **Hop eligibility: volume share or population.** A cluster takes part in the hop if it has more than `ndim` members and either its volume share predicts `2 * ndim` live points (the v1.0 rule) or it has at least `2 * ndim` members (points outside the chain's fold, counted at the recluster); the most populated cluster always does. Where the clustering cuts a mode whose contours are not ellipsoids (heavy tails, thin arms, stars) into lumps, the covariance volumes of the lumps miss their populations by factors of e to e^5, so the volume rule left populated lumps out and the hop off: on `cauchy_d18` at nlive 1000 it was off for half of the posterior mass. A count rule alone turned the hop off for small modes in high dimensions (in the eligibility study the minor-mode logit sd was 2 to 4 times larger on `sepW`, `connW` and `sepM` at 18 and 32 dimensions, 40 seeds per cell), so the rule is the union, and every cluster that v1.0 made eligible stays eligible. Like the frames, the rule reads only the points outside the chain's fold, fixed until the next recluster, so the hop stays exact (`modes.py`).
+  - *Which runs change.* A run changes only if one of its clusterings holds a cluster eligible by population and not by volume. In 120 single runs on CPU (float32, 10 targets, 12 seeds each), every run that changed had such a cluster on its v1.0 trajectory and every run without one was bit-identical: no run of `gauss_d10`, `funnel_d10` or `sepW_d10` (nlive 1000 and 2000) changed, every run of `cauchy_d10`, `needle_d10` and `ndtri_d6` did, and 12 of the 36 runs of `rosen_d4`, `sepWbox_d4` and `eggbox_d2`. In the quick tier of `bench/validate.py` (CPU, float32 and x64) the Gaussians, `funnel_d10` and `loggamma_d10` are bit-identical and no verdict changes. The full tier (H100, 64 seeds, key 0) passes all 12 cases in float32 and in x64 with the digits of the v1.0.0 tables of `bench/RESULTS.md`, except `rosen_d10` and `ndtri_d6` (and the z of `sepWbox_d4` in x64), which moved within their errors.
+  - *Paired gain.* v1.0.0 and this rule on the same 256 keys, on an H100 in float32 at the defaults. A seed fails if a minor mode is lost (below 10% of its true mass) or its logit error exceeds 0.5; no seed is excluded. The p-value is the two-sided exact McNemar test on the paired outcomes, Holm-adjusted over the three cells it marks. "Hop on" is the share of the posterior mass gathered while every clustering had two eligible clusters.
+
+    | target | nlive | failures (v1.0 → union) | McNemar p | survivor logit sd | hop on |
+    |---|---|---|---|---|---|
+    | `cauchy_d18` | 1000 | 12.1% → 6.2% | 0.016 (Holm) | 0.327 → 0.223 | 0.50 → 0.91 |
+    | `sepM_d32` | 1000 | 80.9% → 69.5% | 0.0008 (Holm) | 0.926 → 0.649 | 0.07 → 0.18 |
+    | `sepM_d32` | 2000 | 28.5% → 23.4% | 0.07 (Holm) | 0.428 → 0.307 | 0.66 → 0.76 |
+    | `sepM_d18` | 1000 | 27.7% → 22.7% | 0.09 | 0.364 → 0.391 | 0.70 → 0.75 |
+    | `needle_d18` | 1000 | 2.7% → 3.5% | 0.80 | 0.220 → 0.227 | 0.56 → 0.99 |
+    | `needle_d18` | 2000 | 1.6% → 1.2% | 1.0 | 0.197 → 0.182 | 0.64 → 1.00 |
+    | `needle_d10` + 8 flat | 1000 | 7.0% → 5.9% | 0.55 | 0.258 → 0.246 | 0.71 → 0.94 |
+    | `needle_d10` + 8 flat | 2000 | 1.6% → 0.8% | 0.63 | 0.176 → 0.165 | 0.78 → 0.99 |
+
+    `needle_d10` + 8 flat is `needle_d10` with 8 coordinates that the likelihood does not depend on. The three cells the eligibility study had found a gain on (v1 at 0f65066, CPU, 120 paired seeds: failures 15.0% → 3.3%, 79.2% → 65.8% and 33.3% → 25.8%) gain again, and the survivor logit sd falls by 28 to 32% in each. On the needles, whose modes have thin arms (a funnel neck), the hop is now on for 0.94 to 1.00 of the posterior mass, but the scatter of the minor mass does not move: its ellipsoids still cover the arms poorly. Mode loss is unchanged (seeds lost under v1.0 / the union: 4/6, 141/135, 46/50 and 52/45; none on the needles), and so are logZ bias, scatter/logzerr and the number of likelihood calls, within their errors.
+  - *Known limits.* `sepM_d32` at nlive 1000 still loses its 6% minor mode in about half of the seeds under either rule (141 and 135 of 256): the mode holds far fewer than `5 * ndim` live points. The hop's warning still fires in nearly every run of `cauchy_d18` and `needle_d18` (in 91% of the `cauchy_d18` runs at nlive 1000 against 96%, and 95% of the `needle_d18` runs at 2000 against 96%), because the clustering still cuts their modes into lumps (`mode_lumps`).
+
 ## v1.0.0 (2026-10-24)
 
 tinyns v1 is a rewrite: a new full-JAX core, a new algorithm and a new API.
