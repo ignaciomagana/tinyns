@@ -299,6 +299,60 @@ column.
 the first-order `logzerr` of the release is 3% smaller at 10-D to about 11%
 larger at 2-D without ties, and the new formula does not change logZ.
 
+### The release code
+
+`python bench/validate.py --tier full` on the release code (e556387; the
+commits after it change only docs, docstrings and tests) on an H100 NVL with
+JAX 0.4.34 and its CUDA 12 plugin, 64 runs per case, key 0. All 12 cases pass
+in float32 and in x64. The worst z is +2.2 in float32 and -2.0 in x64, both
+`gauss_d32`. The largest minor-mode logit bias is `sepW_d18`'s +0.007 ±
+0.002 in float32, a shift of its 6% mass by about 0.0004 (+0.004 ± 0.003 in
+x64). The `hop` column is the smallest acceptance over the runs: 0.25 to 0.28
+on `loggamma_d10` and 0.72 to 0.79 on the two-mode mixtures. The first case's
+`wall s` in float32 includes compiling in a cold process.
+
+Float32:
+
+| case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | post t [max] | logit bias ± se | logit sd [max] | lost | hop | modes | unres | ncall | wall s | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gauss_d2 | 1000 | 25 | 64 | -0.012 ± 0.010 | -1.2 | 1.02 [0.78, 1.33] | 0.8 [3.6] | - | - | - | - | 1 (64/64 ok) | 0/64 | 2.11e+05 | 665 | PASS |
+| gauss_d10 | 1000 | 60 | 64 | +0.012 ± 0.021 | +0.6 | 0.98 [0.75, 1.28] | 2.3 [4.1] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.95e+06 | 20 | PASS |
+| gauss_d32 | 1000 | 192 | 64 | +0.076 ± 0.034 | +2.2 | 0.91 [0.69, 1.19] | 2.9 [4.4] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.83e+07 | 34 | PASS |
+| rosen_d4 | 1000 | 100 | 64 | +0.018 ± 0.014 | +1.3 | 0.99 [0.76, 1.29] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.66e+06 | 13 | PASS |
+| rosen_d10 | 1000 | 250 | 64 | +0.013 ± 0.026 | +0.5 | 1.06 [0.81, 1.39] | - | - | - | - | - | 1-2 (64/64 ok) | 4/64 | 1.07e+07 | 22 | PASS |
+| funnel_d10 | 1000 | 60 | 64 | -0.020 ± 0.018 | -1.1 | 1.05 [0.81, 1.38] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 3.44e+06 | 17 | PASS |
+| loggamma_d10 | 1000 | 60 | 64 | -0.027 ± 0.020 | -1.3 | 1.18 [0.90, 1.54] | - | -0.009 ± 0.005 | 0.041 [0.4] | 0.00 | 0.28 | 4 (64/64 ok) | 0/64 | 1.42e+06 | 16 | PASS |
+| eggbox_d2 | 1000 | 25 | 64 | -0.011 ± 0.011 | -1.0 | 1.08 [0.83, 1.41] | - | - | - | - | - | 14-18 (64/64 ok) | 29/64 | 2.28e+05 | 12 | PASS |
+| ndtri_d6 | 1000 | 144 | 64 | -0.002 ± 0.025 | -0.1 | 1.17 [0.89, 1.53] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 4.71e+06 | 19 | PASS |
+| sepWbox_d4 | 1000 | 25 | 64 | +0.002 ± 0.015 | +0.1 | 1.02 [0.78, 1.33] | - | +0.006 ± 0.008 | 0.063 [0.12] | 0.00 | 0.79 | 2 (64/64 ok) | 0/64 | 4.31e+05 | 14 | PASS |
+| sepW_d10 | 2000 | 60 | 64 | +0.001 ± 0.017 | +0.1 | 1.01 [0.77, 1.32] | - | -0.004 ± 0.005 | 0.037 [0.12] | 0.00 | 0.76 | 2 (64/64 ok) | 0/64 | 4.81e+06 | 26 | PASS |
+| sepW_d18 | 4000 | 108 | 64 | -0.008 ± 0.015 | -0.5 | 0.92 [0.70, 1.20] | - | +0.007 ± 0.002 | 0.019 [0.12] | 0.00 | 0.72 | 2 (64/64 ok) | 0/64 | 3.02e+07 | 43 | PASS |
+
+x64:
+
+| case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | post t [max] | logit bias ± se | logit sd [max] | lost | hop | modes | unres | ncall | wall s | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gauss_d2 | 1000 | 25 | 64 | -0.001 ± 0.010 | -0.1 | 1.05 [0.81, 1.38] | 2.0 [3.6] | - | - | - | - | 1 (64/64 ok) | 0/64 | 2.11e+05 | 39 | PASS |
+| gauss_d10 | 1000 | 60 | 64 | +0.000 ± 0.016 | +0.0 | 0.77 [0.59, 1.01] | 2.0 [4.1] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.95e+06 | 21 | PASS |
+| gauss_d32 | 1000 | 192 | 64 | -0.083 ± 0.042 | -2.0 | 1.10 [0.84, 1.44] | 3.1 [4.4] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.83e+07 | 34 | PASS |
+| rosen_d4 | 1000 | 100 | 64 | +0.015 ± 0.015 | +1.0 | 1.04 [0.80, 1.36] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.66e+06 | 16 | PASS |
+| rosen_d10 | 1000 | 250 | 64 | -0.016 ± 0.027 | -0.6 | 1.10 [0.84, 1.43] | - | - | - | - | - | 1-2 (64/64 ok) | 7/64 | 1.07e+07 | 25 | PASS |
+| funnel_d10 | 1000 | 60 | 64 | +0.024 ± 0.021 | +1.1 | 1.19 [0.91, 1.56] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 3.44e+06 | 20 | PASS |
+| loggamma_d10 | 1000 | 60 | 64 | -0.010 ± 0.017 | -0.6 | 1.00 [0.77, 1.31] | - | +0.002 ± 0.006 | 0.047 [0.4] | 0.00 | 0.25 | 4 (64/64 ok) | 0/64 | 1.42e+06 | 19 | PASS |
+| eggbox_d2 | 1000 | 25 | 64 | +0.014 ± 0.010 | +1.4 | 1.03 [0.79, 1.34] | - | - | - | - | - | 14-18 (64/64 ok) | 28/64 | 2.26e+05 | 15 | PASS |
+| ndtri_d6 | 1000 | 144 | 64 | -0.015 ± 0.025 | -0.6 | 1.16 [0.89, 1.52] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 4.71e+06 | 21 | PASS |
+| sepWbox_d4 | 1000 | 25 | 64 | +0.011 ± 0.017 | +0.6 | 1.16 [0.88, 1.51] | - | +0.002 ± 0.008 | 0.062 [0.12] | 0.00 | 0.79 | 2 (64/64 ok) | 0/64 | 4.31e+05 | 17 | PASS |
+| sepW_d10 | 2000 | 60 | 64 | -0.006 ± 0.017 | -0.4 | 0.97 [0.75, 1.27] | - | -0.003 ± 0.004 | 0.035 [0.12] | 0.00 | 0.76 | 2 (64/64 ok) | 0/64 | 4.81e+06 | 24 | PASS |
+| sepW_d18 | 4000 | 108 | 64 | -0.013 ± 0.016 | -0.8 | 0.97 [0.74, 1.27] | - | +0.004 ± 0.003 | 0.023 [0.12] | 0.00 | 0.72 | 2 (64/64 ok) | 0/64 | 3.02e+07 | 48 | PASS |
+
+On the same GPU `pytest -m slow` passed 6 of 6 in x64. In float32 it failed
+`test_modes_that_are_not_convex_18d`: all 8 runs of its plain 18-D target
+(a 20% mode without arms) found both modes, but in one the minor mode split
+off late and was partly lost, and that run warned that the hop ran only in
+part; the 8 runs gave a minor mass of 0.174 against 0.200 (logit sd 1.0), and
+the test allows no warning on that target. At 8851058 the same test passed in
+float32 (one of the 8 runs lost the mode entirely, with no warning).
+
 ## tinyns v1 on the mixtures, by nlive
 
 The competitors ran these targets at nlive 500 (Nautilus at its own 2000).
