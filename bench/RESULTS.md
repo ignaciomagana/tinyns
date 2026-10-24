@@ -89,7 +89,10 @@ default 1000).**
   and `connW_d32` (the minor mode lost in 25% and 30% of the seeds) and the
   three `sepM` targets. At 1000 only `sepM_d18` and `sepM_d32` fail.
 - Its error bars are honest: sd(logZ) / logzerr is between 0.69 and 1.32 in
-  all 72 cells (nlive 2000 and 4000 included).
+  all 72 cells (nlive 2000 and 4000 included). That is the logzerr of these
+  runs, a sum of information increments; the first-order logzerr of the
+  release is 3% smaller at 10-D to about 11% larger at 2-D without ties, and
+  logZ is unchanged.
 - No run of tinyns v1 timed out or raised an error (2240 runs).
 - **Time.** A compiled run takes 1.1 to 20 s on the H100 and a first run 9 to
   31 s. BlackJAX NSS's `run s` is 9.0 to 77 s, but about 9 s of every run is
@@ -274,7 +277,10 @@ move, and CPU measurements the fifth.
 `python bench/validate.py --tier full` at afa58dd on the H100 (x64, 64 runs
 per case, key 0). All 10 cases pass. Rerun at 88c572b (after the plateau fix),
 it passes again with the same printed digits except `eggbox_d2` (dlogZ
-+0.010 against +0.011); the quick tier passes 7 of 7.
++0.010 against +0.011); the quick tier passes 7 of 7. This table predates
+the posterior, hop and 0.12 logit-sd criteria (its logit-sd limit was 0.4)
+and the `ndtri_d6` and `sepWbox_d4` cases, so it has no post t or hop
+column.
 
 | case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | logit bias ± se | logit sd | lost | modes | unres | ncall | wall s | verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -288,6 +294,10 @@ it passes again with the same printed digits except `eggbox_d2` (dlogZ
 | eggbox_d2 | 1000 | 25 | 64 | +0.011 ± 0.012 | +1.0 | 1.17 [0.89, 1.52] | - | - | - | 15-18 (64/64 ok) | 30/64 | 2.28e+05 | 10 | PASS |
 | sepW_d10 | 2000 | 60 | 64 | +0.026 ± 0.019 | +1.4 | 1.08 [0.83, 1.41] | -0.004 ± 0.005 | 0.039 | 0.00 | 2 (64/64 ok) | 0/64 | 4.8e+06 | 16 | PASS |
 | sepW_d18 | 4000 | 108 | 64 | +0.005 ± 0.016 | +0.3 | 0.98 [0.75, 1.28] | -0.000 ± 0.003 | 0.021 | 0.00 | 2 (64/64 ok) | 0/64 | 3.02e+07 | 39 | PASS |
+
+`scat/err` uses the `logzerr` of afa58dd, a sum of information increments;
+the first-order `logzerr` of the release is 3% smaller at 10-D to about 11%
+larger at 2-D without ties, and logZ is unchanged.
 
 ## tinyns v1 on the mixtures, by nlive
 
@@ -507,6 +517,11 @@ Competitor / `tinyns_v1`, geometric mean over the `tinyns_v1` cells of the famil
 Hardware (wall times compare only within one label):
 - `CPU 4c`: no GPU, Intel(R) Xeon(R) CPU E5-2695 v3 @ 2.30GHz, 4 threads visible, Slurm RM
 - `GPU H100`: NVIDIA H100 80GB HBM3, Intel(R) Xeon(R) Platinum 8468, 20 threads visible, no Slurm
+
+The `logzerr`, `scat/err` and `in 3s` of the tinyns_v1 rows use the
+`logzerr` of afa58dd, a sum of information increments; the first-order
+`logzerr` of the release is 3% smaller at 10-D to about 11% larger at 2-D
+without ties, and logZ is unchanged.
 
 | target | sampler | hw | nlive | ok | dlogZ | rms | sd | logzerr | scat/err | in 3s | logit bias | logit sd [95% CI] | lost | ncall | wall s | compile s | run s | first s | acc |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
