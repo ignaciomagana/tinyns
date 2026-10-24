@@ -38,9 +38,12 @@ get uploaded, and the tag goes on last.
 `bench/README.md` describes the gate's cases and criteria. A correct sampler
 fails a case about once in 70 cases at 16 seeds and once in 170 at 64, because
 the bias tests use the se of the seeds. So about one quick-tier run in 8 has a
-false FAIL, and one full-tier run in 14. Rerun the case with another key and
-more seeds (`--cases NAME --seed 1 --seeds 128`) before calling it a
-regression, and record the rerun in the release notes.
+false FAIL, and one full-tier run in 14. Some cases fail more often: the
+calibration runs put single cases at 1% to 4% at 16 seeds, and the x64 quick
+`gauss_d2` case failed on 3 of 24 keys (the default key 0 among them, at the
+1.0.0 release commit), so a false FAIL may come more often than that. Rerun
+the case with another key and more seeds (`--cases NAME --seed 1 --seeds 128`)
+before calling it a regression, and record the rerun in the release notes.
 
 ## 3. Build and inspect
 
@@ -50,9 +53,9 @@ regression, and record the rerun in the release notes.
       with uncommitted changes
 - [ ] `tar tzf dist/tinyns-X.Y.Z.tar.gz`: only `src/`, `tests/`, `bench/`,
       `examples/`, `README.md`, `CHANGELOG.md`, `LICENSE`, `pyproject.toml`,
-      `.gitignore` and `PKG-INFO` (about 60 files, about 250 KB)
+      `.gitignore` and `PKG-INFO` (about 60 files, about 320 KB)
 - [ ] `python -m zipfile -l dist/tinyns-X.Y.Z-py3-none-any.whl`: only
-      `tinyns/` and `tinyns-X.Y.Z.dist-info/` (about 85 KB)
+      `tinyns/` and `tinyns-X.Y.Z.dist-info/` (about 105 KB)
 - [ ] in a fresh venv on Python 3.12 or newer (so the newest JAX), install the
       wheel and run the quickstart and the tests against it from the unpacked
       sdist, without its `src/`:
