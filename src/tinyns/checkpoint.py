@@ -19,23 +19,36 @@ previous checkpoint or the new one, never a torn file. It holds
 - ``meta_json``: the format, the tinyns version, the resolved ``Config``, the
   x64 flag and float dtype, the lane count and ``batched_data``, the host call
   counters (Python ints, one per lane), the accumulated ``wall_time_s``,
-  ``compile_s`` and ``sampling_s`` and the number of chunks.
+  ``compile_s`` and ``sampling_s``, the number of chunks, the JAX build
+  and device that a resume needs to be bit-identical (:func:`_environment`;
+  on a CPU, where a fixed seed is bit-reproducible between processes), and
+  ``mixed_build``, true once the run has been resumed under another one.
 
 Files of any other format are refused; there is no reader for older formats.
+A different JAX build or device is not refused but warned about: the resumed
+run is a valid run, but it may not be bit-identical to an uninterrupted one.
+The warning is repeated at every later resume (``mixed_build``), although the
+checkpoints written after it record the new build. The file keeps the mode of
+the checkpoint it replaces (a new one gets the mode of any new file, ``0o666``
+less the umask), so a ``chmod`` that shares it with a group survives the
+rewrites. A symbolic link at the path is followed, as ``open`` does.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import json
 import os
-import tempfile
+import secrets
+import stat
 import warnings
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import jaxlib
 import numpy as np
 from jax import random
 
@@ -82,7 +95,9 @@ class Checkpoint:
     ``state`` is a :class:`tinyns.core.State` whose key is a JAX key; ``dead``
     holds one :class:`tinyns.core.Dead` of numpy rows per lane (a single lane
     for an unbatched run); ``ncall`` and ``ncall_valid`` are per-lane Python
-    ints; ``batch`` is the lane count of a batched run (``None`` unbatched).
+    ints; ``batch`` is the lane count of a batched run (``None`` unbatched);
+    ``mixed_build`` is true once the run has been resumed under another
+    tinyns version, JAX build or device.
     """
 
     state: Any
@@ -97,10 +112,35 @@ class Checkpoint:
     config: dict
     batch: int | None
     batched_data: bool
+    mixed_build: bool = False
 
 
 def _dtype_name() -> str:
     return jnp.dtype(jnp.result_type(float)).name
+
+
+def _device(array):
+    """The device that ``array`` (a state leaf) is on; the first device for a
+    host array."""
+    devices = getattr(array, "devices", None)
+    return next(iter(devices())) if callable(devices) else jax.devices()[0]
+
+
+def _environment(device) -> dict:
+    """The JAX build and device that a resume needs to be bit-identical to
+    an uninterrupted run (on a CPU; on a GPU in float32 they are needed but
+    not enough): the JAX and jaxlib versions, ``jax_threefry_partitionable``
+    (it changes the random stream; its default changed in JAX 0.5), and the
+    platform and kind of ``device``, the one the run's state is on."""
+    return {
+        "jax_version": jax.__version__,
+        "jaxlib_version": jaxlib.__version__,
+        "threefry_partitionable": getattr(
+            jax.config, "jax_threefry_partitionable", None
+        ),
+        "backend": device.platform,
+        "device_kind": device.device_kind,
+    }
 
 
 def save(path, ckpt: Checkpoint) -> None:
@@ -136,26 +176,108 @@ def save(path, ckpt: Checkpoint) -> None:
         "compile_s": float(ckpt.compile_s),
         "sampling_s": float(ckpt.sampling_s),
         "chunks": int(ckpt.chunks),
+        **_environment(_device(state.u)),
+        "mixed_build": bool(ckpt.mixed_build),
     }
     arrays["meta_json"] = np.asarray(json.dumps(meta, sort_keys=True))
     _atomic_savez(path, arrays)
 
 
-def _atomic_savez(path, arrays: dict) -> None:
+def _file_path(path) -> str:
+    """``path`` with its symbolic links (and ``..``) resolved, so that a link
+    is written through (replacing the link itself would leave its target
+    stale). Raises ``IsADirectoryError`` when it names no file: it is empty,
+    ends in a separator or resolves to a directory (``"out"``, ``"x/.."``;
+    the parent directory was written to, or the run failed at its last
+    save)."""
     path = os.fspath(path)
+    real = os.path.realpath(path)
+    if not os.path.basename(path) or os.path.isdir(real):
+        raise IsADirectoryError(
+            errno.EISDIR,
+            f"{path!r} names no file (it is empty, ends in a separator or is a "
+            "directory)",
+        )
+    return real
+
+
+def _temp_file(path: str) -> tuple[int, str]:
+    """Create a new file next to ``path`` for writing; return ``(fd, name)``.
+
+    It is created like any new file (mode ``0o666`` less the umask, where
+    ``mkstemp`` would make it ``0o600``) and then takes the mode of ``path``
+    if that exists, so that replacing ``path`` keeps its mode.
+    """
     directory = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
-    )
+    prefix = os.path.join(directory, f".{os.path.basename(path)}.")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for _ in range(100):
+        tmp = f"{prefix}{secrets.token_hex(4)}.tmp"
+        try:
+            fd = os.open(tmp, flags, 0o666)
+        except FileExistsError:
+            continue
+        with contextlib.suppress(OSError):  # no file to replace yet
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        return fd, tmp
+    raise FileExistsError(f"no unused temporary file name next to {path}")
+
+
+def _cannot_write(exc: OSError, what: str, directory: str) -> OSError:
+    """``exc`` again, naming ``what`` (the file asked for) and ``directory``
+    instead of the temporary file next to it."""
+    message = f"cannot write {what} in the directory {directory}: "
+    message += exc.strerror or str(exc)
+    if exc.errno is None:
+        return type(exc)(message)
+    return type(exc)(exc.errno, message)
+
+
+def check_writable(path) -> str:
+    """Raise ``OSError`` naming ``path`` unless a file can be written next to
+    it, as :func:`save` does: a run checks its checkpoint path before it
+    compiles and samples, not at its first save. A temporary file is created
+    and removed (``os.access`` is unreliable on network file systems).
+    Returns the file a run reads and writes, :func:`_file_path` of ``path``."""
+    path = os.fspath(path)
+    target = _file_path(path)
+    try:
+        fd, tmp = _temp_file(target)
+    except OSError as exc:
+        raise _cannot_write(
+            exc, f"the checkpoint {path}", os.path.dirname(target)
+        ) from exc
+    os.close(fd)
+    os.unlink(tmp)
+    return target
+
+
+def _atomic_savez(path, arrays: dict, compressed: bool = False) -> None:
+    """Write ``arrays`` to the ``.npz`` file ``path`` (exactly that name):
+    a temporary file in the same directory, ``fsync``, then ``os.replace``,
+    so that a crash leaves the old file or the new one. The file keeps the
+    mode of the file it replaces (:func:`_temp_file`), and a symbolic link at
+    ``path`` is written through (:func:`_file_path`). This needs write access
+    to the directory, and a read-only file is replaced like any other. An
+    ``OSError`` names ``path``, not the temporary file."""
+    name = os.fspath(path)
+    path = _file_path(name)
+    directory = os.path.dirname(path)
+    try:
+        fd, tmp = _temp_file(path)
+    except OSError as exc:
+        raise _cannot_write(exc, name, directory) from exc
     try:
         with os.fdopen(fd, "wb") as f:
-            np.savez(f, **arrays)
+            (np.savez_compressed if compressed else np.savez)(f, **arrays)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-    except BaseException:
+    except BaseException as exc:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+        if isinstance(exc, OSError):
+            raise _cannot_write(exc, name, directory) from exc
         raise
     with contextlib.suppress(OSError):  # make the rename durable (POSIX)
         dir_fd = os.open(directory, os.O_RDONLY)
@@ -171,16 +293,21 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
     Raises ``ValueError`` naming the mismatch when the file is not a
     ``tinyns-ckpt-7`` checkpoint, or when its config, x64 flag, float dtype,
     lane count, ``batched_data`` or starting key differ from this run's.
+    Warns when it was written by another tinyns version, JAX build or device
+    (:func:`_environment`), or was resumed under another before
+    (``mixed_build``): the resumed run may not be bit-identical.
     Returns a :class:`Checkpoint`.
     """
     from tinyns import __version__
-    from tinyns.core import Dead, State
+    from tinyns.core import Dead, State, _user_stacklevel
 
     path = os.fspath(path)
     try:
         data = np.load(path, allow_pickle=False)
     except Exception as exc:  # noqa: BLE001 - any unreadable file is refused
         raise ValueError(f"{path} is not a {FORMAT} checkpoint: {exc}") from exc
+    if not isinstance(data, np.lib.npyio.NpzFile):  # a .npy file
+        raise ValueError(f"{path} is not a {FORMAT} checkpoint (not an .npz file)")
     with data:
         if "meta_json" not in data.files:
             raise ValueError(f"{path} is not a {FORMAT} checkpoint")
@@ -214,12 +341,6 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 f"{path}: the checkpoint was started from a different key; pass "
                 "the original key or a new checkpoint path"
             )
-        if meta["tinyns_version"] != __version__:
-            warnings.warn(
-                f"{path} was written by tinyns {meta['tinyns_version']}, this is "
-                f"{__version__}: the resumed run may not be bit-identical",
-                stacklevel=3,
-            )
         fields = {}
         for name in State._fields:
             if name == "key":
@@ -228,6 +349,27 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 )
             else:
                 fields[name] = jnp.asarray(data[f"state/{name}"])
+        now = {"tinyns_version": __version__, **_environment(_device(fields["u"]))}
+        changed = [
+            name for name, value in now.items() if meta.get(name, value) != value
+        ]
+        if changed:
+            warnings.warn(
+                f"{path} was written with "
+                + ", ".join(f"{name}={meta[name]!r}" for name in changed)
+                + "; this run has "
+                + ", ".join(f"{name}={now[name]!r}" for name in changed)
+                + ": the resumed run may not be bit-identical to an "
+                "uninterrupted one",
+                stacklevel=_user_stacklevel(),
+            )
+        elif meta.get("mixed_build"):
+            warnings.warn(
+                f"{path} was resumed under another tinyns version, JAX build "
+                "or device before: the run may not be bit-identical to an "
+                "uninterrupted one",
+                stacklevel=_user_stacklevel(),
+            )
         lanes = 1 if batch is None else batch
         dead = [
             Dead(**{
@@ -249,6 +391,7 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
         config=meta["config"],
         batch=meta["batch"],
         batched_data=bool(meta["batched_data"]),
+        mixed_build=bool(changed or meta.get("mixed_build")),
     )
 
 

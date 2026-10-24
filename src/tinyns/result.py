@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import bisect
+import copy
 import itertools
 import json
 import math
+import operator
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
 
-import jax.numpy as jnp
 import numpy as np
+from jax import random
 
+from tinyns.checkpoint import _atomic_savez
 from tinyns.math import (
+    as_key,
     effective_sample_size_from_log_weights,
     normalize_log_weights,
     systematic_resample,
@@ -66,13 +70,34 @@ SEPARATION_SIGMA = 3.0
 SLAB_SCORE = 30.0
 SLAB_NEIGHBOURS = 8
 # Two modes are one if the likelihood dips by less than SADDLE_DEPTH between
-# them (:func:`_saddle_depth`). The split test also cuts lumps off one mode
-# whose contours are a core with thin arms, and the lumps leave gaps in the
-# live points too: dips of 0.0 to 1.8 between such lumps and their mode
-# (needle_d18 of ``bench.targets``, 16 runs; an 18-D posterior with a funnel
-# neck, 3 runs), against at least 5.7 between the separate modes of LogGamma
-# (2-D and 10-D) and 40 to 200 for the Gaussian mixtures, the product of
-# Cauchy factors and the eggbox (nlive 400 to 1000, 132 runs).
+# them and the bottom of the dip lies above the posterior median likelihood
+# of at least one of them (:func:`_apart`). The split test also cuts lumps
+# off one mode whose contours are a core with thin arms, and the lumps leave
+# gaps in the live points too: dips of 0.0 to 1.8 between such lumps and
+# their mode (needle_d18 of ``bench.targets``, 16 runs; an 18-D posterior
+# with a funnel neck, 3 runs), against at least 5.7 between the separate
+# modes of LogGamma (2-D and 10-D) and 40 to 200 for the Gaussian mixtures,
+# the product of Cauchy factors and the eggbox (nlive 400 to 1000, 132
+# runs). In few dimensions no depth tells both apart: two equal Gaussians D
+# sigma apart dip by D^2/8 - log 2 in any dimension (1.84 at 4.5 sigma), and
+# pairs 3.5 to 5 sigma apart in 2-D and 4.5 to 5 in 3-D, which the
+# clustering separates, were one mode in all 96 runs (nlive 500). But the
+# bulk of a mode lies close to its peak there (a Gaussian's posterior median
+# 0.69 below it in 2-D, 1.18 in 3-D and 8.7 in 18-D), and such a dip runs
+# below the bulk of both: those pairs are now two modes in the 95 runs whose
+# clustering found two, while the dips between the lumps of needle_d18
+# bottom out 7.8 to 9.0 above the bulk (8 runs) and a 2-D pair 3 sigma apart
+# stays one mode (0.08 to 0.16 above). With both tests, pass 6 keeps equal
+# Gaussians apart from about 2.5 sigma in 1-D (a dip of 0.13: two modes in
+# 32 of 32 runs at nlive 200 and 500, one at 2.2 sigma), 3.3 in 2-D, 3.9 in
+# 3-D, 4.8 in 5-D and 5.2 in 6-D, and from 5.4 (the depth) on in 7-D and up,
+# but only where passes 1 to 5 separated them: at 5 sigma in 5-D they did in
+# 7 of 32 runs. Nor does it help a close mode of less mass: the clustering
+# leaves it in the labels it split the heavier one from, which also hold
+# both modes' points from before the split, and passes 2 and 3 merge the
+# two. In 2-D a mode of mass 0.1 or 0.2 at 4.5 to 5.5 sigma was one mode
+# with the other in 70 of 72 runs (a 0.2 mode at 5 sigma was kept apart in
+# 2 of 16), and a 0.1 mode at 6.5 sigma in 18 of 32 (nlive 500).
 SADDLE_DEPTH = 3.0
 SADDLE_BINS = 16
 # The sampler's clustering separated a mode if at least SEPARATED_SHARE of
@@ -80,21 +105,60 @@ SADDLE_BINS = 16
 # least PURE_LABEL of their own mass in that mode.
 PURE_LABEL, SEPARATED_SHARE = 0.9, 0.5
 # The hop balanced the modes only in part (a warning) when, after they
-# separated, the clustering held LUMPS_WARN clusters per mode or more on
-# average over the posterior mass, when a clustering had fewer than two
-# eligible clusters for HOP_OFF_WARN of that mass or more, or when the hop
-# accepted less than HOP_ACCEPT_WARN of its proposals. Measured on the
-# targets of ``bench`` (nlive 200 to 2000, 330 runs): the Gaussian mixtures,
-# LogGamma and the plain two-mode targets held at most 1.29 clusters per
-# mode (1.11 above nlive 200), against 1.54 to 3.7 for the needle (d >= 10)
-# and Cauchy targets and 2.5 to 3.6 for an 18-D posterior whose modes have
-# a funnel neck. On those three the hop cut the run-to-run scatter of the
-# minor mass in logit only 1.6 to 3 times (needle_d18: 0.57 to 0.19), against
-# 16 to 19 times on the plain targets (0.37 to 0.019 at 18-D). The hop was
-# off for at most 0.30 of the mass where it balanced the modes, but for 0.55
-# and 0.82 in 2 of 8 LogGamma runs, and it accepted at least 0.19 of its
-# proposals on every target but the 18-D posterior (0.6 to 0.8%).
+# separated and while two of them held live points, the clustering held
+# LUMPS_WARN clusters per mode or more on average over the posterior mass,
+# when a clustering had fewer than two eligible clusters for HOP_OFF_WARN of
+# that mass or more, or when over the whole run the hop accepted less than
+# HOP_ACCEPT_WARN of its proposals. Measured on the targets of ``bench``
+# (nlive 200 to 2000, 330 runs, averages up to the end of the run): the
+# needle (d >= 10) and Cauchy targets held 1.54 to 3.7 clusters per mode and
+# an 18-D posterior whose modes have a funnel neck 2.5 to 3.6. On those
+# three the hop cut the run-to-run scatter of the minor mass in logit only
+# 1.6 to 3 times (needle_d18: 0.57 to 0.19), against 16 to 19 times on the
+# plain targets (0.37 to 0.019 at 18-D), and it accepted at least 0.19 of
+# its proposals on every target but the 18-D posterior (0.6 to 0.8%). Once
+# one mode is left the hop is off by necessity; averaged up to the end, that
+# stretch fired the warning on correct runs whose heaviest mode is also the
+# tallest (hop off for 0.47 to 0.68 of the mass: all 16 runs of a 4-D
+# mixture of masses 0.7 and 0.3 and widths 0.5 and 1, 13 of 16 of two 2-D
+# Gaussians of masses 0.8 and 0.2). Up to the death of the second-last mode
+# (CPU, nlive 400 to 1000, about 400 runs of two- and three-mode Gaussian
+# mixtures in 2 to 18 dimensions, LogGamma and the needle and Cauchy
+# targets), the mixtures and LogGamma held at most 1.13 clusters per mode,
+# against 2.0 to 3.6 for the needle and 1.8 to 2.5 for Cauchy targets; the
+# hop was off for at most 0.35 of the mass on the mixtures and LogGamma at
+# nlive 1000, but for 0.5 to 0.88 in 4 of 8 loggamma_d10 runs and 1 of 8
+# runs of a 10-D plain two-mode target at nlive 500, and it accepted at
+# least 0.2 of its proposals. A run that lost a mode, or the narrow core of
+# one, ends like a correct run with one mode alive, and the warning does not
+# flag it: up to the end of the run the hop was off for 0.51 to 0.61 of the
+# mass on 6 such runs (2 of 32 of a 4-D mixture of masses 0.6, 0.3 and 0.1
+# lost the 0.6 mode; 3 of 8 and 1 of 8 of a 4-D and a 6-D pair of masses 0.8
+# and 0.2, each mode a narrow core in a wide needle, lost most of the minor
+# core), against 0.38 to 0.84 on correct runs, so the old average flagged
+# them by accident.
 LUMPS_WARN, HOP_OFF_WARN, HOP_ACCEPT_WARN = 1.5, 0.5, 0.02
+# The nearest-neighbour search of modes() takes its distances in blocks of
+# about this many coordinate differences (float64: 32 MB, at any nlive).
+_NEAREST_BLOCK = 2**22
+# walks is too short (a warning) when UNMOVED_WARN of the replacement chains
+# or more returned their seed (``metadata["unmoved_fraction"]``; at the 25%
+# walk acceptance, walks of 4 or fewer). The copies keep the insertion ranks
+# uniform, so the insertion test barely sees it, but on 5-D and 10-D
+# Gaussians (24 to 48 runs per walks) logZ scattered 1.2 to 3.8 times
+# logzerr at a fraction of 0.32 to 0.74 (3.8 +- 0.55 on the 5-D one at 0.74,
+# walks 1, nlive 400); in 16-D it was 0.25 +- 0.09 too high
+# at 0.36 (walks 4) and 1.4 +- 0.2 at 0.58. It catches gross shortfalls only:
+# at 0.12 to 0.27 the scatter was 0.9 to 1.5 times logzerr (1.3 to 1.5,
+# +- 0.14 to 0.19, in 3 of 6 cases), and in 16-D logZ was 0.20 +- 0.10 high
+# at 0.15 (walks 8). At the default walks and nlive 500 the fraction was at
+# most 0.07 on the targets of ``bench`` (the eggbox). The eggbox at nlive 100
+# comes close (two sets of 32 runs): 0.25 and 0.28 on average, a warning in
+# 16% and 31% of the runs, and a scatter of 1.3 and 2.0 times logzerr (at
+# twice the walks: 0.20 unmoved, a scatter of 1.0 to 1.2). A lower threshold
+# would flag correct runs: at nlive 200 the eggbox averaged 0.19 with a
+# scatter of 0.95 and 1.1.
+UNMOVED_WARN = 0.3
 
 
 def _jsonable(value):
@@ -115,27 +179,39 @@ def _npz_scalar(value):
     return array.reshape(()).item()
 
 
-def _information(logwt, logl, logz: float):
-    """Return the information ``H`` as a JAX scalar (NaN when undefined)."""
-    weights = jnp.exp(jnp.asarray(logwt) - logz)
-    logl = jnp.asarray(logl)
-    finite = jnp.isfinite(logl)
-    if (
-        not math.isfinite(logz)
-        or not bool(jnp.all(jnp.isfinite(weights)))
-        or bool(jnp.any((weights > 0.0) & ~finite))
-    ):
-        return jnp.asarray(math.nan)
+def _information(logwt, logl, logz: float) -> float:
+    """Return the information ``H`` in float64 (NaN when undefined)."""
+    if not math.isfinite(logz):
+        return math.nan
+    with np.errstate(over="ignore"):
+        weights = np.exp(np.asarray(logwt, dtype=np.float64) - logz)
+    logl = np.asarray(logl, dtype=np.float64)
+    finite = np.isfinite(logl)
+    if not np.all(np.isfinite(weights)) or np.any((weights > 0.0) & ~finite):
+        return math.nan
     contributing = (weights > 0.0) & finite
-    information = jnp.sum(jnp.where(contributing, weights * (logl - logz), 0.0))
-    return jnp.maximum(information, 0.0)
+    # Mask before multiplying: 0 * -inf would be NaN.
+    information = np.sum(weights * np.where(contributing, logl - logz, 0.0))
+    return max(float(information), 0.0)
 
 
 def _ridge(cov):
-    """Add a relative ridge of ``1e-12`` times the mean variance."""
-    ndim = cov.shape[-1]
-    scale = max(float(np.trace(cov)) / ndim, 1e-300)
-    return cov + 1e-12 * scale * np.eye(ndim)
+    """Add ``1e-12 (v_i + 1e-12 v)`` to each variance ``v_i`` (``v``: their
+    mean; the second term is a floor for an axis of zero variance, and the
+    floor of ``v`` leaves ``1e-312`` on a set without any spread).
+
+    The ridge is relative to each axis, like that of the frames on the
+    device (:func:`tinyns.modes._ridge`): one of ``1e-12 v`` on every axis
+    swamped an axis below about ``1e-6`` of the others' width, which an x64
+    run resolves: two clusters 6 sd apart along an axis ``1e-7`` wide (and
+    0.1 and 0.29 wide along the others) kept a quarter of their Fisher
+    separation, and the labels of two modes 12 sd apart along one ``3e-8``
+    wide were merged by pass 2 of :meth:`NestedSamplingResult.modes` (pass 4
+    cut them apart again, with an ``urn_sd`` half the right one).
+    """
+    var = np.diagonal(cov)
+    scale = max(float(np.mean(var)), 1e-288)
+    return cov + np.diag(1e-12 * (var + 1e-12 * scale))
 
 
 def _fisher(x, side) -> float:
@@ -187,6 +263,20 @@ def _nearest_mode(u, weights, label, k):
         logdet = np.sum(np.log(np.diag(chol)))
         score.append(np.sum(z * z, axis=0) + 2 * logdet - 2 * math.log(mass))
     return np.argmin(np.asarray(score), axis=0)
+
+
+def _nearest_other(z, rows) -> np.ndarray:
+    """The nearest other row of ``z`` (Euclidean) to each of the rows
+    ``rows``, taken in blocks of about ``_NEAREST_BLOCK`` distances, so
+    that the memory does not grow as ``len(rows) * len(z)``."""
+    nearest = np.zeros(len(rows), dtype=int)
+    block = max(1, _NEAREST_BLOCK // max(z.size, 1))
+    for start in range(0, len(rows), block):
+        i = rows[start : start + block]
+        dist = np.sum((z[i][:, None, :] - z[None, :, :]) ** 2, axis=-1)
+        dist[np.arange(len(i)), i] = np.inf
+        nearest[start : start + block] = np.argmin(dist, axis=1)
+    return nearest
 
 
 def _discriminant(x, side):
@@ -273,16 +363,27 @@ def _weighted_median(x, weights) -> float:
     return float(x[order][min(np.searchsorted(cw, 0.5 * cw[-1]), len(x) - 1)])
 
 
-def _saddle_depth(u, logl, weights, a, b) -> float:
-    """How far the likelihood dips between the samples ``a`` and ``b``.
+def _apart(u, logl, weights, a, b) -> bool:
+    """Whether the samples ``a`` and ``b`` are separate modes: the likelihood
+    dips between them (:func:`_saddle`) by at least ``SADDLE_DEPTH``, or to
+    below the posterior median likelihood of both."""
+    depth, saddle = _saddle(u, logl, weights, a, b)
+    bulk = min(_weighted_median(logl[mask], weights[mask]) for mask in (a, b))
+    return depth >= SADDLE_DEPTH or saddle < bulk
+
+
+def _saddle(u, logl, weights, a, b) -> tuple[float, float]:
+    """How far the likelihood dips between the samples ``a`` and ``b``, and
+    the likelihood at the bottom of the dip: ``(depth, saddle)``.
 
     Along the Fisher discriminant of the two sets (posterior-weighted
     covariances), the stretch between their weighted medians is cut into
     ``SADDLE_BINS`` bins, and each bin's profile is the highest likelihood
-    of a sample of ``a`` or ``b`` in it. The depth is the lower of the two
-    end bins' profiles minus the lowest profile (``inf`` if a bin is empty;
-    0 for sets with the same median). Dead points cover every contour, so
-    between separate modes the bins hold only the samples of low contours.
+    of a sample of ``a`` or ``b`` in it. ``saddle`` is the lowest profile and
+    ``depth`` the lower of the two end bins' profiles minus ``saddle``
+    (``inf`` and ``-inf`` if a bin is empty; ``(0, inf)``, no dip, for sets
+    with the same median). Dead points cover every contour, so between
+    separate modes the bins hold only the samples of low contours.
     """
 
     def moments(mask):
@@ -298,13 +399,14 @@ def _saddle_depth(u, logl, weights, a, b) -> float:
     pa = _weighted_median(u[a] @ w, weights[a])
     pb = _weighted_median(u[b] @ w, weights[b])
     if not pb > pa:
-        return 0.0
+        return 0.0, math.inf
     both = a | b
     at = np.floor((u[both] @ w - pa) / (pb - pa) * SADDLE_BINS).astype(int)
     inside = (at >= 0) & (at <= SADDLE_BINS)  # the median of b: the last bin
     profile = np.full(SADDLE_BINS, -np.inf)
     np.maximum.at(profile, np.minimum(at[inside], SADDLE_BINS - 1), logl[both][inside])
-    return float(min(profile[0], profile[-1]) - profile.min())
+    saddle = float(profile.min())
+    return float(min(profile[0], profile[-1]) - saddle), saddle
 
 
 def _kolmogorov_pvalue(n: int, ks: float) -> float:
@@ -393,22 +495,34 @@ def _log_weights(logl, nlive_i, log_t=None):
 def _evidence(logl, nlive_i):
     """Return ``(logwt, logz, logzerr)`` in float64 (see :func:`_log_weights`).
 
-    ``logzerr = sqrt(sum_i dH_i / n_i)``, with ``dH_i`` the increment of the
-    running information at sample ``i`` and ``n_i = nlive_i[i]``; at a
-    constant live count ``n`` it is Skilling's ``sqrt(H / n)``.
+    ``logzerr`` is the spread of ``logz`` over the prior-volume path, to
+    first order: the shrinkage of sample ``j`` has ``Var(log t_j) = 1 /
+    n_j^2`` (``t_j ~ Beta(n_j, 1)``, ``n_j = nlive_i[j]``) and moves ``logz``
+    by ``S_j = d logz / d log t_j = sum_{i>j} p_i - L_j X_j / Z`` (``p_i``
+    the normalized weights; ``S = 0`` for the last sample, which takes all
+    the volume left), so ``logzerr^2 = sum_j (S_j / n_j)^2``. At a constant
+    live count ``n`` it is close to Skilling's ``sqrt(H / n)``. Unlike a sum
+    of information increments it keeps the volume uncertainty of the deaths
+    on a plateau below the posterior mass (zero-weight deaths, ``S_j``
+    near 1) and is never negative; the deaths of a plateau that holds the
+    remaining mass (``S_j = 0``) add none, since their widths sum to the
+    volume left exactly. With few live points above a plateau the spread of
+    ``logz`` is skewed, which :meth:`NestedSamplingResult.logz_bootstrap`
+    (it draws the shrinkages) shows.
     """
     logl = np.asarray(logl, dtype=np.float64)
-    logwt = _log_weights(logl, nlive_i)
+    n = np.asarray(nlive_i, dtype=np.float64)
+    logwt = _log_weights(logl, n)
     logz = float(_np_logsumexp(logwt, axis=0))
     if not math.isfinite(logz):
         return logwt, logz, math.nan
     p = np.exp(logwt - logz)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        c = np.cumsum(p)
-        a = np.cumsum(np.where(p > 0.0, p * logl, 0.0))
-        h = np.where(c > 0.0, a / c - np.log(c) - logz, 0.0)
-    var = np.sum(np.diff(h, prepend=0.0) / np.asarray(nlive_i, dtype=np.float64))
-    return logwt, logz, math.sqrt(max(float(var), 0.0))
+    after = np.concatenate([np.cumsum(p[::-1])[::-1][1:], [0.0]])  # sum_{i>j} p_i
+    with np.errstate(divide="ignore"):
+        own = np.exp(logl + np.cumsum(-1.0 / n) - logz)  # L_j X_j / Z; 0 at -inf
+    s = after - own
+    s[-1] = 0.0
+    return logwt, logz, math.sqrt(float(np.sum((s / n) ** 2)))
 
 
 @dataclass(kw_only=True)
@@ -422,7 +536,9 @@ class NestedSamplingResult:
     ``nlive, ..., 1`` over the final live points. On a likelihood plateau
     (live points tied at one likelihood) the tied deaths count at
     ``nlive, nlive - 1, ...`` across the steps they take (Fowlie, Handley and
-    Su 2021), so ``nlive_i`` is lower there.
+    Su 2021), so ``nlive_i`` is lower there, and so it is for the final live
+    points still tied at the last step's contour (a run that ended on a
+    plateau, or stopped during one).
     """
 
     samples_u: ArrayLike
@@ -446,9 +562,12 @@ class NestedSamplingResult:
     counting plateaus as above."""
 
     labels: ArrayLike | None = None
-    """Cluster slot of each sample when it died (the final live points: at the
-    end of the run), from the on-device clustering (:mod:`tinyns.modes`);
-    :meth:`modes` reads it. ``None`` for a result built by hand."""
+    """Cluster label of each sample when it died (the final live points: at
+    the end of the run), from the on-device clustering (:mod:`tinyns.modes`):
+    ``id * folds + j``, with ``id`` the id of its cluster in clustering ``j =
+    (fold + 1) mod folds``, one that contains it, so a run without splits
+    gives ``0``, ``1`` and ``2``. :meth:`modes` reads it. ``None`` for a
+    result built by hand."""
 
     insertion_ranks: ArrayLike | None = None
     """In-sampler insertion rank of every point born during the run (``niter``
@@ -486,7 +605,9 @@ class NestedSamplingResult:
 
     success: bool = True
     """True if the run converged (``dlogz``) or ended on a likelihood plateau;
-    False if it stopped at ``maxiter`` or ``maxcall``."""
+    False if it stopped at ``maxiter`` or ``maxcall``, or if ``logz`` is not
+    finite (status ``"invalid"``: a likelihood of +inf, or no finite
+    likelihood found)."""
 
     message: str = ""
     """Human-readable status of the run."""
@@ -494,24 +615,47 @@ class NestedSamplingResult:
     metadata: dict[str, Any] | None = None
     """Run settings and telemetry: ``status``, ``walks``, ``dlogz``,
     ``final_delta_logz``, ``acceptance`` (of the walk steps), ``scale``,
-    ``ncall_valid`` (in-cube likelihood calls), ``x64``, the hop counters,
+    ``ncall_valid`` (the proposals that passed the likelihood-free tests;
+    :class:`tinyns.core.State`), ``unmoved_fraction`` (of the replacement
+    chains), ``x64``, the hop counters,
     ``wall_time_s``, ``compile_s``, ``sampling_s``, ``resumed`` and more (the
     CHANGELOG lists the keys)."""
 
-    def log_weights(self):
-        """Return posterior weights normalized in log space."""
+    def _no_weight(self) -> bool:
+        """True if no sample has a positive posterior weight (``logz = -inf``:
+        no finite likelihood was found)."""
+        logwt = np.asarray(self.logwt, dtype=float)
+        return logwt.size > 0 and not np.any(logwt > -np.inf)
 
+    def _check_weight(self) -> None:
+        if self._no_weight():
+            raise ValueError(
+                "no sample has a positive posterior weight (logz is -inf)"
+                + (f": {self.message}" if self.message else "")
+            )
+
+    def log_weights(self) -> np.ndarray:
+        """Return posterior weights normalized in log space.
+
+        This and the other weight statistics compute in NumPy float64 on the
+        host (:mod:`tinyns.math`), whatever JAX's precision.
+        """
+
+        self._check_weight()
         return normalize_log_weights(self.logwt)
 
-    def weights(self):
-        """Return normalized linear posterior weights."""
+    def weights(self) -> np.ndarray:
+        """Return normalized linear posterior weights (NumPy float64)."""
 
-        return jnp.exp(self.log_weights())
+        return np.exp(self.log_weights())
 
     def posterior_ess(self) -> float:
-        """Return the effective sample size of the posterior weights."""
+        """Return the effective sample size of the posterior weights (0 when
+        no sample has a positive weight)."""
 
-        return float(effective_sample_size_from_log_weights(self.logwt))
+        if self._no_weight():
+            return 0.0
+        return effective_sample_size_from_log_weights(self.logwt)
 
     def max_weight_fraction(self) -> float:
         """Return the largest normalized posterior weight fraction."""
@@ -519,7 +663,7 @@ class NestedSamplingResult:
         weights = self.weights()
         if weights.size == 0:
             return 0.0
-        return float(jnp.max(weights))
+        return float(np.max(weights))
 
     def posterior_weight_entropy(self) -> float:
         """Return the Shannon entropy of normalized posterior weights."""
@@ -527,27 +671,27 @@ class NestedSamplingResult:
         weights = self.weights()
         if weights.size == 0:
             return 0.0
-        positive = weights > 0.0
-        return float(-jnp.sum(weights[positive] * jnp.log(weights[positive])))
+        positive = weights[weights > 0.0]
+        return float(-np.sum(positive * np.log(positive)))
 
     def posterior_weight_entropy_fraction(self) -> float:
         """Return posterior weight entropy as a fraction of equal-weight entropy."""
 
-        n = int(jnp.asarray(self.logwt).size)
+        n = int(np.size(self.logwt))
         if n <= 1:
             return 0.0
-        fraction = self.posterior_weight_entropy() / float(jnp.log(n))
-        return float(jnp.clip(fraction, 0.0, 1.0))
+        fraction = self.posterior_weight_entropy() / math.log(n)
+        return float(np.clip(fraction, 0.0, 1.0))
 
     def live_weight_fraction(self) -> float:
         """Return the posterior weight fraction in the final live points."""
 
-        return float(jnp.sum(self.weights()[int(self.niter) :]))
+        return float(np.sum(self.weights()[int(self.niter) :]))
 
     def dead_weight_fraction(self) -> float:
         """Return the posterior weight fraction in the dead points."""
 
-        return float(jnp.clip(1.0 - self.live_weight_fraction(), 0.0, 1.0))
+        return float(np.clip(1.0 - self.live_weight_fraction(), 0.0, 1.0))
 
     @cached_property
     def _births(self) -> tuple[np.ndarray, np.ndarray]:
@@ -644,7 +788,7 @@ class NestedSamplingResult:
         return out
 
     def modes(self) -> list[dict[str, Any]]:
-        """Return the posterior modes, heaviest first, with their urn error bar.
+        """Return the posterior modes, heaviest first, with their mass scatter.
 
         Post-processing of the run's samples: it reads the cluster labels the
         run recorded (:attr:`labels`: the id of each sample's cluster when it
@@ -685,7 +829,8 @@ class NestedSamplingResult:
            leave a slab across a coordinate axis of the unit cube empty
            (``SLAB_SCORE``): this finds the modes the sampler's clustering
            did not separate, such as the 18 of an eggbox, when planes across
-           the axes of the cube separate them;
+           the axes of the cube separate them and they still hold live
+           points at that median;
         5. every sample is relabelled by its nearest mode (hard-EM
            classification with each mode's posterior-weighted mean and
            covariance), so that a mode has its points from before it was
@@ -693,11 +838,22 @@ class NestedSamplingResult:
         6. two modes are one if the likelihood of their samples dips by less
            than ``SADDLE_DEPTH`` along the line between them (the highest
            likelihood in each of ``SADDLE_BINS`` stretches of their
-           discriminant direction): the split test also cuts lumps off a mode
-           whose contours have thin arms or a funnel neck, and their live
-           points leave gaps as separate modes do, but the dead points show
-           no saddle between them. A lump joined to its mode only along a
-           curved path (a funnel neck) is not found this way.
+           discriminant direction) and the bottom of the dip lies above the
+           posterior median likelihood of at least one of them
+           (:func:`_apart`): the split test also cuts lumps off a mode whose
+           contours have thin arms or a funnel neck, and their live points
+           leave gaps as separate modes do, but the dead points show no
+           saddle between them. In few dimensions the bulk of a mode lies
+           close to its peak, and a shallow dip below the bulk of both
+           separates two modes (equal Gaussians from about 2.5 standard
+           deviations apart in 1-D, 3.3 in 2-D, 3.9 in 3-D, against 5.4
+           from the depth alone), if the passes before separated them. A
+           close mode of less mass is mostly not separated before: the
+           clustering leaves it in the labels it split the heavier one from
+           (in 2-D a mode of mass 0.1 or 0.2 was one mode with the other in
+           nearly all runs at 4.5 to 5.5 standard deviations apart, and a
+           0.1 mode in about half of them at 6.5). A lump joined to its mode
+           only along a curved path (a funnel neck) is not found this way.
 
         Each mode's live count ``n(t)`` is rebuilt from the birth and death
         iterations. The mode is isolated from the first iteration at which
@@ -712,7 +868,9 @@ class NestedSamplingResult:
         median and ``2 g / (N^2 (1 - g))`` up to the rest's, with ``g = n /
         N``. The hop removes most of that drift (about 7x less scatter in the
         v1 bake-off), so ``urn_sd`` is an upper bound for a mode the sampler
-        tracked.
+        tracked. It treats the rest as one urn, which holds for two modes or
+        modes of one shape: without the hop, three modes of different widths
+        in 2 to 4 dimensions scattered 1.5 to 4 times more than ``urn_sd``.
 
         The live slots form ``metadata["folds"]`` cross-fitted folds, and a
         point and all its descendants stay in one fold, so each fold samples
@@ -723,39 +881,115 @@ class NestedSamplingResult:
         (``fold_sd`` 0.04 to 0.1 on the Gaussian mixtures of ``bench``);
         where it does not, each fold drifts on its own (0.4 on the 18-D
         needle target, 1 to 1.6 on an 18-D posterior whose modes have a
-        funnel neck). The run's mass, their average, then scatters from run
-        to run by about ``fold_sd / sqrt(folds)`` (within a factor of 2 on
-        those targets).
+        funnel neck). Every fold weighs its samples with the run's prior
+        volumes, so ``fold_sd`` misses their error, which moves the masses of
+        all folds together (:meth:`_volume_variance`): it vanishes for modes
+        of one height and grows with the prior volume between the bulk of the
+        mode and that of the rest, as when the heaviest mode is also the
+        narrowest. ``run_sd = sqrt(fold_sd^2 / folds + V)``, with ``V`` that
+        error's variance, is the run-to-run scatter of the mass in logit,
+        measured within the run. On a 4-D mixture of masses 0.75, 0.2 and
+        0.05 and widths 0.25, 0.5 and 0.75 (rotated Gaussians in
+        ``[-12, 12]^4``, about 10 apart in a triangle; 16 runs at nlive 1000)
+        the masses
+        scattered by 0.056, 0.053 and 0.079, against a median ``run_sd`` of
+        0.053, 0.046 and 0.065 and ``fold_sd / sqrt(3)`` of 0.015, 0.012 and
+        0.027; for modes of one height ``run_sd`` is ``fold_sd / sqrt(3)``.
+        Three folds give two degrees of freedom, so one run's value is good
+        to a factor of about 2. That holds for runs that kept every mode: a
+        run that lost a mode, or most of one, lies far outside its
+        ``run_sd``, and the warnings of :meth:`diagnostics` need not say so.
+        On 16 other seeds of the mixture above, one run kept 0.47 of the
+        0.75 mode (logZ 9 ``logzerr`` low), and the masses scattered by
+        0.31, 0.25 and 0.27; without it by 0.069, 0.058 and 0.101, against
+        a median ``run_sd`` of 0.053, 0.048 and 0.062.
 
         Per mode: ``mass``, ``urn_sd``, ``fold_mass``, ``fold_sd``,
-        ``isolation_iteration``, ``min_live`` (the smallest ``n`` between
-        isolation and the mode's median), ``unresolved`` (``min_live`` below
+        ``run_sd`` (``None`` without folds), ``min_live`` (the smallest ``n``
+        between isolation and the mode's median), ``isolation_iteration``,
+        ``extinction_iteration`` (the first iteration from which the mode
+        holds no live point; ``niter`` for a mode that holds some of the
+        final live points), ``unresolved`` (``min_live`` below
         ``UNRESOLVED_PER_DIM * ndim``: the mass is not reliable, raise
         ``nlive``) and ``tracked``: False for a mode that the sampler's
         clustering did not separate from its neighbours, that is, one that
         pass 4 cut out of a larger one while less than ``SEPARATED_SHARE`` of
         its mass carries labels that put ``PURE_LABEL`` of their own mass in
-        it. The hop did not balance such a mode, its mass scatters by about
-        ``urn_sd``, and the count of such modes is a lower bound (modes with
-        fewer than ``SLAB_NEIGHBOURS`` live points, or that no axis-aligned
-        plane separates, stay merged). :meth:`diagnostics` also reports for
-        how much of the run the clustering's slots were full
-        (``mode_slots_full``: no further mode could be split off then) and
-        for how much of the posterior mass the hop was off
-        (``mode_hop_off``). A mode lost before the end leaves no trace in its
-        own run, and neither does one that never held more than about
-        ``ndim`` live points per fold. A unimodal run (or a result without
-        :attr:`labels`) gives one mode of mass 1.
+        it. The hop did not balance such a mode, its mass scatters as
+        without the hop (by at least about ``run_sd``: each fold drifts on
+        its own; without the hop three modes of a mixture in 2-D and 3-D
+        scattered 1.4 to 3 times their ``run_sd``), and the count of such
+        modes is a lower bound (modes with fewer than ``SLAB_NEIGHBOURS``
+        live points, or that no axis-aligned plane separates, stay merged).
+        A mode can also be merged into a tracked one: a mode whose live
+        points were gone before the clustering first split the cluster it
+        shared with its neighbours carries only that cluster's labels,
+        which passes 1 to 3 set aside, and pass 5 gives its samples to the
+        nearest mode found. The lowest of three modes in a line can be such
+        a mode: on a 4-D mixture of masses 0.75, 0.2 and 0.05 along the
+        diagonal of the cube, 8 to 12 standard deviations apart and the 0.05
+        mode at an end, 26 of 32 runs at nlive 1000 reported two modes
+        (about 0.75 and 0.25), both tracked, and no warning, while the same
+        modes in a triangle, or with the 0.05 mode in the middle, gave three
+        in every run. So the count is a lower bound for tracked modes too;
+        logZ and the summed mass of the merged modes are right.
+        :meth:`diagnostics` also reports for how much of the run the
+        clustering's slots were full (``mode_slots_full``: no further mode
+        could be split off then) and for how much of the posterior mass the
+        hop was off while two modes held live points (``mode_hop_off``). A
+        mode lost before the end leaves no trace in its own run (no
+        ``unresolved`` flag and, in the runs measured, no warning), and
+        neither does one that never held more than about ``ndim`` live points
+        per fold. A mode's share of the live points when it separates from
+        the others is its share of the prior volume there, not its posterior
+        mass, so a narrow mode can be lost although it holds most of the
+        mass, and logZ then comes out low by about ``log(1 - mass)``, beyond
+        ``logzerr``. On a 4-D mixture of masses 0.6, 0.3 and 0.1 and widths
+        0.25, 0.5 and 0.75 (rotated Gaussians in ``[-12, 12]^4``) the 0.6
+        mode held a median of 8 to 9 of 500 live points when it separated; it
+        was lost in 7 of 32 runs in float32 and 4 of 32 in x64 at nlive 500,
+        and in 3 and 4 of 64 at nlive 1000, all without a warning and with
+        logZ 0.62 to 1.03 low (4.6 to 10.4 ``logzerr``), while 172 of the 174
+        runs that kept it flagged it unresolved. A light mode can be lost
+        too: on the 18-D target ``build_two_mode(18, 0.2)`` of
+        ``bench.targets`` 2 of 16 runs in x64 lost its 20% mode, and all 14
+        that kept it flagged it. So if any run flags a mode unresolved, other
+        runs may have lost it: raise ``nlive`` and compare runs. A unimodal
+        run (or a result without :attr:`labels`, or without posterior
+        weight) gives one mode of mass 1, flagged ``unresolved`` if ``nlive``
+        is below ``UNRESOLVED_PER_DIM * ndim``: too few live points for a
+        covariance-adapted walk to learn the shape of a mode (a near-Gaussian
+        one can do with fewer: on a 32-D Gaussian logZ was 9 nats high at
+        nlive 40, 1 at 64 and right at 100).
+        ``metadata["mode_tree"]`` holds the parents of the first
+        ``TREE_SIZE - 1`` cluster ids of each clustering
+        (:data:`tinyns.modes.TREE_SIZE`), and ``metadata["mode_tree_dropped"]``
+        counts the clusters made past them, whose parents are not recorded:
+        pass 2 cannot tell that the clusters they were split from held
+        several modes. The modes are worked out once per result, and each
+        call returns a copy: :meth:`diagnostics`, :meth:`summary` and
+        ``print(result)`` reuse them, so a result must not be changed in place
+        after any of these (``dataclasses.replace`` gives a new one, whose
+        modes are worked out afresh).
         """
 
+        return copy.deepcopy(self._mode_list)
+
+    @cached_property
+    def _mode_list(self) -> list[dict[str, Any]]:
+        """:meth:`modes`, worked out once per result."""
         fold = self._sample_folds()
         folds = None if fold is None else int(fold.max()) + 1
+        nlive, niter = int(self.nlive), int(self.niter)
         one = [{"mass": 1.0, "urn_sd": 0.0,
                 "fold_mass": None if folds is None else [1.0] * folds,
                 "fold_sd": None if folds is None else 0.0,
-                "min_live": int(self.nlive), "isolation_iteration": 0,
-                "unresolved": False, "tracked": True}]
-        if int(self.niter) == 0 or self.labels is None:
+                "run_sd": None if folds is None else 0.0,
+                "min_live": nlive, "isolation_iteration": 0,
+                "extinction_iteration": niter,
+                "unresolved": bool(nlive < UNRESOLVED_PER_DIM * int(self.ndim)),
+                "tracked": True}]
+        if niter == 0 or self.labels is None or self._no_weight():
             return one
         try:
             return self._modes(one)
@@ -799,7 +1033,7 @@ class NestedSamplingResult:
         # 6. Modes that the likelihood does not dip between are one mode.
         logl, group = np.asarray(self.logl, dtype=float), np.arange(len(kept))
         for a, b in itertools.combinations(range(len(kept)), 2):
-            if _saddle_depth(u, logl, weights, label == a, label == b) < SADDLE_DEPTH:
+            if not _apart(u, logl, weights, label == a, label == b):
                 group[group == group[b]] = group[a]
         whole = [all(tracked[c] for c in kept[group == g]) for g in np.unique(group)]
         label = np.unique(group[label], return_inverse=True)[1]
@@ -809,8 +1043,8 @@ class NestedSamplingResult:
 
     @cached_property
     def _weights(self) -> np.ndarray:
-        """:meth:`weights` as a NumPy float64 array."""
-        return np.asarray(self.weights(), dtype=float)
+        """:meth:`weights`, computed once for :meth:`modes`."""
+        return self.weights()
 
     def _median(self, mask) -> int:
         """The posterior median iteration of the samples ``mask``."""
@@ -872,13 +1106,20 @@ class NestedSamplingResult:
             )
             min_live = int(n[lo : max(stop, lo + 1)].min())
             fold_mass, fold_sd = self._fold_spread(mine)
+            run_sd = None
+            if fold_sd is not None:
+                volume = self._volume_variance(mine)
+                run_sd = math.sqrt(fold_sd**2 / len(fold_mass) + volume)
+            living = np.flatnonzero(n > 0)
             out.append({
                 "mass": float(weights[mine].sum() / cumulative[-1]),
                 "urn_sd": float(math.sqrt(variance)),
                 "fold_mass": fold_mass,
                 "fold_sd": fold_sd,
+                "run_sd": run_sd,
                 "min_live": min_live,
                 "isolation_iteration": int(lo),
+                "extinction_iteration": int(living[-1]) + 1 if len(living) else 0,
                 "unresolved": bool(min_live < UNRESOLVED_PER_DIM * ndim),
                 "tracked": tracked[c],
             })
@@ -924,6 +1165,23 @@ class NestedSamplingResult:
         half = 0.5 * folds / int(self.nlive)
         g = np.clip(mass, half, 1.0 - half)
         return mass.tolist(), float(np.std(np.log(g / (1.0 - g)), ddof=1))
+
+    def _volume_variance(self, mine) -> float:
+        """The variance of the logit of the mass of the samples ``mine`` from
+        the prior volumes, which every fold shares (first order in the
+        ``Beta(n_i, 1)`` shrinkages of :meth:`logz_bootstrap`). An error ``e``
+        in the log shrinkage of death ``i`` scales the weights of every later
+        sample by ``exp(e)``, which moves the logit by ``e (F_rest - F)``,
+        with ``F`` and ``F_rest`` the shares of the mass of the mode and of
+        the rest in the samples up to ``i``; ``e`` has variance ``1 /
+        n_i^2``. It vanishes where the mode and the rest die together (modes
+        of one height) and grows with the prior volume between their bulks.
+        The widths of single samples are left out: their scatter is that of
+        the posterior samples, which the folds measure."""
+        weights = self._weights
+        mode, rest = np.cumsum(weights * mine), np.cumsum(weights * ~mine)
+        gap = rest / max(rest[-1], 1e-300) - mode / max(mode[-1], 1e-300)
+        return float(np.sum((gap / np.asarray(self.nlive_i, dtype=float)) ** 2))
 
     def _merge_labels(self, label, ids, u, median, alive):
         """Passes 2 and 3 of :meth:`modes`: the mode of every sample (-1:
@@ -1110,9 +1368,8 @@ class NestedSamplingResult:
             dev = x - x.mean(0)
             chol = np.linalg.cholesky(_ridge(dev.T @ dev / max(len(x) - 1, 1)))
             z = np.linalg.solve(chol, dev.T).T
-            dist = np.sum((z[other][:, None, :] - z[None, :, :]) ** 2, axis=-1)
-            dist[np.arange(other.sum()), np.flatnonzero(other)] = np.inf
-            if not (other.any() and np.any(owner[np.argmin(dist, axis=1)] == m)):
+            nearest = _nearest_other(z, np.flatnonzero(other))
+            if not (other.any() and np.any(owner[nearest] == m)):
                 of_label[members] = -1
         return np.unique(of_label, return_inverse=True)[1][label] - 1
 
@@ -1131,42 +1388,70 @@ class NestedSamplingResult:
         )
         return max(int(row[1]) for row in history), full / int(self.niter)
 
-    def _history_mean(self, start: int, value) -> float | None:
+    def _history_mean(self, start: int, stop: int, value) -> float | None:
         """The posterior-weighted mean of ``value(clusters, eligible)`` over
-        the dead points from iteration ``start`` on, from the record of the
-        step at which each died (``metadata["mode_history"]``: the most
-        clusters and the fewest eligible ones of a clustering); ``None``
-        without that record."""
+        the dead points of iterations ``start`` to ``stop - 1``, from the
+        record of the step at which each died (``metadata["mode_history"]``:
+        the most clusters and the fewest eligible ones of a clustering);
+        ``None`` without that record."""
         history = (self.metadata or {}).get("mode_history")
         niter = int(self.niter)
         if not history or niter == 0:
             return None
         start = min(max(int(start), 0), niter - 1)
+        stop = min(max(int(stop), start + 1), niter)
         starts = [int(row[0]) for row in history]
         at = np.maximum(np.searchsorted(starts, np.arange(niter), side="right") - 1, 0)
         values = np.array([float(value(int(row[1]), int(row[2]))) for row in history])
-        weights = self._weights[start:niter]
-        return float(weights @ values[at][start:] / max(weights.sum(), 1e-300))
+        weights = self._weights[start:stop]
+        return float(weights @ values[at][start:stop] / max(weights.sum(), 1e-300))
 
-    def _hop_off(self, start: int = 0) -> float | None:
-        """The fraction of the posterior mass from iteration ``start`` on
-        during which a clustering had fewer than two eligible clusters, so
-        that the hop was off in its fold."""
-        return self._history_mean(start, lambda clusters, eligible: eligible < 2)
+    def _hop_window(self, modes) -> tuple[int, int]:
+        """The iterations ``[start, stop)`` during which the hop had modes to
+        balance: from the first isolation of one of ``modes`` to the last
+        iteration at which two tracked modes (two modes, if fewer are
+        tracked) still held live points. After that, one mode is left and
+        the hop is off by necessity; where the heaviest mode is also the
+        tallest, that stretch holds most of the posterior mass."""
+        start = min(mode["isolation_iteration"] for mode in modes)
+        ends = [mode["extinction_iteration"] for mode in modes if mode["tracked"]]
+        if len(ends) < 2:
+            ends = [mode["extinction_iteration"] for mode in modes]
+        stop = sorted(ends)[-2] if len(ends) > 1 else int(self.niter)
+        return start, stop
 
-    def _lumps(self, start: int, nmodes: int) -> float | None:
+    def _hop_off(self, start: int, stop: int) -> float | None:
+        """The fraction of the posterior mass of iterations ``start`` to
+        ``stop - 1`` during which a clustering had fewer than two eligible
+        clusters, so that the hop was off in its fold."""
+        return self._history_mean(start, stop, lambda clusters, eligible: eligible < 2)
+
+    def _lumps(self, start: int, stop: int, nmodes: int) -> float | None:
         """The posterior-weighted mean number of clusters per mode, of the
-        clustering with the most, from iteration ``start`` on."""
-        return self._history_mean(start, lambda clusters, eligible: clusters / nmodes)
+        clustering with the most, over iterations ``start`` to ``stop - 1``."""
+        return self._history_mean(
+            start, stop, lambda clusters, eligible: clusters / nmodes
+        )
 
     def _mode_warnings(self, modes) -> list[str]:
         """The warnings of :meth:`diagnostics` about ``modes``."""
         warnings = [
             f"mode {i} (mass {mode['mass']:.3g}) is unresolved: it held "
-            f"{mode['min_live']} live points; raise nlive"
+            f"{mode['min_live']} live points, and in other runs such a mode "
+            "may be lost entirely, with no warning; raise nlive and compare "
+            "runs"
             for i, mode in enumerate(modes)
-            if mode["unresolved"]
+            if mode["unresolved"] and len(modes) > 1
         ]
+        if len(modes) == 1 and modes[0]["unresolved"]:
+            least = math.ceil(UNRESOLVED_PER_DIM * int(self.ndim))
+            warnings.append(
+                f"mode 0 (mass 1) is unresolved: the run held {modes[0]['min_live']} "
+                f"live points, fewer than the {least} ({UNRESOLVED_PER_DIM:g} * "
+                "ndim) a covariance-adapted walk may need to learn the shape of "
+                "a mode, and logZ may be biased beyond logzerr (a near-Gaussian "
+                "mode can do with fewer); raise nlive"
+            )
         most, full = self._mode_slots()
         loose = sum(not mode["tracked"] for mode in modes)
         if loose:
@@ -1174,8 +1459,9 @@ class NestedSamplingResult:
             warnings.append(
                 f"{loose} of the {len(modes)} modes were not separated by the "
                 f"sampler's clustering{held}: the inter-mode hop did not balance "
-                "them, so their masses scatter from run to run by about urn_sd, "
-                "and there may be more modes than were found"
+                "them, so their masses scatter from run to run as without the "
+                "hop (by at least about run_sd), and there may be more modes "
+                "than were found"
             )
         warnings += self._hop_warnings(modes)
         if full and len(modes) > 1:
@@ -1199,41 +1485,51 @@ class NestedSamplingResult:
 
     def _hop_warnings(self, modes) -> list[str]:
         """The warning of :meth:`diagnostics` when the hop balanced two or
-        more modes that the clustering separated only in part: after they
-        separated, the clustering held at least ``LUMPS_WARN`` clusters per
-        mode on average over the posterior mass (it cut modes into lumps, and
-        the hop's ellipsoids cover such modes poorly), or the hop was off for
-        at least ``HOP_OFF_WARN`` of that mass, or it accepted less than
-        ``HOP_ACCEPT_WARN`` of its proposals. The masses then scatter from run
-        to run more than where the hop works, and the spread of the folds'
-        masses measures by how much."""
+        more modes that the clustering separated only in part: while two of
+        them held live points after they separated (:meth:`_hop_window`),
+        the clustering held at least ``LUMPS_WARN`` clusters per mode on
+        average over the posterior mass (it cut modes into lumps, and the
+        hop's ellipsoids cover such modes poorly), or the hop was off for at
+        least ``HOP_OFF_WARN`` of that mass, or, over the whole run, it
+        accepted less than ``HOP_ACCEPT_WARN`` of its proposals. The warning
+        names only the causes that passed their threshold. The masses then
+        scatter from run to run more than where the hop works, and the spread
+        of the folds' masses measures by how much (``run_sd``)."""
         if sum(mode["tracked"] for mode in modes) < 2:
             return []  # the warning about untracked modes says it
-        start = min(mode["isolation_iteration"] for mode in modes)
-        lumps, off = self._lumps(start, len(modes)), self._hop_off(start)
+        start, stop = self._hop_window(modes)
+        lumps = self._lumps(start, stop, len(modes))
+        off = self._hop_off(start, stop)
         acceptance = (self.metadata or {}).get("hop_acceptance")
-        if not (
-            (lumps is not None and lumps >= LUMPS_WARN)
-            or (off is not None and off >= HOP_OFF_WARN)
-            or (acceptance is not None and acceptance < HOP_ACCEPT_WARN)
-        ):
-            return []
+        lumpy = lumps is not None and lumps >= LUMPS_WARN
+        idle = off is not None and off >= HOP_OFF_WARN
+        rare = acceptance is not None and acceptance < HOP_ACCEPT_WARN
         parts = []
-        if lumps is not None:
+        if lumpy:
             parts.append(
                 f"the sampler's clustering held {lumps:.2g} clusters per mode "
                 "on average (it cut modes into lumps)"
             )
-        if off is not None:
+        if idle:
             parts.append(
                 "the inter-mode hop was off (fewer than two eligible clusters) "
                 f"for {100 * off:.0f}% of the posterior mass"
             )
-        if acceptance is not None:
-            hop = "it" if off is not None else "the inter-mode hop"
-            parts.append(f"{hop} accepted {100 * acceptance:.2g}% of its proposals")
+        if parts:
+            parts[0] = (
+                "after the modes separated and while two of them held live "
+                "points, " + parts[0]
+            )
+        if rare:  # the acceptance is counted over the whole run
+            hop = "it" if idle else "the inter-mode hop"
+            parts.append(
+                f"over the run {hop} accepted {100 * acceptance:.2g}% of its "
+                "proposals"
+            )
+        if not parts:
+            return []
         text = (
-            "after the modes separated, " + ", ".join(parts[:-1])
+            ", ".join(parts[:-1])
             + (", and " if len(parts) > 1 else "") + parts[-1]
             + ": the hop balanced the modes only in part, so their masses may "
             "scatter from run to run more than where it works"
@@ -1248,7 +1544,7 @@ class NestedSamplingResult:
                 f"mode {i} the masses "
                 + ", ".join(f"{m:.3g}" for m in mode["fold_mass"])
                 + f" (fold_sd {mode['fold_sd']:.2f} in logit: a run-to-run "
-                f"scatter of about {mode['fold_sd'] / math.sqrt(folds):.2g})"
+                f"scatter, run_sd, of about {mode['run_sd']:.2g})"
                 for i, mode in spread
             )
         return [text]
@@ -1313,29 +1609,57 @@ class NestedSamplingResult:
         windows), the posterior ``modes`` (:meth:`modes`),
         ``mode_slots_full``, the fraction of the run during which every
         cluster slot of the sampler's clustering was in use, two averages
-        over the posterior mass after the modes separated: ``mode_lumps``,
+        over the posterior mass after the modes separated and while two of
+        them held live points (the whole run for one mode): ``mode_lumps``,
         the number of clusters per mode found (of the clustering with the
         most), and ``mode_hop_off``, the fraction during which a clustering
         had fewer than two eligible clusters (the hop was off in its fold),
         and ``hop_acceptance`` (``None`` for a result without those
         records).
-        The warnings name each unresolved mode and the modes the clustering
-        did not separate (their number is a lower bound); they say when the
-        hop balanced the modes only in part (``mode_lumps`` at least
-        ``LUMPS_WARN``, ``mode_hop_off`` at least ``HOP_OFF_WARN`` or
-        ``hop_acceptance`` below ``HOP_ACCEPT_WARN``), with the folds' masses
-        of each mode, and when the slots were full in a run of several modes.
+        The warnings name each unresolved mode (a single mode too; for one of
+        several modes the warning adds that in other runs such a mode may be
+        lost entirely, which leaves no flag in the run that lost it) and the
+        modes the clustering did not separate (their number is a lower
+        bound); they say when the hop balanced the modes only in part
+        (``mode_lumps`` at least ``LUMPS_WARN``, ``mode_hop_off`` at least
+        ``HOP_OFF_WARN`` or ``hop_acceptance`` below ``HOP_ACCEPT_WARN``;
+        each cause is named only when it passed its threshold), with the
+        folds' masses and the ``run_sd`` of each mode, and when the slots were
+        full in a run of several modes.
+        Another warns when ``UNMOVED_WARN`` of the replacement chains or more
+        did not move (``metadata["unmoved_fraction"]``): ``walks`` is too
+        short. It catches gross shortfalls only; rerunning with twice the
+        walks remains the check.
+
+        A run that ended on a likelihood plateau (``metadata["status"]`` is
+        ``"plateau"``) stopped where it should: the final live points are
+        the plateau and carry its posterior mass whatever ``dlogz``, so the
+        checks of the final live weight and of ``final_delta_logz`` are
+        skipped and one note gives that mass (more live points can find a
+        higher region that none of them reached). The checks of the final
+        live weight are skipped on an ``"invalid"`` run too, which neither
+        ``dlogz`` nor ``nlive`` mends. A result without posterior weight
+        (``logz = -inf``) has ``posterior_ess`` 0 and NaN weight fractions.
         """
 
         metadata = {} if self.metadata is None else self.metadata
+        plateau = metadata.get("status") == "plateau"
+        # The final live weight says nothing of the stopping rule on a
+        # plateau (it is the plateau's) or at a likelihood of +inf.
+        check_stop = metadata.get("status") not in ("plateau", "invalid")
+        weighted = not self._no_weight()
         posterior_ess = self.posterior_ess()
-        nposterior = int(jnp.asarray(self.logwt).size)
-        max_weight_fraction = self.max_weight_fraction()
-        entropy_fraction = self.posterior_weight_entropy_fraction()
-        live_weight_fraction = self.live_weight_fraction()
+        nposterior = int(np.size(self.logwt))
+        max_weight_fraction = entropy_fraction = math.nan
+        live_weight_fraction = dead_weight_fraction = math.nan
+        if weighted:
+            max_weight_fraction = self.max_weight_fraction()
+            entropy_fraction = self.posterior_weight_entropy_fraction()
+            live_weight_fraction = self.live_weight_fraction()
+            dead_weight_fraction = self.dead_weight_fraction()
         insertion = self.insertion_test()
         modes = self.modes()
-        separated = min(mode["isolation_iteration"] for mode in modes)
+        start, stop = self._hop_window(modes)
         dlogz = metadata.get("dlogz")
         final_delta_logz = metadata.get("final_delta_logz")
         acceptance = metadata.get("acceptance")
@@ -1349,26 +1673,41 @@ class NestedSamplingResult:
             warnings.append("posterior dominated by a small number of weighted samples")
         if entropy_fraction < 0.5:
             warnings.append("low posterior weight entropy")
-        if live_weight_fraction > 0.5:
+        if live_weight_fraction > 0.5 and check_stop:
             warnings.append(
                 "final live points carry most posterior weight; consider tighter "
                 "dlogz or more live points"
             )
-        if live_weight_fraction > 0.25 and dlogz is not None and dlogz >= 0.1:
+        if (
+            live_weight_fraction > 0.25
+            and dlogz is not None
+            and dlogz >= 0.1
+            and check_stop
+        ):
             warnings.append(
                 "large final-live weight fraction; evidence may be sensitive to "
                 "stopping"
             )
         if (
             self.success
+            and check_stop
             and None not in (final_delta_logz, dlogz)
             and final_delta_logz > dlogz
         ):
             warnings.append("successful run has final_delta_logz above requested dlogz")
+        if plateau and weighted:
+            warnings.append(self._plateau_note())
         if not math.isfinite(float(self.logzerr)):
             warnings.append("logzerr is not finite")
         if acceptance is not None and acceptance < 0.01:
             warnings.append("low replacement acceptance")
+        unmoved = metadata.get("unmoved_fraction")
+        if unmoved is not None and unmoved >= UNMOVED_WARN:
+            warnings.append(
+                f"{unmoved:.0%} of the replacement chains did not move: walks is "
+                "too short (logZ may be biased and scatter beyond logzerr); rerun "
+                "with twice the walks"
+            )
         # Bonferroni over the pooled test and the windows.
         pvalues = [insertion["pvalue"]] + [w["pvalue"] for w in insertion["windows"]]
         if insertion["n"] >= 20 and min(pvalues) * len(pvalues) < 0.01:
@@ -1396,38 +1735,75 @@ class NestedSamplingResult:
             "max_weight_fraction": max_weight_fraction,
             "posterior_weight_entropy_fraction": entropy_fraction,
             "live_weight_fraction": live_weight_fraction,
-            "dead_weight_fraction": self.dead_weight_fraction(),
+            "dead_weight_fraction": dead_weight_fraction,
             "final_delta_logz": final_delta_logz,
             "acceptance": acceptance,
             "insertion_pvalue": insertion["pvalue"],
             "modes": modes,
             "mode_slots_full": self._mode_slots()[1],
-            "mode_lumps": self._lumps(separated, len(modes)),
-            "mode_hop_off": self._hop_off(separated),
+            "mode_lumps": self._lumps(start, stop, len(modes)) if weighted else None,
+            "mode_hop_off": self._hop_off(start, stop) if weighted else None,
             "hop_acceptance": metadata.get("hop_acceptance"),
             "warnings": warnings,
         }
 
-    def resample_equal(self, key, n: int | None = None):
+    def _plateau_note(self) -> str:
+        """The note of :meth:`diagnostics` on a run that ended on a plateau:
+        the posterior mass of the final live points tied at the highest
+        likelihood (the plateau)."""
+        niter = int(self.niter)
+        live = np.asarray(self.logl, dtype=float)[niter:]
+        top = live == live.max() if live.size else live.astype(bool)
+        mass = float(np.sum(self._weights[niter:][top]))
+        return (
+            f"the run ended on a likelihood plateau, which holds {mass:.3g} of "
+            "the posterior in the final live points on it (a tighter dlogz does "
+            "not change that; raise nlive if a higher region could have been "
+            "missed)"
+        )
+
+    def resample_equal(self, key, n: int | None = None) -> np.ndarray:
         """Return ``n`` equally weighted posterior samples (systematic resampling).
 
         ``key`` is a JAX PRNG key or an int seed; ``n`` defaults to the
-        posterior effective sample size.
+        posterior effective sample size. Sample ``i`` comes ``floor(n w_i)``
+        or ``ceil(n w_i)`` times (:func:`tinyns.math.systematic_resample`), so
+        the samples are not independent draws, and they are returned in a
+        random order: in the order of ``samples`` (by increasing likelihood)
+        a prefix or a split of them would not be a posterior sample. Returns a
+        NumPy array.
         """
 
         if n is None:
             n = max(1, int(self.posterior_ess()))
+        try:
+            if isinstance(n, bool) or getattr(n, "dtype", None) == np.bool_:
+                raise TypeError
+            n = operator.index(n)  # an int, NumPy or JAX integer; not 5.0
+        except TypeError:
+            raise TypeError("n must be an integer") from None
         if n < 1:
             raise ValueError("n must be at least 1")
+        self._check_weight()
 
-        indices = systematic_resample(key, self.logwt, n)
-        return jnp.asarray(self.samples)[indices]
+        key_start, key_order = random.split(as_key(key))
+        indices = systematic_resample(key_start, self.logwt, n)
+        seed = np.asarray(random.key_data(key_order))
+        order = np.random.default_rng(seed).permutation(n)
+        return np.asarray(self.samples)[indices[order]]
 
     def summary(self) -> str:
         """Return a human-readable multi-line summary of the result.
 
         With more than one posterior mode it ends with a per-mode table
-        (:meth:`modes`) and the warnings about the mode count.
+        (:meth:`modes`) and the warnings about the modes; the columns are the
+        mode's ``mass``, three standard deviations of its logit, and
+        ``min_live``. ``run sd`` (``run_sd``) is the run-to-run scatter of the
+        mass, measured within the run; ``fold sd`` (``fold_sd``) its spread
+        over the cross-fitted folds; ``sd w/o hop`` (``urn_sd``) the scatter of
+        a run without the inter-mode hop, from the live counts (for two modes;
+        with three or more of different shapes it is too low). The warning
+        about an unresolved mode is printed for a single mode too.
         """
 
         insertion = self.insertion_test()
@@ -1443,22 +1819,22 @@ class NestedSamplingResult:
             f"message: {self.message}",
         ]
         modes = self.modes()
+        warnings = self._mode_warnings(modes)
         if len(modes) > 1:
-            lines.append("mode      mass  logit sd   fold sd  min live")
+            lines.append("mode      mass    run sd   fold sd  sd w/o hop  min live")
             for i, mode in enumerate(modes):
                 flag = "  unresolved: raise nlive" if mode["unresolved"] else ""
                 flag += "" if mode["tracked"] else "  not tracked"
-                fold_sd = mode["fold_sd"]
-                fold_sd = "       -" if fold_sd is None else f"{fold_sd:8.2f}"
-                lines.append(
-                    f"{i:4d}  {mode['mass']:8.4f}  {mode['urn_sd']:8.2f}  "
-                    f"{fold_sd}  {mode['min_live']:8d}{flag}"
+                run_sd, fold_sd = (
+                    "       -" if mode[name] is None else f"{mode[name]:8.2f}"
+                    for name in ("run_sd", "fold_sd")
                 )
-            lines += [
-                "warning: " + text
-                for text in self._mode_warnings(modes)
-                if "is unresolved" not in text
-            ]
+                lines.append(
+                    f"{i:4d}  {mode['mass']:8.4f}  {run_sd}  {fold_sd}  "
+                    f"{mode['urn_sd']:10.2f}  {mode['min_live']:8d}{flag}"
+                )
+            warnings = [text for text in warnings if "is unresolved" not in text]
+        lines += ["warning: " + text for text in warnings]
         return "\n".join(lines)
 
     def __str__(self) -> str:
@@ -1466,28 +1842,41 @@ class NestedSamplingResult:
 
     def save_npz(self, path) -> None:
         """Save the final result to a compressed NumPy ``.npz`` file (with
-        :attr:`labels` and the insertion ranks when present)."""
+        :attr:`labels` and the insertion ranks when present).
+
+        The file is ``path`` itself (no ``.npz`` is appended; a symbolic
+        link is written through), written atomically like a checkpoint
+        (:mod:`tinyns.checkpoint`). ``path`` may also be a writable binary
+        file object.
+        """
 
         optional = {
             name: np.asarray(getattr(self, name))
             for name in _RESULT_NPZ_OPTIONAL
             if getattr(self, name) is not None
         }
-        np.savez_compressed(
-            path,
+        arrays = {
             **{name: np.asarray(getattr(self, name)) for name in _RESULT_NPZ_ARRAYS},
             **optional,
             **{
                 name: np.asarray(kind(getattr(self, name)))
                 for name, kind in _RESULT_NPZ_SCALARS.items()
             },
-            metadata_json=np.asarray(json.dumps(self.metadata, default=_jsonable)),
-            format_version=np.asarray(_RESULT_NPZ_FORMAT_VERSION),
-        )
+            "metadata_json": np.asarray(json.dumps(self.metadata, default=_jsonable)),
+            "format_version": np.asarray(_RESULT_NPZ_FORMAT_VERSION),
+        }
+        if hasattr(path, "write"):
+            np.savez_compressed(path, **arrays)
+        else:
+            _atomic_savez(path, arrays, compressed=True)
 
     @classmethod
     def load_npz(cls, path) -> NestedSamplingResult:
-        """Load a result previously written by :meth:`save_npz`."""
+        """Load a result previously written by :meth:`save_npz`.
+
+        The arrays are NumPy arrays of the dtypes saved, whatever JAX's
+        precision: a result saved under x64 keeps its float64 values.
+        """
 
         with np.load(path) as data:
             required = {*_RESULT_NPZ_ARRAYS, *_RESULT_NPZ_SCALARS}
@@ -1504,7 +1893,7 @@ class NestedSamplingResult:
                     f"{format_version!r}; expected {_RESULT_NPZ_FORMAT_VERSION!r}"
                 )
             return cls(
-                **{name: jnp.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
+                **{name: np.asarray(data[name]) for name in _RESULT_NPZ_ARRAYS},
                 **{
                     name: np.asarray(data[name]) if name in data.files else None
                     for name in _RESULT_NPZ_OPTIONAL

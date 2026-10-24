@@ -29,7 +29,9 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
+import sys
 import time
+import warnings
 from typing import Any, NamedTuple
 
 import jax
@@ -51,14 +53,21 @@ from tinyns.math import as_key
 from tinyns.result import NestedSamplingResult, _evidence
 
 # Run status codes (State.status): ``STATUS[code]`` is the name of ``code``.
-RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU = range(5)
-STATUS = ("running", "converged", "maxiter", "maxcall", "plateau")
+RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU, INVALID = range(6)
+STATUS = ("running", "converged", "maxiter", "maxcall", "plateau", "invalid")
 _MESSAGES = (
     "running",
     "converged: the live points hold less than dlogz of the evidence",
     "stopped at maxiter before reaching dlogz",
     "stopped at maxcall before reaching dlogz",
     "likelihood plateau: no live point lies above the deleted ones",
+    "loglike returned +inf at a live point (an overflow? write it in log "
+    "space or enable x64): logz is +inf and the run stopped there",
+)
+# The message of an INVALID result whose logz is -inf.
+_NO_FINITE = (
+    "no live point has a finite likelihood (-inf or NaN wherever sampled): "
+    "check loglike, or raise nlive if its support is tiny"
 )
 
 # Step-scale adaptation: the walk step is ``exp(log_scale) * L z`` with ``L``
@@ -79,6 +88,10 @@ _MAX_SCALE = 10.0
 _CHUNK_EFOLDS = 4.0
 _CHUNK_SECONDS = 45.0
 _CHECKPOINT_SECONDS = 600.0
+# On resume, the number of live points (of highest likelihood) and of dead
+# points (spread over the death order) of each lane that are evaluated again
+# (:func:`_check_resume`).
+_RESUME_CHECKS = 16
 _INT32_MAX = 2**31 - 1
 # The frames a chain looks up at every step when no clustering has more in use
 # (kernel 1 of :func:`_kernel_level`).
@@ -93,6 +106,20 @@ def _check_int(name: str, value, minimum: int) -> int:
     return int(value)
 
 
+def _user_stacklevel() -> int:
+    """The ``stacklevel`` at which a warning issued by the caller of this
+    function names the first frame outside tinyns and ``dataclasses``: the
+    user's line, whether they built a :class:`Config`, re-made one with
+    ``dataclasses.replace``, built a ``NestedSampler`` or ran one. Python
+    shows a warning once per line it names, so a fixed level inside tinyns
+    would show it once per session."""
+    own = ("tinyns", "dataclasses")
+    frame, level = sys._getframe(1), 1
+    while frame and frame.f_globals.get("__name__", "").split(".")[0] in own:
+        frame, level = frame.f_back, level + 1
+    return level
+
+
 def default_walks(ndim: int) -> int:
     """Default chain length: ``max(25, 6 ndim, ndim^2 // 6)``.
 
@@ -103,8 +130,14 @@ def default_walks(ndim: int) -> int:
     9 later on), and in high dimensions ``6 ndim`` steps leave a small upward
     logZ bias from that phase. This default keeps the bias below the logZ
     scatter on correlated Gaussians from 2 to 64 dimensions with 250 to 2000
-    live points. It is also enough for a 10-D Rosenbrock from
-    ``nlive=1000``.
+    live points, for posteriors that are roughly Gaussian in the unit cube. A
+    nonlinear prior transform that presses most coordinates against faces of
+    the cube needs more: ``ndtri_d6`` in ``bench/validate.py`` (a normal
+    prior, the data 3 prior sd off centre in all 6 coordinates) needs 4 times
+    as many, and a stronger conflict can need more still, so check that
+    doubling ``walks`` moves logZ by less than ``logzerr``. On a 10-D
+    Rosenbrock it leaves logZ 0.05 to 0.09 low at ``nlive=1000`` and
+    unbiased from 2000.
     """
     return max(25, 6 * ndim, ndim * ndim // 6)
 
@@ -150,12 +183,27 @@ class Config:
         for name in ("_hop", "_local"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
-        _check_int("_folds", self._folds, 2)
+        folds = _check_int("_folds", self._folds, 2)
+        # Each fold's walk covariance is fitted to the other folds' points,
+        # about (K - 1) / K of nlive, which span fewer than ndim directions
+        # below this: on a 32-D Gaussian nlive 40 left logZ 9 nats high.
+        least = folds / (folds - 1) * (ndim + 1)
+        if nlive < least:
+            warnings.warn(
+                f"nlive={nlive} is too few for ndim={ndim}: below "
+                f"{math.ceil(least)} live points the walk covariances, fitted to "
+                f"{folds - 1} of the {folds} folds, cannot span every "
+                "direction, and logZ can be biased far beyond logzerr; use at "
+                "least 5 * ndim",
+                UserWarning,
+                stacklevel=_user_stacklevel(),
+            )
         for name, value in (
             ("ndim", ndim),
             ("nlive", nlive),
             ("num_delete", k),
             ("walks", walks),
+            ("_folds", folds),
         ):
             object.__setattr__(self, name, value)
 
@@ -184,37 +232,51 @@ class Config:
 class State(NamedTuple):
     """The live set and the run scalars, threaded through :func:`step`.
 
-    ``ncall`` counts the likelihood evaluations (out-of-cube proposals of a
-    vmapped step are evaluated, clipped, and counted) and ``ncall_valid`` the
-    in-cube ones; both are int32, and :func:`run` drains them into host
-    integers after every chunk. A hand-written loop that may exceed ``2**31``
-    calls must count on the host too (``ncall += int(new.ncall - old.ncall)``
-    stays right when the counter wraps) and pass the total to
-    :func:`finalise`. ``logz`` is the running evidence of the dead points,
-    used only to stop; :func:`finalise` recomputes it.
+    ``ncall`` counts the likelihood evaluations the algorithm makes and
+    ``ncall_valid`` the proposals that pass the likelihood-free tests (inside
+    the open unit cube, and the Hastings test of a local-walk or hop step).
+    With ``num_delete > 1`` the chains are vmapped and every proposal is
+    evaluated (an out-of-cube one at the chain's point) and counted. With
+    ``num_delete=1`` the other proposals skip the likelihood (``lax.cond``)
+    and are not counted, so ``ncall == ncall_valid``; but in a batched
+    :func:`run`, which vmaps the step over the runs, the ``cond`` becomes a
+    select that evaluates them too (an out-of-cube one at the chain's point),
+    uncounted. ``ncall`` thus counts what the run alone evaluates, in a batch
+    as well, and ``maxcall`` applies to it. Under ``jax.vmap(step)`` the
+    ``lax.switch`` over the three chain kernels also gets a batched index and
+    runs all three, which triples the evaluations (and the recluster ``cond``
+    computes a recluster at every step); batch runs with :func:`run`, which
+    passes one unbatched kernel level and recluster predicate. ``ncall`` and
+    ``ncall_valid`` are int32, and :func:`run` drains them into host integers
+    after every chunk. A hand-written loop that may exceed ``2**31`` calls
+    must count on the host too (``ncall += int(new.ncall - old.ncall)`` stays
+    right when the counter wraps) and pass the total to :func:`finalise`.
+    ``logz`` is the running evidence of the dead points, used only to stop;
+    :func:`finalise` recomputes it.
 
     The log prior volume after the step is ``-it * S + log_x_ties``
     (:func:`_log_x`): ``-it * S`` is recomputed from ``it`` (no running sum
     to lose precision in float32) and ``log_x_ties`` is the extra
     compression of the deaths tied with an earlier step's contour, exactly 0
     on a run without ties. ``lstar_prev`` is the contour of the last step
-    (NaN before the first) and ``tie_run`` the number of consecutive steps,
-    ending with the last, whose contour equals it (:func:`_tie_counts`).
+    (-inf before the first, with ``it = 0``) and ``tie_run`` the number of
+    consecutive steps, ending with the last, whose contour equals it
+    (:func:`_tie_counts`).
     """
 
     key: Any  # PRNG key
-    u: Any  # (m, d) live points in the unit cube
+    u: Any  # (m, d) live points in the open unit cube
     logl: Any  # (m,)
     logl_birth: Any  # (m,) contour each live point was born above; -inf at init
     it: Any  # int32 steps done
     logz: Any  # running log evidence of the dead points
     log_x_ties: Any  # extra log prior volume removed by tied deaths (<= 0)
-    lstar_prev: Any  # contour of the last step; NaN before the first
+    lstar_prev: Any  # contour of the last step; -inf before the first
     tie_run: Any  # int32 consecutive steps, ending with the last, at lstar_prev
     log_scale: Any  # log of the walk-step multiplier
     ncall: Any  # int32 likelihood evaluations
-    ncall_valid: Any  # int32 in-cube likelihood evaluations
-    status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL or PLATEAU
+    ncall_valid: Any  # int32 proposals passing the likelihood-free tests
+    status: Any  # int32: RUNNING, CONVERGED, MAXITER, MAXCALL, PLATEAU, INVALID
     # Mode tracking (tinyns.modes). The live slots form K folds (slot index
     # mod K); clustering j is of the points outside fold j. label[j, i] is
     # point i's cluster slot in clustering j (-1 when i is in fold j), and
@@ -274,7 +336,8 @@ class Dead(NamedTuple):
 
 
 def _loglike_u(loglike, prior_transform, u, dtype):
-    """``loglike(prior_transform(u))`` as a ``dtype`` scalar; NaN becomes -inf."""
+    """``loglike(prior_transform(u))`` as a ``dtype`` scalar; NaN becomes -inf
+    (+inf is kept: :func:`_step` stops the run on it)."""
     logl = jnp.asarray(loglike(prior_transform(u)))
     if logl.shape != ():
         raise ValueError(f"loglike must return a scalar, got shape {logl.shape}")
@@ -293,17 +356,18 @@ def _live_chol(u, mask):
     m, d = u.shape
     w = mask.astype(u.dtype)
     n = jnp.maximum(jnp.sum(w), 1.0)
-    x = (u - (w @ u) / n) * w[:, None]
+    x = (u - _modes.matmul(w, u)[None] / n) * w[:, None]
     dof = jnp.maximum(n - 1.0, 1.0)
     std = jnp.sqrt(jnp.sum(x * x, axis=0) / dof)
-    z = x / jnp.where(std > 0, std, 1.0)
-    corr = z.T @ z / dof + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
+    z = x / jnp.where(std > 0, std, 1.0)[None]
+    corr = _modes.matmul(z.T, z) / dof
+    corr = corr + 10.0 * jnp.finfo(u.dtype).eps * jnp.eye(d, dtype=u.dtype)
     chol = jnp.linalg.cholesky(corr)
     chol = jnp.where(jnp.all(jnp.isfinite(chol)), chol, jnp.eye(d, dtype=u.dtype))
     return std[:, None] * chol
 
 
-def _walk_mask(above, other, seeds, ndim):
+def _walk_mask(above, other, ndim):
     """The live points whose covariance shapes the walk of the chains seeded
     in one fold: the points ``other`` (outside the fold) above ``L*``.
 
@@ -317,14 +381,25 @@ def _walk_mask(above, other, seeds, ndim):
     order ``ndim / nlive``, which overestimated logZ unless the walks were
     long.
 
-    When fewer than ``ndim + 1`` such points remain (a nearly exhausted live
-    set) the points above ``L*`` other than the step's seeds are used, and
-    the seeds too if that is still too few, so the covariance has full rank.
+    When fewer than ``ndim + 1`` of them lie above ``L*`` (at the start of a
+    run whose likelihood is ``-inf`` or tied on most of the prior, or on a
+    nearly exhausted live set), every point outside the fold is used, those
+    at or below ``L*`` too: the covariance stays cross-fitted and of full
+    rank, and spans the region the few points above ``L*`` were drawn from.
+    (Falling back to the points above ``L*`` of every fold, the seeds among
+    them, kept the chains near the few finite points of a run's start, and
+    logZ came out several ``logzerr`` high in 10 and 20 dimensions.) Only
+    when the live set is too small for that (``nlive`` below about ``1.5
+    (ndim + 1)``) are all live points used.
+
+    The rule counts points, not directions: on an extreme support (a slab 1%
+    of the prior wide in 10-D) the ``ndim + 1`` or more points above ``L*``
+    of the next step can be copies of a few (a chain that did not move
+    returns its seed), and the covariance is rank-deficient for that step.
+    Testing its conditioning instead of the count left logZ unchanged.
     """
-    m = above.shape[0]
-    held_out = above & ~jnp.zeros((m,), bool).at[seeds].set(True)
-    mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, held_out)
-    return jnp.where(jnp.sum(mask) >= ndim + 1, mask, above)
+    mask = jnp.where(jnp.sum(above & other) >= ndim + 1, above & other, other)
+    return jnp.where(jnp.sum(mask) >= ndim + 1, mask, jnp.ones_like(mask))
 
 
 def _hop_steps(walks: int, n_hops: int) -> np.ndarray:
@@ -380,10 +455,14 @@ def _chain(
 ):
     """A fixed-length constrained Metropolis chain from ``(u, logl)``.
 
-    Proposals outside the unit cube or at or below ``lstar`` are rejected; an
-    unmoved chain returns its seed. With ``skip`` (one unbatched chain) a
-    proposal that fails the likelihood-free tests skips the likelihood
-    (``lax.cond``); otherwise the clipped proposal is evaluated and masked.
+    Proposals outside the open unit cube or at or below ``lstar`` are
+    rejected; an unmoved chain returns its seed. With ``skip`` (one unbatched
+    chain) a proposal that fails the likelihood-free tests skips the
+    likelihood (``lax.cond``; a vmap over runs turns it into a select, which
+    evaluates the proposal but does not count it); otherwise it is evaluated
+    and masked. Wherever one outside the cube is evaluated, it is evaluated
+    at the chain's point, so the callables only ever see points of the open
+    cube.
 
     The steps are the random walk ``u + s L z``, except that with ``hop``
     every ``HOP_EVERY``-th step is the inter-mode hop from the chain's
@@ -435,13 +514,15 @@ def _chain(
         mine = near
 
         def live_step(z):
-            return chol @ z
+            return _modes.matmul(chol, z)
 
         def frame_chol(c):
             return near.chol[c]
 
         def offsets(v):
-            return jnp.einsum("cij,cj->ci", near.ichol, v - near.mu)
+            return jnp.einsum(
+                "cij,cj->ci", near.ichol, v[None] - near.mu, precision=_modes.PRECISION
+            )
 
     else:
         if tracked:
@@ -451,13 +532,16 @@ def _chain(
             ))
 
         def live_step(z):
-            return jnp.einsum("fij,j->fi", chol, z)[fold]
+            return jnp.einsum("fij,j->fi", chol, z, precision=_modes.PRECISION)[fold]
 
         def frame_chol(c):
             return near.chol[fold, c]
 
         def offsets(v):
-            y = jnp.einsum("fcij,fcj->fci", near.ichol, v - near.mu)
+            y = jnp.einsum(
+                "fcij,fcj->fci", near.ichol, v[None, None] - near.mu,
+                precision=_modes.PRECISION,
+            )
             return y[fold]
 
     if draws is None:
@@ -495,7 +579,7 @@ def _chain(
         z = random.normal(k_z, u.shape, u.dtype)
         move = live_step(z)
         if local:
-            move = jnp.where(use_local, frame_chol(c) @ z, move)
+            move = jnp.where(use_local, _modes.matmul(frame_chol(c), z), move)
         prop = u + scale * move
         hop = jnp.asarray(False)
         if tracked and n_hops > 0:
@@ -518,16 +602,19 @@ def _chain(
             h_ok = _modes.hop_accept(hop_uniforms[index], mine.eligible, r2_new, r2, d)
             ok = jnp.where(hop, h_ok, ok)
 
-        inside = jnp.all((prop >= 0.0) & (prop <= 1.0))
+        # The open cube: the faces have zero measure, and a transform such
+        # as ndtri(u) or -log(u) is infinite on them. A proposal outside is
+        # evaluated (vmapped) at the chain's point instead, and masked.
+        inside = jnp.all((prop > 0.0) & (prop < 1.0))
         call = inside & ok
-        clipped = jnp.clip(prop, 0.0, 1.0)
+        at = jnp.where(inside, prop, u)
         if skip:
             new = lax.cond(
-                call, evaluate, lambda v: jnp.asarray(-jnp.inf, dtype), clipped
+                call, evaluate, lambda v: jnp.asarray(-jnp.inf, dtype), at
             )
             nev = nev + call.astype(jnp.int32)
         else:
-            new = jnp.where(call, evaluate(clipped), -jnp.inf)
+            new = jnp.where(call, evaluate(at), -jnp.inf)
             nev = nev + 1
         accept = call & (new > lstar)
         u = jnp.where(accept, prop, u)
@@ -553,6 +640,9 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
     dtype = jnp.result_type(float)
     key, sub = random.split(key)
     u = random.uniform(sub, (m, d), dtype)
+    # A draw of exactly 0 (one in 2^23 per coordinate in float32) moves into
+    # the open cube, to half the spacing of the draws.
+    u = jnp.where(u > 0, u, jnp.finfo(dtype).eps / 2)
     logl = lax.map(
         lambda v: _loglike_u(loglike, prior_transform, v, dtype), u, batch_size=k
     )
@@ -566,14 +656,15 @@ def _init(key, loglike, prior_transform, cfg: Config) -> State:
         it=jnp.zeros((), i32),
         logz=jnp.asarray(-jnp.inf, dtype),
         log_x_ties=jnp.zeros((), dtype),
-        lstar_prev=jnp.asarray(jnp.nan, dtype),
+        lstar_prev=jnp.asarray(-jnp.inf, dtype),
         tie_run=jnp.zeros((), i32),
         log_scale=jnp.asarray(math.log(_INITIAL_SCALE), dtype),
         ncall=jnp.asarray(m, i32),
         ncall_valid=jnp.asarray(m, i32),
         status=jnp.asarray(RUNNING, i32),
-        label=jnp.where(_fold(m, folds)[None, :] == jnp.arange(folds)[:, None], -1, 0)
-        .astype(i32),
+        label=jnp.where(
+            _fold(m, folds)[None, :] == jnp.arange(folds, dtype=i32)[:, None], -1, 0
+        ).astype(i32),
         **_empty_frames(d, folds, dtype),
     )
 
@@ -708,7 +799,12 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     replacement only when that fold has too few (one uniform per new point:
     the rank of its seed among the fold's points above ``L*``), and from the
     whole live set only when it has none. A live point and its descendants
-    thus stay in one fold."""
+    thus stay in one fold.
+
+    The draws with replacement read the points above ``L*`` in slot order
+    from one sort of each fold, so a step costs ``O(m log m)``, not ``O(k
+    m)`` (a ``(k, m)`` mask took 28 of a 44 ms step at nlive 1e4 on a CPU,
+    and 7.6 GiB per run at nlive 1e5)."""
     m, k = above.shape[0], worst.shape[0]
     fold = _fold(m, folds)
     score = jnp.where(above, random.gumbel(key_seed, (m,), dtype), -jnp.inf)
@@ -718,14 +814,23 @@ def _seeds(key_seed, key_fill, above, worst, folds: int, dtype):
     tops = jnp.stack([
         lax.top_k(jnp.where(fold == j, score, -jnp.inf), k)[1] for j in range(folds)
     ])
-    n_fold = jnp.stack([jnp.sum(above & (fold == j)) for j in range(folds)])
-    mine = above[None, :] & (fold[None, :] == dead_fold[:, None])
-    mine = jnp.where((n_fold[dead_fold] > 0)[:, None], mine, above[None, :])
-    count = jnp.sum(mine, axis=1)
-    pick = (random.uniform(key_fill, (k,), dtype) * count).astype(jnp.int32)
-    pick = jnp.minimum(pick, count - 1)
-    order = jnp.cumsum(mine, axis=1) - 1  # a row's rank among its candidates
-    fill = jnp.argmax(mine & (order == pick[:, None]), axis=1)
+    # Row j of a (folds, n) view holds slots j, j + folds, ... (padded at the
+    # end), so its points above L* come first, in slot order, after a stable
+    # sort of ~above; position p in row j is slot j + folds * p.
+    n = -(-m // folds)
+    by_fold = jnp.concatenate([above, jnp.zeros((n * folds - m,), bool)])
+    by_fold = by_fold.reshape(n, folds).T
+    first = jnp.argsort(~by_fold, axis=1, stable=True).astype(jnp.int32)
+    anywhere = jnp.argsort(~above, stable=True).astype(jnp.int32)
+    n_fold = jnp.sum(by_fold, axis=1, dtype=jnp.int32)
+    has = n_fold[dead_fold] > 0
+    count = jnp.where(has, n_fold[dead_fold], jnp.sum(above, dtype=jnp.int32))
+    pick = random.uniform(key_fill, (k,), dtype) * count.astype(dtype)
+    pick = jnp.maximum(jnp.minimum(pick.astype(jnp.int32), count - 1), 0)
+    fill = jnp.where(
+        has, dead_fold + folds * first[dead_fold, jnp.minimum(pick, n - 1)],
+        anywhere[pick],
+    )
     return jnp.where(rank < n_fold[dead_fold], tops[dead_fold, rank], fill)
 
 
@@ -787,10 +892,11 @@ def _tie_counts(dead_logl, state: State, cfg: Config):
     the previous step's contour (``lstar_prev``) is tied, and the
     ``tie_run`` steps at that contour have taken ``k`` deaths each, so death
     ``j`` counts at ``m - j - k * tie_run``. Any other death counts at
-    ``m - j``.
+    ``m - j``, as does every death of the first step (``lstar_prev`` is -inf
+    there, a sentinel and not a contour).
     """
     m, k = cfg.nlive, cfg.num_delete
-    tied = dead_logl == state.lstar_prev
+    tied = (dead_logl == state.lstar_prev) & (state.it > 0)
     base = jnp.arange(m, m - k, -1, dtype=jnp.int32)
     nlive = jnp.where(tied, base - k * state.tie_run, base)
     return jnp.maximum(nlive, 1), tied
@@ -817,7 +923,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # covariance, the cluster frames of the hop and of the local walk) is
     # built from the points outside fold j alone.
     chols = jnp.stack([
-        _live_chol(state.u, _walk_mask(above, fold != j, seeds, cfg.ndim))
+        _live_chol(state.u, _walk_mask(above, fold != j, cfg.ndim))
         for j in range(folds)
     ])
     frames = _frames(state)  # frames[j]: fitted outside fold j
@@ -866,7 +972,7 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
 
         def run():
             draws = (step_keys, *hop_draws)
-            if k == 1:  # no vmap: the cond really skips out-of-cube proposals
+            if k == 1:  # no vmap: the cond skips rejected proposals (in one run)
                 first = jax.tree_util.tree_map(lambda a: a[0], draws)
                 out = chain(seeds[0], chain_fold[0], first, True)
                 return tuple(x[None] for x in out)
@@ -885,11 +991,18 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     # with exactly its likelihood (a plateau above L*, the seed of an unmoved
     # chain) are in a random order with it: the rank takes a uniform place
     # among them, from a key folded off k_seed (the other draws are as they
-    # were).
-    below = jnp.sum(above & (state.logl < new_logl[:, None]), axis=1, dtype=jnp.int32)
-    same = jnp.sum(above & (state.logl == new_logl[:, None]), axis=1, dtype=jnp.int32)
+    # were). The survivors' likelihoods are sorted once (the others padded
+    # with +inf, which only the count of equals could see). The two binary
+    # searches are unrolled: JAX's default runs each as a loop of log2(nlive)
+    # sequential steps, which a GPU pays for at every step (a CPU step takes
+    # the same time either way).
+    ranked = jnp.sort(jnp.where(above, state.logl, jnp.inf))
+    below = jnp.searchsorted(ranked, new_logl, side="left", method="scan_unrolled")
+    upto = jnp.searchsorted(ranked, new_logl, side="right", method="scan_unrolled")
+    below, upto = below.astype(jnp.int32), upto.astype(jnp.int32)
+    same = jnp.minimum(upto, n_above) - below
     place = random.uniform(random.fold_in(k_seed, 1), (k,), dtype)
-    place = jnp.minimum((place * (same + 1)).astype(jnp.int32), same)
+    place = jnp.minimum((place * (same + 1).astype(dtype)).astype(jnp.int32), same)
     insertion = below + place
     nlive, tied = _tie_counts(dead_logl, state, cfg)
     log_x = _log_x(state, cfg)
@@ -906,7 +1019,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     log_x_ties = state.log_x_ties + jnp.sum(jnp.where(tied, log_t - plain_t, 0.0))
     # The step scale adapts to the random-walk acceptance alone.
     walk_moves = jnp.sum(moves - hops).astype(dtype)
-    acceptance = walk_moves / jnp.maximum(k * walks - jnp.sum(hop_tries), 1)
+    walk_tries = jnp.maximum(k * walks - jnp.sum(hop_tries), 1).astype(dtype)
+    acceptance = walk_moves / walk_tries
     rate = 0.5 * min(1.0, k / 32)
     log_scale = jnp.clip(
         state.log_scale + rate * jnp.clip(acceptance - _TARGET_ACCEPT, -0.5, 0.5),
@@ -940,7 +1054,8 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     nearest = jax.vmap(  # over clusterings j: (folds, k)
         lambda fr: _modes.nearest(fr, new_u)
     )(frames)
-    nearest = jnp.where(jnp.arange(folds)[:, None] == dead_fold[None, :], -1, nearest)
+    clustering = jnp.arange(folds, dtype=i32)
+    nearest = jnp.where(clustering[:, None] == dead_fold[None, :], -1, nearest)
     new = new._replace(label=state.label.at[:, worst].set(nearest))
     n_clusters = jnp.max(jnp.sum(frames.active, axis=1))
     n_eligible = jnp.min(jnp.sum(frames.eligible, axis=1))
@@ -960,14 +1075,22 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
         nlive=nlive,
         nslots=jnp.full((k,), n_above + 1, i32),
     )
-    # A plateau (nothing above L*) leaves the live set as it was.
-    stuck = state._replace(status=jnp.asarray(PLATEAU, jnp.int32))
+    # A plateau (nothing above L*) leaves the live set as it was. At L* =
+    # -inf no live point has a finite likelihood, and at L* = +inf the live
+    # points above the deleted ones are all +inf: neither run is valid.
+    stuck = state._replace(
+        status=jnp.where(jnp.isfinite(lstar), PLATEAU, INVALID).astype(jnp.int32)
+    )
     new = new._replace(**{
         name: jnp.where(n_above == 0, getattr(stuck, name), getattr(new, name))
         for name in State._fields
         if name not in ("key", "ncall", "ncall_valid")
     })
-    return new, dead
+    # A live point with a likelihood of +inf never dies: it is not valid, and
+    # the first step after which one is live (from init or new) sets INVALID.
+    invalid = (n_above > 0) & jnp.any(jnp.isposinf(new.logl))
+    status = jnp.where(invalid, jnp.asarray(INVALID, jnp.int32), new.status)
+    return new._replace(status=status), dead
 
 
 def delta_logz(state: State, cfg: Config):
@@ -1031,6 +1154,27 @@ def _init_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
         if axes is None:
             return lane(key, leaves)
         return jax.vmap(lane, in_axes=(0, axes))(key, leaves)
+
+    return jax.jit(kernel)
+
+
+@_kernel_cache
+def _logl_kernel(loglike_spec, prior_spec, cfg: Config, axes=None):
+    """Jitted ``loglike(prior_transform(u))`` of the rows of ``u``, ``(n, d)``,
+    in batches of ``num_delete`` like :func:`_init`; ``axes`` (a batched run;
+    see :func:`_init_kernel`) vmaps it over a leading lane axis of ``u``."""
+
+    def lane(u, leaves):
+        loglike, prior_transform = _rebuild(loglike_spec, prior_spec, leaves)
+        return lax.map(
+            lambda v: _loglike_u(loglike, prior_transform, v, u.dtype), u,
+            batch_size=min(cfg.num_delete, u.shape[0]),
+        )
+
+    def kernel(u, *leaves):
+        if axes is None:
+            return lane(u, leaves)
+        return jax.vmap(lane, in_axes=(0, axes))(u, leaves)
 
     return jax.jit(kernel)
 
@@ -1101,12 +1245,14 @@ def _chunk_kernel(loglike_spec, prior_spec, cfg: Config, capacity: int, axes=Non
 
         def body(carry):
             state, rows, count, i = carry
-            running = state.status == RUNNING
+            it = state.it
             state, dead = step_all(state)
             rows = jax.tree_util.tree_map(
                 lambda r, x: lax.dynamic_update_index_in_dim(r, x, i, 0), rows, dead
             )
-            count = count + (running & (state.status != PLATEAU)).astype(i32)
+            # The rows are valid when the step counted (not on a plateau, and
+            # not for a lane that had stopped).
+            count = count + (state.it - it).astype(i32)
             return terminate(state, call_budget), rows, count, i + 1
 
         start = terminate(state, call_budget)
@@ -1124,7 +1270,9 @@ def init(key, loglike, prior_transform, cfg: Config) -> State:
 
     ``key`` is a PRNG key or an int seed. The points are evaluated with
     ``lax.map`` in batches of ``cfg.num_delete``, the batch a step uses.
+    ``prior_transform`` must return one array (``TypeError`` otherwise).
     """
+    _check_prior_transform(prior_transform, cfg.ndim)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
     )
@@ -1137,13 +1285,50 @@ def step(state: State, loglike, prior_transform, cfg: Config) -> tuple[State, De
     """Delete the ``k`` lowest live points and replace them; return the new
     state and the step's :class:`Dead` rows.
 
-    It does not test termination: loop while :func:`delta_logz` is above
-    your ``dlogz`` and pass that ``dlogz`` to :func:`finalise`. On a plateau
-    (no live point above the deleted ones) the live set is unchanged, the rows
-    are not valid and ``status`` becomes ``PLATEAU``
-    (``STATUS[int(state.status)] == "plateau"``); otherwise ``status`` is left
-    as it is (``RUNNING`` after :func:`init`). Before the step, the live
-    points are reclustered if a recluster is due (``cfg.recluster_every``).
+    It does not test dlogz: loop while :func:`delta_logz` is at or above
+    your ``dlogz`` and the status is ``"running"``, and pass that ``dlogz``
+    to :func:`finalise`. On a plateau (no live point above the deleted ones)
+    the live points and the run's scalars (``it``, ``logz``, ...) are
+    returned as they were, the rows are not valid, and ``status`` becomes
+    ``PLATEAU`` (``STATUS[int(state.status)] == "plateau"``), or ``INVALID``
+    (``"invalid"``) where L*, the highest deleted likelihood, is not finite:
+    no live point has a finite likelihood, or the others are +inf. Such a
+    step still runs its chains: the key advances, and ``ncall`` and
+    ``ncall_valid`` count their likelihood calls, so a ``lax.scan`` chunk
+    that goes on after a plateau calls the likelihood at each of its
+    remaining steps (keep the chunks short for a costly likelihood). A step
+    after which a live point has a likelihood of +inf sets ``INVALID`` too
+    (its rows are valid). Otherwise ``status`` is left as it is
+    (``RUNNING`` after :func:`init`). So the rows of the first
+    ``int(state.it)`` steps are the valid ones::
+
+        rows = []
+        while delta_logz(state, cfg) >= dlogz:
+            state, dead = step(state, loglike, prior_transform, cfg)
+            rows.append(dead)
+            if STATUS[int(state.status)] != "running":  # plateau or invalid
+                break
+        dead = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs)[: int(state.it)], *rows
+        )
+
+    Before the step, the live points are reclustered if a recluster is due
+    (``cfg.recluster_every``).
+
+    Pass the same ``loglike`` and ``prior_transform`` objects at every call.
+    The compiled step is cached on a pytree callable's structure (such as
+    ``jax.tree_util.Partial(fn, data)``) and on any other callable's identity
+    (:mod:`tinyns.callables`), so a new function, closure or bound method
+    compiles it again (a new pytree of the same structure does not): seconds
+    per call in an eager loop whose compiled step takes milliseconds. A bound
+    method is a new object at every access: store ``ll = model.loglike``
+    once, or use a module-level function or a pytree callable with array
+    leaves. A stored method, like any closure, keeps the values it was traced
+    with: after ``model.mu = 5`` store it again (or put ``mu`` in a pytree
+    callable's leaves). A step inside ``lax.scan``, or in one jitted
+    function called repeatedly, is traced once and is not affected. A Python
+    loop under ``jax.jit`` that passes a new object at every step traces
+    each step anew, though the jitted function still compiles once.
     """
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
         loglike, prior_transform, cfg.ndim
@@ -1163,13 +1348,18 @@ def finalise(
 ) -> NestedSamplingResult:
     """Build the :class:`NestedSamplingResult` from the final state and the rows.
 
-    ``dead`` holds the valid rows of every step in order, with any leading
-    shape (``(steps, k)`` or flat). Each dead row dies at its recorded live
-    count (``dead.nlive``: ``m - j`` for death ``j`` of a step, fewer on a
-    likelihood plateau) and the final live points are appended by
-    increasing likelihood at live counts ``m, m-1, ..., 1``; the weights,
-    ``logz`` and ``logzerr = sqrt(sum_i dH_i / n_i)`` are recomputed in
-    float64 (:func:`tinyns.result._evidence`). ``result.labels`` holds each
+    ``dead`` holds the valid rows of the ``state.it`` steps in order, with
+    any leading shape (``(steps, k)`` or flat; other row counts raise
+    ``ValueError``: drop the rows of a step on a plateau, see :func:`step`).
+    Each dead row dies at its recorded live count (``dead.nlive``: ``m - j``
+    for death ``j`` of a step, fewer on a likelihood plateau) and the final
+    live points are appended by increasing likelihood at live counts ``m,
+    m-1, ..., 1``, but those still tied at the last step's contour (a run
+    that stopped on a plateau, or during one), which count on from the
+    plateau's last dead row as :func:`_tie_counts` does: ``m - j - k *
+    tie_run``. The weights, ``logz`` and ``logzerr`` (first order in the
+    prior-volume shrinkages) are recomputed in float64
+    (:func:`tinyns.result._evidence`). ``result.labels`` holds each
     sample's cluster label when it died (the final live points: their last
     labels), which :meth:`~tinyns.NestedSamplingResult.modes` reads, and
     ``result.insertion_ranks`` / ``insertion_slots`` the in-sampler insertion
@@ -1178,11 +1368,15 @@ def finalise(
     points).
 
     ``result.success`` and ``result.message`` are read from ``state.status``.
-    :func:`step` leaves it ``RUNNING`` (or sets ``PLATEAU``), so after a
-    hand-written loop pass the ``dlogz`` the loop stopped at: a running state
-    with ``delta_logz(state, cfg) < dlogz`` (the driver's rule) is reported as
-    converged. Without ``dlogz``, or above it, the result has
-    ``success=False`` and the message ``"running"``.
+    :func:`step` leaves it ``RUNNING`` (or sets ``PLATEAU`` or ``INVALID``),
+    so after a hand-written loop pass the ``dlogz`` the loop stopped at: a
+    running state with ``delta_logz(state, cfg) < dlogz`` (the driver's rule)
+    is reported as converged. Without ``dlogz``, or above it, the result has
+    ``success=False`` and the message ``"running"``. A result whose ``logz``
+    is not finite has the status ``"invalid"`` and ``success=False``,
+    whatever stopped the run, with a message (also issued as a
+    ``RuntimeWarning``) for ``logz = +inf`` (a likelihood of +inf) or
+    ``-inf`` (no finite likelihood was found).
 
     ``ncall`` overrides ``state.ncall``, an int32 that wraps after ``2**31``
     calls: the driver drains it, and a long hand-written loop passes its own
@@ -1196,8 +1390,12 @@ def finalise(
     m, d, k = cfg.nlive, cfg.ndim, cfg.num_delete
     dead_logl = np.asarray(dead.logl, np.float64).reshape(-1)
     niter = dead_logl.size
-    if niter % k:
-        raise ValueError(f"{niter} dead rows are not whole steps of {k}")
+    if niter != int(state.it) * k:
+        raise ValueError(
+            f"{niter} dead rows, but the state has done {int(state.it)} steps of "
+            f"{k}: pass the rows of the first state.it steps (a step on a "
+            "plateau returns rows that are not valid)"
+        )
     order = np.argsort(np.asarray(state.logl), kind="stable")
     u = np.concatenate([np.asarray(dead.u).reshape(-1, d), np.asarray(state.u)[order]])
     logl = np.concatenate([dead_logl, np.asarray(state.logl, np.float64)[order]])
@@ -1212,9 +1410,13 @@ def finalise(
     labels = np.concatenate([
         np.asarray(dead.label).reshape(-1), live_label[order]
     ]).astype(np.int32)
-    nlive_i = np.concatenate([
-        np.asarray(dead.nlive, np.int64).reshape(-1), m - np.arange(m)
-    ])
+    # The live points still tied at the last step's contour (a prefix: every
+    # live point is at or above it) die after the tie_run steps of k tied
+    # deaths there (_tie_counts; tie_run is 0 before the first step).
+    live_n = m - np.arange(m)
+    tied = logl[niter:] == float(state.lstar_prev)
+    live_n = np.maximum(np.where(tied, live_n - k * int(state.tie_run), live_n), 1)
+    nlive_i = np.concatenate([np.asarray(dead.nlive, np.int64).reshape(-1), live_n])
     logwt, logz, logzerr = _evidence(logl, nlive_i)
 
     log_x = -(niter // k) * cfg.log_shrink + float(state.log_x_ties)
@@ -1231,9 +1433,14 @@ def finalise(
     status = int(state.status)
     if status == RUNNING and dlogz is not None and delta_logz(state, cfg) < dlogz:
         status = CONVERGED
+    message = _MESSAGES[status]
+    if not math.isfinite(logz):
+        status = INVALID
+        message = _MESSAGES[INVALID] if logz > 0 else _NO_FINITE
+        warnings.warn(message, RuntimeWarning, stacklevel=_user_stacklevel())
     samples = u
     if prior_transform is not None:
-        samples = _transform(prior_transform, u, state.u.dtype)
+        samples = _transform(prior_transform, u, state.u.dtype, _transform_block(k))
     info = {
         "status": STATUS[status],
         "num_delete": k,
@@ -1249,6 +1456,7 @@ def finalise(
         **({} if dlogz is None else {"dlogz": dlogz}),
         **_mode_info(dead, k, hops, hop_tries),
         "mode_tree": _mode_tree(state),
+        "mode_tree_dropped": _mode_tree_dropped(state),
         "folds": cfg._folds,
     }
     return NestedSamplingResult(
@@ -1269,13 +1477,45 @@ def finalise(
         num_delete=k,
         ndim=d,
         success=status in (CONVERGED, PLATEAU),
-        message=_MESSAGES[status],
+        message=message,
         metadata={**info, **(metadata or {})},
     )
 
 
-# Rows per call of the compiled prior transform of :func:`finalise`.
-_TRANSFORM_BLOCK = 65536
+# The final prior pass of :func:`finalise` maps the samples in blocks of the
+# power of two at or above num_delete (a step maps num_delete rows at once),
+# and at least this many rows. A block that runs out of device memory is
+# halved (:func:`_transform`).
+_TRANSFORM_BLOCK = 1024
+
+
+def _transform_block(num_delete: int) -> int:
+    """Rows per call of the final prior pass of a run of ``num_delete``."""
+    return max(_TRANSFORM_BLOCK, 1 << (num_delete - 1).bit_length())
+
+
+def _check_theta(theta) -> None:
+    """Raise ``TypeError`` unless ``theta`` (the output of ``prior_transform``
+    or its shape) is one array; its shape is free (a scalar at ``ndim=1``,
+    derived parameters)."""
+    if not isinstance(theta, (jax.Array, jax.ShapeDtypeStruct)):
+        raise TypeError(
+            f"prior_transform must return one array, got {type(theta).__name__} "
+            f"{jax.tree_util.tree_structure(theta)}: stack the parameters into "
+            "a vector (jnp.stack) and unpack them in loglike"
+        )
+
+
+def _check_prior_transform(prior_transform, ndim: int) -> None:
+    """Check that ``prior_transform`` returns one array, before a run samples
+    (``finalise`` could not map the samples otherwise). A prior that cannot
+    be evaluated abstractly here is left to the compiled kernels."""
+    u = jax.ShapeDtypeStruct((int(ndim),), jnp.result_type(float))
+    try:
+        theta = jax.eval_shape(prior_transform, u)
+    except Exception:  # noqa: BLE001 - the kernels raise their own error
+        return
+    _check_theta(theta)
 
 
 @_kernel_cache
@@ -1286,12 +1526,13 @@ def _transform_kernel(prior_spec):
     return jax.jit(kernel)
 
 
-def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
+def _transform(prior_transform, u: np.ndarray, dtype, block: int) -> np.ndarray:
     """``prior_transform`` of every row of ``u``, as a ``(len(u), -1)`` array.
 
-    The rows go through one compiled kernel in blocks of ``_TRANSFORM_BLOCK``
-    (the last one padded), so the lanes of a batch, whose sample counts
-    differ, share one compile.
+    The rows go through one compiled kernel in blocks of ``block`` rows (the
+    last one padded), so the lanes of a batch, whose sample counts differ,
+    share one compile. A block that runs out of device memory is halved and
+    the pass goes on from it; ``MemoryError`` if one row does not fit.
     """
     n, d = u.shape
     leaves, spec = _split_callable(
@@ -1301,19 +1542,35 @@ def _transform(prior_transform, u: np.ndarray, dtype) -> np.ndarray:
     kernel = _transform_kernel(spec)
     u = np.asarray(u, dtype)
     out = []
-    for start in range(0, n, _TRANSFORM_BLOCK):
-        block = u[start : start + _TRANSFORM_BLOCK]
-        rows = len(block)
-        if rows < _TRANSFORM_BLOCK:  # the last block, padded
-            pad = np.full((_TRANSFORM_BLOCK - rows, d), 0.5, dtype)
-            block = np.concatenate([block, pad])
-        out.append(np.asarray(kernel(block, *leaves))[:rows].reshape(rows, -1))
+    start = 0
+    while start < n:
+        rows = min(block, n - start)
+        chunk = u[start : start + rows]
+        if rows < block:  # the last block, padded
+            chunk = np.concatenate([chunk, np.full((block - rows, d), 0.5, dtype)])
+        try:
+            theta = kernel(chunk, *leaves)
+            _check_theta(theta)
+            out.append(np.asarray(theta)[:rows].reshape(rows, -1))
+        except Exception as err:
+            if "RESOURCE_EXHAUSTED" not in str(err):
+                raise
+            if block == 1:
+                raise MemoryError(
+                    "out of device memory in the final prior_transform pass "
+                    "of finalise, even one sample at a time"
+                ) from err
+            block //= 2
+            continue
+        start += rows
     return np.concatenate(out) if out else np.zeros((0, d), dtype)
 
 
 def _mode_tree(state: State) -> list:
     """``[label, parent label]`` of every cluster made by a split (labels as
-    :func:`_reported_label` records them), for ``result.metadata``."""
+    :func:`_reported_label` records them), for ``result.metadata``: the ids
+    below ``TREE_SIZE`` of each clustering (:func:`_mode_tree_dropped` counts
+    the others)."""
     tree, nxt = np.asarray(state.mode_tree), np.asarray(state.mode_next)
     folds = tree.shape[0]
     return [
@@ -1321,6 +1578,13 @@ def _mode_tree(state: State) -> list:
         for j in range(folds)
         for uid in range(1, min(int(nxt[j]), tree.shape[1]))
     ]
+
+
+def _mode_tree_dropped(state: State) -> int:
+    """The number of clusters made by a split whose parent ``mode_tree``
+    did not record: ``TREE_SIZE - 1`` ids per clustering are recorded."""
+    nxt = np.asarray(state.mode_next)
+    return int(np.maximum(nxt - _modes.TREE_SIZE, 0).sum())
 
 
 def _mode_info(dead: Dead, k: int, hops, hop_tries) -> dict:
@@ -1388,6 +1652,78 @@ def _lane_callable(fn, lane: int):
     )
 
 
+def _check_resume(path, state: State, dead: list, cfg: Config, kernel,
+                  leaves) -> None:
+    """Raise ``ValueError`` unless ``loglike(prior_transform(u))`` gives back
+    the likelihoods stored in a checkpoint, in every lane with its own data:
+    those of the ``_RESUME_CHECKS`` live points of highest likelihood and of
+    as many dead points (``dead``, one :class:`Dead` per lane), spread evenly
+    over the death order (the same count in every lane).
+
+    The callables are not stored in a checkpoint: this refuses one written
+    for another likelihood, prior or dataset, which would otherwise be
+    resumed (a finished one returned as it is). The dead points see a change
+    the live ones do not: a wider constraint of a plateau whose live points
+    all lie in the old one, or a change where the run has been. A change at
+    none of the points checked is not seen. ``kernel`` is the run's
+    :func:`_logl_kernel`. It compiles apart from the run's kernels, so the
+    values may differ in the last bits: finite ones match to a relative
+    ``sqrt(eps)`` of the float dtype, ``|new - old| <= sqrt(eps) (1 + |old|)``,
+    and infinite ones (a NaN is stored as ``-inf``) exactly. In float32 a
+    change smaller than that (``3.5e-4 |logL|``) is not seen: possibly a new
+    noise realisation of the same model, from about ``1e5`` data points (the
+    change goes like ``sqrt(|logL|)``; at ``1e5`` it was still 1.2 times the
+    tolerance). Setting ``_RESUME_CHECKS = 0`` skips the check, for a
+    likelihood that does not give back its own values to that tolerance.
+    """
+    n = min(_RESUME_CHECKS, cfg.nlive)
+    if n == 0:
+        return
+    batched = state.u.ndim == 3
+    u, logl = np.asarray(state.u), np.asarray(state.logl)
+    if not batched:  # one lane: give it a lane axis
+        u, logl = u[None], logl[None]
+    top = np.argsort(-logl, axis=1, kind="stable")[:, :n]
+    u = np.take_along_axis(u, top[..., None], axis=1)
+    logl = np.take_along_axis(logl, top, axis=1)
+    m = min(_RESUME_CHECKS, *(rows.logl.size for rows in dead))
+    if m:
+        dead_u, dead_logl = [], []
+        for rows in dead:
+            i = np.linspace(0, rows.logl.size - 1, m).round().astype(int)
+            dead_u.append(np.asarray(rows.u).reshape(-1, u.shape[-1])[i])
+            dead_logl.append(np.asarray(rows.logl).reshape(-1)[i])
+        u = np.concatenate([u, np.stack(dead_u)], axis=1)
+        logl = np.concatenate([logl, np.stack(dead_logl)], axis=1)
+    old = logl.astype(np.float64)
+    new = kernel(jnp.asarray(u if batched else u[0]), *leaves)
+    new = np.asarray(new, np.float64).reshape(old.shape)
+    rtol = math.sqrt(np.finfo(state.u.dtype).eps)
+    finite = np.isfinite(old)
+    with np.errstate(invalid="ignore"):  # inf - inf
+        diff = np.abs(new - old) / (1.0 + np.abs(old))
+    bad = ~np.where(finite, diff <= rtol, new == old)
+    if np.any(bad):
+        lane, i = np.argwhere(bad)[0]
+        where = f" (lane {lane})" if batched else ""
+        how = (
+            f"a relative difference of {float(diff[lane, i]):.3g} where "
+            f"{rtol:.3g} is allowed" if finite[lane, i]
+            else "an infinite value must come back exactly"
+        )
+        raise ValueError(
+            f"{path}: this loglike and prior_transform do not give back the "
+            f"likelihoods stored in the checkpoint{where}: "
+            f"{float(new[lane, i])!r} against {float(old[lane, i])!r} stored "
+            f"at a {'live' if i < n else 'dead'} point ({how}), at "
+            f"{int(bad[lane].sum())} of the {n} live and {m} dead points "
+            "checked. A checkpoint of another likelihood, prior or dataset is "
+            "not resumed: use one checkpoint path per problem. If this is the "
+            "same problem and its likelihood does not give back its own "
+            "values, tinyns.core._RESUME_CHECKS = 0 skips this check"
+        )
+
+
 def _dead_template(cfg: Config, dtype) -> Dead:
     """The rows of one step as zeros."""
     k, d = cfg.num_delete, cfg.ndim
@@ -1427,16 +1763,25 @@ def run(
 
     Stops when ``delta_logz < dlogz``, before ``maxiter`` dead points would be
     exceeded, once ``maxcall`` likelihood evaluations are reached (checked
-    after each step) or on a plateau. Chunks of steps run on the device; the
-    host syncs once per chunk, sizes the next one to about 45 s and, with
-    ``progress``, prints one line per chunk.
+    after each step), on a plateau, or at a live likelihood of +inf or with
+    no finite one (status ``"invalid"``, ``success=False``; a lane of a batch
+    stops alone). Chunks of steps run on the device; the host syncs once per
+    chunk, sizes the next one to about 45 s and, with ``progress``, prints
+    one line per chunk.
 
     ``checkpoint`` is a path: if the file exists the run resumes from it
-    (refusing a different config, x64 flag, float dtype, key or batch), and
-    the run writes it atomically at a chunk boundary at most every
-    ``_CHECKPOINT_SECONDS`` and at the end. A resumed run is bit-identical to
-    an uninterrupted one: each step splits ``state.key``, so the random stream
-    depends on the step count only, never on where the chunks end. A status of
+    (refusing a different config, x64 flag, float dtype, key or batch, and
+    live or dead points whose likelihoods ``loglike`` and ``prior_transform``
+    do not give back: :func:`_check_resume`), and the run writes it
+    atomically at a chunk boundary at most every ``_CHECKPOINT_SECONDS`` and
+    at the end. A path that cannot be written raises ``OSError`` before
+    anything compiles; a symbolic link (or ``..``) in it is resolved once.
+    Each step splits ``state.key``, so the random stream depends on the step
+    count only, never on where the chunks end: on a CPU a resumed run is
+    bit-identical to an uninterrupted one on the same JAX build (a checkpoint
+    of another build or device warns). On a GPU in float32, where a fixed
+    seed is not bit-reproducible between processes, a run resumed in a new
+    process agrees with an uninterrupted one in distribution. A status of
     ``converged``, ``maxiter`` or ``maxcall`` in the checkpoint is re-tested
     against this call's limits, so a run stopped by ``maxiter`` continues.
 
@@ -1456,6 +1801,8 @@ def run(
     key, batch = _key_batch(key)
     if batched_data and batch is None:
         raise ValueError("batched_data=True needs a batch of keys")
+    if checkpoint is not None:  # the file read and written: links resolved
+        checkpoint = _checkpoint.check_writable(checkpoint)
     loglike = _device_leaves(loglike)
     prior_transform = _device_leaves(prior_transform)
     (ll_dyn, ll_spec), (pt_dyn, pt_spec) = _split_callables(
@@ -1473,10 +1820,20 @@ def run(
             )
         for leaf, axis in zip(leaves, axes, strict=True):
             if axis == 0 and (leaf.ndim == 0 or leaf.shape[0] != batch):
+                hint = (
+                    " (a NumPy float scalar or 0-d array is an array leaf too:"
+                    " pass a value shared by all runs as a Python float)"
+                    if leaf.ndim == 0
+                    else ""
+                )
                 raise ValueError(
                     f"batched_data: every array leaf needs a leading axis of "
-                    f"{batch} lanes, got shape {leaf.shape}"
+                    f"{batch} lanes, got shape {leaf.shape}{hint}"
                 )
+    _check_prior_transform(
+        _lane_callable(prior_transform, 0) if batched_data else prior_transform,
+        cfg.ndim,
+    )
     lanes = 1 if batch is None else batch
     dtype = jnp.result_type(float)
 
@@ -1489,6 +1846,10 @@ def run(
             batched_data=batched_data,
             key=key,
         )
+        _check_resume(
+            checkpoint, ckpt.state, ckpt.dead, cfg,
+            _logl_kernel(ll_spec, pt_spec, cfg, axes), leaves,
+        )
         state = ckpt.state
         status = np.asarray(state.status)
         stopped = np.isin(status, (CONVERGED, MAXITER, MAXCALL))  # re-tested
@@ -1498,12 +1859,14 @@ def run(
         ncall, ncall_valid = list(ckpt.ncall), list(ckpt.ncall_valid)
         wall0, compile_s, nchunks = ckpt.wall_time_s, ckpt.compile_s, ckpt.chunks
         sampling_s = ckpt.sampling_s
+        mixed_build = ckpt.mixed_build
     else:
         state = _init_kernel(ll_spec, pt_spec, cfg, axes)(key, *leaves)
         rows_by_lane = [[_empty_dead(cfg, dtype)] for _ in range(lanes)]
         ncall, ncall_valid = [0] * lanes, [0] * lanes
         wall0 = compile_s = sampling_s = 0.0
         nchunks = 0
+        mixed_build = False
 
     capacity = max(1, math.ceil(_CHUNK_EFOLDS / cfg.log_shrink))
     kernel = _chunk_kernel(ll_spec, pt_spec, cfg, capacity, axes)
@@ -1537,6 +1900,7 @@ def run(
                 config=dataclasses.asdict(cfg),
                 batch=batch,
                 batched_data=batched_data,
+                mixed_build=mixed_build,
             ),
         )
 
@@ -1572,8 +1936,10 @@ def run(
             ncall[lane] += int(calls[lane])
             ncall_valid[lane] += int(valid[lane])
             n = int(count[lane])
+            # A copy: a view would keep the chunk's whole buffer (every lane,
+            # the full capacity) alive until the rows are concatenated.
             rows_by_lane[lane].append(
-                jax.tree_util.tree_map(lambda r, n=n, b=lane: r[:n, b], rows)
+                jax.tree_util.tree_map(lambda r, n=n, b=lane: np.array(r[:n, b]), rows)
             )
             if status[lane] == MAXCALL and (maxcall is None or ncall[lane] < maxcall):
                 status[lane] = RUNNING  # only the int32 window of the budget was used
@@ -1642,7 +2008,10 @@ def run(
 
 def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale):
     """One progress line: iteration, logz, dlogz, calls, calls/s, acceptance
-    and step scale (for a batch: the running lanes and the range of each)."""
+    and step scale. For a batch: the number of running lanes, the range of
+    the iteration, the largest dlogz and the median scale over the running
+    lanes alone (a stopped lane is frozen), and the number of stopped lanes
+    in each status."""
     k = cfg.num_delete
     if batch is None:
         return (
@@ -1651,9 +2020,19 @@ def _progress_line(cfg, batch, status, it, logz, remain, ncall, rate, acc, scale
             f"acc={acc:.3f} scale={float(scale[0]):.3g} [{STATUS[int(status[0])]}]"
         )
     running = status == RUNNING
-    return (
-        f"tinyns: lanes running={int(running.sum())}/{batch} "
-        f"niter={int(it.min()) * k}..{int(it.max()) * k} "
-        f"dlogz<={float(np.max(remain)):.3g} ncall={sum(ncall)} "
-        f"calls/s={rate:.3g} acc={acc:.3f} scale={float(np.median(scale)):.3g}"
-    )
+    line = f"tinyns: lanes running={int(running.sum())}/{batch} "
+    if running.any():
+        it = it[running]
+        line += (
+            f"niter={int(it.min()) * k}..{int(it.max()) * k} "
+            f"dlogz<={float(np.max(remain[running])):.3g} "
+        )
+    line += f"ncall={sum(ncall)} calls/s={rate:.3g} acc={acc:.3f}"
+    if running.any():
+        line += f" scale={float(np.median(scale[running])):.3g}"
+    stopped = np.bincount(status[~running], minlength=len(STATUS))
+    if stopped.any():
+        line += " [" + " ".join(
+            f"{name}={n}" for name, n in zip(STATUS, stopped, strict=True) if n
+        ) + "]"
+    return line

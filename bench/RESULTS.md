@@ -10,7 +10,17 @@ python bench/summarize.py results_gpu.jsonl results_cpu.jsonl results_probe.json
     --sha tinyns_v1=afa58dd --reference-nlive 500,1000 --out report.md
 ```
 
-The record files are not in the repository.
+The record files are not in the repository. `results_gpu.jsonl` is the
+complete set of the H100 sweep (4975 records, copied from js2h100 on
+2026-10-23); the cells of tinyns 0.x and JAXNS on `connW`, `sepM` and
+`mix3`, which an earlier copy lacked, are in it.
+
+The records were written with the adapters as they were before four fixes
+(Known gaps): BlackJAX's post-processing and tinyns's init kernel compiled
+inside their `run s`, BlackJAX's stop ran on to the end of a 20-step chunk,
+and the CPU samplers' batched likelihood compiled once per batch size. The
+H100 cells were not measured again; the text below states what the fixes
+change, from the records and from CPU measurements.
 
 The tinyns v1 rows were measured at afa58dd, one merge before b67b458 (which
 lowers the JAX floor to 0.4.31 and removes three optimization barriers). The
@@ -24,7 +34,7 @@ both, with the same printed digits. The rows were not rerun.
 | `tinyns_v1` | v1 at afa58dd | defaults: `num_delete = nlive // 10`, `walks = max(25, 6 d, d^2 // 6)`, `dlogz = 0.1`; nlive 500 and 1000 (the default) on every target, 2000 and 4000 on the mixtures |
 | `tinyns_v02` | `release/0.x` at 2f67111 (v0.2.5 behaviour) | defaults, cluster swap on; nlive 500, `dlogz = 0.1` |
 | `blackjax_nss` | blackjax 1.7.1 | nlive 500, `num_delete = 50`, `num_inner_steps = max(5, 2 d)`, `dlogz = 0.1` |
-| `jaxns` | jaxns 3.0.0 | all defaults: `30 d` chains, `5 d` slices, stop at `dlogZ = log1p(1e-3)` |
+| `jaxns` | jaxns 3.0.0 | all defaults: `30 d` chains, `5 d` slices, stop at `dlogZ = log1p(1e-3)` (a remaining-evidence fraction of 1e-3) |
 | `jaxns:nlive` | jaxns 3.0.0 | `root_allocation_degree = 500`, else defaults |
 | `dynesty` | dynesty 3.1.0 | nlive 500, `bound='multi'`, `sample='auto'`, `dlogz = 0.1` |
 | `dynesty:rwalk100` | dynesty 3.1.0 | nlive 500, `sample='rwalk'`, `walks=100`, `dlogz = 0.1` |
@@ -46,13 +56,20 @@ both, with the same printed digits. The rows were not rerun.
   counted, not dropped.
 - **Times.** Every seed ran in a fresh process with a persistent JAX
   compilation cache. `wall s` is the median over seeds, so it includes
-  loading the compiled programs from the cache (2.3 s for tinyns v1) but not
-  compiling them. `run s` is the time of the compiled run (tinyns and
-  BlackJAX time their compilation apart; JAXNS does not). `first s` is the
-  first seed of the cell, which compiled everything: a cold start.
+  loading the compiled programs from the cache (2.3 s for tinyns v1). The
+  cache keeps only programs that take a second or more to compile, so the
+  small ones compile again in every process, and `wall s` includes them.
+  `run s` is wall minus `compile s`, where the sampler times its
+  compilation apart (tinyns and BlackJAX; JAXNS does not). In these records
+  it still holds some compilation: the first-call compiles of BlackJAX's
+  eager ops, inside a fixed cost of about 9 s per run, and the init kernel
+  and prior map of tinyns (Known gaps). `first s` is the first seed of the
+  cell, which compiled everything: a cold start.
 - **Likelihood calls** are what each sampler counts. tinyns counts every
   evaluation, the out-of-cube lanes of its vmapped chains included; BlackJAX
-  and JAXNS do not count the lanes that idle inside a vmap.
+  and JAXNS do not count the lanes that idle inside a vmap. BlackJAX's
+  records run past its stop (+19% calls on `gauss_d2`), and JAXNS and
+  UltraNest stop later than `dlogz = 0.1` in low dimensions (Known gaps).
 - **Accurate** is defined in `bench/README.md`: at least 90% of the runs
   finished, the logZ bias is within 3 standard errors or 0.1 nats, and on a
   mixture at most 10% of the seeds lost a mode and the logit bias of the
@@ -72,14 +89,27 @@ default 1000).**
   and `connW_d32` (the minor mode lost in 25% and 30% of the seeds) and the
   three `sepM` targets. At 1000 only `sepM_d18` and `sepM_d32` fail.
 - Its error bars are honest: sd(logZ) / logzerr is between 0.69 and 1.32 in
-  all 72 cells (nlive 2000 and 4000 included).
+  all 72 cells (nlive 2000 and 4000 included). That is the logzerr of these
+  runs, a sum of information increments; the first-order logzerr of the
+  release is 3% smaller at 10-D to about 11% larger at 2-D without ties, and
+  the new formula does not change logZ.
 - No run of tinyns v1 timed out or raised an error (2240 runs).
 - **Time.** A compiled run takes 1.1 to 20 s on the H100 and a first run 9 to
-  31 s. BlackJAX NSS takes 9 to 77 s compiled, JAXNS 16 to 360 s with its
-  programs cached (7 s to 19 min at its default chain count), and tinyns 0.x
-  6 to 510 s. The CPU samplers take from 6 s (dynesty, 2-D) to more than 4 h
-  on 4 cores; that is a different machine and a likelihood called from
-  Python, so it measures a workflow and not an algorithm.
+  31 s. BlackJAX NSS's `run s` is 9.0 to 77 s, but about 9 s of every run is
+  a fixed cost: over its 24 cells at nlive 500, `run s` = 9.3 s + 62 us per
+  call of a chain (ncall / num_delete; R² = 0.998), against 1.95 s + 14.7 us
+  for tinyns (R² = 0.95). On CPU the old adapter's fixed cost is almost all
+  first-call compilation of its eager ops, mostly its post-processing. The
+  H100's was not split; that it is the same compilation is an inference
+  (Known gaps). Its ratio to tinyns's compiled time, 4.0 to 8.1 as recorded,
+  is therefore mostly that fixed cost at low d; the ratio of the slopes is
+  4.2, and past both fixed costs it is 3.9 to 5.2 on the four cells where
+  BlackJAX's run is more than three times its fixed cost (`gauss_d64` and the
+  three 32-D mixtures). JAXNS takes 16 to 360 s with its programs cached (7 s
+  to 19 min at its default chain count), and tinyns 0.x 6 to 510 s. The CPU
+  samplers take from 6 s (dynesty, 2-D) to more than 4 h on 4 cores; that is
+  a different machine and a likelihood called from Python, so it measures a
+  workflow and not an algorithm.
 - **Likelihood calls.** tinyns v1 is not the sampler with the fewest calls.
   - Nautilus needs 1.7 to 24 times fewer calls than tinyns at nlive 500, and
     reaches an rms 2 to 28 times smaller with them. Where it is accurate it
@@ -89,12 +119,19 @@ default 1000).**
     points) has a logZ bias of up to -0.22 that its own precision resolves.
   - dynesty's default and UltraNest's MLFriends need 1.5 to 13 times fewer
     calls than tinyns at d <= 10 on the unimodal targets.
-  - BlackJAX NSS needs 0.9 to 1.9 times the calls of tinyns and 4 to 8
-    times its compiled time; JAXNS with 500 chains needs 2.2 to 6.6 times
-    the calls.
-  - tinyns v1 spends 1.0 to 1.9 times the calls of tinyns 0.x (it counts the
-    out-of-cube lanes of its vmapped chains) and is 4 to 45 times faster
-    compiled.
+  - BlackJAX NSS needs 0.9 to 1.6 times the calls of tinyns. As recorded it
+    is 0.9 to 1.9, because its stop ran on to the end of a 20-step chunk:
+    with the fixed adapter (every run replayed on CPU; the calls do not
+    depend on the device) it is 0.98 on `gauss_d2` and 1.64 on `eggbox_d2`,
+    not 1.17 and 1.92, and at most 1.60 elsewhere (Known gaps).
+  - JAXNS with 500 chains needs 2.2 (`loggamma_d2`) to 6.6 times the calls.
+    In low dimensions part of that is its stricter stop: about 1.5 times the
+    calls at d = 2 and 1.2 to 1.3 at d = 4 to 8 (Known gaps).
+  - tinyns v1 spends 1.0 to 1.25 times the calls of tinyns 0.x up to
+    d = 32, because it counts the out-of-cube lanes of its vmapped chains.
+    At d = 64 it spends 1.9 times, because it also walks 682 steps against
+    0.x's 384: 1.94 / (682 / 384) = 1.09, as on the other Gaussians. It is
+    4 to 45 times faster compiled.
 - **High dimensions.** On `gauss_d64` tinyns v1 is unbiased (+0.21 ± 0.13 at
   nlive 500, -0.04 ± 0.12 at 1000), as is JAXNS (+0.06 ± 0.10 with 2.8
   times the calls and 19 times the time). BlackJAX NSS is high by 3.3,
@@ -106,7 +143,8 @@ default 1000).**
   500 and by 0.06 to 0.08 at 1000, and one seed in all loses the mode
   (`connW_d18` at 500). At d = 10 and 18 BlackJAX NSS, JAXNS and dynesty
   scatter by 0.4 to 1.2 and lose the mode in up to 30% of the seeds; at
-  d = 4 they are closer (0.08 to 0.45). Nautilus (0.03 to 0.22) and
+  d = 4 they are closer (0.08 to 0.45). tinyns 0.x is close to v1 (0.09 to
+  0.50 up to d = 18, no seed lost). Nautilus (0.03 to 0.22) and
   UltraNest's MLFriends at d <= 10 (0.07 to 0.09) are as tight as tinyns or
   tighter; MLFriends pays for it with 6
   to 11 times the calls at d = 10 and timeouts (5 of 40 on `sepW_d10`, all
@@ -121,9 +159,11 @@ volume.
 - No competitor is accurate on any `sepM` target at the settings of this
   sweep: BlackJAX NSS, dynesty and UltraNest's slice sampler lose the mode
   in 30 to 70% of the seeds, Nautilus in 95 to 100%, and UltraNest's
-  MLFriends timed out on 12 of 20 seeds of `sepM_d10`. tinyns 0.x and JAXNS have not run them
-  yet. In the probe, Nautilus with `n_live=8000` is accurate on `sepM_d10`
-  (5 seeds, logit sd 0.07, 5.6e5 calls).
+  MLFriends timed out on 12 of 20 seeds of `sepM_d10`. tinyns 0.x loses
+  the mode in 40 to 65% of the seeds, and JAXNS in 45 to 98% with 500
+  chains (60 to 83% at its default chain count). In the probe, Nautilus
+  with `n_live=8000` is accurate on `sepM_d10` (5 seeds, logit sd 0.07,
+  5.6e5 calls).
 - With more live points tinyns recovers the mode once it holds about
   `5 * ndim` of them (the rule in the README's Limitations; the mode holds
   `0.06 * nlive`):
@@ -148,8 +188,9 @@ volume.
 
 ## Known gaps
 
-The comparison is not like for like in these respects. The first four are
-reruns that were deferred; the probe says which way each would move.
+The comparison is not like for like in these respects. The first five are
+reruns that were deferred; the probe says which way the first four would
+move, and CPU measurements the fifth.
 
 - **Nautilus without a pool, at its default `n_live`.** Its wall times
   (1 min to more than 4 h) are for 4 cores with its networks trained one
@@ -171,8 +212,59 @@ reruns that were deferred; the probe says which way each would move.
   nlive 500 (but for dynesty at 1600 on `gauss_d32`, still high by 0.36,
   and Nautilus's own 2000). The headline ratios use tinyns at 500 and 1000
   and correct for the difference with the costs at equal rms.
-- **Missing cells.** tinyns 0.x, `jaxns` and `jaxns:nlive` have not run
-  `connW`, `sepM` and `mix3` (and `jaxns:nlive` not `sepW_d32`).
+- **Adapter faults in these records, fixed since.** The H100 cells were
+  not measured again with the fixed adapters; that rerun is a follow-up,
+  and it would also measure how much of BlackJAX's fixed cost is
+  compilation.
+  - *BlackJAX's `run s` holds the compiles of its eager ops.* Its
+    post-processing (`finalise`, `log_weights`, the prior map) runs op by
+    op on arrays whose length depends on the run, as did the key splits,
+    reshapes and sums between its chunks and the draw of its initial
+    points, so each op compiled on its first call in every process,
+    outside `compile s`, and each is too small for the persistent cache. On
+    CPU, in a fresh process with a warm cache, these compiles are 2.3 to
+    2.4 s of a `run s` of 2.4 s on `gauss_d2` and 2.8 s on `gauss_d8`; with
+    the fix the two take 0.07 and 0.38 s. On the H100 the fit above puts a
+    fixed cost of 9.3 s in every run (tinyns's is 1.95 s), but the records
+    do not split it: that it is mostly these compiles is inferred from the
+    CPU measurement.
+  - *tinyns's `run s` holds its init kernel and prior map*, which compiled
+    (or loaded) inside the timed run; `compile s` was the step kernel only.
+    On CPU that is 0.35 to 0.39 s of a `run s` of 0.5 s on `gauss_d2` and
+    1.1 s on `gauss_d8` (0.13 and 0.71 s with the fix). On the H100 it is
+    inside the 1.95 s of the fit.
+  - *BlackJAX ran past its stop.* The rule was tested once per 20-step
+    chunk, so a run went on to the first chunk end at which it held: 0 to 19
+    steps past the first step that met it, or more where the remainder rose
+    above `dlogz` again (9 of the 20 `funnel_d10` runs, up to 66 steps, and
+    one `gauss_d64` run). Up to d = 10 (`funnel_d10` aside) the seeds of a
+    target first meet the rule within 3 to 15 steps of each other, so the
+    excess is set per target by where those steps fall in a chunk; it is not
+    half a chunk on average. Replayed on CPU (all 680 runs; the replay gives
+    each recorded call count exactly, as the calls do not depend on the
+    device), the recorded calls are high by 19% on `gauss_d2`, 17% on
+    `eggbox_d2`, 9% on `loggamma_d2`, `funnel_d10` and `loggamma_d10`, 6% on
+    `sepW_d4` and `connW_d4`, 2 to 5% on the other targets up to d = 10, and
+    under 3% from d = 16. Its logZ is not biased by it: stopping at the
+    first step moves logZ by under 0.001 on the seven targets up to d = 8
+    (20 seeds, paired) and by -0.03 ± 0.01 on `funnel_d10`, against a
+    logzerr of 0.07 to 0.21.
+  - *The CPU samplers' batched likelihood compiled once per batch size.*
+    UltraNest's MLFriends asked for 59 and 56 sizes in two runs of
+    `gauss_d2`: 8.3 s against 2.9 s with the batches padded to a power of
+    two in a fresh process, 5.0 s against 3.0 s in a warm one, with the same
+    calls and logZ. Its walls of 15 to 40 s at d <= 8 hold several seconds
+    of compilation each; the walls of minutes to hours are hardly affected.
+- **Stopping rules differ.** JAXNS's default stop is a remaining-evidence
+  fraction of 1e-3 at the contour likelihood, and UltraNest's
+  `frac_remain=0.01` leaves 1% of the evidence in the live points, against
+  about 9.5% for `dlogz = 0.1`. In low dimensions both stop later than
+  tinyns, with the same logZ: JAXNS needs about 1.5 times the calls at
+  d = 2 (1.0 to 2.4 per seed), 1.2 to 1.3 at d = 4 to 8 and under 10% more
+  from d = 16, with the same logzerr, and UltraNest about 1.25 times on
+  `gauss_d2`, with a logzerr 9 to 20% smaller (5 seeds). A JAXNS fraction
+  of `1 - exp(-0.1)` would not match tinyns either: at the contour
+  likelihood it stops earlier from d = 8.
 - **Seeds.** 20 or 40 per cell (10 for the CPU samplers at d >= 32, 5 or 10
   in the probe): a logit sd has a relative error of 11 to 16%, and a lost
   fraction of 5% is one or two seeds.
@@ -185,7 +277,10 @@ reruns that were deferred; the probe says which way each would move.
 `python bench/validate.py --tier full` at afa58dd on the H100 (x64, 64 runs
 per case, key 0). All 10 cases pass. Rerun at 88c572b (after the plateau fix),
 it passes again with the same printed digits except `eggbox_d2` (dlogZ
-+0.010 against +0.011); the quick tier passes 7 of 7.
++0.010 against +0.011); the quick tier passes 7 of 7. This table predates
+the posterior, hop and 0.12 logit-sd criteria (its logit-sd limit was 0.4)
+and the `ndtri_d6` and `sepWbox_d4` cases, so it has no post t or hop
+column.
 
 | case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | logit bias ± se | logit sd | lost | modes | unres | ncall | wall s | verdict |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -199,6 +294,74 @@ it passes again with the same printed digits except `eggbox_d2` (dlogZ
 | eggbox_d2 | 1000 | 25 | 64 | +0.011 ± 0.012 | +1.0 | 1.17 [0.89, 1.52] | - | - | - | 15-18 (64/64 ok) | 30/64 | 2.28e+05 | 10 | PASS |
 | sepW_d10 | 2000 | 60 | 64 | +0.026 ± 0.019 | +1.4 | 1.08 [0.83, 1.41] | -0.004 ± 0.005 | 0.039 | 0.00 | 2 (64/64 ok) | 0/64 | 4.8e+06 | 16 | PASS |
 | sepW_d18 | 4000 | 108 | 64 | +0.005 ± 0.016 | +0.3 | 0.98 [0.75, 1.28] | -0.000 ± 0.003 | 0.021 | 0.00 | 2 (64/64 ok) | 0/64 | 3.02e+07 | 39 | PASS |
+
+`scat/err` uses the `logzerr` of afa58dd, a sum of information increments;
+the first-order `logzerr` of the release is 3% smaller at 10-D to about 11%
+larger at 2-D without ties, and the new formula does not change logZ.
+
+### The release code
+
+`python bench/validate.py --tier full` on the release code (e556387; the
+commits after it change only docs, docstrings, tests and the wording of one
+warning) on an H100 NVL with JAX 0.4.34 and its CUDA 12 plugin, 64 runs per
+case, key 0. All 12 cases pass in float32 and in x64. The worst z is +2.2 in
+float32 and -2.0 in x64, both `gauss_d32`. The largest minor-mode logit bias
+is `sepW_d18`'s +0.007 ± 0.002 in float32, a shift of its 6% mass by about
+0.0004 (+0.004 ± 0.003 in x64). The `hop` column is the smallest acceptance
+over the runs: 0.25 to 0.28 on `loggamma_d10` and 0.72 to 0.79 on the
+two-mode mixtures. The first case's `wall s` in float32 includes compiling in
+a cold process.
+
+Float32:
+
+| case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | post t [max] | logit bias ± se | logit sd [max] | lost | hop | modes | unres | ncall | wall s | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gauss_d2 | 1000 | 25 | 64 | -0.012 ± 0.010 | -1.2 | 1.02 [0.78, 1.33] | 0.8 [3.6] | - | - | - | - | 1 (64/64 ok) | 0/64 | 2.11e+05 | 665 | PASS |
+| gauss_d10 | 1000 | 60 | 64 | +0.012 ± 0.021 | +0.6 | 0.98 [0.75, 1.28] | 2.3 [4.1] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.95e+06 | 20 | PASS |
+| gauss_d32 | 1000 | 192 | 64 | +0.076 ± 0.034 | +2.2 | 0.91 [0.69, 1.19] | 2.9 [4.4] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.83e+07 | 34 | PASS |
+| rosen_d4 | 1000 | 100 | 64 | +0.018 ± 0.014 | +1.3 | 0.99 [0.76, 1.29] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.66e+06 | 13 | PASS |
+| rosen_d10 | 1000 | 250 | 64 | +0.013 ± 0.026 | +0.5 | 1.06 [0.81, 1.39] | - | - | - | - | - | 1-2 (64/64 ok) | 4/64 | 1.07e+07 | 22 | PASS |
+| funnel_d10 | 1000 | 60 | 64 | -0.020 ± 0.018 | -1.1 | 1.05 [0.81, 1.38] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 3.44e+06 | 17 | PASS |
+| loggamma_d10 | 1000 | 60 | 64 | -0.027 ± 0.020 | -1.3 | 1.18 [0.90, 1.54] | - | -0.009 ± 0.005 | 0.041 [0.4] | 0.00 | 0.28 | 4 (64/64 ok) | 0/64 | 1.42e+06 | 16 | PASS |
+| eggbox_d2 | 1000 | 25 | 64 | -0.011 ± 0.011 | -1.0 | 1.08 [0.83, 1.41] | - | - | - | - | - | 14-18 (64/64 ok) | 29/64 | 2.28e+05 | 12 | PASS |
+| ndtri_d6 | 1000 | 144 | 64 | -0.002 ± 0.025 | -0.1 | 1.17 [0.89, 1.53] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 4.71e+06 | 19 | PASS |
+| sepWbox_d4 | 1000 | 25 | 64 | +0.002 ± 0.015 | +0.1 | 1.02 [0.78, 1.33] | - | +0.006 ± 0.008 | 0.063 [0.12] | 0.00 | 0.79 | 2 (64/64 ok) | 0/64 | 4.31e+05 | 14 | PASS |
+| sepW_d10 | 2000 | 60 | 64 | +0.001 ± 0.017 | +0.1 | 1.01 [0.77, 1.32] | - | -0.004 ± 0.005 | 0.037 [0.12] | 0.00 | 0.76 | 2 (64/64 ok) | 0/64 | 4.81e+06 | 26 | PASS |
+| sepW_d18 | 4000 | 108 | 64 | -0.008 ± 0.015 | -0.5 | 0.92 [0.70, 1.20] | - | +0.007 ± 0.002 | 0.019 [0.12] | 0.00 | 0.72 | 2 (64/64 ok) | 0/64 | 3.02e+07 | 43 | PASS |
+
+x64:
+
+| case | nlive | walks | seeds | dlogZ ± se | z | scat/err [3 se] | post t [max] | logit bias ± se | logit sd [max] | lost | hop | modes | unres | ncall | wall s | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| gauss_d2 | 1000 | 25 | 64 | -0.001 ± 0.010 | -0.1 | 1.05 [0.81, 1.38] | 2.0 [3.6] | - | - | - | - | 1 (64/64 ok) | 0/64 | 2.11e+05 | 39 | PASS |
+| gauss_d10 | 1000 | 60 | 64 | +0.000 ± 0.016 | +0.0 | 0.77 [0.59, 1.01] | 2.0 [4.1] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.95e+06 | 21 | PASS |
+| gauss_d32 | 1000 | 192 | 64 | -0.083 ± 0.042 | -2.0 | 1.10 [0.84, 1.44] | 3.1 [4.4] | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.83e+07 | 34 | PASS |
+| rosen_d4 | 1000 | 100 | 64 | +0.015 ± 0.015 | +1.0 | 1.04 [0.80, 1.36] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 1.66e+06 | 16 | PASS |
+| rosen_d10 | 1000 | 250 | 64 | -0.016 ± 0.027 | -0.6 | 1.10 [0.84, 1.43] | - | - | - | - | - | 1-2 (64/64 ok) | 7/64 | 1.07e+07 | 25 | PASS |
+| funnel_d10 | 1000 | 60 | 64 | +0.024 ± 0.021 | +1.1 | 1.19 [0.91, 1.56] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 3.44e+06 | 20 | PASS |
+| loggamma_d10 | 1000 | 60 | 64 | -0.010 ± 0.017 | -0.6 | 1.00 [0.77, 1.31] | - | +0.002 ± 0.006 | 0.047 [0.4] | 0.00 | 0.25 | 4 (64/64 ok) | 0/64 | 1.42e+06 | 19 | PASS |
+| eggbox_d2 | 1000 | 25 | 64 | +0.014 ± 0.010 | +1.4 | 1.03 [0.79, 1.34] | - | - | - | - | - | 14-18 (64/64 ok) | 28/64 | 2.26e+05 | 15 | PASS |
+| ndtri_d6 | 1000 | 144 | 64 | -0.015 ± 0.025 | -0.6 | 1.16 [0.89, 1.52] | - | - | - | - | - | 1 (64/64 ok) | 0/64 | 4.71e+06 | 21 | PASS |
+| sepWbox_d4 | 1000 | 25 | 64 | +0.011 ± 0.017 | +0.6 | 1.16 [0.88, 1.51] | - | +0.002 ± 0.008 | 0.062 [0.12] | 0.00 | 0.79 | 2 (64/64 ok) | 0/64 | 4.31e+05 | 17 | PASS |
+| sepW_d10 | 2000 | 60 | 64 | -0.006 ± 0.017 | -0.4 | 0.97 [0.75, 1.27] | - | -0.003 ± 0.004 | 0.035 [0.12] | 0.00 | 0.76 | 2 (64/64 ok) | 0/64 | 4.81e+06 | 24 | PASS |
+| sepW_d18 | 4000 | 108 | 64 | -0.013 ± 0.016 | -0.8 | 0.97 [0.74, 1.27] | - | +0.004 ± 0.003 | 0.023 [0.12] | 0.00 | 0.72 | 2 (64/64 ok) | 0/64 | 3.02e+07 | 48 | PASS |
+
+On the same GPU `pytest -m slow` passed 6 of 6 in x64. In float32 it failed
+`test_modes_that_are_not_convex_18d`: all 8 runs of its plain 18-D target
+(then shape M, `build_two_mode(18, 0.2)`: a 20% mode without arms, with
+0.035 of the main mode's volume) found both modes, but in one the minor mode
+split off late and was partly lost, and that run warned that the hop ran only
+in part; the 8 runs gave a minor mass of 0.174 against 0.200 (logit sd 1.0),
+and the test allows no warning on that target. At 8851058 the same test
+passed in float32 (one of the 8 runs lost the mode entirely, with no
+warning). The test's plain control is now shape W,
+`build_two_mode(18, 0.2, "sep", "W")` (the same two modes as `needle_d18`
+without its arms), and the test checks every run's oracle minor mass against
+the truth. With it, on the same H100 at 8100150 (src as at e556387 but for
+the wording of one warning), `pytest -m slow` passes 6 of 6 in float32 and
+in x64: every plain run found both modes with no warning and an oracle minor
+mass of 0.192 to 0.208, and all 8 runs of `needle_d18` and of `cauchy_d18`
+reported two modes and warned.
 
 ## tinyns v1 on the mixtures, by nlive
 
@@ -271,13 +434,13 @@ Only the `tinyns_v1` cells at nlive 500, 1000 enter this section.
 | loggamma | 6/6 | 6 of 10 | 2 of 10 |
 | eggbox | 2/2 | 5 of 10 | 1 of 10 |
 | sepW | 7/8 | 6 of 11 | 2 of 11 |
-| connW | 7/8 | 5 of 8 | 3 of 8 |
+| connW | 7/8 | 5 of 11 | 3 of 11 |
 | sepM | 1/6 | 2 of 2 | 1 of 2 |
-| mix3 | 2/2 | 3 of 4 | 2 of 4 |
+| mix3 | 2/2 | 4 of 5 | 2 of 5 |
 
-Competitor / `tinyns_v1`, geometric mean over the common accurate targets. Above 1: `tinyns_v1` needs fewer calls or less time, or has the smaller rms or logit sd. `at equal rms` is the cost ratio times the squared rms ratio (cost taken to go as 1 / rms^2). Wall times compare across hardware labels only as measured.
+Competitor / `tinyns_v1`, geometric mean over the `tinyns_v1` cells of the family where both are accurate (`common`, out of the `ran` cells whose target the competitor ran; a target counts once per `tinyns_v1` nlive). Above 1: `tinyns_v1` needs fewer calls or less time, or has the smaller rms or logit sd. `at equal rms` is the cost ratio times the squared rms ratio (cost taken to go as 1 / rms^2). Wall times compare across hardware labels only as measured.
 
-| family | competitor | hw | common / ran | calls | wall time | rms | calls at equal rms | wall time at equal rms | logit sd |
+| family | competitor | hw | common / ran cells | calls | wall time | rms | calls at equal rms | wall time at equal rms | logit sd |
 |---|---|---|---|---|---|---|---|---|---|
 | gauss | blackjax_nss | GPU H100 | 6/10 | 1.02 | 3.02 | 1.28 | 1.67 | 4.92 | - |
 | gauss | dynesty | CPU 4c | 4/10 | 0.0908 | 3.88 | 1.2 | 0.131 | 5.59 | - |
@@ -333,7 +496,7 @@ Competitor / `tinyns_v1`, geometric mean over the common accurate targets. Above
 | sepW | dynesty | CPU 4c | 4/8 | 2.39 | 93.4 | 1.14 | 3.12 | 122 | 3.17 |
 | sepW | dynesty:rwalk100 | CPU 4c | 4/8 | 1.67 | 41.7 | 1.18 | 2.32 | 58 | 6.22 |
 | sepW | jaxns | GPU H100 | 2/8 | 1.18 | 2.89 | 2.93 | 10.1 | 24.8 | 5.99 |
-| sepW | jaxns:nlive | GPU H100 | 4/6 | 4.5 | 10.3 | 2.16 | 21 | 48 | 5.57 |
+| sepW | jaxns:nlive | GPU H100 | 4/8 | 4.5 | 10.3 | 2.16 | 21 | 48 | 5.57 |
 | sepW | nautilus | CPU 4c | 4/8 | 0.127 | 108 | 0.122 | 0.00189 | 1.6 | 0.433 |
 | sepW | nautilus:discard | CPU 4c | 6/8 | 0.105 | 197 | 0.0373 | 0.000147 | 0.275 | 0.482 |
 | sepW | tinyns_v02 | GPU H100 | 6/8 | 0.578 | 7.33 | 1.15 | 0.764 | 9.68 | 1.51 |
@@ -342,23 +505,32 @@ Competitor / `tinyns_v1`, geometric mean over the common accurate targets. Above
 | connW | blackjax_nss | GPU H100 | 2/8 | 1.16 | 2.92 | 1.6 | 2.97 | 7.48 | 2.93 |
 | connW | dynesty | CPU 4c | 2/8 | 0.201 | 8.91 | 1.54 | 0.475 | 21 | 1.2 |
 | connW | dynesty:rwalk100 | CPU 4c | 4/8 | 1.66 | 42.3 | 1.25 | 2.6 | 66 | 4.17 |
+| connW | jaxns | GPU H100 | 6/8 | 2.52 | 8.13 | 3.55 | 31.8 | 103 | 5.27 |
+| connW | jaxns:nlive | GPU H100 | 6/8 | 4.43 | 12 | 2.83 | 35.4 | 95.9 | 3.45 |
 | connW | nautilus | CPU 4c | 4/8 | 0.128 | 116 | 0.0747 | 0.000712 | 0.644 | 0.438 |
 | connW | nautilus:discard | CPU 4c | 4/8 | 0.148 | 119 | 0.0515 | 0.000392 | 0.316 | 0.513 |
+| connW | tinyns_v02 | GPU H100 | 4/8 | 0.577 | 5.03 | 1.42 | 1.16 | 10.2 | 1.34 |
 | connW | ultranest | CPU 4c | 4/4 | 0.679 | 39 | 1.2 | 0.973 | 55.9 | 0.952 |
 | connW | ultranest:slice | CPU 4c | 2/6 | 0.925 | 54.5 | 1.54 | 2.19 | 129 | 8.79 |
 | sepM | blackjax_nss | GPU H100 | 0/6 | - | - | - | - | - | - |
 | sepM | dynesty | CPU 4c | 0/6 | - | - | - | - | - | - |
 | sepM | dynesty:rwalk100 | CPU 4c | 0/6 | - | - | - | - | - | - |
+| sepM | jaxns | GPU H100 | 0/6 | - | - | - | - | - | - |
+| sepM | jaxns:nlive | GPU H100 | 0/6 | - | - | - | - | - | - |
 | sepM | nautilus | CPU 4c | 0/6 | - | - | - | - | - | - |
 | sepM | nautilus:discard | CPU 4c | 0/6 | - | - | - | - | - | - |
 | sepM | nautilus:discard [n_live=8000] | CPU 4c | 1/2 | 0.229 | 950 | 0.0464 | 0.000494 | 2.05 | 1.48 |
+| sepM | tinyns_v02 | GPU H100 | 0/6 | - | - | - | - | - | - |
 | sepM | ultranest | CPU 4c | 0/2 | - | - | - | - | - | - |
 | sepM | ultranest:slice | CPU 4c | 0/6 | - | - | - | - | - | - |
 | mix3 | blackjax_nss | GPU H100 | 0/2 | - | - | - | - | - | - |
 | mix3 | dynesty | CPU 4c | 0/2 | - | - | - | - | - | - |
 | mix3 | dynesty:rwalk100 | CPU 4c | 0/2 | - | - | - | - | - | - |
+| mix3 | jaxns | GPU H100 | 0/2 | - | - | - | - | - | - |
+| mix3 | jaxns:nlive | GPU H100 | 0/2 | - | - | - | - | - | - |
 | mix3 | nautilus | CPU 4c | 2/2 | 0.0878 | 342 | 0.304 | 0.00814 | 31.7 | 0.348 |
 | mix3 | nautilus:discard | CPU 4c | 2/2 | 0.0976 | 351 | 0.0439 | 0.000188 | 0.677 | 0.589 |
+| mix3 | tinyns_v02 | GPU H100 | 2/2 | 0.581 | 7.85 | 1.3 | 0.986 | 13.3 | 1.36 |
 | mix3 | ultranest | CPU 4c | 0/2 | - | - | - | - | - | - |
 | mix3 | ultranest:slice | CPU 4c | 2/2 | 1.07 | 59.7 | 1.47 | 2.31 | 129 | 9.8 |
 
@@ -371,12 +543,12 @@ Competitor / `tinyns_v1`, geometric mean over the common accurate targets. Above
 | dynesty:rwalk100 | dynesty 3.1.0 | 620ca72 | CPU 4c | 24 | 590 | 0 | 0 |
 | dynesty:rwalk100 [walks=192] | dynesty 3.1.0 | 620ca72 | CPU 4c | 1 | 5 | 0 | 0 |
 | dynesty:rwalk100 [walks=384] | dynesty 3.1.0 | 620ca72 | CPU 4c | 1 | 5 | 0 | 0 |
-| jaxns | jaxns 3.0.0 | 620ca72 | GPU H100 | 16 | 400 | 0 | 0 |
-| jaxns:nlive | jaxns 3.0.0 | 620ca72 | GPU H100 | 15 | 360 | 0 | 0 |
+| jaxns | jaxns 3.0.0 | 620ca72 | GPU H100 | 24 | 680 | 0 | 0 |
+| jaxns:nlive | jaxns 3.0.0 | 620ca72 | GPU H100 | 24 | 680 | 0 | 0 |
 | nautilus | nautilus-sampler 1.0.6 | 620ca72 | CPU 4c | 24 | 590 | 10 | 0 |
 | nautilus:discard | nautilus-sampler 1.0.6 | 620ca72 | CPU 4c | 24 | 590 | 10 | 0 |
 | nautilus:discard [n_live=8000] | nautilus-sampler 1.0.6 | 620ca72 | CPU 4c | 1 | 5 | 0 | 0 |
-| tinyns_v02 | tinyns 0.2.5 | 620ca72 | GPU H100 | 16 | 400 | 0 | 0 |
+| tinyns_v02 | tinyns 0.2.5 | 620ca72 | GPU H100 | 24 | 680 | 0 | 0 |
 | tinyns_v1 | tinyns 1.0.0.dev0 | afa58dd | GPU H100 | 72 | 2240 | 0 | 0 |
 | ultranest | ultranest 4.5.2 | 620ca72 | CPU 4c | 14 | 375 | 78 | 0 |
 | ultranest:slice | ultranest 4.5.2 | 620ca72 | CPU 4c | 15 | 260 | 0 | 0 |
@@ -391,12 +563,12 @@ Competitor / `tinyns_v1`, geometric mean over the common accurate targets. Above
 | dynesty:rwalk100 | 3/5 | 2/2 | 1/1 | 2/3 | 1/1 | 2/4 | 2/4 | 0/3 | 0/1 |
 | dynesty:rwalk100 [walks=192] | 1/1 | - | - | - | - | - | - | - | - |
 | dynesty:rwalk100 [walks=384] | 0/1 | - | - | - | - | - | - | - | - |
-| jaxns | 5/5 | 2/2 | 1/1 | 3/3 | 1/1 | 1/4 | - | - | - |
-| jaxns:nlive | 5/5 | 2/2 | 1/1 | 3/3 | 1/1 | 2/3 | - | - | - |
+| jaxns | 5/5 | 2/2 | 1/1 | 3/3 | 1/1 | 1/4 | 3/4 | 0/3 | 0/1 |
+| jaxns:nlive | 5/5 | 2/2 | 1/1 | 3/3 | 1/1 | 2/4 | 3/4 | 0/3 | 0/1 |
 | nautilus | 3/5 | 2/2 | 1/1 | 3/3 | 1/1 | 2/4 | 2/4 | 0/3 | 1/1 |
 | nautilus:discard | 4/5 | 2/2 | 1/1 | 3/3 | 1/1 | 3/4 | 2/4 | 0/3 | 1/1 |
 | nautilus:discard [n_live=8000] | - | - | - | - | - | - | - | 1/1 | - |
-| tinyns_v02 | 4/5 | 1/2 | 1/1 | 2/3 | 1/1 | 3/4 | - | - | - |
+| tinyns_v02 | 4/5 | 1/2 | 1/1 | 2/3 | 1/1 | 3/4 | 2/4 | 0/3 | 1/1 |
 | tinyns_v1 (nlive 500) | 5/5 | 1/2 | 1/1 | 3/3 | 1/1 | 3/4 | 3/4 | 0/3 | 1/1 |
 | tinyns_v1 (nlive 1000) | 5/5 | 2/2 | 1/1 | 3/3 | 1/1 | 4/4 | 4/4 | 1/3 | 1/1 |
 | tinyns_v1 (nlive 2000) | - | - | - | - | - | 4/4 | 4/4 | 2/3 | 1/1 |
@@ -409,6 +581,11 @@ Competitor / `tinyns_v1`, geometric mean over the common accurate targets. Above
 Hardware (wall times compare only within one label):
 - `CPU 4c`: no GPU, Intel(R) Xeon(R) CPU E5-2695 v3 @ 2.30GHz, 4 threads visible, Slurm RM
 - `GPU H100`: NVIDIA H100 80GB HBM3, Intel(R) Xeon(R) Platinum 8468, 20 threads visible, no Slurm
+
+The `logzerr`, `scat/err` and `in 3s` of the tinyns_v1 rows use the
+`logzerr` of afa58dd, a sum of information increments; the first-order
+`logzerr` of the release is 3% smaller at 10-D to about 11% larger at 2-D
+without ties, and the new formula does not change logZ.
 
 | target | sampler | hw | nlive | ok | dlogZ | rms | sd | logzerr | scat/err | in 3s | logit bias | logit sd [95% CI] | lost | ncall | wall s | compile s | run s | first s | acc |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -592,6 +769,7 @@ Hardware (wall times compare only within one label):
 | sepW_d32 | dynesty | CPU 4c | 500 | 10/10 | +4.015 ± 0.122 | 4.032 | 0.384 | 0.528 | 0.73 | 0.00 | +1.69 ± 0.281 | 0.89 [0.32, 1.14] | 0.00 | 1.12e+07 | 1352 | - | - | - | no: Z,M |
 | sepW_d32 | dynesty:rwalk100 | CPU 4c | 500 | 10/10 | +2.689 ± 0.141 | 2.723 | 0.447 | 0.532 | 0.84 | 0.00 | +1.51 ± 0.236 | 0.75 [0.52, 0.84] | 0.00 | 6.04e+06 | 863 | - | - | - | no: Z,M |
 | sepW_d32 | jaxns | GPU H100 | 960 | 40/40 | -1.022 ± 0.236 | 1.795 | 1.495 | 0.344 | 4.34 | 0.55 | +0.37 ± 0.331 | 1.44 [1.07, 1.73] | 0.53 | 1.35e+08 | 344 | - | - | 398 | no: Z,M |
+| sepW_d32 | jaxns:nlive | GPU H100 | 500 | 40/40 | -1.013 ± 0.315 | 2.212 | 1.991 | 0.476 | 4.18 | 0.47 | +0.96 ± 0.480 | 1.66 [1.01, 2.04] | 0.70 | 7.03e+07 | 195 | - | - | 241 | no: Z,M |
 | sepW_d32 | nautilus | CPU 4c | 2000 | 10/10 | -0.215 ± 0.002 | 0.215 | 0.006 | - | - | - | - | - [-, -] | 1.00 | 5.37e+05 | 9644 | - | - | - | no: Z,M |
 | sepW_d32 | nautilus:discard | CPU 4c | 2000 | 10/10 | -0.062 ± 0.001 | 0.062 | 0.004 | - | - | - | - | - [-, -] | 1.00 | 5.65e+05 | 9571 | - | - | - | no: M |
 | sepW_d32 | tinyns_v02 | GPU H100 | 500 | 40/40 | +0.775 ± 0.077 | 0.913 | 0.489 | 0.476 | 1.03 | 0.90 | +1.23 ± 0.097 | 0.60 [0.45, 0.74] | 0.05 | 9.5e+06 | 200 | 2.3 | 197.4 | 200 | no: Z,M |
@@ -603,8 +781,11 @@ Hardware (wall times compare only within one label):
 | connW_d4 | blackjax_nss | GPU H100 | 500 | 40/40 | -0.041 ± 0.029 | 0.185 | 0.183 | 0.170 | 1.08 | 1.00 | +0.02 ± 0.035 | 0.22 [0.17, 0.25] | 0.00 | 3.54e+05 | 11 | 1.2 | 9.3 | 13 | yes |
 | connW_d4 | dynesty | CPU 4c | 500 | 40/40 | +0.025 ± 0.028 | 0.178 | 0.178 | 0.204 | 0.87 | 1.00 | -0.05 ± 0.014 | 0.09 [0.07, 0.10] | 0.00 | 6.14e+04 | 32 | - | - | - | yes |
 | connW_d4 | dynesty:rwalk100 | CPU 4c | 500 | 40/40 | +0.042 ± 0.026 | 0.166 | 0.163 | 0.204 | 0.80 | 1.00 | -0.11 ± 0.042 | 0.26 [0.19, 0.32] | 0.00 | 7.42e+05 | 103 | - | - | - | yes |
+| connW_d4 | jaxns | GPU H100 | 120 | 40/40 | +0.058 ± 0.063 | 0.398 | 0.399 | 0.336 | 1.19 | 1.00 | -0.05 ± 0.043 | 0.27 [0.19, 0.34] | 0.00 | 3.74e+05 | 12 | - | - | 30 | yes |
+| connW_d4 | jaxns:nlive | GPU H100 | 500 | 40/40 | -0.033 ± 0.038 | 0.242 | 0.243 | 0.166 | 1.47 | 0.95 | -0.02 ± 0.022 | 0.14 [0.11, 0.16] | 0.00 | 1.43e+06 | 30 | - | - | 75 | yes |
 | connW_d4 | nautilus | CPU 4c | 2000 | 40/40 | -0.010 ± 0.001 | 0.013 | 0.008 | - | - | - | -0.01 ± 0.005 | 0.03 [0.02, 0.04] | 0.00 | 6.08e+04 | 204 | - | - | - | yes |
 | connW_d4 | nautilus:discard | CPU 4c | 2000 | 40/40 | -0.000 ± 0.001 | 0.008 | 0.008 | - | - | - | -0.01 ± 0.006 | 0.04 [0.03, 0.04] | 0.00 | 7.32e+04 | 212 | - | - | - | yes |
+| connW_d4 | tinyns_v02 | GPU H100 | 500 | 40/40 | -0.002 ± 0.025 | 0.154 | 0.156 | 0.165 | 0.94 | 0.97 | -0.01 ± 0.014 | 0.09 [0.05, 0.12] | 0.00 | 1.74e+05 | 12 | 2.2 | 10.1 | 15 | yes |
 | connW_d4 | tinyns_v1 | GPU H100 | 500 | 40/40 | +0.004 ± 0.022 | 0.137 | 0.139 | 0.173 | 0.80 | 1.00 | -0.04 ± 0.014 | 0.09 [0.07, 0.11] | 0.00 | 2.16e+05 | 4 | 2.3 | 1.2 | 10 | yes |
 | connW_d4 | tinyns_v1 | GPU H100 | 1000 | 40/40 | -0.007 ± 0.016 | 0.098 | 0.099 | 0.122 | 0.81 | 1.00 | -0.00 ± 0.010 | 0.06 [0.05, 0.07] | 0.00 | 4.31e+05 | 4 | 2.4 | 1.3 | 10 | yes |
 | connW_d4 | tinyns_v1 | GPU H100 | 2000 | 40/40 | -0.007 ± 0.013 | 0.083 | 0.084 | 0.087 | 0.96 | 1.00 | -0.02 ± 0.007 | 0.05 [0.04, 0.05] | 0.00 | 8.62e+05 | 4 | 2.4 | 1.2 | 10 | yes |
@@ -613,8 +794,11 @@ Hardware (wall times compare only within one label):
 | connW_d10 | blackjax_nss | GPU H100 | 500 | 40/40 | +0.121 ± 0.037 | 0.258 | 0.231 | 0.270 | 0.85 | 1.00 | -0.08 ± 0.072 | 0.45 [0.33, 0.55] | 0.00 | 1.96e+06 | 13 | 1.1 | 12.1 | 16 | no: Z |
 | connW_d10 | dynesty | CPU 4c | 500 | 40/40 | +0.117 ± 0.050 | 0.332 | 0.315 | 0.313 | 1.01 | 1.00 | -0.30 ± 0.075 | 0.48 [0.35, 0.58] | 0.00 | 5.94e+05 | 90 | - | - | - | no: M |
 | connW_d10 | dynesty:rwalk100 | CPU 4c | 500 | 40/40 | +0.072 ± 0.036 | 0.239 | 0.231 | 0.313 | 0.74 | 1.00 | +0.01 ± 0.065 | 0.41 [0.34, 0.48] | 0.00 | 1.94e+06 | 267 | - | - | - | yes |
+| connW_d10 | jaxns | GPU H100 | 300 | 40/40 | -0.307 ± 0.121 | 0.816 | 0.766 | 0.342 | 2.24 | 0.85 | -0.15 ± 0.113 | 0.71 [0.53, 0.87] | 0.00 | 4.66e+06 | 39 | - | - | 83 | yes |
+| connW_d10 | jaxns:nlive | GPU H100 | 500 | 40/40 | -0.015 ± 0.097 | 0.604 | 0.611 | 0.265 | 2.31 | 0.80 | +0.01 ± 0.061 | 0.38 [0.30, 0.45] | 0.00 | 7.25e+06 | 54 | - | - | 107 | yes |
 | connW_d10 | nautilus | CPU 4c | 2000 | 40/40 | -0.007 ± 0.001 | 0.011 | 0.008 | - | - | - | -0.06 ± 0.006 | 0.04 [0.03, 0.05] | 0.00 | 1.39e+05 | 1012 | - | - | - | yes |
 | connW_d10 | nautilus:discard | CPU 4c | 2000 | 40/40 | -0.002 ± 0.001 | 0.008 | 0.008 | - | - | - | -0.01 ± 0.007 | 0.05 [0.03, 0.05] | 0.00 | 1.55e+05 | 1032 | - | - | - | yes |
+| connW_d10 | tinyns_v02 | GPU H100 | 500 | 40/40 | +0.022 ± 0.053 | 0.333 | 0.337 | 0.265 | 1.27 | 0.97 | -0.06 ± 0.020 | 0.13 [0.10, 0.15] | 0.00 | 9.89e+05 | 32 | 2.2 | 29.5 | 35 | yes |
 | connW_d10 | tinyns_v1 | GPU H100 | 500 | 40/40 | -0.068 ± 0.047 | 0.300 | 0.296 | 0.278 | 1.06 | 1.00 | -0.03 ± 0.020 | 0.13 [0.08, 0.17] | 0.00 | 1.2e+06 | 4 | 2.3 | 1.9 | 10 | yes |
 | connW_d10 | tinyns_v1 | GPU H100 | 1000 | 40/40 | -0.018 ± 0.025 | 0.160 | 0.161 | 0.197 | 0.82 | 1.00 | -0.01 ± 0.009 | 0.06 [0.05, 0.07] | 0.00 | 2.41e+06 | 4 | 2.4 | 1.9 | 10 | yes |
 | connW_d10 | tinyns_v1 | GPU H100 | 2000 | 40/40 | -0.022 ± 0.026 | 0.165 | 0.165 | 0.139 | 1.18 | 0.97 | -0.00 ± 0.006 | 0.04 [0.03, 0.04] | 0.00 | 4.81e+06 | 4 | 2.4 | 2.0 | 10 | yes |
@@ -624,8 +808,11 @@ Hardware (wall times compare only within one label):
 | connW_d18 | blackjax_nss | GPU H100 | 500 | 40/40 | +0.358 ± 0.048 | 0.469 | 0.307 | 0.363 | 0.85 | 1.00 | -0.17 ± 0.122 | 0.75 [0.54, 0.94] | 0.05 | 5.98e+06 | 18 | 1.3 | 16.9 | 21 | no: Z |
 | connW_d18 | dynesty | CPU 4c | 500 | 40/40 | +0.838 ± 0.059 | 0.916 | 0.374 | 0.407 | 0.92 | 0.85 | +0.10 ± 0.093 | 0.59 [0.41, 0.74] | 0.00 | 1.33e+06 | 201 | - | - | - | no: Z |
 | connW_d18 | dynesty:rwalk100 | CPU 4c | 500 | 40/40 | +0.250 ± 0.055 | 0.423 | 0.346 | 0.408 | 0.85 | 1.00 | -0.16 ± 0.115 | 0.72 [0.54, 0.87] | 0.03 | 3.49e+06 | 490 | - | - | - | no: Z |
+| connW_d18 | jaxns | GPU H100 | 540 | 40/40 | -0.201 ± 0.161 | 1.028 | 1.021 | 0.343 | 2.97 | 0.72 | -0.24 ± 0.134 | 0.85 [0.63, 1.01] | 0.00 | 2.53e+07 | 106 | - | - | 158 | yes |
+| connW_d18 | jaxns:nlive | GPU H100 | 500 | 40/40 | -0.358 ± 0.175 | 1.149 | 1.106 | 0.357 | 3.10 | 0.62 | -0.36 ± 0.138 | 0.85 [0.63, 1.05] | 0.05 | 2.31e+07 | 98 | - | - | 149 | yes |
 | connW_d18 | nautilus | CPU 4c | 2000 | 40/40 | +0.002 ± 0.003 | 0.017 | 0.018 | - | - | - | -1.06 ± 0.035 | 0.22 [0.17, 0.26] | 0.00 | 2.67e+05 | 3825 | - | - | - | no: M |
 | connW_d18 | nautilus:discard | CPU 4c | 2000 | 40/40 | -0.007 ± 0.002 | 0.012 | 0.010 | - | - | - | -0.13 ± 0.022 | 0.14 [0.10, 0.18] | 0.00 | 2.92e+05 | 3882 | - | - | - | no: M |
+| connW_d18 | tinyns_v02 | GPU H100 | 500 | 40/40 | +0.205 ± 0.062 | 0.436 | 0.390 | 0.357 | 1.09 | 1.00 | -0.21 ± 0.079 | 0.50 [0.36, 0.61] | 0.00 | 3.14e+06 | 74 | 2.2 | 71.4 | 77 | no: Z |
 | connW_d18 | tinyns_v1 | GPU H100 | 500 | 40/40 | -0.040 ± 0.050 | 0.318 | 0.319 | 0.373 | 0.86 | 1.00 | -0.12 ± 0.075 | 0.47 [0.26, 0.66] | 0.03 | 3.76e+06 | 6 | 2.3 | 3.6 | 12 | yes |
 | connW_d18 | tinyns_v1 | GPU H100 | 1000 | 40/40 | +0.022 ± 0.043 | 0.271 | 0.273 | 0.264 | 1.03 | 1.00 | -0.01 ± 0.011 | 0.07 [0.05, 0.08] | 0.00 | 7.53e+06 | 6 | 2.4 | 3.6 | 12 | yes |
 | connW_d18 | tinyns_v1 | GPU H100 | 2000 | 40/40 | -0.031 ± 0.027 | 0.173 | 0.172 | 0.187 | 0.92 | 1.00 | -0.01 ± 0.006 | 0.03 [0.03, 0.04] | 0.00 | 1.51e+07 | 6 | 2.4 | 3.6 | 12 | yes |
@@ -634,8 +821,11 @@ Hardware (wall times compare only within one label):
 | connW_d32 | blackjax_nss | GPU H100 | 500 | 20/20 | +1.940 ± 0.094 | 1.982 | 0.420 | 0.478 | 0.88 | 0.10 | +1.66 ± 0.090 | 0.39 [0.24, 0.48] | 0.05 | 1.8e+07 | 34 | 1.0 | 32.6 | 36 | no: Z,M |
 | connW_d32 | dynesty | CPU 4c | 500 | 10/10 | +3.532 ± 0.147 | 3.559 | 0.464 | 0.525 | 0.88 | 0.00 | +1.67 ± 0.327 | 1.03 [0.22, 1.57] | 0.00 | 1.12e+07 | 1365 | - | - | - | no: Z,M |
 | connW_d32 | dynesty:rwalk100 | CPU 4c | 500 | 10/10 | +2.475 ± 0.158 | 2.521 | 0.501 | 0.528 | 0.95 | 0.00 | +1.49 ± 0.274 | 0.87 [0.40, 1.07] | 0.00 | 6.05e+06 | 862 | - | - | - | no: Z,M |
+| connW_d32 | jaxns | GPU H100 | 960 | 20/20 | -0.501 ± 0.235 | 1.142 | 1.053 | 0.344 | 3.06 | 0.55 | -0.31 ± 0.338 | 1.22 [0.63, 1.69] | 0.35 | 1.33e+08 | 342 | - | - | 413 | no: M |
+| connW_d32 | jaxns:nlive | GPU H100 | 500 | 20/20 | -1.664 ± 0.456 | 2.591 | 2.038 | 0.478 | 4.27 | 0.35 | +0.41 ± 0.684 | 1.81 [0.57, 2.47] | 0.65 | 7.06e+07 | 195 | - | - | 220 | no: Z,M |
 | connW_d32 | nautilus | CPU 4c | 2000 | 10/10 | -0.222 ± 0.002 | 0.222 | 0.008 | - | - | - | - | - [-, -] | 1.00 | 5.42e+05 | 9645 | - | - | - | no: Z,M |
 | connW_d32 | nautilus:discard | CPU 4c | 2000 | 10/10 | -0.066 ± 0.004 | 0.067 | 0.013 | - | - | - | - | - [-, -] | 1.00 | 5.7e+05 | 9784 | - | - | - | no: M |
+| connW_d32 | tinyns_v02 | GPU H100 | 500 | 20/20 | +0.756 ± 0.095 | 0.863 | 0.427 | 0.476 | 0.90 | 0.95 | +0.92 ± 0.192 | 0.86 [0.38, 1.16] | 0.00 | 9.46e+06 | 198 | 2.3 | 195.4 | 199 | no: Z,M |
 | connW_d32 | tinyns_v1 | GPU H100 | 500 | 20/20 | +0.232 ± 0.102 | 0.501 | 0.455 | 0.495 | 0.92 | 1.00 | -0.11 ± 0.318 | 1.19 [0.70, 1.46] | 0.30 | 1.16e+07 | 10 | 2.4 | 7.9 | 16 | no: M |
 | connW_d32 | tinyns_v1 | GPU H100 | 1000 | 20/20 | +0.110 ± 0.079 | 0.363 | 0.355 | 0.350 | 1.01 | 1.00 | -0.11 ± 0.149 | 0.65 [0.26, 0.90] | 0.05 | 2.31e+07 | 11 | 2.4 | 8.7 | 18 | yes |
 | connW_d32 | tinyns_v1 | GPU H100 | 2000 | 20/20 | +0.018 ± 0.050 | 0.217 | 0.222 | 0.248 | 0.90 | 1.00 | -0.01 ± 0.051 | 0.23 [0.11, 0.30] | 0.00 | 4.64e+07 | 11 | 2.4 | 8.2 | 17 | yes |
@@ -644,9 +834,12 @@ Hardware (wall times compare only within one label):
 | sepM_d10 | blackjax_nss | GPU H100 | 500 | 20/20 | +0.061 ± 0.064 | 0.286 | 0.287 | 0.270 | 1.06 | 1.00 | +0.07 ± 0.254 | 0.88 [0.34, 1.25] | 0.40 | 1.97e+06 | 13 | 1.1 | 12.3 | 17 | no: M |
 | sepM_d10 | dynesty | CPU 4c | 500 | 20/20 | +0.126 ± 0.057 | 0.281 | 0.257 | 0.311 | 0.83 | 1.00 | +0.23 ± 0.293 | 1.02 [0.65, 1.19] | 0.40 | 5.97e+05 | 94 | - | - | - | no: M |
 | sepM_d10 | dynesty:rwalk100 | CPU 4c | 500 | 20/20 | +0.006 ± 0.054 | 0.235 | 0.241 | 0.311 | 0.78 | 1.00 | -0.15 ± 0.270 | 0.97 [0.58, 1.19] | 0.35 | 1.95e+06 | 269 | - | - | - | no: M |
+| sepM_d10 | jaxns | GPU H100 | 300 | 20/20 | +0.058 ± 0.147 | 0.644 | 0.658 | 0.342 | 1.92 | 0.85 | +0.79 ± 0.490 | 1.39 [0.68, 1.84] | 0.60 | 4.57e+06 | 37 | - | - | 65 | no: M |
+| sepM_d10 | jaxns:nlive | GPU H100 | 500 | 20/20 | +0.010 ± 0.068 | 0.297 | 0.304 | 0.266 | 1.14 | 1.00 | +0.42 ± 0.388 | 1.29 [0.75, 1.64] | 0.45 | 7.46e+06 | 56 | - | - | 75 | no: M |
 | sepM_d10 | nautilus | CPU 4c | 2000 | 20/20 | -0.107 ± 0.002 | 0.108 | 0.008 | - | - | - | -2.10 ± - | - [-, -] | 0.95 | 1.34e+05 | 785 | - | - | - | no: Z,M |
 | sepM_d10 | nautilus:discard | CPU 4c | 2000 | 20/20 | -0.061 ± 0.002 | 0.061 | 0.007 | - | - | - | - | - [-, -] | 1.00 | 1.49e+05 | 811 | - | - | - | no: M |
 | sepM_d10 | nautilus:discard [n_live=8000] | CPU 4c | 8000 | 5/5 | -0.004 ± 0.004 | 0.010 | 0.010 | - | - | - | -0.01 ± 0.030 | 0.07 [0.02, 0.08] | 0.00 | 5.55e+05 | 4177 | - | - | - | yes |
+| sepM_d10 | tinyns_v02 | GPU H100 | 500 | 20/20 | +0.157 ± 0.065 | 0.324 | 0.291 | 0.265 | 1.10 | 0.95 | -0.10 ± 0.191 | 0.66 [0.33, 0.93] | 0.40 | 9.93e+05 | 31 | 2.2 | 28.3 | 29 | no: M |
 | sepM_d10 | tinyns_v1 | GPU H100 | 500 | 20/20 | +0.002 ± 0.058 | 0.251 | 0.258 | 0.278 | 0.93 | 1.00 | -0.06 ± 0.262 | 0.74 [0.12, 1.09] | 0.60 | 1.2e+06 | 4 | 2.3 | 1.9 | 10 | no: M |
 | sepM_d10 | tinyns_v1 | GPU H100 | 1000 | 20/20 | -0.020 ± 0.049 | 0.214 | 0.218 | 0.196 | 1.11 | 1.00 | +0.01 ± 0.010 | 0.04 [0.03, 0.05] | 0.05 | 2.42e+06 | 4 | 2.4 | 2.0 | 10 | yes |
 | sepM_d10 | tinyns_v1 | GPU H100 | 2000 | 20/20 | +0.016 ± 0.030 | 0.130 | 0.133 | 0.140 | 0.95 | 1.00 | +0.01 ± 0.007 | 0.03 [0.02, 0.04] | 0.00 | 4.86e+06 | 5 | 2.4 | 2.1 | 10 | yes |
@@ -656,8 +849,11 @@ Hardware (wall times compare only within one label):
 | sepM_d18 | blackjax_nss | GPU H100 | 500 | 40/40 | +0.226 ± 0.061 | 0.442 | 0.385 | 0.364 | 1.06 | 0.97 | +0.64 ± 0.331 | 1.37 [1.02, 1.59] | 0.57 | 6.04e+06 | 18 | 1.3 | 16.9 | 21 | no: Z,M |
 | sepM_d18 | dynesty | CPU 4c | 500 | 40/40 | +0.689 ± 0.076 | 0.837 | 0.480 | 0.407 | 1.18 | 0.88 | +0.41 ± 0.269 | 1.17 [0.79, 1.47] | 0.53 | 1.33e+06 | 200 | - | - | - | no: Z,M |
 | sepM_d18 | dynesty:rwalk100 | CPU 4c | 500 | 40/40 | +0.198 ± 0.070 | 0.480 | 0.443 | 0.410 | 1.08 | 0.97 | +0.41 ± 0.260 | 1.35 [1.07, 1.54] | 0.33 | 3.5e+06 | 489 | - | - | - | no: M |
+| sepM_d18 | jaxns | GPU H100 | 540 | 40/40 | -0.274 ± 0.153 | 0.993 | 0.967 | 0.344 | 2.81 | 0.68 | +0.12 ± 0.518 | 1.46 [0.54, 1.72] | 0.80 | 2.52e+07 | 105 | - | - | 132 | no: M |
+| sepM_d18 | jaxns:nlive | GPU H100 | 500 | 40/40 | -0.481 ± 0.163 | 1.127 | 1.032 | 0.357 | 2.89 | 0.68 | -0.40 ± 0.419 | 1.39 [0.74, 1.81] | 0.72 | 2.36e+07 | 99 | - | - | 120 | no: M |
 | sepM_d18 | nautilus | CPU 4c | 2000 | 40/40 | -0.142 ± 0.001 | 0.143 | 0.005 | - | - | - | - | - [-, -] | 1.00 | 2.38e+05 | 1993 | - | - | - | no: Z,M |
 | sepM_d18 | nautilus:discard | CPU 4c | 2000 | 40/40 | -0.061 ± 0.001 | 0.062 | 0.008 | - | - | - | - | - [-, -] | 1.00 | 2.58e+05 | 2059 | - | - | - | no: M |
+| sepM_d18 | tinyns_v02 | GPU H100 | 500 | 40/40 | +0.124 ± 0.052 | 0.346 | 0.326 | 0.357 | 0.91 | 1.00 | +0.65 ± 0.199 | 0.82 [0.41, 1.15] | 0.57 | 3.11e+06 | 71 | 2.2 | 68.7 | 72 | no: M |
 | sepM_d18 | tinyns_v1 | GPU H100 | 500 | 40/40 | +0.028 ± 0.075 | 0.468 | 0.473 | 0.373 | 1.27 | 1.00 | +0.02 ± 0.300 | 1.08 [0.56, 1.36] | 0.68 | 3.76e+06 | 6 | 2.3 | 3.3 | 12 | no: M |
 | sepM_d18 | tinyns_v1 | GPU H100 | 1000 | 40/40 | -0.023 ± 0.048 | 0.301 | 0.304 | 0.264 | 1.15 | 1.00 | -0.16 ± 0.070 | 0.40 [0.11, 0.58] | 0.20 | 7.54e+06 | 6 | 2.4 | 4.0 | 12 | no: M |
 | sepM_d18 | tinyns_v1 | GPU H100 | 2000 | 40/40 | -0.014 ± 0.033 | 0.204 | 0.206 | 0.187 | 1.10 | 1.00 | -0.01 ± 0.004 | 0.03 [0.02, 0.03] | 0.00 | 1.51e+07 | 6 | 2.4 | 4.1 | 13 | yes |
@@ -666,8 +862,11 @@ Hardware (wall times compare only within one label):
 | sepM_d32 | blackjax_nss | GPU H100 | 500 | 40/40 | +1.449 ± 0.128 | 1.656 | 0.812 | 0.485 | 1.67 | 0.55 | +2.68 ± 0.145 | 0.58 [0.26, 0.78] | 0.60 | 1.84e+07 | 34 | 1.0 | 32.6 | 37 | no: Z,M |
 | sepM_d32 | dynesty | CPU 4c | 500 | 10/10 | +3.398 ± 0.357 | 3.562 | 1.128 | 0.529 | 2.13 | 0.00 | +2.95 ± 0.216 | 0.53 [0.15, 0.71] | 0.40 | 1.13e+07 | 1372 | - | - | - | no: Z,M |
 | sepM_d32 | dynesty:rwalk100 | CPU 4c | 500 | 10/10 | +1.699 ± 0.273 | 1.886 | 0.863 | 0.529 | 1.63 | 0.50 | +1.57 ± 1.095 | 2.19 [-, -] | 0.60 | 6.12e+06 | 827 | - | - | - | no: Z,M |
+| sepM_d32 | jaxns | GPU H100 | 960 | 40/40 | -0.724 ± 0.220 | 1.554 | 1.392 | 0.344 | 4.04 | 0.53 | +0.93 ± 0.638 | 1.69 [0.68, 2.18] | 0.82 | 1.34e+08 | 346 | - | - | 376 | no: Z,M |
+| sepM_d32 | jaxns:nlive | GPU H100 | 500 | 40/40 | -1.107 ± 0.286 | 2.102 | 1.810 | 0.477 | 3.80 | 0.55 | +4.64 ± - | - [-, -] | 0.97 | 7.19e+07 | 196 | - | - | 222 | no: Z,M |
 | sepM_d32 | nautilus | CPU 4c | 2000 | 10/10 | -0.216 ± 0.002 | 0.216 | 0.006 | - | - | - | - | - [-, -] | 1.00 | 4.81e+05 | 5671 | - | - | - | no: Z,M |
 | sepM_d32 | nautilus:discard | CPU 4c | 2000 | 10/10 | -0.061 ± 0.003 | 0.062 | 0.009 | - | - | - | - | - [-, -] | 1.00 | 5.09e+05 | 5579 | - | - | - | no: M |
+| sepM_d32 | tinyns_v02 | GPU H100 | 500 | 40/40 | +0.397 ± 0.075 | 0.616 | 0.477 | 0.477 | 1.00 | 1.00 | +1.78 ± 0.237 | 0.89 [0.29, 1.27] | 0.65 | 9.35e+06 | 198 | 2.2 | 196.1 | 200 | no: Z,M |
 | sepM_d32 | tinyns_v1 | GPU H100 | 500 | 40/40 | +0.148 ± 0.094 | 0.605 | 0.594 | 0.495 | 1.20 | 1.00 | +0.51 ± 0.427 | 1.48 [0.51, 1.82] | 0.70 | 1.15e+07 | 9 | 2.4 | 6.5 | 16 | no: M |
 | sepM_d32 | tinyns_v1 | GPU H100 | 1000 | 40/40 | -0.032 ± 0.046 | 0.286 | 0.288 | 0.351 | 0.82 | 1.00 | +0.26 ± 0.200 | 0.85 [0.50, 1.11] | 0.55 | 2.32e+07 | 10 | 2.4 | 8.1 | 18 | no: M |
 | sepM_d32 | tinyns_v1 | GPU H100 | 2000 | 40/40 | -0.002 ± 0.037 | 0.233 | 0.236 | 0.249 | 0.95 | 1.00 | -0.01 ± 0.063 | 0.34 [0.03, 0.54] | 0.28 | 4.64e+07 | 12 | 2.3 | 9.2 | 17 | no: M |
@@ -676,12 +875,14 @@ Hardware (wall times compare only within one label):
 | mix3_d10 | blackjax_nss | GPU H100 | 500 | 40/40 | +0.168 ± 0.043 | 0.315 | 0.269 | 0.270 | 1.00 | 1.00 | -0.21 ± 0.140 | 0.87 [0.70, 1.01] | 0.12 | 1.95e+06 | 13 | 1.1 | 12.3 | 16 | no: Z,M |
 | mix3_d10 | dynesty | CPU 4c | 500 | 40/40 | +0.132 ± 0.040 | 0.281 | 0.251 | 0.311 | 0.81 | 1.00 | -0.12 ± 0.151 | 0.93 [0.73, 1.10] | 0.10 | 5.9e+05 | 91 | - | - | - | no: Z |
 | mix3_d10 | dynesty:rwalk100 | CPU 4c | 500 | 40/40 | +0.036 ± 0.044 | 0.278 | 0.279 | 0.311 | 0.90 | 1.00 | -0.35 ± 0.097 | 0.61 [0.50, 0.71] | 0.03 | 1.93e+06 | 266 | - | - | - | no: M |
+| mix3_d10 | jaxns | GPU H100 | 300 | 40/40 | -0.309 ± 0.098 | 0.686 | 0.620 | 0.341 | 1.82 | 0.82 | -0.04 ± 0.270 | 1.40 [1.05, 1.67] | 0.45 | 4.55e+06 | 38 | - | - | 53 | no: Z,M |
+| mix3_d10 | jaxns:nlive | GPU H100 | 500 | 40/40 | -0.100 ± 0.079 | 0.504 | 0.501 | 0.264 | 1.89 | 0.88 | -0.16 ± 0.165 | 1.02 [0.82, 1.18] | 0.25 | 7.42e+06 | 54 | - | - | 76 | no: M |
 | mix3_d10 | nautilus | CPU 4c | 2000 | 40/40 | -0.057 ± 0.001 | 0.058 | 0.007 | - | - | - | -0.01 ± 0.003 | 0.02 [0.01, 0.02] | 0.00 | 1.48e+05 | 1507 | - | - | - | yes |
 | mix3_d10 | nautilus:discard | CPU 4c | 2000 | 40/40 | -0.000 ± 0.001 | 0.008 | 0.008 | - | - | - | -0.00 ± 0.005 | 0.03 [0.02, 0.04] | 0.00 | 1.65e+05 | 1543 | - | - | - | yes |
+| mix3_d10 | tinyns_v02 | GPU H100 | 500 | 40/40 | +0.068 ± 0.038 | 0.248 | 0.241 | 0.264 | 0.91 | 1.00 | -0.02 ± 0.012 | 0.08 [0.06, 0.09] | 0.00 | 9.83e+05 | 35 | 2.2 | 32.3 | 38 | yes |
 | mix3_d10 | tinyns_v1 | GPU H100 | 500 | 40/40 | +0.062 ± 0.035 | 0.226 | 0.220 | 0.277 | 0.79 | 1.00 | -0.02 ± 0.009 | 0.06 [0.05, 0.07] | 0.00 | 1.19e+06 | 4 | 2.4 | 2.0 | 10 | yes |
 | mix3_d10 | tinyns_v1 | GPU H100 | 1000 | 40/40 | -0.011 ± 0.026 | 0.160 | 0.162 | 0.196 | 0.83 | 1.00 | -0.02 ± 0.008 | 0.05 [0.04, 0.06] | 0.00 | 2.4e+06 | 4 | 2.4 | 2.1 | 11 | yes |
 | mix3_d10 | tinyns_v1 | GPU H100 | 2000 | 40/40 | -0.013 ± 0.019 | 0.122 | 0.122 | 0.139 | 0.88 | 1.00 | -0.00 ± 0.004 | 0.03 [0.02, 0.03] | 0.00 | 4.79e+06 | 5 | 2.4 | 2.3 | 11 | yes |
 | mix3_d10 | tinyns_v1 | GPU H100 | 4000 | 40/40 | -0.001 ± 0.013 | 0.084 | 0.085 | 0.099 | 0.86 | 1.00 | +0.00 ± 0.003 | 0.02 [0.01, 0.02] | 0.00 | 9.6e+06 | 5 | 2.4 | 2.6 | 11 | yes |
 | mix3_d10 | ultranest | CPU 4c | >=500 | 0/40 (40T 0E) | - | - | - | - | - | - | - | - | - | - | >14405 | - | - | - | no: T |
 | mix3_d10 | ultranest:slice | CPU 4c | >=500 | 10/10 | +0.085 ± 0.089 | 0.279 | 0.280 | 0.356 | 0.79 | 1.00 | +0.15 ± 0.181 | 0.54 [0.27, 0.65] | 0.10 | 1.82e+06 | 263 | - | - | - | yes |
-

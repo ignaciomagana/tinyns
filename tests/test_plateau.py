@@ -140,10 +140,11 @@ def test_finite_plateau() -> None:
     # median is the test.
     first = [r.insertion_test()["windows"][0]["pvalue"] for r in batch]
     assert np.median(first) > 0.05 and min(first) > 1e-8, first
-    # logzerr misses the uncertainty of the plateau's volume; the bootstrap,
-    # which draws every shrinkage, has it (0.36 against a scatter of 0.35).
+    # logzerr counts the uncertainty of the plateau's volume, as the
+    # bootstrap does (0.36 against a scatter of 0.35); the sum of information
+    # increments missed it (0.09).
     ratio = [r.logz_bootstrap(n_realizations=200).logzerr / r.logzerr for r in batch]
-    assert np.median(ratio) > 2, ratio
+    assert 0.7 < np.median(ratio) < 1.4, ratio
 
 
 def test_no_plateau_control() -> None:
@@ -172,7 +173,7 @@ def test_functional_core_carries_the_tie_bookkeeping() -> None:
     cfg = Config(D, m, num_delete=k, walks=20)
     loglike = LOGLIKES["inf"]
     state = init(3, loglike, identity, cfg)
-    assert np.isnan(state.lstar_prev) and int(state.tie_run) == 0
+    assert float(state.lstar_prev) == -np.inf and int(state.tie_run) == 0
     rows = []
     while float(core.delta_logz(state, cfg)) > 0.1:
         state, dead = step(state, loglike, identity, cfg)
@@ -206,3 +207,62 @@ def test_ties_under_vmap() -> None:
         tied.append(int(np.sum(nlive < m - k)))
         assert lane.success
     assert min(tied) > 0 and len(set(tied)) > 1, tied
+
+
+def disc(area):
+    """L = 1 on a disc of ``area`` at the centre of the 2-D cube, 0 elsewhere."""
+    r2 = area / math.pi
+
+    def loglike(u):
+        return jnp.where(jnp.sum((u - 0.5) ** 2) < r2, 0.0, -jnp.inf)
+
+    return loglike
+
+
+def test_indicator_likelihood_ends_on_its_plateau_unbiased() -> None:
+    """An indicator likelihood ends on its plateau: the step that would delete
+    the last r < k points at L = 0 reaches L* = 1 and finds nothing above it,
+    so they stay live, tied at the last contour. They count on from the tied
+    deaths (they were counted at m, m-1, ...: logZ +0.130 +- 0.004 here, a
+    bias that grows as the area shrinks), and logzerr, which was 0, is
+    sqrt(sum 1 / n^2) over the tied counts n, close to the binomial sd
+    sqrt((1 - V) / (m V)) of the volume estimate."""
+    area, m = 0.25, 1000
+    batch = NestedSampler(disc(area), identity, 2, m).run(
+        jax.random.split(jax.random.key(4), 16)
+    )
+    err = np.array([r.logz for r in batch]) - math.log(area)
+    binomial = math.sqrt((1 - area) / (m * area))
+    se = binomial / math.sqrt(len(err))  # known: steadier than the sample se
+    assert abs(err.mean()) < 3.5 * se, (err.mean(), se)
+    for r in batch:
+        assert r.metadata["status"] == "plateau" and r.success
+        q = int(np.sum(np.isneginf(np.asarray(r.logl))))
+        assert 0 < q - r.niter < r.num_delete  # tied points left live
+        # The q tied deaths, dead rows and live points, count at m, ..., m-q+1.
+        n = m - np.arange(q)
+        np.testing.assert_array_equal(np.asarray(r.nlive_i)[:q], n)
+        assert r.logzerr == pytest.approx(math.sqrt(np.sum(1.0 / n**2)), rel=1e-9)
+    # q is random: the mean logzerr has a relative sd of about 0.01 here.
+    assert np.mean([r.logzerr for r in batch]) == pytest.approx(binomial, rel=0.05)
+    assert 0.5 < err.std(ddof=1) / binomial < 1.8
+    # Stopped by maxiter during the tie run: the same counts.
+    r = NestedSampler(disc(area), identity, 2, m).run(1, maxiter=300)
+    assert r.metadata["status"] == "maxiter" and r.niter == 300
+    q = int(np.sum(np.isneginf(np.asarray(r.logl))))
+    np.testing.assert_array_equal(np.asarray(r.nlive_i)[:q], m - np.arange(q))
+
+
+def test_plateau_stop_is_not_an_early_stop_in_the_diagnostics() -> None:
+    """A run that ends on a plateau stopped where it should: no advice to
+    tighten dlogz (which does not change it), no warning on the weight of
+    the final live points (they are the plateau), and one note with the
+    plateau's posterior mass."""
+    r = NestedSampler(disc(0.25), identity, 2, 200).run(5)
+    assert r.metadata["status"] == "plateau"
+    assert r.metadata["final_delta_logz"] > r.metadata["dlogz"]
+    warnings = r.diagnostics()["warnings"]
+    stopping = ("consider tighter dlogz", "final-live", "final_delta_logz")
+    assert not any(text in w for w in warnings for text in stopping), warnings
+    (note,) = [w for w in warnings if "plateau" in w]
+    assert note.startswith("the run ended on a likelihood plateau, which holds 1 ")

@@ -23,6 +23,11 @@ def numpy_callables(target, vectorized: bool):
     both take an (n, d) batch. The prior transform is the target's affine map
     in numpy; the likelihood is the target's JAX function, jitted (and vmapped
     for batches).
+
+    A jitted function compiles once per input shape, and the samplers ask for
+    batches of many sizes (UltraNest's MLFriends 56 to 59 in one run), so a
+    batch is padded to the next power of two with copies of its first row
+    and the padding is sliced off: at most ``log2(n) + 1`` compiles.
     """
     import jax
 
@@ -30,7 +35,12 @@ def numpy_callables(target, vectorized: bool):
         f = jax.jit(jax.vmap(target.loglike))
 
         def loglike(x):
-            return np.asarray(f(np.atleast_2d(x)), dtype=float)
+            x = np.atleast_2d(x)
+            n = len(x)
+            size = 1 << max(n - 1, 0).bit_length()
+            if size > n:
+                x = np.concatenate([x, np.repeat(x[:1], size - n, axis=0)])
+            return np.asarray(f(x), dtype=float)[:n]
 
         def prior_transform(u):
             return target.prior_transform_np(np.atleast_2d(u))

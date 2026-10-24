@@ -80,6 +80,9 @@ def parse_opts(items: list[str]) -> dict:
 
 
 def git_sha() -> str | None:
+    """HEAD of this checkout, plus ``-dirty`` when a tracked file of the
+    sampler or the harness (``src``, ``bench``, ``pyproject.toml``) differs
+    from it; untracked files do not count. None outside a git checkout."""
     try:
         sha = subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -88,9 +91,11 @@ def git_sha() -> str | None:
             check=True,
         ).stdout.strip()
         dirty = subprocess.run(
-            ["git", "-C", str(ROOT), "status", "--porcelain", "bench"],
+            ["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no",
+             "--", "src", "bench", "pyproject.toml"],
             capture_output=True,
             text=True,
+            check=True,
         ).stdout.strip()
         return sha + ("-dirty" if dirty else "")
     except (OSError, subprocess.CalledProcessError):

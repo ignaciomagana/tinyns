@@ -6,6 +6,15 @@ likelihood. Variants: ``default`` (all JAXNS defaults: ``30 * ndim`` root
 chains, ``5 * ndim`` slices per chain, stop at ``dlogZ = log1p(1e-3)``) and
 ``nlive`` (``root_allocation_degree = nlive``). ``logz``/``logzerr`` are the
 classic ``log_Z_mean``/``log_Z_uncert``; weights are ``log_dp``.
+
+The CLI ``--dlogz`` is not passed. JAXNS's ``DepthCondition(dlogZ)`` is not a
+log-evidence remainder but a remaining-evidence fraction, ``L_g X_g / (Z_g +
+L_g X_g)`` at the contour ``L_g``, and its default ``1e-3`` stops later than
+tinyns's ``dlogz = 0.1`` (``Z_live`` from the highest live likelihood) in low
+dimensions: about 1.5 times the calls at d = 2 (1.0 to 2.4 per seed), 1.2 to
+1.3 at d = 4 to 8 and under 10% more from d = 16, with the same logZ and
+logzerr. A fraction of ``1 - exp(-0.1)`` is not the match either: at the
+contour likelihood it stops earlier than tinyns from d = 8.
 """
 
 from __future__ import annotations

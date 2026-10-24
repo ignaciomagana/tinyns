@@ -6,8 +6,9 @@
 A cell is one (sampler, target, nlive); a sampler run with ``--opt`` settings is
 its own sampler, labelled ``name [key=value]``. A repeated seed keeps its last
 record. ``--sha SAMPLER=SHA`` keeps only the records of that sampler that were
-written at that commit (``git_sha``), so runs of an older build of the sampler
-do not enter the table. The report has four parts.
+written at that commit (``git_sha``) from an unmodified checkout, so runs of an
+older or a modified build of the sampler do not enter the table (``SHA-dirty``
+keeps those of a modified one). The report has four parts.
 
 **Cells**, one row each:
 
@@ -48,8 +49,9 @@ A sampler that ran at several ``nlive`` has one row for each.
 
 **Headline** (only when ``--reference``, default ``tinyns_v1``, has records):
 per family, each competitor's calls, wall time, rms and logit sd relative to the
-reference (geometric means over the targets where both are accurate), the same
-costs at equal rms, and the reference's rank by those (``headline``).
+reference (geometric means over the reference cells where both are accurate:
+a target counts once per ``nlive`` the reference ran it at), the same costs at
+equal rms, and the reference's rank by those (``headline``).
 ``--reference-nlive 500,1000`` keeps the headline to the reference's cells at
 those ``nlive``, when it also ran at values no competitor ran at.
 """
@@ -99,12 +101,23 @@ def parse_sha(items) -> dict:
     return out
 
 
+def sha_matches(recorded: str | None, want: str) -> bool:
+    """Whether a record's ``git_sha`` is the commit ``want``, a prefix of its
+    hash as git abbreviates it. A record written from a modified checkout
+    (``<sha>-dirty``, :func:`bench.run.git_sha`) matches only a ``want`` that
+    ends in ``-dirty`` too, and a clean one only a ``want`` that does not."""
+    sha, _, dirty = (recorded or "").partition("-")
+    want_sha, _, want_dirty = want.partition("-")
+    return bool(want_sha) and sha.startswith(want_sha) and dirty == want_dirty
+
+
 def load(paths, sha=None, dropped=None):
     """{(sampler label, target, cli nlive): [records]} from JSONL files.
 
     ``sha`` maps a sampler name (the spec without its variant) to a commit
-    prefix: a record of that sampler with another ``git_sha`` is left out,
-    and counted in ``dropped`` (a dict, sampler -> records) when one is given.
+    (:func:`sha_matches`): a record of that sampler with another ``git_sha``
+    is left out, and counted in ``dropped`` (a dict, sampler -> records) when
+    one is given.
     """
     recs = {}
     sha = sha or {}
@@ -118,7 +131,7 @@ def load(paths, sha=None, dropped=None):
                 if r.get("schema") != "tinyns-bench-1":
                     continue
                 want = sha.get(r["sampler"].split(":")[0])
-                if want and not (r.get("git_sha") or "").startswith(want):
+                if want and not sha_matches(r.get("git_sha"), want):
                     if dropped is not None:
                         dropped[r["sampler"]] = dropped.get(r["sampler"], 0) + 1
                     continue
@@ -447,8 +460,11 @@ def headline(rows, reference: str, nlive=None):
 
     A reference cell pairs with the competitor's cell of the same target (of
     the nearest ``nlive`` when there are several). ``common`` counts the
-    targets where both are accurate, out of those both ran. The ratios are
-    competitor / reference, as geometric means over the common targets:
+    reference cells where both are accurate, out of the ``ran`` reference
+    cells the competitor has a target for. These are cells, not targets: with
+    the reference at two ``nlive`` a target counts twice, and pairs twice
+    with the same competitor cell. The ratios are competitor / reference, as
+    geometric means over the common cells:
 
     ``ncall``, ``wall_s``   as run. Above 1: the reference is cheaper.
     ``rms``, ``logit_sd``   above 1: the reference is more precise.
@@ -543,12 +559,14 @@ def headline_markdown(rows, reference: str, nlive=None) -> str:
         )
     out += [
         "",
-        f"Competitor / `{reference}`, geometric mean over the common accurate "
-        f"targets. Above 1: `{reference}` needs fewer calls or less time, or has "
-        "the smaller rms or logit sd. `at equal rms` is the cost ratio times "
-        "the squared rms ratio (cost taken to go as 1 / rms^2). Wall times "
-        "compare across hardware labels only as measured.\n",
-        "| family | competitor | hw | common / ran | calls | wall time | rms "
+        f"Competitor / `{reference}`, geometric mean over the `{reference}` "
+        "cells of the family where both are accurate (`common`, out of the "
+        "`ran` cells whose target the competitor ran; a target counts once per "
+        f"`{reference}` nlive). Above 1: `{reference}` needs fewer calls or less "
+        "time, or has the smaller rms or logit sd. `at equal rms` is the cost "
+        "ratio times the squared rms ratio (cost taken to go as 1 / rms^2). "
+        "Wall times compare across hardware labels only as measured.\n",
+        "| family | competitor | hw | common / ran cells | calls | wall time | rms "
         "| calls at equal rms | wall time at equal rms | logit sd |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -598,7 +616,11 @@ def samplers_markdown(groups) -> str:
     for s in sorted(by):
         recs = by[s]
         vers = {(r.get("sampler_version") or "").split(" (")[0] for r in recs}
-        shas = {(r.get("git_sha") or "?")[:7] for r in recs}
+        shas = {
+            (r.get("git_sha") or "?")[:7]
+            + ("-dirty" if (r.get("git_sha") or "").endswith("-dirty") else "")
+            for r in recs
+        }
         cells = sum(k[0] == s for k in groups)
         out.append(
             f"| {s} | {', '.join(sorted(vers - {''})) or '-'} "

@@ -4,11 +4,24 @@
                          num_delete=None, walks=None).run(key, dlogz=...)
 
 Defaults resolve in ``Config``: ``num_delete = max(1, nlive // 10)`` chains run
-vmapped per step, ``walks = max(25, 6 * ndim)`` steps each. ``ncall`` counts
-every evaluation, including out-of-cube lanes that the vmapped chains accept
-and waste; ``metadata["ncall_valid"]`` counts only the in-cube ones.
-``compile_s`` is ``metadata["compile_s"]``: v1 compiles its kernel in a
-zero-step chunk and times it apart (it is inside ``wall_s``).
+vmapped per step, ``walks = max(25, 6 * ndim, ndim**2 // 6)`` steps each
+(``tinyns.core.default_walks``). ``ncall`` counts every likelihood
+evaluation. The vmapped chains (``num_delete > 1``) evaluate every proposal,
+also those rejected without the likelihood (an out-of-cube one at the
+chain's point), and waste those calls; ``metadata["ncall_valid"]`` counts
+only the proposals that pass the likelihood-free tests (inside the cube and,
+for a local-walk or hop step, its Hastings test; ``tinyns.core.State``).
+With ``num_delete = 1`` (variant ``k1``) the other proposals skip the
+likelihood, so the two counts are equal.
+
+``compile_s`` is the time of a one-step warm-up run (``maxiter = num_delete``)
+of the same sampler before the timed one, plus the timed run's
+``metadata["compile_s"]``. The warm-up compiles, or loads from the persistent
+cache, every program of the run: the init and step kernels, the prior map of
+``finalise`` and the small eager ops of the driver; ``metadata["compile_s"]``
+alone covers only the step kernel. The warm-up's own work (one init, one
+step) is a small part of it. Both runs are inside ``wall_s``; the timed run's
+own wall time is ``config["run_wall_s"]``.
 
 This adapter ignores ``TINYNS_V02_SRC``; only ``tinyns_v02`` reads it. Within a
 single Python process the first adapter to import ``tinyns`` decides which
@@ -55,8 +68,12 @@ def run(target, seed, cfg):
     sampler = tinyns.NestedSampler(
         target.loglike, target.prior_transform, target.ndim, cfg["nlive"], **kw
     )
+    key = jax.random.PRNGKey(seed)
     with Timer() as t:
-        res = sampler.run(jax.random.PRNGKey(seed), dlogz=cfg["dlogz"], **run_kw)
+        with Timer() as warm:
+            sampler.run(key, dlogz=cfg["dlogz"], maxiter=sampler.config.num_delete)
+        with Timer() as timed:
+            res = sampler.run(key, dlogz=cfg["dlogz"], **run_kw)
     meta = res.metadata or {}
     conf = getattr(sampler, "config", None)
     ncv = meta.get("ncall_valid")
@@ -68,7 +85,7 @@ def run(target, seed, cfg):
         ncall=int(res.ncall),
         ncall_valid=None if ncv is None else int(ncv),
         wall_s=t.s,
-        compile_s=meta.get("compile_s"),
+        compile_s=warm.s + meta.get("compile_s", 0.0),
         sampler_version=f"tinyns {tinyns.__version__} ({tinyns.__file__})",
         config=dict(
             nlive=cfg["nlive"],
@@ -80,5 +97,7 @@ def run(target, seed, cfg):
             niter=int(res.niter),
             success=bool(res.success),
             message=res.message,
+            warmup_s=warm.s,
+            run_wall_s=timed.s,
         ),
     )

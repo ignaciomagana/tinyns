@@ -1,19 +1,24 @@
 [build-system]
-requires = ["hatchling"]
+# 1.27 is the first hatchling with SPDX license expressions (PEP 639).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "tinyns"
-version = "1.0.0"
+# The single source of the version is `__version__` in src/tinyns/__init__.py.
+dynamic = ["version"]
 description = "A tiny, fast, general-purpose nested sampler in JAX."
 keywords = ["nested-sampling", "jax", "gpu", "bayesian-inference", "evidence", "monte-carlo"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Topic :: Scientific/Engineering",
   "Topic :: Scientific/Engineering :: Astronomy",
   "Topic :: Scientific/Engineering :: Mathematics",
@@ -21,13 +26,14 @@ classifiers = [
 ]
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "tinyns contributors" },
 ]
+# jax pulls the matching jaxlib itself.
 dependencies = [
   "jax>=0.4.31",
-  "jaxlib",
   "numpy",
 ]
 
@@ -43,8 +49,29 @@ dev = [
   "ruff",
 ]
 
+[tool.hatch.version]
+path = "src/tinyns/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/tinyns"]
+
+[tool.hatch.build.targets.sdist]
+# An explicit list of top-level paths: a build from a working tree leaves out
+# the rest of it (agent worktrees under .claude/, run outputs at the root). An
+# untracked file inside these paths still ships unless .gitignore covers it;
+# `make dist` builds from `git archive HEAD`, so none does. The tests, bench/
+# and the examples ship, so the suite runs from the sdist against an installed
+# wheel.
+only-include = [
+  "src",
+  "tests",
+  "bench",
+  "examples",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "bench/tests"]

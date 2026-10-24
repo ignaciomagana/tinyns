@@ -14,6 +14,7 @@ from bench.targets import (
     EGG_LOGZ,
     FUNNEL_LOGZ,
     ROSEN_LOGZ,
+    _trapezoid,
     eggbox_logz_quadrature,
     funnel_logz_quadrature,
     get_target,
@@ -30,14 +31,15 @@ def _grid_logz(target, n=1501):
     pts = np.stack([X.ravel(), Y.ravel()], axis=1)
     ll = np.asarray(jax.jit(jax.vmap(target.loglike))(pts), float).reshape(n, n)
     m = ll.max()
-    z = np.trapezoid(np.trapezoid(np.exp(ll - m), xs[1], axis=1), xs[0])
+    z = _trapezoid(_trapezoid(np.exp(ll - m), xs[1], axis=1), xs[0])
     return m + math.log(z) - target.log_prior_volume
 
 
 def test_every_bench_target_builds():
     import jax
+    from bench.validate import CASES
 
-    for name in BENCH_TARGETS:
+    for name in sorted(set(BENCH_TARGETS) | set(CASES)):
         t = get_target(name)
         x = t.prior_transform_np(np.full(t.ndim, 0.5))
         assert np.isfinite(float(jax.jit(t.loglike)(x))), name
@@ -46,6 +48,16 @@ def test_every_bench_target_builds():
             assert abs(sum(t.mode_mass) - 1.0) < 1e-9, name
             r = np.asarray(t.responsibility(x))
             assert r.shape == (len(t.mode_mass),) and abs(r.sum() - 1.0) < 1e-5, name
+
+
+def test_a_target_keeps_one_prior_transform():
+    """``target.prior_transform`` was a new bound method at every access, so
+    each new ``NestedSampler`` on it compiled its kernels again (tinyns
+    caches them on a callable's identity)."""
+    t = get_target("gauss_d2")
+    assert t.prior_transform is t.prior_transform
+    x = np.asarray(t.prior_transform(np.full(2, 0.25)))
+    np.testing.assert_allclose(x, t.prior_transform_np(np.full(2, 0.25)))
 
 
 @pytest.mark.parametrize("name", ["gauss_d2", "loggamma_d2", "rosen_d2"])
@@ -120,19 +132,66 @@ def test_cauchy_evidence_and_mode_masses_are_exact():
     assert np.all(np.abs(r.mean(axis=0) - np.array(t.mode_mass)) < 5 * se + 1e-4)
 
 
+def test_mixture_targets_have_four_dimensions():
+    for name in ("sepW_d6", "sepWtw_d8", "needle_d6", "connMbox_d20"):
+        with pytest.raises(ValueError, match=r"d in \[4, 10, 18, 32\]"):
+            get_target(name)
+
+
+def test_box_mixture_is_the_cube_mixture_in_other_coordinates():
+    """``sepWbox_d4`` has the prior box ``BOX``, and its likelihood and
+    responsibility at x are those of ``sepW_d4`` at u = (x - lo) / (hi - lo)."""
+    import jax
+    from bench.targets import BOX, mixture_spec
+
+    cube, box = get_target("sepW_d4"), get_target("sepWbox_d4")
+    assert np.all(box.lo == BOX[0]) and np.all(box.hi == BOX[1])
+    assert box.logz == cube.logz == 0.0 and box.mode_mass == cube.mode_mass
+    spec = mixture_spec("sepW_d4")
+    rng = np.random.default_rng(0)
+    u = np.concatenate([rng.multivariate_normal(mu, cov, 32)
+                        for mu, cov in zip(spec["means"], spec["covs"], strict=True)])
+    x = box.prior_transform_np(u)
+    for f in ("loglike", "responsibility"):
+        a = np.asarray(jax.vmap(getattr(cube, f))(u), float)
+        b = np.asarray(jax.vmap(getattr(box, f))(x), float)
+        assert np.allclose(a, b, rtol=1e-4, atol=1e-4), f
+
+
+def test_ndtri_target_logz_matches_quadrature():
+    """The coordinates are independent: the 1-D evidence by quadrature of the
+    target's own likelihood in the unit cube, ndtri included."""
+    import jax
+
+    one = get_target("ndtri_d1")
+    u = np.linspace(0.0, 1.0, 400001)[1:-1]
+    ll = np.asarray(jax.jit(jax.vmap(one.loglike))(u[:, None]), float)
+    m = ll.max()
+    assert abs(m + math.log(_trapezoid(np.exp(ll - m), u)) - one.logz) < 1e-4
+    assert get_target("ndtri_d6").logz == pytest.approx(6 * one.logz, rel=1e-12)
+
+
 DEFAULT_SPECS = sorted(adapters.REGISTRY)
 
 
 @pytest.mark.parametrize("name", DEFAULT_SPECS)
 def test_adapter_on_2d_gaussian(name):
-    reason = adapters.unavailable_reason(name)
-    if reason:
-        pytest.skip(reason)
-    t = get_target("gauss_d2")
-    opts = {"n_live": "200"} if name == "nautilus" else {}
-    out = adapters.load(name).run(
-        t, 0, dict(nlive=100, dlogz=0.1, variant="default", opts=opts)
-    )
+    import jax
+
+    # jaxns turns x64 on when it is imported (by unavailable_reason, too): the
+    # tests after this one must run in the x64 mode of the session.
+    x64 = jax.config.jax_enable_x64
+    try:
+        reason = adapters.unavailable_reason(name)
+        if reason:
+            pytest.skip(reason)
+        t = get_target("gauss_d2")
+        opts = {"n_live": "200"} if name == "nautilus" else {}
+        out = adapters.load(name).run(
+            t, 0, dict(nlive=100, dlogz=0.1, variant="default", opts=opts)
+        )
+    finally:
+        jax.config.update("jax_enable_x64", x64)
     for key in ("samples", "logz", "ncall", "wall_s", "sampler_version"):
         assert key in out
     assert out["samples"].shape[1] == 2 and out["ncall"] > 0
@@ -423,10 +482,18 @@ def test_validation_gate_criteria():
     assert validate.judge(dict(good, scat_over_err=1.5, seeds=400)) == ["scatter"]
     assert validate.judge(dict(good, unresolved=1)) == ["flags"]
     assert validate.judge(dict(good, not_converged=1)) == ["flags"]
+    assert validate.judge(dict(good, post_t=3.9, post_bound=4.4)) == []
+    assert validate.judge(dict(good, post_t=4.5, post_bound=4.4)) == ["posterior"]
     modes = dict(good, lost=0.0, logit_z=1.0, logit_sd=0.1)
     assert validate.judge(modes) == []
-    for bad in (dict(lost=0.1), dict(logit_z=3.5), dict(logit_sd=0.5)):
+    for bad in (dict(lost=0.1), dict(logit_z=3.5), dict(logit_sd=0.5),
+                dict(max_logit_sd=0.08)):
         assert validate.judge(dict(modes, **bad)) == ["modes"]
+    # the hop: tried and accepting in at least 90% of the runs
+    hop = dict(modes, hop_acceptance=[0.7] * 15 + [None])
+    assert validate.judge(hop) == []
+    two_low = [0.7] * 14 + [0.01, None]
+    assert validate.judge(dict(hop, hop_acceptance=two_low)) == ["hop"]
     # the mode count: at most 10% of the runs may be wrong
     counted = dict(good, modes_min=4, modes_max=4, nmodes=[4] * 15 + [3],
                    lower_bound=[False] * 16)
@@ -444,23 +511,230 @@ def test_validation_gate_criteria():
     assert validate.judge(lobe) == []
     assert validate.judge(dict(lobe, small_mode=False)) == ["flags"]
     # every case names a target, and the quick tier is a subset of the full one
-    for name, (quick, full, _, modes) in validate.CASES.items():
-        assert get_target(name).logz is not None and full is not None
-        assert quick is None or quick <= full
-        assert 1 <= modes[0] <= modes[1]
+    for name, case in validate.CASES.items():
+        assert get_target(name).logz is not None and case.full is not None
+        assert case.quick is None or case.quick <= case.full
+        assert 1 <= case.modes[0] <= case.modes[1]
 
 
-def test_validation_gate_runs_on_tiny_settings(tmp_path, capsys):
-    """The quick tier's code path: batched seeds, the table, the JSON, the exit code."""
-    import jax
+def test_gate_eggbox_floor_admits_a_correct_count():
+    """At nlive 500 a correct sampler reports 4 to 18 eggbox modes, flagged as
+    a lower bound below 18 (960 runs); the floor stays above 2, which
+    catches a sampler that reports one or two modes."""
     from bench import validate
+
+    lo, hi = validate.CASES["eggbox_d2"][3][:2]
+    good = dict(dz_mean=0.0, dz_se=0.02, scat_over_err=1.0, seeds=16,
+                not_converged=0, unresolved=9, small_mode=True)
+    egg = dict(good, modes_min=lo, modes_max=hi, nmodes=[14] * 14 + [4, 7],
+               lower_bound=[True] * 16)
+    assert validate.judge(egg) == []
+    assert validate.judge(dict(egg, nmodes=[14] * 14 + [2, 1])) == ["count"]
+
+
+def test_gate_catches_a_disabled_hop():
+    """With the hop off the sepW minor-mode logit sd is 0.25 to 0.37 at the
+    gate's nlive, against 0.02 to 0.07 with it: under the accuracy floor of
+    0.4, but over the case's own limit (scaled by 1 / sqrt(nlive) when
+    --nlive overrides the case)."""
+    from bench import validate
+
+    row = dict(dz_mean=0.0, dz_se=0.02, scat_over_err=1.0, seeds=16,
+               not_converged=0, unresolved=0, lost=0.0, logit_z=1.0,
+               max_logit_sd=0.12)
+    assert validate.judge(dict(row, logit_sd=0.048)) == []
+    assert validate.judge(dict(row, logit_sd=0.25)) == ["modes"]
+    assert validate.judge(dict(row, logit_sd=0.25, hop_acceptance=[None] * 16)) == [
+        "modes", "hop"
+    ]
+    for name in ("sepW_d10", "sepW_d18", "sepWbox_d4"):
+        assert 0.05 < validate.CASES[name].logit_sd <= 0.15, name
+
+
+def _x64_flag():
+    import jax
+
+    return "--x64" if jax.config.jax_enable_x64 else "--no-x64"
+
+
+def _fake_run_case(ran, dz_se=0.1):
+    """A stand-in for ``validate.run_case`` that records (case, nlive)."""
+
+    def run_case(name, nlive, *args, **kwargs):
+        ran.append((name, nlive))
+        n = 4
+        return dict(case=name, ndim=1, nlive=nlive, walks=1, seeds=n, wall_s=0.0,
+                    ncall=1.0, logz=[0.0] * n, logzerr=[1.0] * n, not_converged=0,
+                    unresolved=0, nmodes=[1] * n, lower_bound=[False] * n,
+                    dz_mean=0.0, dz_se=dz_se, scat_over_err=1.0, failed=[])
+
+    return run_case
+
+
+def test_gate_overrides_keep_to_the_tier(monkeypatch, capsys):
+    """--nlive changes the cases' nlive, not the tier's cases; --cases runs a
+    case outside the tier (at its full-tier nlive), and warns when an nlive
+    leaves a mode too few live points to be resolved."""
+    from bench import validate
+
+    ran = []
+    monkeypatch.setattr(validate, "run_case", _fake_run_case(ran))
+    assert validate.main(["--tier", "quick", "--nlive", "300", _x64_flag()]) == 0
+    quick = [name for name, case in validate.CASES.items() if case[0] is not None]
+    assert ran == [(name, 300) for name in quick]
+    assert "nlive 300 in every case" in capsys.readouterr().out
+    ran.clear()
+    validate.main(["--cases", "sepW_d18", _x64_flag()])
+    assert ran == [("sepW_d18", validate.CASES["sepW_d18"][1])]
+    ran.clear()
+    validate.main(["--cases", "sepW_d10", "--nlive", "500", _x64_flag()])
+    assert ran == [("sepW_d10", 500)]
+    assert "expect a FAIL on flags" in capsys.readouterr().err
+
+
+def test_gate_degenerate_inputs_and_the_record(monkeypatch, capsys, tmp_path):
+    """Identical runs (se 0) print no z instead of dividing by 0; one seed is
+    rejected before any run; the JSON is written before the table, with the
+    commit the gate ran at."""
+    from bench import run, validate
+
+    real = validate.run_case
+    with pytest.raises(ValueError, match="at least 2 seeds"):
+        real("gauss_d2", 100, seeds=1)
+    ran = []
+    monkeypatch.setattr(validate, "run_case", _fake_run_case(ran, dz_se=0.0))
+    out = tmp_path / "gate.json"
+    assert validate.main(["--cases", "gauss_d2", _x64_flag(), "--json", str(out)]) == 0
+    table = capsys.readouterr().out
+    assert "| +0.000 ± 0.000 | - |" in table
+    meta = json.loads(out.read_text())
+    assert meta["git_sha"] == run.git_sha() and meta["seeds"] == 16
+    assert f"at {run.git_sha() or 'an unknown commit'}," in table
+    with pytest.raises(SystemExit):
+        validate.main(["--cases", "gauss_d2", "--seeds", "1", _x64_flag()])
+    assert ran == [("gauss_d2", 500)]
+
+    def broken(rows):
+        raise RuntimeError("the table")
+
+    monkeypatch.setattr(validate, "to_markdown", broken)
+    out.unlink()
+    with pytest.raises(RuntimeError):
+        validate.main(["--cases", "gauss_d2", _x64_flag(), "--json", str(out)])
+    assert json.loads(out.read_text())["cases"][0]["case"] == "gauss_d2"
+
+
+def test_git_sha_flags_a_modified_sampler(tmp_path, monkeypatch):
+    """``-dirty`` when a tracked file under src, bench or pyproject.toml
+    changed; untracked files and other files do not count."""
+    import shutil
+    import subprocess
+
+    from bench import run
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    repo = tmp_path / "repo"
+    files = ("src/tinyns/core.py", "bench/run.py", "pyproject.toml", "README.md")
+    for f in files:
+        (repo / f).parent.mkdir(parents=True, exist_ok=True)
+        (repo / f).write_text("x = 1\n")
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+           "-c", "commit.gpgsign=false"]
+    subprocess.run(git + ["init", "-q"], check=True)
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "c"], check=True)
+    head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True).stdout.strip()
+    monkeypatch.setattr(run, "ROOT", repo)
+    assert run.git_sha() == head
+    for f in files[:3]:
+        (repo / f).write_text("x = 2\n")
+        assert run.git_sha() == head + "-dirty", f
+        subprocess.run(git + ["checkout", "-q", "--", f], check=True)
+    (repo / "README.md").write_text("x = 2\n")
+    (repo / "bench" / "results.jsonl").write_text("{}\n")
+    assert run.git_sha() == head
+    monkeypatch.setattr(run, "ROOT", tmp_path)  # not a checkout
+    assert run.git_sha() is None
+
+
+def test_report_commit_filter_keeps_modified_builds_apart(tmp_path):
+    """--sha SAMPLER=SHA keeps the records written at SHA from a clean
+    checkout; SHA-dirty keeps those of a modified one."""
+    from bench import summarize
+
+    sha = "a" * 40
+    recs = [dict(_record("tinyns_v1", "gauss_d2", seed, 0.0), git_sha=sha)
+            for seed in range(3)]
+    recs += [dict(_record("tinyns_v1", "gauss_d2", seed, 0.0), git_sha=sha + "-dirty")
+             for seed in range(3, 5)]
+    path = tmp_path / "r.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    for want, kept in (("aaaaaaa", 3), ("aaaaaaa-dirty", 2), ("b", 0)):
+        dropped = {}
+        groups = summarize.load([path], {"tinyns_v1": want}, dropped)
+        assert sum(len(g) for g in groups.values()) == kept, want
+        assert dropped.get("tinyns_v1", 0) == 5 - kept, want
+    md, _ = summarize.report(summarize.load([path]))
+    assert "| aaaaaaa, aaaaaaa-dirty |" in md
+
+
+def test_gate_posterior_criterion():
+    """Exact draws from a gate Gaussian pass; the same draws left in the unit
+    cube (the prior transform not applied) fail by far. The bound uses
+    Student's t."""
+    from bench import validate
+
+    t = get_target("gauss_d10")
+    mean, cov = np.array(t.meta["mean"]), np.array(t.meta["cov"])
+    rng = np.random.default_rng(0)
+    runs = [rng.multivariate_normal(mean, cov, 4000) for _ in range(16)]
+    logwt = np.zeros(4000)
+
+    def stats(samples):
+        offsets = [validate.posterior_offsets(x, logwt, mean, cov) for x in samples]
+        return validate.posterior_stats(*zip(*offsets, strict=True))
+
+    good = stats(runs)
+    assert good["post_t"] < good["post_bound"]
+    assert stats([(x - t.lo) / (t.hi - t.lo) for x in runs])["post_t"] > 100
+    assert validate.t_tail(2.131450, 15) == pytest.approx(0.05, abs=1e-5)
+    assert validate.t_tail(2.656145, 63) == pytest.approx(0.01, abs=1e-5)
+    assert validate.t_bound(1, 10**6) == pytest.approx(3.0, abs=1e-3)
+    assert good["post_bound"] == pytest.approx(validate.t_bound(20, 15))
+
+
+def test_t_bound_has_no_ceiling():
+    """With 2 or 3 seeds the bound passes 1e3 and must not be cut there. At 1
+    and 2 dof the t tail has a closed form: ``2 / pi * atan(1 / t)`` and
+    ``1 - t / sqrt(2 + t^2)``."""
+    import math
+
+    from bench import validate
+
+    for ntests in (4, 20, 64):
+        alpha = math.erfc(validate.NSIGMA / math.sqrt(2.0)) / ntests
+        cauchy = 1.0 / math.tan(math.pi * alpha / 2.0)
+        assert validate.t_bound(ntests, 1) == pytest.approx(cauchy, rel=1e-4)
+        dof2 = math.sqrt(2.0 / ((1.0 - alpha) ** -2 - 1.0))
+        assert validate.t_bound(ntests, 2) == pytest.approx(dof2, rel=1e-4)
+
+
+def test_validation_gate_runs_on_tiny_settings(tmp_path, capsys, monkeypatch):
+    """The quick tier's code path: batched seeds, the table, the JSON, the exit
+    code; a mixture's mode and hop columns, and a hop switched off."""
+    import functools
+
+    from bench import validate
+
+    import tinyns.api
 
     if adapters.unavailable_reason("tinyns_v1"):
         pytest.skip("tinyns v1 is not installed")
-    x64 = "--x64" if jax.config.jax_enable_x64 else "--no-x64"
     out = tmp_path / "gate.json"
     args = ["--cases", "gauss_d2", "--nlive", "100", "--seeds", "3"]
-    code = validate.main(args + [x64, "--json", str(out)])
+    code = validate.main(args + [_x64_flag(), "--json", str(out)])
     table = capsys.readouterr().out
     case = json.loads(out.read_text())["cases"][0]
     assert code == (1 if case["failed"] else 0)
@@ -468,8 +742,16 @@ def test_validation_gate_runs_on_tiny_settings(tmp_path, capsys):
     assert "| gauss_d2 | 100 | 25 | 3 |" in table and "cases pass" in table
     assert abs(case["dz_mean"]) < 1.0 and case["unresolved"] == 0
     assert case["nmodes"] == [1, 1, 1] and "| 1 (3/3 ok) |" in table
+    assert np.shape(case["post_mean"]) == (3, 2) and case["post_bound"] > 3
+    assert f"| {case['post_t']:.1f} [{case['post_bound']:.1f}] |" in table
 
     row = validate.run_case("sepW_d4", 200, seeds=3)  # a mixture: the mode columns
     assert len(row["mode_mass"]) == 3 and 0.0 <= row["lost"] <= 1.0
     assert all(abs(sum(m) - 1.0) < 1e-6 for m in row["mode_mass"])
     assert "| sepW_d4 | 200 |" in validate.to_markdown([row])
+    assert len(row["hop_acceptance"]) == 3 and "hop" not in row["failed"]
+    no_hop = functools.partial(tinyns.api.Config, _hop=False)
+    monkeypatch.setattr(tinyns.api, "Config", no_hop)
+    row = validate.run_case("sepW_d4", 200, seeds=3)
+    assert row["hop_acceptance"] == [None] * 3 and "hop" in row["failed"]
+    assert "| off (3/3 low) |" in validate.to_markdown([row])
