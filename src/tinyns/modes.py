@@ -36,9 +36,13 @@ if it is at least ``max(25, 1.5 (d + 2))`` and both parts have at least 3
 points. A single convex mode gives ``J`` of 10 to 16 however it is cut. Each
 cluster has a frame: its mean and the Cholesky factor of its covariance shrunk
 toward the pooled within-cluster covariance (prior weight ``0.1 d`` points).
-A frame is *eligible* for the hop if its volume share predicts at least ``2
-d`` live points (``m V_c / sum V >= 2 d``) and it has more than ``d``
-members; the most populated cluster always is. A frame *walks*
+A frame is *eligible* for the hop if it has more than ``d`` members and
+either its volume share predicts at least ``2 d`` live points (``m V_c / sum
+V >= 2 d``) or it has at least ``2 d`` members (points outside the fold,
+counted at the recluster); the most populated cluster always is. (The volume
+rule alone misjudged non-ellipsoidal modes, whose covariance volumes miss
+their populations by factors of e to e^5, and left the hop off; the count
+rule alone turned it off for small modes in high dimensions.) A frame *walks*
 (:func:`walk_frames`) if it has at least ``WALK_MIN_POINTS = 3`` members (a
 small mode keeps its own covariance, shrunk toward the pooled one, until it
 is nearly gone). The frames are factorized once, at the recluster, and kept
@@ -147,7 +151,7 @@ SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
 WALK_MIN_POINTS = 3  # a cluster gives the walk its covariance from this size
 SHRINK = 0.1  # frame covariances: prior weight 0.1 d points on the pooled one
-ELIGIBLE_PER_DIM = 2.0  # a frame hops if its volume share predicts 2 d points
+ELIGIBLE_PER_DIM = 2.0  # 2 d points: predicted by volume share, or members
 ELL_R2_PER_DIM = 1.0  # hop ellipsoids: Mahalanobis^2 <= (d + 2) * this
 LLOYD_ITERS = 30  # 2-means iterations of a split
 SPLIT_EM_ITERS = 8  # hard-EM iterations refining a split
@@ -299,11 +303,15 @@ def empty_frames(ndim: int, dtype) -> Frames:
 
 
 def _eligible(logdet, count, active, nlive, d):
-    """Volume share predicts ``2 d`` live points, more than ``d`` members; the
-    most populated cluster always takes part."""
+    """More than ``d`` members, and a volume share that predicts ``2 d`` live
+    points or at least ``2 d`` members; the most populated cluster always
+    takes part. ``count`` and ``logdet`` are of the points outside the fold
+    at the recluster, so the rule, like the frames, does not depend on the
+    chain's own fold."""
     logv = jnp.where(active, logdet, -jnp.inf)
     share = jnp.exp(logv - logsumexp(logv))
-    eligible = active & (nlive * share >= ELIGIBLE_PER_DIM * d) & (count > d)
+    big = (nlive * share >= ELIGIBLE_PER_DIM * d) | (count >= ELIGIBLE_PER_DIM * d)
+    eligible = active & big & (count > d)
     largest = jnp.argmax(jnp.where(active, count, -1.0))
     return eligible.at[largest].set(active[largest])
 
