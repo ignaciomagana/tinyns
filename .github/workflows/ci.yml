@@ -38,6 +38,11 @@ jobs:
           - python-version: "3.11"
             x64: "1"
             jax: "0.10.2"
+          # JAX 0.11, between the pins above and the newest: two bit-identity
+          # tests failed on 0.11.2 alone.
+          - python-version: "3.13"
+            x64: "0"
+            jax: "0.11.2"
           # The newest JAX, unpinned.
           - python-version: "3.12"
             x64: "0"
