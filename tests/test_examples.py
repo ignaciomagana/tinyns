@@ -107,7 +107,7 @@ def test_readme_code_blocks_run(tmp_path, monkeypatch, capsys) -> None:
     text = (ROOT / "README.md").read_text()
     blocks = re.findall(r"^```python\n(.*?)^```", text, flags=re.M | re.S)
     assert len(blocks) >= 6
-    monkeypatch.chdir(tmp_path)  # the snippets write result.npz and run.npz
+    monkeypatch.chdir(tmp_path)  # the snippets write result.npz and run.checkpoint.npz
     namespace: dict = {}
     for block in blocks:
         exec(compile(block, "README.md", "exec"), namespace)
@@ -116,4 +116,5 @@ def test_readme_code_blocks_run(tmp_path, monkeypatch, capsys) -> None:
     result = namespace["result"]
     assert abs(result.logz + math.log(400.0)) < 5.0 * result.logzerr
     assert len(namespace["results"]) == 16
-    assert (tmp_path / "result.npz").exists() and (tmp_path / "run.npz").exists()
+    assert (tmp_path / "result.npz").exists()
+    assert (tmp_path / "run.checkpoint.npz").exists()
