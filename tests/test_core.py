@@ -657,6 +657,24 @@ def test_the_progress_line_counts_a_lane_without_a_finite_likelihood_as_invalid(
     assert not any("plateau" in line for line in lines), lines
     assert lines[-1].endswith("[converged=2 invalid=1]"), lines[-1]
 
+def test_the_warning_of_an_invalid_run_names_the_users_line() -> None:
+    """It named the ``finalise`` call in ``tinyns/core.py``, so under the
+    default filters (once per line named) only the first invalid run of a
+    session warned."""
+
+    def nowhere(x):
+        return -jnp.inf + 0.0 * x[0]
+
+    cfg = Config(2, 50, num_delete=5)
+    for run in (
+        lambda: NestedSampler(nowhere, identity, 2, 50, num_delete=5).run(0),
+        lambda: core.run(0, nowhere, identity, cfg),
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            run()
+        assert [os.path.basename(w.filename) for w in caught] == ["test_core.py"]
+
 
 def test_runs_under_jax_debug_nans() -> None:
     """The contour of the last step starts at -inf (it was a NaN sentinel,

@@ -110,7 +110,9 @@ def _user_stacklevel() -> int:
     """The ``stacklevel`` at which a warning issued by the caller of this
     function names the first frame outside tinyns and ``dataclasses``: the
     user's line, whether they built a :class:`Config`, re-made one with
-    ``dataclasses.replace`` or built a ``NestedSampler``."""
+    ``dataclasses.replace``, built a ``NestedSampler`` or ran one. Python
+    shows a warning once per line it names, so a fixed level inside tinyns
+    would show it once per session."""
     own = ("tinyns", "dataclasses")
     frame, level = sys._getframe(1), 1
     while frame and frame.f_globals.get("__name__", "").split(".")[0] in own:
@@ -1433,7 +1435,7 @@ def finalise(
     if not math.isfinite(logz):
         status = INVALID
         message = _MESSAGES[INVALID] if logz > 0 else _NO_FINITE
-        warnings.warn(message, RuntimeWarning, stacklevel=2)
+        warnings.warn(message, RuntimeWarning, stacklevel=_user_stacklevel())
     samples = u
     if prior_transform is not None:
         samples = _transform(prior_transform, u, state.u.dtype, _transform_block(k))

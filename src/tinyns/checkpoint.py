@@ -297,7 +297,7 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
     Returns a :class:`Checkpoint`.
     """
     from tinyns import __version__
-    from tinyns.core import Dead, State
+    from tinyns.core import Dead, State, _user_stacklevel
 
     path = os.fspath(path)
     try:
@@ -359,14 +359,14 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
                 + ", ".join(f"{name}={now[name]!r}" for name in changed)
                 + ": the resumed run may not be bit-identical to an "
                 "uninterrupted one",
-                stacklevel=3,
+                stacklevel=_user_stacklevel(),
             )
         elif meta.get("mixed_build"):
             warnings.warn(
                 f"{path} was resumed under another tinyns version, JAX build "
                 "or device before: the run may not be bit-identical to an "
                 "uninterrupted one",
-                stacklevel=3,
+                stacklevel=_user_stacklevel(),
             )
         lanes = 1 if batch is None else batch
         dead = [

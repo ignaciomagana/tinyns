@@ -305,6 +305,36 @@ def test_the_jax_build_is_recorded_and_a_change_warns(tmp_path) -> None:
         sampler.run(0, checkpoint=path)
 
 
+def test_a_build_change_warning_names_the_users_line(tmp_path) -> None:
+    """Both warnings named ``tinyns/api.py`` for a ``NestedSampler`` (a fixed
+    stack level), so under the default filters (once per line named) they
+    showed once per session, whatever the user's line."""
+    path = tmp_path / "run.npz"
+    sampler = NestedSampler(gauss, identity, 2, 50, num_delete=5)
+    sampler.run(0, maxiter=100, checkpoint=path)
+    with np.load(path) as data:
+        arrays = dict(data)
+    written = json.loads(str(arrays["meta_json"][()]))
+    written["jax_version"] = "0.4.0"
+    arrays["meta_json"] = np.asarray(json.dumps(written))
+    np.savez(path, **arrays)
+    cfg = Config(2, 50, num_delete=5)
+    for resume in (
+        lambda: sampler.run(0, maxiter=150, checkpoint=path),  # the change
+        lambda: sampler.run(0, maxiter=200, checkpoint=path),  # mixed_build
+        lambda: core.run(0, gauss, identity, cfg, maxiter=250, checkpoint=path),
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resume()
+        names = [
+            os.path.basename(w.filename)
+            for w in caught
+            if "bit-identical" in str(w.message)
+        ]
+        assert names == ["test_checkpoint_guards.py"]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
 def test_a_checkpoint_keeps_its_file_mode(tmp_path) -> None:
     """A checkpoint was always 0600 (``mkstemp``), and a rewrite undid a
