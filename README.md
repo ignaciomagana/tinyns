@@ -165,7 +165,7 @@ a cheap likelihood the run time on a GPU is nearly flat in `nlive`. With
 `num_delete=1` the chains run one at a time and the gain is small: 35 s and
 136 s compiled, 1.3x and 1.7x faster than v0.2.5. A two-mode target in 10
 dimensions took 0.91 s compiled against 0.66 s for a 10-D Gaussian (15 to 20%
-more time per likelihood call with clustering and hops active); the Gaussian
+more time per likelihood call with two modes and the hop active); the Gaussian
 pays for the mode tracking too (see Multimodal posteriors).
 
 ## Multimodal posteriors
@@ -211,8 +211,8 @@ three modes of different widths scattered 1.5 to 4 times more) and two flags.
   without the hop (by about `run_sd`: each fold drifts on its own), and the
   number of such modes is a lower bound. An eggbox is the example: its 18
   modes sit on a lattice that no two-way split separates, and `modes()` finds
-  15 to 18 of them from the gaps between their live points (nlive 1000), none
-  tracked.
+  13 to 18 of them from the gaps between their live points (nlive 1000, 192
+  runs), none tracked.
 
 `diagnostics()` and `summary()` turn both flags into warnings. They also warn
 when the hop balanced the modes only in part: after the modes separated and
@@ -220,7 +220,8 @@ while two of them held live points, the clustering held 1.5 clusters per mode
 or more on average (it cut the modes into lumps) or the hop was off (fewer
 than two clusters eligible to propose from) for half of the posterior mass or
 more, or, over the whole run, the hop accepted less than 2% of its proposals.
-That warning quotes each mode's masses in the three folds and its `run_sd`.
+That warning quotes the fold masses and `run_sd` of each mode but the
+heaviest.
 And they say when the clustering's 8 slots were full during a run with
 several modes: no further mode could be split off then.
 
@@ -384,7 +385,9 @@ results = sampler.run(jax.random.split(jax.random.key(3), 16), batched_data=True
 A batch of keys runs that many independent runs in one compiled program and
 returns a list of results. With `batched_data=True` every array of a pytree
 callable carries a leading batch axis: one dataset per run, for
-simulation-based calibration and mock campaigns. A batched run agrees with the
+simulation-based calibration and mock campaigns. An array that every run
+shares (a lookup table) needs that axis too: tile it, or let `fn` capture it,
+which embeds it in the compiled program. A batched run agrees with the
 run of its key alone in distribution, not bit for bit. A stopped run is
 frozen, not skipped, so the device evaluates about `B` times the calls of the
 longest run: batch runs of similar length.
@@ -430,10 +433,11 @@ result = finalise(state, dead, cfg, prior_transform=prior_transform, dlogz=0.1)
 `State` and `Dead` are pytrees of arrays, so `step` works under `jax.jit`,
 `lax.scan` and `jax.vmap` (under `jax.vmap` it runs all three chain kernels
 and a recluster at every step: batch runs with `run`). Pass the same
-`loglike` and `prior_transform` objects at every `step`: a new object
-compiles it again. `step` does not test termination; the loop does. Given the
-loop's `dlogz`, `finalise` applies the stopping rule of `run` and reports
-`converged` (without it: `success=False`, `running`).
+`loglike` and `prior_transform` function objects at every `step`: a new
+function, closure or bound method compiles it again (a pytree callable is
+keyed on its structure). `step` does not test termination; the loop does.
+Given the loop's `dlogz`, `finalise` applies the stopping rule of `run` and
+reports `converged` (without it: `success=False`, `running`).
 `tinyns.STATUS[int(state.status)]` names the status, which `step` changes only
 on a likelihood plateau (`"plateau"`) or at a likelihood of `+inf`
 (`"invalid"`): stop there. `finalise` takes the rows of exactly the first
@@ -495,7 +499,8 @@ ncall=total)`, as `examples/functional_core.py` does.
   at nlive 1000, 0.6 for its 4% modes) and a 2% mode was lost (below a tenth of its
   weight) in 15% of the runs. `modes()` marks such modes `tracked: False`, and counts only the ones
   that planes across the axes of the unit cube separate.
-- **Curved targets.** A 10-D Rosenbrock is biased low below `nlive=1000` (see
+- **Curved targets.** A 10-D Rosenbrock is biased low at small `nlive`: by
+  0.16 at `nlive=500` and 0.05 to 0.09 at 1000, unbiased from 2000 (see
   Choosing `walks`).
 - **Posteriors pressed against the faces of the unit cube** by a nonlinear
   prior transform need more `walks`: at the default, logZ comes out low and
