@@ -323,21 +323,23 @@ def flagged_runs(results):
 
 @pytest.fixture(scope="module")
 def mix3_runs():
-    """Eight runs of the study's 4-D mixture at nlive 300, where the 0.6 mode
-    was lost in 10 of 32 runs in float32 and 14 of 32 in x64 (14 of 32 in
-    both on tinyns 1.0); 2 and 1 of these 8."""
+    """Sixteen runs of the study's 4-D mixture at nlive 300, where the 0.6
+    mode was lost in 10 of 32 runs in float32 and 14 of 32 in x64 (14 of 32
+    in both on tinyns 1.0); 8 and 9 of these 16 (6 to 9 on JAX 0.4.34 to
+    0.12), each in a batch of four with a run that kept it."""
     sampler = NestedSampler(mix3, lambda u: -12 + 24 * u, 4, nlive=300)
-    return sampler.run(jax.random.split(jax.random.key(0), 8))
+    return sampler.run(jax.random.split(jax.random.key(7), 16))
 
 
 def test_real_lost_modes_are_flagged(mix3_runs) -> None:
-    """In two batches of four, the mode test finds every run that lost a mode
-    (the logZ test flags them too: its guard is that test's own) and flags no
-    run that kept every mode."""
+    """In four batches of four, the mode test finds every run that lost a
+    mode (the logZ test flags them too: its guard is that test's own) and
+    flags no run that kept every mode. The fixture holds at least 3 such
+    runs in both precisions (8 runs at key 0 held 1 in x64)."""
     lost, found, kept_flagged = np.sum(
-        [flagged_runs(mix3_runs[i : i + 4]) for i in (0, 4)], axis=0
+        [flagged_runs(mix3_runs[i : i + 4]) for i in range(0, 16, 4)], axis=0
     )
-    assert lost >= 1 and found == lost and kept_flagged == 0, (
+    assert lost >= 3 and found == lost and kept_flagged == 0, (
         lost, found, kept_flagged
     )
 
