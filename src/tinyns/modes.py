@@ -36,9 +36,9 @@ if it is at least ``max(25, 1.5 (d + 2))`` and both parts have at least 3
 points. A single convex mode gives ``J`` of 10 to 16 however it is cut. Each
 cluster has a frame: its mean and the Cholesky factor of its covariance shrunk
 toward the pooled within-cluster covariance (prior weight ``0.1 d`` points).
-A frame is *eligible* for the hop if its volume share predicts at least ``2
-d`` live points (``m V_c / sum V >= 2 d``) and it has more than ``d``
-members; the most populated cluster always is. A frame *walks*
+A frame is *eligible* for the hop if it has at least ``ELIGIBLE_MIN_POINTS =
+3`` members (2 in one dimension), whatever its volume share; the most
+populated cluster always is. A frame *walks*
 (:func:`walk_frames`) if it has at least ``WALK_MIN_POINTS = 3`` members (a
 small mode keeps its own covariance, shrunk toward the pooled one, until it
 is nearly gone). The frames are factorized once, at the recluster, and kept
@@ -63,6 +63,34 @@ frames the hop step is a walk step. The proposal does not depend on the
 chain's point, so a chain draws those of all its hop steps before it runs
 (:func:`hop_proposal`). The private ``Config._hop=False`` turns the hop off
 (the clustering still runs), for comparisons.
+
+**Thin modes and kept frames.** Once a mode is separated, only the hop
+brings points into it: a new point is a walk from a live seed, so without
+the hop the mode's live count is a critical branching process (each point
+dies about once per e-fold and seeds about one new point) in which 0 is
+absorbing, and from ``n0`` points the mode dies out within ``T`` e-folds
+with probability about ``(T / (1 + T))^n0``. So a frame takes part in the
+hop from 3 members, whatever its volume share, and a slot whose cluster
+falls below 3 members at a recluster keeps the last frame it had with 3 or
+more (:func:`keep_frames`): active and eligible for the hop, not for the
+walk, for ``GHOST_RECLUSTERS = 8`` reclusters (about two e-folds). New
+points may take its label, so a mode the hop refills is reclustered under
+its old id; a slot that holds 3 members again is an ordinary frame, and a
+split may take a kept slot that holds none. In
+``metadata["mode_history"]`` a kept frame counts as a cluster only while its
+slot holds members. The 1.0 rule (a volume share that predicts ``2 d`` live
+points, and more than ``d`` members) left out exactly the thin clusters, and
+a frame went with the last member of its cluster. On
+``build_two_mode(18, 0.2)`` of ``bench.targets`` (nlive 1000, x64) the 20%
+mode was split off with 27 to 47 points, lived for 15 to 20 e-folds as a
+cluster of 5 to 30, below that rule, and drifted to none in 11 of 128 runs;
+with both changes in 1 of 128. A 4-D mixture of masses 0.6, 0.3 and 0.1
+(float32) lost its 0.6 mode in 97 of 384 runs at nlive 500 (now 68), where
+it holds about 6 live points when it separates, and in 19 of 384 at nlive
+1000 (now 6). A mode that holds one or two live points when its contour
+separates is never split off, and nothing here keeps it: the 6-D version of
+that mixture lost its 0.6 mode in 18 and 19 of 24 runs at nlive 1000,
+without and with these changes. Only more live points help there.
 
 **The local walk.** The other steps propose ``y = x + s L_c(x) z``, with
 ``c(x)`` the nearest walking frame (Mahalanobis distance) and ``L_c`` its
@@ -96,7 +124,12 @@ to the cube and ``{L > L*}``), the schedule of hop and walk steps is fixed in
 advance (a composition of invariant kernels), and the frames and covariances
 do not change during a chain. Nothing of the seed's fold enters its kernel:
 not the seed, not the clustering of the other points (fold ``j`` is left out
-of it), and not the seed's ancestors, which are in fold ``j``. The restoring
+of it), and not the seed's ancestors, which are in fold ``j``. A kept frame
+is a frame of the same clustering from an earlier recluster, fitted to
+points outside fold ``j`` (live then, live or dead now), and whether a slot
+keeps one reads that clustering's counts alone, so it adds nothing of fold
+``j`` either; any set of fixed frames leaves the uniform law invariant, and
+a frame only sets how fast the populations relax. The restoring
 force of the hop on the points of fold ``j`` (how well the frames cover each
 mode) depends on the populations of the other folds, not on fold ``j``'s.
 What remains is common to every MCMC-driven nested sampler: a new point is
@@ -136,7 +169,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax, random
 from jax.scipy.linalg import solve_triangular
-from jax.scipy.special import logsumexp
 
 from tinyns._compat import optimization_barrier
 
@@ -147,7 +179,8 @@ SPLIT_J_ABS, SPLIT_J_PER_DIM, MERGE_FRACTION = 25.0, 1.5, 0.5
 MIN_SPLIT_POINTS = 3  # each side of a split needs this many points
 WALK_MIN_POINTS = 3  # a cluster gives the walk its covariance from this size
 SHRINK = 0.1  # frame covariances: prior weight 0.1 d points on the pooled one
-ELIGIBLE_PER_DIM = 2.0  # a frame hops if its volume share predicts 2 d points
+ELIGIBLE_MIN_POINTS = 3  # a frame takes part in the hop from this many members
+GHOST_RECLUSTERS = 8  # reclusters a slot keeps its frame for the hop below that
 ELL_R2_PER_DIM = 1.0  # hop ellipsoids: Mahalanobis^2 <= (d + 2) * this
 LLOYD_ITERS = 30  # 2-means iterations of a split
 SPLIT_EM_ITERS = 8  # hard-EM iterations refining a split
@@ -253,8 +286,9 @@ def stats(x, labels, nslots: int) -> Stats:
     return Stats(mu, scat, count)
 
 
-def frames(st: Stats, nlive: int | None = None) -> Frames:
-    """Frames of the clusters in ``st`` (``nlive``: eligibility, else none).
+def frames(st: Stats, hop: bool = False) -> Frames:
+    """Frames of the clusters in ``st`` (``hop``: mark those eligible for the
+    hop, :func:`_eligible`; else none).
 
     Each covariance is ``(1 - rho) S / (n - 1) + rho kappa P`` with ``S`` the
     scatter, ``P`` the pooled within-cluster covariance, ``kappa`` its scale
@@ -283,10 +317,10 @@ def frames(st: Stats, nlive: int | None = None) -> Frames:
     active = nonempty & ok
     ichol = solve_triangular(chol, jnp.broadcast_to(eye, chol.shape), lower=True)
     logdet = jnp.sum(jnp.log(jnp.diagonal(chol, axis1=-2, axis2=-1)), axis=-1)
-    if nlive is None:
-        eligible = jnp.zeros_like(active)
+    if hop:
+        eligible = _eligible(count, active, d)
     else:
-        eligible = _eligible(logdet, count, active, nlive, d)
+        eligible = jnp.zeros_like(active)
     return Frames(mu, chol, ichol, logdet, count, active, eligible)
 
 
@@ -298,14 +332,64 @@ def empty_frames(ndim: int, dtype) -> Frames:
     return Frames(jnp.zeros((C_MAX, ndim), dtype), eye, eye, zero, zero, off, off)
 
 
-def _eligible(logdet, count, active, nlive, d):
-    """Volume share predicts ``2 d`` live points, more than ``d`` members; the
-    most populated cluster always takes part."""
-    logv = jnp.where(active, logdet, -jnp.inf)
-    share = jnp.exp(logv - logsumexp(logv))
-    eligible = active & (nlive * share >= ELIGIBLE_PER_DIM * d) & (count > d)
+def eligible_min_points(ndim: int) -> int:
+    """The members a frame needs to take part in the hop:
+    ``ELIGIBLE_MIN_POINTS``, or ``ndim + 1`` if that is fewer (2 in one
+    dimension, which the 1.0 rule admitted too)."""
+    return min(ELIGIBLE_MIN_POINTS, ndim + 1)
+
+
+def _eligible(count, active, d):
+    """At least :func:`eligible_min_points` members, whatever the volume
+    share; the most populated cluster always takes part.
+
+    The 1.0 rule also asked for more than ``d`` members and a volume share
+    that predicts ``2 d`` live points, which left out the thin clusters that
+    need the hop most: a cluster whose share is below ``2 d / m`` can never
+    pass it, and the volume of a frame fitted to few points is biased low
+    (by several nats for 20 to 30 points at d = 18). Every cluster that rule
+    admitted is admitted here. ``count`` is of the points outside the fold
+    at the recluster, so the rule, like the frames, does not read the
+    chain's own fold."""
+    eligible = active & (count >= eligible_min_points(d))
     largest = jnp.argmax(jnp.where(active, count, -1.0))
     return eligible.at[largest].set(active[largest])
+
+
+def keep_frames(old: Frames, ghost, new: Frames):
+    """The frames of a recluster, with those of the clusters that fell below
+    :func:`eligible_min_points` members kept for the hop: ``(frames,
+    ghost)``.
+
+    ``old`` are the frames before the recluster and ``new`` those it fitted
+    (any leading axes); ``ghost`` (int32, per slot) is the number of
+    reclusters for which a slot still keeps an old frame (0: none). A slot
+    whose cluster now has fewer members keeps the last frame it had with at
+    least that many (mean, factors and log-determinant), active and
+    eligible, for ``GHOST_RECLUSTERS`` reclusters; a slot that holds that
+    many again is an ordinary frame. A kept frame's ``count`` is that of the
+    slot's members, below ``WALK_MIN_POINTS``, so it never walks
+    (:func:`walk_frames`).
+    """
+    minimum = eligible_min_points(new.mu.shape[-1])
+    weak = new.count < minimum
+    last = old.active & (old.count >= minimum)  # the frame a weak slot keeps
+    ghost = jnp.where(
+        weak, jnp.where(last, GHOST_RECLUSTERS, jnp.maximum(ghost - 1, 0)), 0
+    ).astype(jnp.int32)
+    kept = ghost > 0
+
+    def pick(a, b):
+        return jnp.where(kept.reshape(kept.shape + (1,) * (a.ndim - kept.ndim)), a, b)
+
+    return new._replace(
+        mu=pick(old.mu, new.mu),
+        chol=pick(old.chol, new.chol),
+        ichol=pick(old.ichol, new.ichol),
+        logdet=pick(old.logdet, new.logdet),
+        active=new.active | kept,
+        eligible=new.eligible | kept,
+    ), ghost
 
 
 def mahalanobis(fr: Frames, x):

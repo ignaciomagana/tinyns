@@ -275,7 +275,7 @@ def test_float32_frames_resolve_a_narrow_axis() -> None:
     x = _narrow_cluster()
     u = jnp.asarray(x, jnp.float32)
     st = modes.stats(u, jnp.zeros(len(x), jnp.int32), modes.C_MAX)
-    fr = modes.frames(st, len(x))
+    fr = modes.frames(st)
     chol = np.asarray(fr.chol[0], np.float64)
     sd = np.sqrt(np.diag(chol @ chol.T))
     np.testing.assert_allclose(sd / x.std(axis=0, ddof=1), 1.0, rtol=0.05)

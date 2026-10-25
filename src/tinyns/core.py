@@ -298,6 +298,11 @@ class State(NamedTuple):
     mode_uid: Any  # (K, C) int32
     mode_next: Any  # (K,) int32
     mode_tree: Any  # (K, TREE_SIZE) int32
+    # The reclusters for which a slot whose cluster fell below
+    # tinyns.modes.eligible_min_points members still keeps its last frame
+    # with that many, for the hop (0: an ordinary frame or an empty slot;
+    # tinyns.modes.keep_frames).
+    mode_ghost: Any  # (K, C) int32
 
 
 class Dead(NamedTuple):
@@ -317,8 +322,10 @@ class Dead(NamedTuple):
     ``label`` is each dead point's cluster label when it died (the id of its
     cluster in clustering ``j``, the next fold's; :func:`_reported_label`), and
     ``nclusters`` / ``neligible`` the step's number of clusters (the largest
-    over the clusterings) and of frames taking part in the hop (the
-    smallest), the same in every row.
+    over the clusterings: the slots that hold members, so a kept frame,
+    :func:`tinyns.modes.keep_frames`, counts only while its slot holds
+    some) and of frames taking part in the hop (the smallest; kept frames
+    count), the same in every row.
     """
 
     u: Any  # (k, d)
@@ -679,6 +686,7 @@ def _empty_frames(ndim: int, folds: int, dtype) -> dict:
     out["mode_uid"] = jnp.zeros((folds, _modes.C_MAX), jnp.int32)
     out["mode_next"] = jnp.ones((folds,), jnp.int32)
     out["mode_tree"] = jnp.full((folds, _modes.TREE_SIZE), -1, jnp.int32)
+    out["mode_ghost"] = jnp.zeros((folds, _modes.C_MAX), jnp.int32)
     return out
 
 
@@ -720,6 +728,10 @@ def _recluster(state: State, batched: bool = False) -> State:
     :func:`tinyns.modes.recluster_lanes`): every live point gets a fresh label
     in every clustering but its own fold's, and the frames are refitted (they
     stay fixed until the next recluster, so they are factorized here, once).
+    A slot whose cluster fell below :func:`tinyns.modes.eligible_min_points`
+    members keeps its last frame with that many for the hop
+    (:func:`tinyns.modes.keep_frames`): a frame of the same clustering, so
+    it too depends on the points outside the fold alone.
     ``batched``: the state has a leading lane axis.
     """
     u, label = state.u, state.label
@@ -758,12 +770,16 @@ def _recluster(state: State, batched: bool = False) -> State:
     cols = jnp.where(valid, at, m)
     label = jnp.full((lanes, folds, m + 1), -1, jnp.int32)
     label = label.at[:, jnp.arange(folds)[:, None], cols].set(lab)[..., :m]
-    frames = jax.vmap(lambda st: _modes.frames(st, m))(st)
-    new = {
-        "mode_" + name: x.reshape(lanes, folds, *x.shape[1:])
-        for name, x in frames._asdict().items()
-    }
-    new.update(label=label, mode_uid=uid, mode_next=nxt, mode_tree=tree)
+    frames = jax.vmap(lambda st: _modes.frames(st, hop=True))(st)
+    frames = _modes.Frames(*(x.reshape(lanes, folds, *x.shape[1:]) for x in frames))
+    last, ghost = _frames(state), state.mode_ghost
+    if not batched:
+        last, ghost = jax.tree_util.tree_map(lambda x: x[None], (last, ghost))
+    frames, ghost = _modes.keep_frames(last, ghost, frames)
+    new = {"mode_" + name: x for name, x in frames._asdict().items()}
+    new.update(
+        label=label, mode_uid=uid, mode_next=nxt, mode_tree=tree, mode_ghost=ghost
+    )
     if not batched:
         new = {name: x[0] for name, x in new.items()}
     return state._replace(**new)
@@ -1057,7 +1073,10 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     clustering = jnp.arange(folds, dtype=i32)
     nearest = jnp.where(clustering[:, None] == dead_fold[None, :], -1, nearest)
     new = new._replace(label=state.label.at[:, worst].set(nearest))
-    n_clusters = jnp.max(jnp.sum(frames.active, axis=1))
+    # A kept frame takes part in the hop. Its slot is a cluster while it
+    # holds members (a split cannot take it, as in 1.0), and not once empty.
+    cluster = frames.active & ((state.mode_ghost == 0) | (frames.count > 0.5))
+    n_clusters = jnp.max(jnp.sum(cluster, axis=1))
     n_eligible = jnp.min(jnp.sum(frames.eligible, axis=1))
     dead = Dead(
         state.u[worst],

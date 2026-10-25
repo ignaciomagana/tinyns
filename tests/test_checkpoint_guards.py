@@ -358,7 +358,7 @@ def test_a_checkpoint_keeps_its_file_mode(tmp_path) -> None:
 def test_a_npy_file_is_not_a_checkpoint(tmp_path) -> None:
     path = tmp_path / "samples.npy"
     np.save(path, np.arange(3.0))
-    with pytest.raises(ValueError, match="not a tinyns-ckpt-7 checkpoint"):
+    with pytest.raises(ValueError, match="not a tinyns-ckpt-8 checkpoint"):
         NestedSampler(gauss, identity, 2, 50, num_delete=5).run(0, checkpoint=path)
 
 

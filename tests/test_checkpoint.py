@@ -1,4 +1,4 @@
-"""Checkpoints (``tinyns-ckpt-7``): kill and resume, refusals, atomic writes,
+"""Checkpoints (``tinyns-ckpt-8``): kill and resume, refusals, atomic writes,
 progress lines and the accumulated wall time."""
 
 from __future__ import annotations
@@ -192,7 +192,8 @@ def test_mismatches_are_refused(tmp_path) -> None:
     for field, value, match in (
         ("x64", not x64, "x64 flag"),
         ("dtype", "float16", "float dtype"),
-        ("format", "tinyns-ckpt-6", "not a tinyns-ckpt-7"),
+        # 1.0 wrote tinyns-ckpt-7, without the frames kept for the hop
+        ("format", "tinyns-ckpt-7", r"ckpt-8 checkpoint \(format 'tinyns-ckpt-7'"),
     ):
         with np.load(path) as data:
             arrays = dict(data)
@@ -206,7 +207,7 @@ def test_mismatches_are_refused(tmp_path) -> None:
 
     junk = tmp_path / "junk.npz"
     junk.write_bytes(b"not a checkpoint")
-    with pytest.raises(ValueError, match="not a tinyns-ckpt-7"):
+    with pytest.raises(ValueError, match="not a tinyns-ckpt-8"):
         sampler.run(0, checkpoint=junk)
 
 
