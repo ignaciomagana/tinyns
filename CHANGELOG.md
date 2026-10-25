@@ -34,6 +34,10 @@
 - **Advice.** The unresolved-mode warning of `diagnostics()` now ends "raise nlive and compare runs (tinyns.compare)", and the docstrings of `modes()` and `compare()` give the loss rates of 1.1, each figure labelled with its sampler. The `modes()` docstring also says that `run_sd` falls short where the hop balances the modes only in part (the needle figures above).
 - **`metadata["mode_history"]`.** The clusters column counts a kept frame only while its slot holds members (as 1.0.0 counted such a slot), and the eligible column counts every kept frame. So the history shows the hop on for longer once a mode has died out: on the heavy-and-tall pair of `tests/test_modes.py` (nlive 500, 25 runs), the share of the posterior mass with the hop off, measured to the end of the run (`diagnostics()` does not report it), fell from 0.55–0.63 (1.0.0, x64) to 0.09–0.15 (1.1, float32 and x64), because the dead mode's kept frame stays eligible. `diagnostics()["mode_hop_off"]` averages only while two modes hold live points (the whole run for one mode), and on that pair it was at most 0.033 on 1.0.0 and 0.001 on 1.1.
 
+### Fixed
+
+- **`modes()` printed numpy warnings** ("Mean of empty slice", "invalid value encountered in divide") when, of two sets of live points it compares, one held only copies of points of the other; seen on 1.1 runs of the needle targets. Its result was right (no direction, no gap) and is unchanged.
+
 ### Breaking changes
 
 - **Checkpoint format `tinyns-ckpt-8`.** `State` gains `mode_ghost`. A `tinyns-ckpt-7` checkpoint (1.0.0) is refused with a `ValueError` that names its format, and there is no reader: finish a run on the version it started on. Result files keep their format (`tinyns-result-npz-v4`), and those of 1.0.0 load.
