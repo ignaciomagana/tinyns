@@ -5,10 +5,12 @@ Once a mode is separated, only the hop brings points into it, through an
 eligible frame of its cluster. A frame takes part from 3 members whatever its
 volume share, and a slot whose cluster falls below 3 members keeps its last
 frame for the hop for ``GHOST_RECLUSTERS`` reclusters. The unit tests follow
-a kept frame through its life; the invariance test checks that kept frames
-leave the constrained prior invariant, and its control that the test sees a
-kept frame that depends on the chain's own fold. ``pytest -m slow`` runs the
-gate: the 18-D two-mode target whose 20% mode the 1.0 rule lost.
+a kept frame through its life and check that the kept frames of a fold's
+clustering do not read that fold; the invariance test checks that kept
+frames leave the constrained prior invariant, and its control that the test
+sees a kept frame that depends on the chain's own fold. A run killed while a
+frame is kept resumes to the bit. ``pytest -m slow`` runs the gate: the 18-D
+two-mode target whose 20% mode the 1.0 rule lost.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from jax import random
 from jax.scipy.special import logsumexp
 
 from tinyns import NestedSampler, core, modes
+from tinyns import checkpoint as ckpt
 from tinyns.core import Config
 
 D = 3
@@ -255,6 +258,74 @@ def test_recluster_keeps_the_frame_of_a_cluster_that_died() -> None:
         assert bool(modes.walk_frames(frames)[c])
 
 
+def _kept_after_two_reclusters(seed, stay=False):
+    """The live set of :func:`_blob_state` with the bulk points of fold 0
+    drawn from ``seed``, through two reclusters: one with the thin cluster,
+    and one after its points were refilled in the wide cluster (fold 0's
+    refills drawn from ``seed`` too; with ``stay``, fold 0's thin points are
+    not refilled). Returns the two states and the one before the second
+    recluster."""
+    state, cfg = _blob_state()
+    fold0 = np.arange(cfg.nlive) % cfg._folds == 0
+    rng = np.random.default_rng(100 + seed)
+    u = np.array(state.u)
+    bulk0 = fold0 & (np.arange(cfg.nlive) >= 18)
+    u[bulk0] = 0.35 + 0.04 * rng.standard_normal((int(bulk0.sum()), cfg.ndim))
+    u = jnp.asarray(u, state.u.dtype)
+    alive = core._recluster(state._replace(u=u, logl=jax.vmap(_bowl)(u)))
+    refill = 0.35 + 0.04 * np.random.default_rng(2).standard_normal((18, cfg.ndim))
+    refill[fold0[:18]] = 0.35 + 0.04 * rng.standard_normal((6, cfg.ndim))
+    moved = ~fold0[:18] if stay else np.ones(18, bool)
+    lab = np.asarray(alive.label)[:, 18:]
+    wide = jnp.asarray([int(row[row >= 0][0]) for row in lab], jnp.int32)
+    label = alive.label.at[:, :18].set(jnp.where(
+        jnp.asarray(moved) & (alive.label[:, :18] >= 0), wide[:, None],
+        alive.label[:, :18],
+    ))
+    u = np.array(alive.u)
+    u[:18][moved] = refill[moved]
+    u = jnp.asarray(u, state.u.dtype)
+    dead = alive._replace(u=u, logl=jax.vmap(_bowl)(u), label=label)
+    return alive, dead, core._recluster(dead)
+
+
+def test_kept_frames_do_not_read_the_fold() -> None:
+    """Two live sets that differ in the points of fold 0 alone, through a
+    recluster with a thin cluster and one after the points of the other
+    folds left it. In the second, fold 0's thin points stay, so clusterings
+    1 and 2 hold 6 of them and keep no frame. Clustering 0 (the kernel of
+    the chains seeded in fold 0) sees none in either, keeps the thin
+    cluster's frame and is the same to the bit in both, countdown included,
+    while clusterings 1 and 2, which read fold 0, are not. A batch of the
+    two gives each lane its own recluster."""
+    fields = [f"mode_{name}" for name in modes.Frames._fields] + [
+        "mode_ghost", "mode_uid", "mode_next", "mode_tree", "label"
+    ]
+    a_alive, a_dead, a = _kept_after_two_reclusters(0)
+    b_alive, b_dead, b = _kept_after_two_reclusters(1, stay=True)
+    assert np.asarray(a.mode_ghost).max(axis=1).tolist() == [
+        modes.GHOST_RECLUSTERS
+    ] * 3
+    assert np.asarray(b.mode_ghost).max(axis=1).tolist() == [
+        modes.GHOST_RECLUSTERS, 0, 0
+    ]
+    for x, y in ((a_alive, b_alive), (a, b)):
+        for name in fields:
+            np.testing.assert_array_equal(
+                getattr(x, name)[0], getattr(y, name)[0], name
+            )
+        for j in (1, 2):
+            assert not np.array_equal(x.mode_mu[j], y.mode_mu[j])
+
+    pair = jax.tree_util.tree_map(lambda p, q: jnp.stack([p, q]), a_dead, b_dead)
+    both = core._recluster(pair, batched=True)
+    for lane, alone in enumerate((a, b)):
+        for name in fields:
+            np.testing.assert_array_equal(
+                getattr(both, name)[lane], getattr(alone, name), name
+            )
+
+
 def test_a_kept_slot_that_holds_points_is_a_cluster() -> None:
     """Eight narrow groups fill the ``C_MAX = 8`` slots; then one group falls
     to 2 points per clustering, below the 3 a frame needs, and its slot
@@ -420,6 +491,47 @@ def test_a_run_keeps_the_frame_of_a_mode_that_dies() -> None:
     result = core.run(3, gaussian, lambda u: u, Config(D, 200, 20, 20))
     history = result.metadata["mode_history"]
     assert all(eligible <= clusters for _, clusters, eligible in history), history
+
+
+class Crash(Exception):
+    pass
+
+
+def test_resume_with_a_kept_frame_is_bit_identical(tmp_path, monkeypatch) -> None:
+    """The run of :func:`test_a_run_keeps_the_frame_of_a_mode_that_dies`,
+    killed after a checkpoint written while the slot of a cluster with no
+    member left keeps its frame (countdown between 0 and
+    ``GHOST_RECLUSTERS``) and resumed, gives the run that was not
+    interrupted: the kept frames and their countdown are checkpointed. (A
+    resume that lost the countdown drops that frame at the next recluster,
+    and the run differs from there.)"""
+    cfg = Config(D, 200, 20, 20)
+    whole = core.run(3, two_gaussians, lambda u: u, cfg)
+    path = tmp_path / "run.npz"
+    monkeypatch.setattr(core, "_CHECKPOINT_SECONDS", 0.0)
+    monkeypatch.setattr(core, "_CHUNK_SECONDS", 0.0)  # one step per chunk
+    save = ckpt.save
+
+    def kept(ghost, count):
+        return (ghost > 0) & (ghost < modes.GHOST_RECLUSTERS) & (count < 0.5)
+
+    def save_then_crash(where, c):
+        save(where, c)
+        if np.any(kept(np.asarray(c.state.mode_ghost), np.asarray(c.state.mode_count))):
+            raise Crash
+
+    monkeypatch.setattr(ckpt, "save", save_then_crash)
+    with pytest.raises(Crash):
+        core.run(3, two_gaussians, lambda u: u, cfg, checkpoint=path)
+    monkeypatch.setattr(ckpt, "save", save)
+    with np.load(path) as data:
+        assert np.any(kept(data["state/mode_ghost"], data["state/mode_count"]))
+    resumed = core.run(3, two_gaussians, lambda u: u, cfg, checkpoint=path)
+    assert resumed.metadata["resumed"]
+    for name in ("samples_u", "logl", "logwt", "labels"):
+        np.testing.assert_array_equal(getattr(resumed, name), getattr(whole, name))
+    assert resumed.logz == whole.logz
+    assert resumed.metadata["mode_history"] == whole.metadata["mode_history"]
 
 
 @pytest.mark.slow
