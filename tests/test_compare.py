@@ -264,7 +264,8 @@ def rot(d, seed):
 
 # The 4-D mixture of the lost-mode study (masses 0.6, 0.3 and 0.1, widths
 # 0.25, 0.5 and 0.75, rotated, in [-12, 12]^4): the 0.6 mode holds about 6 of
-# 500 live points when it separates and is lost in about 1 of 4 runs.
+# 500 live points when it separates and is lost in about 1 of 6 runs (1 of 4
+# on tinyns 1.0).
 MIX_W = np.array([0.6, 0.3, 0.1])
 MIX_MU = np.array([[-5, -5, 0, 0], [5, -4, 1, 0], [0, 5, -1, 1]], dtype=float)
 MIX_CHOL = np.linalg.cholesky([
@@ -323,7 +324,8 @@ def flagged_runs(results):
 @pytest.fixture(scope="module")
 def mix3_runs():
     """Eight runs of the study's 4-D mixture at nlive 300, where the 0.6 mode
-    was lost in 14 of 32 runs (x64 off and on)."""
+    was lost in 10 of 32 runs in float32 and 14 of 32 in x64 (14 of 32 in
+    both on tinyns 1.0); 2 and 1 of these 8."""
     sampler = NestedSampler(mix3, lambda u: -12 + 24 * u, 4, nlive=300)
     return sampler.run(jax.random.split(jax.random.key(0), 8))
 
@@ -362,11 +364,12 @@ def test_runs_that_lost_different_modes_both_lack_one(mix3_runs) -> None:
 
 @pytest.mark.slow
 def test_lost_modes_are_flagged_in_batches_of_four() -> None:
-    """64 runs of the 4-D mixture at nlive 500 (the 0.6 mode lost in about 1
-    of 4) in batches of four: every lost run is flagged where a run of its
-    batch kept the mode, the mode test finds all but at most one of them (13
-    of 13 in float32, 19 of 19 in x64; a run whose modes() merged the mode
-    with another is no reference for it), and at most one other run is
+    """64 runs of the 4-D mixture at nlive 500 (the 0.6 mode lost in 10 runs
+    in float32 and 12 in x64; 17 and 19 on tinyns 1.0) in batches of four:
+    every lost run is flagged where a run of its batch kept the mode, the
+    mode test finds all but at most one of them (10 of 10 in float32, 12 of
+    12 in x64; 13 of 13 and 19 of 19 on 1.0; a run whose modes() merged the
+    mode with another is no reference for it), and at most one other run is
     flagged (none)."""
     sampler = NestedSampler(mix3, lambda u: -12 + 24 * u, 4, nlive=500)
     results = sampler.run(jax.random.split(jax.random.key(1), 64))
