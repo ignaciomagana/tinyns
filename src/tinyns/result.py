@@ -175,12 +175,18 @@ UNMOVED_WARN = 0.3
 # (30,700 pairs, with the controls sepW_d10, rosen_d10 and the shape-W
 # control of the 18-D target). An untracked mode is not balanced by the hop,
 # and its mass scatters from run to run as without it: the peaks of the
-# eggbox differed up to 26-fold between runs that kept them all.
+# eggbox differed up to 48-fold between runs that kept them all, and such a
+# run held at least 0.021 of the mass another run found in a peak (128 runs
+# at nlive 1000). A sample counts toward a mode only within the reach of its
+# frame, so that the samples of a mode that the other run lacks count for
+# none of its modes; with that reach, the least share of a run that kept a
+# tracked mode stayed 0.13.
 # _COMPARE_TAIL is the posterior mass of a run's lightest samples that the
-# mode test leaves out.
+# mode test leaves out, and _COMPARE_REACH the share of a mode's posterior
+# mass that lies beyond the reach of its frame in the run that found it.
 COMPARE_SIGMA, COMPARE_MIN_MASS = 4.0, 0.05
 COMPARE_LOST_SHARE, COMPARE_LOST_SHARE_UNTRACKED = 0.1, 0.01
-_COMPARE_TAIL = 1e-6
+_COMPARE_TAIL, _COMPARE_REACH = 1e-6, 1e-3
 
 
 def _jsonable(value):
@@ -283,14 +289,27 @@ def _mode_frames(u, weights, label, k) -> list[tuple]:
     return frames
 
 
-def _nearest_frame(u, frames) -> np.ndarray:
+def _frame_r2(u, frame) -> np.ndarray:
+    """``r^2`` of each of the rows ``u`` in a frame of :func:`_mode_frames`."""
+    z = np.linalg.solve(frame[1], (u - frame[0]).T)
+    return np.sum(z * z, axis=0)
+
+
+def _nearest_frame(u, frames, reach=None) -> np.ndarray:
     """The frame of least ``r^2 + 2 log det L - 2 log mass`` for each of the
-    rows ``u`` (:func:`_mode_frames`)."""
+    rows ``u`` (:func:`_mode_frames`). With ``reach`` (an ``r^2`` for each
+    frame), only a frame whose reach holds the row counts, and a row that no
+    frame reaches gets -1."""
     score = []
-    for mu, chol, logdet, mass in frames:
-        z = np.linalg.solve(chol, (u - mu).T)
-        score.append(np.sum(z * z, axis=0) + 2 * logdet - 2 * math.log(mass))
-    return np.argmin(np.asarray(score), axis=0)
+    for c, frame in enumerate(frames):
+        r2 = _frame_r2(u, frame)
+        near = r2 + 2 * frame[2] - 2 * math.log(frame[3])
+        score.append(near if reach is None else np.where(r2 <= reach[c], near, np.inf))
+    score = np.asarray(score)
+    nearest = np.argmin(score, axis=0)
+    if reach is not None:
+        nearest[np.isinf(score.min(axis=0))] = -1
+    return nearest
 
 
 def _nearest_mode(u, weights, label, k):
@@ -2014,8 +2033,9 @@ class Comparison:
     e_run^2)``; ``None`` if not compared) and ``missing_modes``, the modes of
     other runs that it lacks, each as ``run``, ``mode`` (its index in that
     run's :meth:`~NestedSamplingResult.modes`), ``mass`` (there) and
-    ``mass_here`` (the posterior mass of this run's samples nearest that
-    mode). ``flagged`` lists the flagged runs, and ``best`` is the run of
+    ``mass_here`` (the posterior mass of this run's samples that the frame
+    of that mode reaches and that lie nearest it; :func:`compare`).
+    ``flagged`` lists the flagged runs, and ``best`` is the run of
     highest logZ (``None`` if no run was compared). :meth:`summary` (and
     ``print``) gives a table.
     """
@@ -2055,14 +2075,26 @@ class Comparison:
         return self.summary()
 
 
-def _bulk(result: NestedSamplingResult) -> tuple[np.ndarray, np.ndarray]:
+def _bulk(result: NestedSamplingResult) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The samples of ``result`` (unit cube) that carry all but
-    ``_COMPARE_TAIL`` of its posterior mass, and their weights."""
+    ``_COMPARE_TAIL`` of its posterior mass, their weights, and which they
+    are."""
     weights = result._weights
     order = np.argsort(weights)
     keep = np.ones(len(weights), dtype=bool)
     keep[order[np.cumsum(weights[order]) <= _COMPARE_TAIL]] = False
-    return np.asarray(result.samples_u, dtype=float)[keep], weights[keep]
+    return np.asarray(result.samples_u, dtype=float)[keep], weights[keep], keep
+
+
+def _reach(r2, weights) -> float:
+    """The least ``r^2`` within which the rows of ``r2`` (with ``weights``)
+    hold all but ``_COMPARE_REACH`` of their weight; ``-inf`` for no row."""
+    if not len(r2):
+        return -math.inf
+    order = np.argsort(r2)
+    cumulative = np.cumsum(weights[order])
+    at = np.searchsorted(cumulative, (1 - _COMPARE_REACH) * cumulative[-1])
+    return float(r2[order][min(at, len(r2) - 1)])
 
 
 def compare(results) -> Comparison:
@@ -2085,11 +2117,18 @@ def compare(results) -> Comparison:
       ``COMPARE_LOST_SHARE_UNTRACKED`` (a hundredth): the hop did not balance
       such a mode, and its mass scatters from run to run as without the hop.
       This run's samples are given to the nearest of the other run's modes
-      (the posterior-weighted mean and covariance of each, as in pass 5 of
-      :meth:`modes <NestedSamplingResult.modes>`), so the test does not
-      depend on how this run's own modes were counted: a run that merged two
-      modes into one, or cut one into lumps, still holds their mass where
-      the other run found it.
+      that reaches them. The frame of a mode is the posterior-weighted mean
+      and covariance of its samples, as in pass 5 of :meth:`modes
+      <NestedSamplingResult.modes>`, and it reaches out to the ``r^2``
+      within which those samples hold all but a thousandth of its mass; a
+      sample that no mode reaches counts for none, so two runs that each
+      lost a different mode both lack the mode of the other. A run that
+      reports one mode is compared in the frame of all its samples. The test
+      does not depend on how this run's own modes were counted: a run that
+      merged two modes into one, or cut one into lumps, still holds their
+      mass where the other run found it. It does depend on the other run's:
+      a mode is found lacking only against a run whose :meth:`modes
+      <NestedSamplingResult.modes>` separated it.
 
     A run that did not succeed (``maxiter``, ``maxcall``, ``invalid``), has
     no posterior weight or has a logzerr that is not finite is flagged with
@@ -2124,21 +2163,38 @@ def compare(results) -> Comparison:
     none of the 1364 without. Controls, 32 runs each at nlive 1000
     (Gaussians in 8-D and 16-D, ``sepW_d10``, the shape-W control
     ``build_two_mode(18, 0.2, 'sep', 'W')``, ``rosen_d10`` and the eggbox):
-    no run flagged in 2000 batches of each. Of 128 new eggbox runs (4
-    batches of 32), 37 had lost a peak of 2.2% or 4.2% of the posterior
-    (below a tenth of its mass); it flagged 14 of those when the 32 runs
-    were compared at once (another run had put that peak at 0.05 or more)
-    and 3 in batches of 4, and none of the 91 runs that kept every peak.
+    no run flagged in 2000 batches of each. Of 128 new eggbox runs at
+    nlive 1000, 31 had lost a peak (below a tenth of its mass: 33 peaks of
+    2.2% of the posterior and 4 of 4.2%); it flagged 13 of them when the 128
+    runs were compared at once (another run had put that peak at 0.05 or
+    more) and 4 in consecutive batches of 4, and none of the 97 runs that
+    kept every peak.
 
     A mode that every run lost is not found: if a fraction ``p`` of the runs
     lose it, a batch of ``B`` runs misses it with probability ``p^B``. The
     6-D version of the mixture, whose 0.6 mode holds 1 or 2 of 1000 live
     points when it separates, lost it in 23 of 24 runs, and only the batches
-    that held the one run that kept it were flagged. The highest logZ of
-    many runs is high by chance, so in a large batch the logZ test can flag
-    a run whose logZ scatters beyond logzerr: of 32 runs of the 4-D mixture
-    at nlive 300 (x64) it flagged one that kept every mode, and none in
-    batches of 4.
+    that held the one run that kept it were flagged. Nor does the mode test
+    find a mode that the runs which kept it did not separate: on the 4-D
+    mixture at nlive 1000, one of the 61 runs that kept every mode merged
+    the 0.6 mode with the 0.1 one, and against it the 3 runs that had lost
+    the 0.6 mode held a third of the merged mode, in their 0.1 mode (the
+    logZ test flagged them: 5.7 to 6.1 combined logzerr low). The highest
+    logZ of many runs is high by chance, so in a large batch the logZ test
+    can flag a run whose logZ scatters beyond logzerr: of 32 runs of the 4-D
+    mixture at nlive 300 (x64) it flagged one that kept every mode, and none
+    in batches of 4.
+
+    On two targets the bars of the mode test sit below the scatter of runs
+    that kept every mode by a factor of only 1.3 and 2. On the 18-D target,
+    a run that kept the 0.2 mode held at least 0.13 of the mass another run
+    found there (26,912 pairs; the bar is a tenth). The peaks of the eggbox
+    are untracked, and their masses differed up to 48-fold between runs
+    that kept them all (0.11 to 5.3 times the truth); a run held at least
+    0.021 of the mass another run found in a peak (89,280 pairs of the 128
+    new runs; the bar is a hundredth). On a target whose modes scatter more
+    from run to run the mode test can flag a correct run, the more likely
+    the larger the batch.
 
     Example::
 
@@ -2195,14 +2251,17 @@ def compare(results) -> Comparison:
         shortfall[j] = gap / scale if scale > 0 else (math.inf if gap > 0 else 0.0)
 
     # The mode test: the samples of every other run, given to the nearest of
-    # the modes of run i.
+    # the modes of run i whose frame reaches them (one mode: the frame of all
+    # the samples of run i).
     missing = {j: [] for j in ok}
-    bulk = {}
+    bulk = {j: _bulk(results[j]) for j in ok} if len(ok) > 1 else {}
     for i in ok:
         modes, label = results[i]._mode_fit
         heavy = [m for m, mode in enumerate(modes) if mode["mass"] >= COMPARE_MIN_MASS]
-        if label is None or not heavy or len(ok) < 2:
+        if not heavy or len(ok) < 2:
             continue
+        if label is None:
+            label = np.zeros(len(results[i]._weights), dtype=int)
         mass = np.array([mode["mass"] for mode in modes])
         index = np.full(len(modes), -1)
         index[mass > 0] = np.arange(np.sum(mass > 0))
@@ -2213,14 +2272,20 @@ def compare(results) -> Comparison:
             )
         except np.linalg.LinAlgError:  # a degenerate mode: no frame
             continue
+        u, weights, keep = bulk[i]
+        own = index[label][keep]
+        reach = [
+            _reach(_frame_r2(u[own == c], frame), weights[own == c])
+            for c, frame in enumerate(frames)
+        ]
         for j in ok:
             if j == i:
                 continue
-            if j not in bulk:
-                bulk[j] = _bulk(results[j])
-            u, weights = bulk[j]
+            u, weights, _ = bulk[j]
+            nearest = _nearest_frame(u, frames, reach)
+            inside = nearest >= 0
             here = np.bincount(
-                _nearest_frame(u, frames), weights, minlength=len(frames)
+                nearest[inside], weights[inside], minlength=len(frames)
             )
             missing[j] += [
                 {"run": i, "mode": m, "mass": float(mass[m]),
@@ -2242,13 +2307,20 @@ def compare(results) -> Comparison:
             )
         lacks = missing.get(j, [])
         if lacks:
+            # Modes of several runs may be one mode, or several: count the
+            # (run, mode) pairs and name the runs.
             worst = max(lacks, key=lambda item: item["mass"])
-            found = len({item["run"] for item in lacks})
+            heaviest = (
+                f"mode {worst['mode']} of run {worst['run']}: mass "
+                f"{worst['mass']:.3g} there, {worst['mass_here']:.2g} here"
+            )
+            found = sorted({item["run"] for item in lacks})
+            names = ", ".join(map(str, found[:-1])) + " and " * (len(found) > 1)
+            names = ("runs " if len(found) > 1 else "run ") + names + str(found[-1])
             reasons.append(
-                "it lacks a mode that "
-                + (f"run {worst['run']}" if found == 1 else f"{found} other runs")
-                + f" found (mode {worst['mode']} of run {worst['run']}: mass "
-                f"{worst['mass']:.3g} there, {worst['mass_here']:.2g} here)"
+                f"it lacks a mode that {names} found ({heaviest})" if len(lacks) == 1
+                else f"it lacks {len(lacks)} modes that {names} found (the "
+                f"heaviest: {heaviest})"
             )
         runs.append({
             "run": j,

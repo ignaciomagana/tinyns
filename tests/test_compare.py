@@ -43,13 +43,15 @@ def batch():
     return NestedSampler(two_modes, lambda u: u, 3, nlive=400).run(keys)
 
 
-def minor_scaled(result, scale):
+def minor_scaled(result, scale, major=1.0):
     """``result`` with the posterior mass of its minor mode times ``scale``
-    (0: a run that lost the mode), and logz to match."""
+    and of its major mode times ``major`` (0: a run that lost the mode), and
+    logz to match."""
     logwt = np.asarray(result.logwt, dtype=float).copy()
     minor = np.asarray(result.samples_u)[:, 0] > 0.55
     with np.errstate(divide="ignore"):
         logwt[minor] += math.log(scale) if scale > 0 else -np.inf
+        logwt[~minor] += math.log(major) if major > 0 else -np.inf
     return dataclasses.replace(
         result, logwt=logwt, logz=float(np.logaddexp.reduce(logwt))
     )
@@ -103,7 +105,9 @@ def test_a_run_that_lost_a_mode_is_flagged(batch) -> None:
     report = compare([*batch[1:], lost])
     assert report.flagged == [3]
     row = report.runs[3]
-    assert "it lacks a mode that 3 other runs found (mode 1 of run " in row["reason"]
+    assert row["reason"].startswith(
+        "it lacks 3 modes that runs 0, 1 and 2 found (the heaviest: mode 1 of run "
+    )
     assert sorted(item["run"] for item in row["missing_modes"]) == [0, 1, 2]
     for item in row["missing_modes"]:
         assert item["mode"] == 1
@@ -111,6 +115,44 @@ def test_a_run_that_lost_a_mode_is_flagged(batch) -> None:
         assert item["mass"] == batch[1 + item["run"]].modes()[1]["mass"]
         assert item["mass_here"] == pytest.approx(0.0, abs=1e-6)
     assert "run 3: " + row["reason"] in report.summary()
+
+
+def test_each_sample_has_the_mode_that_modes_lists(batch) -> None:
+    """The mode test takes the mode of each sample from modes(), as its index
+    in that list, which is by mass: with the minor mode made the heavier the
+    order flips, and a run that lacks it lacks mode 0."""
+    lost = minor_scaled(batch[1], 0.0)
+    for scale in (1.0, 10.0):
+        run = minor_scaled(batch[0], scale)
+        modes, label = run._mode_fit
+        weights = run.weights()
+        assert [weights[label == m].sum() for m in range(len(modes))] == pytest.approx(
+            [mode["mass"] for mode in modes]
+        )
+        minor = 0 if scale > 1 else 1
+        assert (modes[minor]["mass"] > 0.5) == (scale > 1)
+        (item,) = compare([run, lost]).runs[1]["missing_modes"]
+        assert item["mode"] == minor and item["mass"] == modes[minor]["mass"]
+        assert item["mass_here"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_runs_that_each_kept_a_different_mode_both_lack_one(batch) -> None:
+    """A run that reports one mode is compared with the frame of all its
+    samples: of two runs that each kept one of the two modes, each lacks the
+    mode of the other, even at one logZ."""
+    major = minor_scaled(batch[0], 0.0)
+    minor = dataclasses.replace(minor_scaled(batch[1], 1.0, major=0.0), logz=major.logz)
+    assert len(major.modes()) == len(minor.modes()) == 1
+    report = compare([major, minor])
+    assert report.flagged == [0, 1]
+    for row, other in zip(report.runs, (1, 0), strict=True):
+        assert row["logz_shortfall"] == 0
+        (item,) = row["missing_modes"]
+        assert (item["run"], item["mode"], item["mass"]) == (other, 0, 1.0)
+        assert item["mass_here"] == pytest.approx(0.0, abs=1e-6)
+        assert row["reason"].startswith(
+            f"it lacks a mode that run {other} found (mode 0 of run {other}: mass 1 "
+        )
 
 
 def test_a_run_with_its_modes_merged_is_not_flagged(batch) -> None:
@@ -241,48 +283,96 @@ def mix3(x):
     return logsumexp(jnp.asarray(MIX_CONST) - 0.5 * jnp.sum(z * z, axis=1))
 
 
-def mix3_lost(result):
-    """Whether the run kept less than a tenth of the mass of a component (the
-    mass of the samples whose likeliest component it is)."""
+def mix3_component(result):
+    """The likeliest component of each sample."""
     x = np.asarray(result.samples, dtype=float)
     score = [MIX_CONST[i] - 0.5 * np.sum(np.linalg.solve(MIX_CHOL[i], (x - MIX_MU[i]).T)
                                          ** 2, axis=0) for i in range(3)]
-    best = np.argmax(score, axis=0)
+    return np.argmax(score, axis=0)
+
+
+def mix3_lost(result):
+    """Whether the run kept less than a tenth of the mass of a component (the
+    mass of the samples whose likeliest component it is)."""
+    best = mix3_component(result)
     mass = [result.weights()[best == i].sum() for i in range(3)]
     return bool(np.any(np.asarray(mass) < 0.1 * MIX_W))
 
 
 def flagged_runs(results):
-    """compare() on ``results``: every run that lost a mode is flagged if
-    another run kept every mode, and a run that lacks a mode of another run
-    did lose one; returns the number of runs lost and of the others flagged
-    (by the logZ test)."""
+    """compare() on ``results`` against the oracle: a run that kept every
+    mode lacks none of another run, and if a run kept every mode, every run
+    that lost one is flagged. Returns how many runs lost a mode next to a run
+    that kept every mode, how many of those lack a mode of another run (the
+    mode test), and how many runs that kept every mode were flagged (by the
+    logZ test)."""
     lost = [mix3_lost(r) for r in results]
     report = compare(results)
     for row, gone in zip(report.runs, lost, strict=True):
         assert gone or not row["missing_modes"], (row, lost)
         assert row["flagged"] or not gone or all(lost), (row, lost)
-    return sum(lost), sum(row["flagged"] and not gone
-                          for row, gone in zip(report.runs, lost, strict=True))
+    near = [gone and not all(lost) for gone in lost]
+    rows = list(zip(report.runs, lost, near, strict=True))
+    return (
+        sum(near),
+        sum(bool(row["missing_modes"]) for row, _, n in rows if n),
+        sum(row["flagged"] and not gone for row, gone, _ in rows),
+    )
 
 
-def test_real_lost_modes_are_flagged() -> None:
+@pytest.fixture(scope="module")
+def mix3_runs():
     """Eight runs of the study's 4-D mixture at nlive 300, where the 0.6 mode
-    was lost in 14 of 32 runs (x64 off and on), in two batches of four."""
+    was lost in 14 of 32 runs (x64 off and on)."""
     sampler = NestedSampler(mix3, lambda u: -12 + 24 * u, 4, nlive=300)
-    results = sampler.run(jax.random.split(jax.random.key(0), 8))
-    for i in (0, 4):
-        flagged_runs(results[i : i + 4])
+    return sampler.run(jax.random.split(jax.random.key(0), 8))
+
+
+def test_real_lost_modes_are_flagged(mix3_runs) -> None:
+    """In two batches of four, the mode test finds every run that lost a mode
+    (the logZ test flags them too: its guard is that test's own) and flags no
+    run that kept every mode."""
+    lost, found, kept_flagged = np.sum(
+        [flagged_runs(mix3_runs[i : i + 4]) for i in (0, 4)], axis=0
+    )
+    assert lost >= 1 and found == lost and kept_flagged == 0, (
+        lost, found, kept_flagged
+    )
+
+
+def test_runs_that_lost_different_modes_both_lack_one(mix3_runs) -> None:
+    """Two runs that kept every mode, one made to lose the 0.3 mode and the
+    other the 0.1 mode: each lacks the mode of the other, as no frame of the
+    other run reaches the samples of the mode it holds instead."""
+    a, b = [r for r in mix3_runs if not mix3_lost(r)][:2]
+    pair = []
+    for run, gone in ((a, 1), (b, 2)):
+        logwt = np.asarray(run.logwt, dtype=float).copy()
+        logwt[mix3_component(run) == gone] = -np.inf
+        pair.append(dataclasses.replace(
+            run, logwt=logwt, logz=float(np.logaddexp.reduce(logwt))
+        ))
+    assert [len(run.modes()) for run in pair] == [2, 2]
+    report = compare(pair)
+    for row, other in zip(report.runs, (1, 0), strict=True):
+        (item,) = row["missing_modes"]
+        assert item["run"] == other and item["mass_here"] < 1e-3
+    assert compare([a, b]).flagged == []
 
 
 @pytest.mark.slow
 def test_lost_modes_are_flagged_in_batches_of_four() -> None:
     """64 runs of the 4-D mixture at nlive 500 (the 0.6 mode lost in about 1
     of 4) in batches of four: every lost run is flagged where a run of its
-    batch kept the mode, and at most one other run is flagged."""
+    batch kept the mode, the mode test finds all but at most one of them (13
+    of 13 in float32, 19 of 19 in x64; a run whose modes() merged the mode
+    with another is no reference for it), and at most one other run is
+    flagged (none)."""
     sampler = NestedSampler(mix3, lambda u: -12 + 24 * u, 4, nlive=500)
     results = sampler.run(jax.random.split(jax.random.key(1), 64))
-    lost, kept_flagged = np.sum(
+    lost, found, kept_flagged = np.sum(
         [flagged_runs(results[i : i + 4]) for i in range(0, 64, 4)], axis=0
     )
-    assert lost >= 2 and kept_flagged <= 1, (lost, kept_flagged)
+    assert lost >= 2 and found >= lost - 1 and kept_flagged <= 1, (
+        lost, found, kept_flagged
+    )
