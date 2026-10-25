@@ -776,8 +776,9 @@ H100, the others on 4 CPU cores with the likelihood called from Python. The
 tinyns rows predate the fixes of its release review.
 
 Evidence. Each cell is the logZ bias ± its standard error; likelihood calls;
-time (compiled for tinyns and BlackJAX, with a fixed cost of about 9 s still
-in BlackJAX's; with cached programs for JAXNS):
+time (compiled for tinyns and BlackJAX, but with about 9 s of first-call
+compilation still in BlackJAX's, see *Time* below; with cached programs for
+JAXNS):
 
 | sampler | on | `gauss_d16` | `gauss_d64` | `rosen_d10` |
 |---|---|---|---|---|
@@ -814,11 +815,16 @@ comparison.
   on 22 at 1000, and its error bars are honest (sd / logzerr from 0.69 to
   1.32, with the earlier `logzerr`). At 500 it is low by 0.22 on `rosen_d10`
   and loses the minor mode of the 32-D mixtures in 25 to 30% of the runs.
-- **Time.** A compiled run takes 1 to 20 s and a first run 9 to 31 s, against
-  9 to 77 s for BlackJAX NSS and 16 to 360 s for JAXNS. About 9 s of each
-  BlackJAX run is a fixed cost, which on CPU is the first-call compilation of
-  its adapter's eager ops (fixed since; the H100 split is not measured). Past
-  it, BlackJAX's time grows 4.2 times as fast with the calls as tinyns's.
+- **Time.** In the sweep a compiled run takes 1 to 20 s and a first run 9 to
+  31 s, against 9 to 77 s for BlackJAX NSS and 16 to 360 s for JAXNS. About
+  9 s of each BlackJAX run there is the first-call compilation of its
+  adapter's eager ops, fixed since. Timed again with the fixed adapters on an
+  H100 NVL (JAX 0.10.2, x64, 9 of the targets, 16 seeds; `bench/RESULTS.md`),
+  BlackJAX's compiled run takes 0.17 to 69 s against 0.11 to 23 s for
+  tinyns: 1.3 to 3.5 times as long (2.9 to 3.5 from d = 16), where the
+  sweep's records give 4.0 to 8.1. Its time grows 3.5 times as fast with the
+  calls as tinyns's (4.2 in the sweep), and its `compile s` is 5.3 to 7.9 s
+  a run, mostly its post-processing, against 2.3 to 2.9 s for tinyns.
 - **Calls.** tinyns does not need the fewest. Nautilus needs 1.7 to 24 times
   fewer for an rms 2 to 28 times smaller, and dynesty and UltraNest need 1.5
   to 13 times fewer below d = 10 on unimodal targets: with an expensive
@@ -842,10 +848,10 @@ comparison.
   slice sampler at d = 10 (it finishes where MLFriends timed out), chain
   lengths matched to tinyns's at d >= 30 (dynesty's `rwalk` is unbiased on
   `gauss_d32` with 192 steps), competitor rows at nlive 1000 and above, and
-  the H100 cells again with the adapters fixed after the sweep (BlackJAX's
-  times hold a fixed cost of about 9 s, which on CPU is the compilation of
-  its eager ops, and its stop ran past `dlogz`, +19% calls on `gauss_d2`; the
-  CPU samplers' walls hold a compile per batch size). JAXNS and UltraNest
+  the sweep's cells again with the adapters fixed after it (BlackJAX's times
+  hold about 9 s of compilation and its stop ran past `dlogz`, +19% calls on
+  `gauss_d2`; the CPU samplers' walls hold a compile per batch size; only
+  BlackJAX and tinyns were timed again, on 9 targets). JAXNS and UltraNest
   stop later than `dlogz = 0.1` in low dimensions (JAXNS: about 1.5 times the
   calls at d = 2). `bench/RESULTS.md` states each correction.
 
