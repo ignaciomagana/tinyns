@@ -9,19 +9,18 @@ multimodal posteriors inside the sampler, and it is not tied to any application.
 ## Install
 
 `tinyns` needs Python 3.10+ and JAX 0.4.31+. It is not on PyPI yet; install
-the 1.0.0 release from GitHub:
+the 1.1.0 release from GitHub:
 
 ```bash
-python -m pip install "git+https://github.com/ignaciomagana/tinyns.git@v1.0.0"
+python -m pip install "git+https://github.com/ignaciomagana/tinyns.git@v1.1.0"
 ```
 
-Without `@v1.0.0` you get the development version (`main`). For a GPU,
+Without `@v1.1.0` you get the development version (`main`). For a GPU,
 install the matching JAX build first (see the JAX install guide). For
 development: clone, `python -m pip install -e '.[dev]'`, then `make test`.
 
-This README describes the development version, 1.1 (unreleased; see
-`CHANGELOG.md`; until it is tagged, `tinyns.__version__` still reports
-1.0.0). It keeps thin modes more often than 1.0.0 and adds
+This README describes 1.1.0 (see `CHANGELOG.md`). It keeps thin modes
+more often than 1.0.0 and adds
 `tinyns.compare`, which 1.0.0 does not have. A figure that names no version
 was measured on 1.0.0 (or on the v1 code before it). The two versions give
 the same run, bit for bit, wherever the clustering never splits (Gaussians

@@ -19,4 +19,4 @@ __all__ = [
 ]
 
 # The single source of the version: pyproject.toml reads it (hatch dynamic).
-__version__ = "1.0.0"
+__version__ = "1.1.0"
