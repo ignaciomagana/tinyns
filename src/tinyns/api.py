@@ -135,7 +135,9 @@ class NestedSampler:
         ``batched_data=True`` every array leaf of a pytree ``loglike`` or
         ``prior_transform`` (e.g. ``jax.tree_util.Partial(fn, data)`` with
         ``data`` stacked over runs) carries the same leading axis of ``B``:
-        run ``i`` sees slice ``i``.
+        run ``i`` sees slice ``i``. Each result records
+        ``metadata["batched_data"]``, and :func:`tinyns.compare` refuses the
+        results of ``batched_data=True``, which are of different datasets.
         """
         try:
             return core.run(

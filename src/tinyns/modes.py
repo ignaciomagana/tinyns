@@ -70,13 +70,13 @@ the hop the mode's live count is a critical branching process (each point
 dies about once per e-fold and seeds about one new point) in which 0 is
 absorbing, and from ``n0`` points the mode dies out within ``T`` e-folds
 with probability about ``(T / (1 + T))^n0``. So a frame takes part in the
-hop from 3 members, whatever its volume share, and a slot whose cluster
-falls below 3 members at a recluster keeps the last frame it had with 3 or
-more (:func:`keep_frames`): active and eligible for the hop, not for the
-walk, for ``GHOST_RECLUSTERS = 8`` reclusters (about two e-folds). New
-points may take its label, so a mode the hop refills is reclustered under
-its old id; a slot that holds 3 members again is an ordinary frame, and a
-split may take a kept slot that holds none. In
+hop from 3 members (2 in one dimension), whatever its volume share, and a
+slot whose cluster falls below that at a recluster keeps the last frame it
+had with at least that many (:func:`keep_frames`): active and eligible for
+the hop, not for the walk, for ``GHOST_RECLUSTERS = 8`` reclusters (about
+two e-folds). New points may take its label, so a mode the hop refills is
+reclustered under its old id; a slot that holds 3 members again is an
+ordinary frame, and a split may take a kept slot that holds none. In
 ``metadata["mode_history"]`` a kept frame counts as a cluster only while its
 slot holds members. The 1.0 rule (a volume share that predicts ``2 d`` live
 points, and more than ``d`` members) left out exactly the thin clusters, and
@@ -88,9 +88,10 @@ with both changes in 1 of 128. A 4-D mixture of masses 0.6, 0.3 and 0.1
 (float32) lost its 0.6 mode in 97 of 384 runs at nlive 500 (now 68), where
 it holds about 6 live points when it separates, and in 19 of 384 at nlive
 1000 (now 6). A mode that holds one or two live points when its contour
-separates is never split off, and nothing here keeps it: the 6-D version of
-that mixture lost its 0.6 mode in 18 and 19 of 24 runs at nlive 1000,
-without and with these changes. Only more live points help there.
+separates is rarely split off with enough points to be kept, and these
+changes did not help it: the 6-D version of that mixture lost its 0.6 mode
+in 18 and 19 of 24 runs at nlive 1000, without and with them. Only more
+live points help there.
 
 **The local walk.** The other steps propose ``y = x + s L_c(x) z``, with
 ``c(x)`` the nearest walking frame (Mahalanobis distance) and ``L_c`` its

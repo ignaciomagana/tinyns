@@ -28,7 +28,9 @@ the same run, bit for bit, wherever the clustering never splits (Gaussians
 in 2 to 16 dimensions and the eggbox at `nlive=1000`, in float32 and x64).
 Elsewhere the runs differ; on the targets measured again, 1.1 was as
 accurate as 1.0.0 or more, except that the minor mode's mass scatters more
-on the needle targets (see Limitations).
+on the needle targets (see Limitations). A likelihood call can cost a few
+percent more where 1.1 uses more frames: up to 9% on a CPU on an 18-D
+target, and no cost was resolved on a GPU (see `CHANGELOG.md`).
 
 ## Quickstart
 
@@ -122,15 +124,16 @@ likelihood contour `L*`; proposals that leave the open unit cube or fall to
   Hastings correction when the proposal lands in another cluster.
 - **Hop.** Every 10th chain step is an independence Metropolis-Hastings
   proposal from the union of ellipsoids fitted to every cluster of 3 or more
-  members (2 in 1-D), whatever its volume (with fewer than two such
-  clusters, the hop is off). It moves points between modes and keeps the
-  mode weights right. Once a mode is separated, only the hop brings points
-  into it, so a cluster that falls below 3 members keeps its last frame in
-  the hop for 8 reclusters (about two e-folds of prior volume), and the hop
-  can refill the mode from there. 1.0.0 admitted a cluster only if it had
-  more than `ndim` members and a volume share that predicted `2 * ndim`
-  live points, which left out the thin clusters that need the hop most, and
-  a cluster's frame went with its last member.
+  members (2 in 1-D), whatever its volume. It moves points between modes and
+  keeps the mode weights right. Once a mode is separated, only the hop
+  brings points into it, so a cluster that falls below 3 members (2 in 1-D)
+  keeps its last frame in the hop for 8 reclusters (about two e-folds of
+  prior volume), and the hop can refill the mode from there. With fewer
+  than two such frames, kept frames included, the hop is off. 1.0.0
+  admitted a cluster only if it had more than `ndim` members and a volume
+  share that predicted `2 * ndim` live points, which left out the thin
+  clusters that need the hop most, and a cluster's frame went with its last
+  member.
 - **Cross-fitting.** The live slots form three folds. A chain seeded in one
   fold uses clusters and covariances fitted to the other two only (as emcee
   moves each half of its walkers with the other half).
@@ -170,10 +173,11 @@ chain length. A kept frame is one that the same clustering fitted earlier to
 points outside the fold, so it adds nothing of the chain's fold either. On 1.1
 the hop with kept frames was run as the sampler runs it, 200,000 chains in
 each of four cases (float32 and x64): the uniform law held (chi-square p 0.22
-to 0.99), with about 25,500 to 31,600 chains per case moving into a dying
-mode through a kept frame. What remains is common to every MCMC-driven nested
-sampler: a new point is correlated with its seed (hence `walks`), and the step
-scale adapts on past chains.
+to 0.99), and about 25,500 to 31,600 chains per case moved into the ball
+whose frame was kept, in three of the cases only through the kept frame.
+What remains is common to every MCMC-driven nested sampler: a new point is
+correlated with its seed (hence `walks`), and the step scale adapts on past
+chains.
 
 **Speed.** Measured on one NVIDIA H100 in float32, on a 13-D correlated
 Gaussian run to `dlogz = 0.1` with the default settings of each version (v1
@@ -287,8 +291,9 @@ three modes of different widths scattered 1.5 to 4 times more) and two flags.
 when the hop balanced the modes only in part: after the modes separated and
 while two of them held live points, the clustering held 1.5 clusters per mode
 or more on average (it cut the modes into lumps) or the hop was off (fewer
-than two clusters eligible to propose from) for half of the posterior mass or
-more, or, over the whole run, the hop accepted less than 2% of its proposals.
+than two eligible frames to propose from, kept frames included) for half of
+the posterior mass or more, or, over the whole run, the hop accepted less
+than 2% of its proposals.
 That warning quotes the fold masses and `run_sd` of each mode but the
 heaviest.
 And they say when the clustering's 8 slots were full during a run with
@@ -356,11 +361,12 @@ cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
   of the volume when it separates, about 6 of 500 live points. On 1.1
   (float32, CPU) it was lost in 68 of 384 runs at `nlive=500` and in 6 of 384
   at 1000, about 1 run in 60 (97 and 19 on 1.0.0). In 6-D it holds 1.7 of
-  1000 live points there, and 1.1 lost it in 40 of 48 runs at 1000, and in
-  9, 7 and 3 of 16 at 2000, 4000 and 8000. The rule gives an `nlive` of 33
-  to 67. The prior-volume share is not known in advance: raise `nlive`, and
-  run 4 seeds (`jax.random.split(key, 4)`) and check them with
-  `tinyns.compare` (see Multimodal posteriors).
+  1000 live points there, and 1.1 lost it in 40 of 48 runs at 1000; a
+  prototype of 1.1 lost it in 9, 7 and 3 of 16 runs at 2000, 4000 and 8000
+  (key 5). The rule gives an `nlive` of 33 to 67. The prior-volume share is
+  not known in advance: raise `nlive`, and run 4 seeds
+  (`jax.random.split(key, 4)`) and check them with `tinyns.compare` (see
+  Multimodal posteriors).
 - *`modes()` flags a mode unresolved.* The flag is a reason to raise `nlive`,
   but its absence is not proof. A mode that is lost leaves no trace in its own
   run. On 1.1, of the 768 runs of the 4-D mixture above at `nlive` 500 and
@@ -492,11 +498,11 @@ shares (a lookup table) needs that axis too: tile it, or let `fn` capture it,
 which embeds it in the compiled program. A batched run agrees with the
 run of its key alone in distribution, not bit for bit. A stopped run is
 frozen, not skipped, so the device evaluates about `B` times the calls of the
-longest run: batch runs of similar length. Each result records
-`metadata["batched_data"]` (new in 1.1), and `tinyns.compare` refuses the
-runs of `batched_data=True`, which are of different datasets. A result saved
-before 1.1 does not record it: before you compare such runs, make sure they
-share one likelihood and prior.
+longest run: batch runs of similar length. Each result of `run`
+records `metadata["batched_data"]` (new in 1.1), and `tinyns.compare`
+refuses the runs of `batched_data=True`, which are of different datasets. A
+result saved before 1.1, or made by `finalise`, does not record it: before
+you compare such runs, make sure they share one likelihood and prior.
 
 ## Pytree callables
 
@@ -568,7 +574,7 @@ does.
   raise `nlive`.
 - **A mode can be lost with no warning.** A run that loses a mode reports the
   modes left, with no flag and almost never a warning, and its logZ is low by
-  about `log(1 - mass)`, which can lie within `logzerr`. 1.1 keeps most of
+  about `log(1 - mass)`, which can lie within `logzerr`. 1.1 loses fewer of
   the modes that the clustering splits off: every cluster of 3 or more
   members takes part in the hop, and a dying cluster's frame stays in it for
   about two e-folds (see How it works). The 18-D two-mode target
@@ -580,21 +586,23 @@ does.
   none off, and the logit sd of the kept mass fell from 0.334 to 0.035. On
   other keys 1.1 lost it in 1 of 192 runs, and 1.0.0 in 8 of 96. What 1.1
   does not fix:
-  - A mode that holds 1 or 2 live points when its contour separates is never
-    split off, so no frame can keep it, and it is lost in most runs. The
-    0.6 mode of the 6-D mixture of Choosing `nlive` (1.7 of 1000 live points
-    there) was lost at `nlive=1000` in 40 of 48 runs on 1.1 (39 on 1.0.0),
-    and in 9, 7 and 3 of 16 at 2000, 4000 and 8000 (10, 12 and 4 on 1.0.0),
-    with logZ about `log(1 - 0.6) = -0.92` low. Only more live points help.
-  - A mode with a few live points when it separates is still lost now and
-    then: the 0.6 mode of the 4-D mixture (about 6 of 500 there) in 68 of 384
-    runs at `nlive=500` and 6 of 384 at 1000 on 1.1 (97 and 19 on 1.0.0),
-    with logZ 4.4 to 9.9 `logzerr` low.
+  - A mode that holds 1 or 2 live points when its contour separates is
+    rarely split off with enough points to be kept, and it is lost in most
+    runs; the 1.1 rules did not change that. The 0.6 mode of the 6-D
+    mixture of Choosing `nlive` (1.7 of 1000 live points there) was lost at
+    `nlive=1000` in 40 of 48 runs on 1.1 (39 on 1.0.0), and on a prototype
+    of 1.1 in 9, 7 and 3 of 16 at 2000, 4000 and 8000 (key 5; 10, 12 and 4
+    on 1.0.0), with logZ about `log(1 - 0.6) = -0.92` low. Only more live
+    points help.
+  - A mode with a few live points when it separates is still lost: the 0.6
+    mode of the 4-D mixture (about 6 of 500 there) in 68 of 384 runs (18%)
+    at `nlive=500` and 6 of 384 (1.6%) at 1000 on 1.1 (97 and 19 on
+    1.0.0), with logZ 4.4 to 9.9 `logzerr` low.
   - A mode that `modes()` does not separate from its neighbour is lost
     unseen. On two connected modes in 32-D (`connW_d32`, nlive 1000,
-    float32, 32 runs) `modes()` reported one mode in every run and no run
-    warned; 1.1 lost the 6% mode in 1 run, and lost it or put it more than
-    0.5 off in logit in 3 (11 on 1.0.0).
+    float32, 32 runs) `modes()` reported one mode in every run. 1.1 lost
+    the 6% mode in 1 run, and lost it or put it more than 0.5 off in logit
+    in 3 (11 on 1.0.0), and none of those runs warned.
 
   Run 4 seeds of one problem and check them with `tinyns.compare` (see
   Multimodal posteriors): it flags a lost run when another run of the batch
@@ -613,8 +621,10 @@ does.
   low, under the bar of 4). It missed none of the 181 lost at `nlive=500`.
   On the 6-D mixture (1.1, nlive 1000) batches of 4 flagged the 16 lost runs
   that shared a batch with a run that kept the mode, and none of the 24 in
-  batches that had all lost it. A larger batch makes these misses rarer,
-  and so does a higher `nlive`. But in a large batch the highest logZ is
+  batches that had all lost it. A larger batch makes these misses rarer
+  where some runs keep the mode and separate it, and so does a higher
+  `nlive`; neither helps with a mode that no run separates, as on
+  `connW_d32` above. But in a large batch the highest logZ is
   high by chance, so the logZ test can flag a correct run: in batches of 32
   of the 2048 runs above it flagged 8 of the 1501 that kept every mode (4.1
   to 4.7 combined `logzerr` low), and none in batches of 4. The mode test's

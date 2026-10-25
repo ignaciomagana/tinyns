@@ -934,19 +934,19 @@ class NestedSamplingResult:
         its logit over the folds: a measurement, within the run, of how much
         the mass scatters. Where the hop balances the modes the folds agree
         (``fold_sd`` 0.04 to 0.1 on the Gaussian mixtures of ``bench``);
-        where it does not, each fold drifts on its own (0.4 on the 18-D
-        needle target, 1 to 1.6 on an 18-D posterior whose modes have a
-        funnel neck). Every fold weighs its samples with the run's prior
-        volumes, so ``fold_sd`` misses their error, which moves the masses of
-        all folds together (:meth:`_volume_variance`): it vanishes for modes
-        of one height and grows with the prior volume between the bulk of the
-        mode and that of the rest, as when the heaviest mode is also the
-        narrowest. ``run_sd = sqrt(fold_sd^2 / folds + V)``, with ``V`` that
-        error's variance, is the run-to-run scatter of the mass in logit,
-        measured within the run. On a 4-D mixture of masses 0.75, 0.2 and
-        0.05 and widths 0.25, 0.5 and 0.75 (rotated Gaussians in
-        ``[-12, 12]^4``, about 10 apart in a triangle; 16 runs at nlive 1000)
-        the masses
+        where it does not, each fold drifts on its own (a median of about
+        0.3 on the 18-D needle target at nlive 1000, on tinyns 1.0 and 1.1;
+        1 to 1.6 on an 18-D posterior whose modes have a funnel neck). Every
+        fold weighs its samples with the run's prior volumes, so ``fold_sd``
+        misses their error, which moves the masses of all folds together
+        (:meth:`_volume_variance`): it vanishes for modes of one height and
+        grows with the prior volume between the bulk of the mode and that of
+        the rest, as when the heaviest mode is also the narrowest.
+        ``run_sd = sqrt(fold_sd^2 / folds + V)``, with ``V`` that error's
+        variance, is the run-to-run scatter of the mass in logit, measured
+        within the run. On a 4-D mixture of masses 0.75, 0.2 and 0.05 and
+        widths 0.25, 0.5 and 0.75 (rotated Gaussians in ``[-12, 12]^4``,
+        about 10 apart in a triangle; 16 runs at nlive 1000) the masses
         scattered by 0.056, 0.053 and 0.079, against a median ``run_sd`` of
         0.053, 0.046 and 0.065 and ``fold_sd / sqrt(3)`` of 0.015, 0.012 and
         0.027; for modes of one height ``run_sd`` is ``fold_sd / sqrt(3)``.
@@ -960,10 +960,10 @@ class NestedSamplingResult:
         a median ``run_sd`` of 0.053, 0.048 and 0.062. Where the hop
         balanced the modes only in part (a warning of :meth:`diagnostics`),
         ``run_sd`` falls short too: on the 18-D needle target at nlive 1000
-        the minor mass scattered by 0.28 in logit over 128 runs, against a
-        median ``run_sd`` of 0.19, and 18 of the 125 runs that gave one lay
-        beyond 3 ``run_sd``, each with that warning (on tinyns 1.0: 0.25,
-        0.17 and 15 of 126).
+        (float32, CPU) the minor mass scattered by 0.28 in logit over 128
+        runs, against a median ``run_sd`` of 0.19, and 18 of the 125 runs
+        that gave one lay beyond 3 ``run_sd``, each with that warning (on
+        tinyns 1.0: 0.25, 0.17 and 15 of 126).
 
         Per mode: ``mass``, ``urn_sd``, ``fold_mass``, ``fold_sd``,
         ``run_sd`` (``None`` without folds), ``min_live`` (the smallest ``n``
@@ -1008,20 +1008,21 @@ class NestedSamplingResult:
         ``logzerr``. Once separated, a mode is kept populated by the hop
         alone, and the hop reaches it only after the clustering has split it
         off (:mod:`tinyns.modes`, *Thin modes and kept frames*): a mode that
-        holds one or two live points when its contour separates is never
-        split off, and is lost in most runs. On a 4-D mixture of masses 0.6,
-        0.3 and 0.1 and widths 0.25, 0.5 and 0.75 (rotated Gaussians in
-        ``[-12, 12]^4``, float32) the 0.6 mode holds about 6 of 500 live
-        points when it separates; it was lost in 68 of 384 runs at nlive 500
-        (97 on tinyns 1.0) and in 6 of 384 at nlive 1000 (19 on 1.0), all
-        but two without a warning and with logZ 0.60 to 1.26 low (4.4 to 9.9
-        ``logzerr``), while 684 of the 694 runs that kept it flagged it
-        unresolved. In 6-D it holds 1.7 of 1000 live points there, and was
-        lost in 19 of 24 runs at nlive 1000 (18 on 1.0) and 3 of 16 at
-        nlive 8000 (4 on 1.0). A light
-        mode can be lost too, with logZ about right: on the 18-D target
-        ``build_two_mode(18, 0.2)`` of ``bench.targets`` 1 of 128 runs in x64
-        lost its 20% mode (11 on 1.0), and all 127 that kept it flagged it.
+        holds one or two live points when its contour separates is rarely
+        split off with enough points to be kept, and is lost in most runs.
+        On a 4-D mixture of masses 0.6, 0.3 and 0.1 and widths 0.25, 0.5 and
+        0.75 (rotated Gaussians in ``[-12, 12]^4``, float32) the 0.6 mode
+        holds about 6 of 500 live points when it separates; it was lost in
+        68 of 384 runs at nlive 500 (97 on tinyns 1.0) and in 6 of 384 at
+        nlive 1000 (19 on 1.0), all but two without a warning and with logZ
+        0.60 to 1.26 low (4.4 to 9.9 ``logzerr``), while 684 of the 694 runs
+        that kept it flagged it unresolved. In 6-D it holds 1.7 of 1000 live
+        points there, and was lost in 19 of 24 runs at nlive 1000 (18 on
+        1.0), and on a prototype of 1.1 in 3 of 16 at nlive 8000 (4 on 1.0).
+        A light mode can be lost too, with logZ about right: on the 18-D
+        target ``build_two_mode(18, 0.2)`` of ``bench.targets`` 1 of 128
+        runs in x64 lost its 20% mode (11 on 1.0), and all 127 that kept it
+        flagged it.
         So if any run flags a mode unresolved, other runs may have lost it:
         raise ``nlive``, and run several seeds and compare them
         (:func:`tinyns.compare`). A unimodal run (or a result without
@@ -2118,10 +2119,11 @@ def compare(results) -> Comparison:
 
     A mode can die out of a run before its posterior bulk (the live points
     of a mode drift, and a thin mode can reach zero), and the run that lost
-    it gives no sign: :meth:`NestedSamplingResult.modes` does not list it, no
-    warning fires, and logZ is low by about ``log(1 - mass)``, which can lie
-    within ``logzerr``. Runs of other seeds keep the mode in most cases, so a
-    batch of runs shows the loss. A run is flagged if
+    it gives almost no sign: :meth:`NestedSamplingResult.modes` does not
+    list it, a warning almost never fires, and logZ is low by about
+    ``log(1 - mass)``, which can lie within ``logzerr``. Runs of other seeds
+    keep the mode in most cases, so a batch of runs shows the loss. A run is
+    flagged if
 
     - its logZ lies more than ``COMPARE_SIGMA`` (4) combined logzerr,
       ``sqrt(e_best^2 + e_run^2)``, below the highest logZ of the runs; or
@@ -2147,8 +2149,9 @@ def compare(results) -> Comparison:
       <NestedSamplingResult.modes>` separated it.
 
     A run that did not succeed (``maxiter``, ``maxcall``, ``invalid``), has
-    no posterior weight or has a logzerr that is not finite is flagged with
-    its message and takes no part in the comparison of the others. Runs at
+    no posterior weight or has a logzerr that is not finite is flagged "not
+    compared" with the reason (the run's message, or that logz or logzerr
+    is not finite) and takes no part in the comparison of the others. Runs at
     different ``nlive`` (or ``walks``, ``num_delete``) can be compared; the
     run at lower ``nlive`` is the more likely to lose a mode. The comparison
     runs no likelihood and compiles nothing: it works out :meth:`modes
@@ -2161,8 +2164,9 @@ def compare(results) -> Comparison:
     :meth:`NestedSamplingResult.load_npz`. The runs of ``run(keys,
     batched_data=True)`` are of different datasets, so they are refused
     (``ValueError``), as are runs of different ``ndim``; a result saved
-    before 1.1 or built by hand does not record ``batched_data``, and the
-    caller must make sure that such runs are of one likelihood and prior.
+    before 1.1, made by :func:`tinyns.finalise` or built by hand does not
+    record ``batched_data`` (only ``run`` does), and the caller must make
+    sure that such runs are of one likelihood and prior.
 
     What it finds, in batches of 4 drawn from the saved runs of the 1.0.0
     sampler in the lost-mode study of 1.1. A 4-D mixture of masses 0.6, 0.3
@@ -2195,10 +2199,10 @@ def compare(results) -> Comparison:
     the mode, are of the two kinds below: 12 in batches whose every run had
     lost it, and 2 in a batch whose one run that kept it had merged it with
     the 0.3 mode (their logZ 2.6 and 3.8 combined logzerr low). On
-    ``build_two_mode(18, 0.2)`` (64 runs, x64) it flagged the one lost run
-    and no other, and on a Gaussian in 8-D, ``sepW_d10``, the shape-W
-    control, ``rosen_d10`` and the eggbox (64 runs each) no run that kept
-    every mode.
+    ``build_two_mode(18, 0.2)`` (64 runs at nlive 1000, x64) it flagged the
+    one lost run and no other, and on a Gaussian in 8-D, ``sepW_d10``, the
+    shape-W control, ``rosen_d10`` and the eggbox (64 runs each at nlive
+    1000, float32) no run that kept every mode.
 
     A mode that every run lost is not found: if a fraction ``p`` of the runs
     lose it, a batch of ``B`` runs misses it with probability ``p^B``. The
@@ -2215,12 +2219,13 @@ def compare(results) -> Comparison:
     kept every mode merged the 0.6 mode with the 0.1 one, and against it the
     3 runs that had lost the 0.6 mode held a third of the merged mode, in
     their 0.1 mode (the logZ test flagged them: 5.7 to 6.1 combined logzerr
-    low). A larger batch makes both misses rarer, and so does a higher
-    ``nlive``, at which fewer runs lose the mode. The highest logZ of many
-    runs is high by chance, so in a large batch the logZ test can flag a run
-    whose logZ scatters beyond logzerr: in batches of 32 of the 2048 runs
-    above it flagged 8 of the 1501 that kept every mode (4.1 to 4.7 combined
-    logzerr low), and none in batches of 4.
+    low). A larger batch makes both misses rarer where some runs keep the
+    mode and separate it, and so does a higher ``nlive``, at which fewer
+    runs lose the mode; neither helps with a mode that no run separates. The
+    highest logZ of many runs is high by chance, so in a large batch the
+    logZ test can flag a run whose logZ scatters beyond logzerr: in batches
+    of 32 of the 2048 runs above it flagged 8 of the 1501 that kept every
+    mode (4.1 to 4.7 combined logzerr low), and none in batches of 4.
 
     On two targets the bars of the mode test sit below the scatter of runs
     of the 1.0.0 sampler that kept every mode by a factor of only 1.3 and 2.
