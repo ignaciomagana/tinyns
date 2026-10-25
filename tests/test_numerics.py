@@ -327,6 +327,21 @@ def test_host_separation_along_a_very_narrow_axis(width) -> None:
     assert _gap(x, side) > SEPARATION_SIGMA
 
 
+def test_a_set_of_copies_has_no_separation() -> None:
+    """A set whose rows are all copies of rows of the other set is empty once
+    copies count once: no direction and no gap, and no numpy warning about
+    the mean of an empty set (seen in modes() on 1.1 needle runs)."""
+    from tinyns.result import _discriminant
+
+    x = np.random.default_rng(0).normal(size=(20, 3))
+    x = np.concatenate([x, x[:2]])
+    side = np.arange(len(x)) >= 20
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        w, lo, hi = _discriminant(x, side)
+    assert np.all(w == 0.0) and lo == hi == 0.0
+
+
 # --- the precision of the internal products ----------------------------------
 
 

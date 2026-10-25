@@ -339,12 +339,15 @@ def _discriminant(x, side):
     a unit within-set standard deviation, and the ends ``(lo, hi)`` of the
     empty stretch between the two sets along it: ``lo = max x[~side] @ w``
     and ``hi = min x[side] @ w`` (``hi < lo`` if they overlap; ``w = 0`` and
-    no stretch for sets without any spread).
+    no stretch for sets without any spread, or when one set is only copies of
+    rows of the other).
 
     Repeated rows count once: an unmoved chain returns a copy of its seed, and
     copies would shrink the within-set scatter without adding information."""
     x, first = np.unique(x, axis=0, return_index=True)  # copies of a seed: once
     side = np.asarray(side)[first]
+    if side.all() or not side.any():  # one set held only copies of the other
+        return np.zeros(x.shape[1]), 0.0, 0.0
     a, b = x[~side], x[side]
     dev = np.concatenate([a - a.mean(0), b - b.mean(0)])
     within = _ridge(dev.T @ dev / max(len(x) - 2, 1))
