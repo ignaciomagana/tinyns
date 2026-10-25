@@ -98,16 +98,16 @@ def test_runs_that_kept_every_mode_are_not_flagged(batch) -> None:
 
 def test_a_run_that_lost_a_mode_is_flagged(batch) -> None:
     """The run that lost the 0.25 mode lists no such mode and its logZ is
-    only log(0.75) = -0.29 low, about 1.6 combined logzerr: the mode test
-    flags it, from where the other runs found the mode."""
+    only log(0.75) = -0.29 low, 1.5 to 2.9 combined logzerr below the best
+    run here (4.2 on JAX 0.4.34 in x64, where the logZ test fires too): the
+    mode test flags it, from where the other runs found the mode."""
     lost = minor_scaled(batch[0], 0.0)
     assert len(lost.modes()) == 1
     report = compare([*batch[1:], lost])
     assert report.flagged == [3]
     row = report.runs[3]
-    assert row["reason"].startswith(
-        "it lacks 3 modes that runs 0, 1 and 2 found (the heaviest: mode 1 of run "
-    )
+    lacks = "it lacks 3 modes that runs 0, 1 and 2 found (the heaviest: mode 1 of run "
+    assert lacks in row["reason"]
     assert sorted(item["run"] for item in row["missing_modes"]) == [0, 1, 2]
     for item in row["missing_modes"]:
         assert item["mode"] == 1
