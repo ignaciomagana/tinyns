@@ -19,6 +19,16 @@ Without `@v1.0.0` you get the development version (`main`). For a GPU,
 install the matching JAX build first (see the JAX install guide). For
 development: clone, `python -m pip install -e '.[dev]'`, then `make test`.
 
+This README describes the development version, 1.1 (unreleased; see
+`CHANGELOG.md`). It keeps thin modes more often than 1.0.0 and adds
+`tinyns.compare`, which 1.0.0 does not have. A figure that names no version
+was measured on 1.0.0 (or on the v1 code before it). The two versions give
+the same run, bit for bit, wherever the clustering never splits (Gaussians
+in 2 to 16 dimensions and the eggbox at `nlive=1000`, in float32 and x64).
+Elsewhere the runs differ; on the targets measured again, 1.1 was as
+accurate as 1.0.0 or more, except for the scatter of a mode with thin arms
+(see Limitations).
+
 ## Quickstart
 
 ```python
@@ -84,6 +94,10 @@ and `to_numpy()` return every field, and `to_dynesty_dict()` gives
 dynesty-style keys. The weights are computed in NumPy float64,
 `resample_equal` returns systematic draws in a random order, `save_npz(path)`
 writes exactly `path`, atomically, and `load_npz` keeps the saved dtypes.
+A batched run (`run(keys)`) returns a list of results, and
+`tinyns.compare(results)` checks runs of one problem against each other: it
+flags a run that lost a mode the other runs found (see Multimodal
+posteriors).
 
 A run that found no finite likelihood (a bug in `loglike`, or a support
 smaller than about `1 / nlive` of the prior) ends with `success=False`, the
@@ -106,9 +120,16 @@ likelihood contour `L*`; proposals that leave the open unit cube or fall to
   Cholesky factor of the covariance of the cluster of `x`, and the exact
   Hastings correction when the proposal lands in another cluster.
 - **Hop.** Every 10th chain step is an independence Metropolis-Hastings
-  proposal from the union of ellipsoids fitted to the clusters that are large
-  enough to be eligible (with fewer than two, the hop is off). It moves
-  points between modes and keeps the mode weights right.
+  proposal from the union of ellipsoids fitted to every cluster of 3 or more
+  members (2 in 1-D), whatever its volume (with fewer than two such
+  clusters, the hop is off). It moves points between modes and keeps the
+  mode weights right. Once a mode is separated, only the hop brings points
+  into it, so a cluster that falls below 3 members keeps its last frame in
+  the hop for 8 reclusters (about two e-folds of prior volume), and the hop
+  can refill the mode from there. 1.0.0 admitted a cluster only if it had
+  more than `ndim` members and a volume share that predicted `2 * ndim`
+  live points, which left out the thin clusters that need the hop most, and
+  a cluster's frame went with its last member.
 - **Cross-fitting.** The live slots form three folds. A chain seeded in one
   fold uses clusters and covariances fitted to the other two only (as emcee
   moves each half of its walkers with the other half).
@@ -144,9 +165,14 @@ likelihood contour `L*`; proposals that leave the open unit cube or fall to
 **Exactness.** A chain's kernel is built without its own fold, so it does not
 depend on the chain's seed or its ancestors, and both moves leave the uniform
 law on `{L > L*}` invariant. The end point therefore has that law for any
-chain length. What remains is common to every MCMC-driven nested sampler: a
-new point is correlated with its seed (hence `walks`), and the step scale
-adapts on past chains.
+chain length. A kept frame is one that the same clustering fitted earlier to
+points outside the fold, so it adds nothing of the chain's fold either. On 1.1
+the hop with kept frames was run as the sampler runs it, 200,000 chains in
+each of four cases (float32 and x64): the uniform law held (chi-square p 0.22
+to 0.99), with 26,000 to 31,000 chains per case moving into a dying mode
+through a kept frame. What remains is common to every MCMC-driven nested
+sampler: a new point is correlated with its seed (hence `walks`), and the step
+scale adapts on past chains.
 
 **Speed.** Measured on one NVIDIA H100 in float32, on a 13-D correlated
 Gaussian run to `dlogz = 0.1` with the default settings of each version (v1
@@ -181,11 +207,46 @@ validation cells where every mode held that many, the weights showed no bias
 within the measurement error. Below it a mode's weight is biased or scatters
 widely, and the mode can be lost; `result.modes()` (and `summary()`) flag it
 `unresolved: raise nlive` in a run that kept it. A run that lost it has no
-flag and, in every such run measured, no warning (see Choosing `nlive` and
-Limitations). The mode tracking is a fixed cost per step, which
-unimodal runs pay too: about 6% of the run time at 1 ms per likelihood call,
-but about 40% of a compiled run of the 13-D Gaussian of Speed (0.93 s against
-0.56 s before the mode tracking).
+flag and almost never a warning: on 1.1, 72 of the 74 runs that lost the
+heavy narrow mode of the 4-D mixture of Choosing `nlive` warned of nothing.
+Runs of other seeds keep the mode in most cases, so a batch of seeds shows
+the loss (below; see also Choosing `nlive` and Limitations). The mode
+tracking is a fixed cost per step, which unimodal runs pay too: about 6% of
+the run time at 1 ms per likelihood call, but about 40% of a compiled run of
+the 13-D Gaussian of Speed (0.93 s against 0.56 s before the mode tracking).
+
+**Compare runs.** Run several seeds of one problem and pass the results to
+`tinyns.compare` (new in 1.1):
+
+```python
+from tinyns import compare
+
+runs = sampler.run(jax.random.split(jax.random.key(1), 4))  # 4 seeds
+report = compare(runs)
+print(report)  # a table, and why each flagged run is flagged (report.flagged)
+```
+
+It flags a run whose logZ lies more than 4 combined `logzerr`
+(`sqrt(e_best**2 + e_run**2)`) below the highest, or that holds less than a
+tenth of a mode of mass 0.05 or more that another run found (a hundredth if
+the other run's clustering did not separate that mode: `tracked` is False).
+Modes are matched by location, within the reach of each mode's frame, not
+counted: a run whose `modes()` merged two modes or cut one into lumps is not
+flagged for it, and two runs that each lost a different mode are both
+flagged. A run that did not succeed is flagged "not compared" and takes no
+part. `report.runs` gives each run's reason, logZ shortfall and the modes it
+lacks. `compare` runs no likelihood and compiles nothing; on a CPU it takes
+about 1 s for 4 runs of an 18-D target. On 1.1, in consecutive batches of 4,
+it flagged 533 of the 547 runs of the 4-D mixture that lost its heavy mode
+(2048 runs at `nlive` 300 and 500, float32 and x64), and none of the 1501
+that kept every mode. Of 64 runs of the 18-D target under Limitations (nlive
+1000, x64) it flagged the one that lost the 20% mode, and no other. It
+flagged no run that kept every mode of a Gaussian in 8-D, `sepW_d10`, the
+18-D control `build_two_mode(18, 0.2, "sep", "W")`, `rosen_d10` or the
+eggbox (64 runs each, nlive 1000, float32). It cannot flag a mode that no run
+of the batch separated, and in a large batch its logZ test can flag a correct
+run (see Limitations). The runs of `run(keys, batched_data=True)` are of
+different datasets, and `compare` refuses them.
 
 `result.modes()` counts the modes from the clusters the run recorded, and
 gives each mode's mass, its run-to-run scatter measured within the run
@@ -205,7 +266,10 @@ three modes of different widths scattered 1.5 to 4 times more) and two flags.
   the narrowest (a 4-D mixture of masses 0.75, 0.2 and 0.05: logit scatter
   0.056, 0.053 and 0.079, median `run_sd` 0.053, 0.046 and 0.065,
   `fold_sd / sqrt(3)` 0.015, 0.012 and 0.027). One run's value is good to a
-  factor of about 2, if the run kept every mode.
+  factor of about 2, if the run kept every mode and the hop balanced the
+  modes. Where `diagnostics()` warns that the hop did so only in part,
+  `run_sd` falls short: on `needle_d18` on 1.1 the minor mass scattered by
+  0.28 in logit against a median `run_sd` of 0.19 (see Limitations).
 - `unresolved`: the mode held fewer than `5 * ndim` live points (a unimodal
   run too: a 32-D Gaussian was 9 nats high at nlive 40 and right at 100).
 - `tracked`: `False` if the sampler's clustering never separated the mode from
@@ -268,34 +332,47 @@ cheap likelihood the run time hardly depends on `nlive` (0.71 s at 1000,
 
 - *a small or narrow mode matters.* A mode needs `5 * ndim` live points to be
   weighted correctly, twice that if it is much thinner than the main mode.
-  Its share of the live points when it separates from the others is its
-  share of the prior volume there, not its share `f` of the posterior. On
-  the two-mode mixtures of the sweep, `nlive` of about `5 * ndim / f` to
-  `10 * ndim / f` gave the mode enough points: a 6% mode was weighted without
-  bias and never lost from `nlive` 500, 1000 and 2000 at 10, 18 and 32
-  dimensions (1000, 2000 and 4000 for a thin one, still lost in 1 run of 40
-  at 32). At half of that the thin mode was lost in 5 to 40% of the runs. A
-  narrow mode can hold 2% of the live points or fewer when it separates, even
-  if it holds most of the posterior, and the rule is then far too low. On a
-  4-D mixture of masses 0.6, 0.3 and 0.1 and widths 0.25, 0.5 and 0.75
-  (rotated Gaussians in `[-12, 12]^4`) the 0.6 mode held a median of 8 to 9
-  of 500 live points when it separated, and 11 to 12 of 1000; in 6-D, 1 to 7
-  of 1000 in the 5 runs that kept it. The rule gives an `nlive` of 33 to 67.
-  At 500 the 0.6 mode was lost in 7 of 32 runs in float32 and 4 of 32 in
-  x64, at 1000 in 3 and 4 of 64, and in 6-D at 1000 in 21 and 22 of 24. The
-  prior-volume share is not known in advance: raise `nlive` and compare runs.
+  On the two-mode mixtures of the sweep (1.0.0), `nlive` of about
+  `5 * ndim / f` to `10 * ndim / f` gave a mode of posterior share `f`
+  enough points: a 6% mode was weighted without bias and never lost from
+  `nlive` 500, 1000 and 2000 at 10, 18 and 32 dimensions (1000, 2000 and
+  4000 for a thin one, still lost in 1 run of 40 at 32). At half of that the
+  thin mode was lost in 5 to 40% of the runs. But a mode's share of the live
+  points when it separates from the others is its share of the prior volume
+  inside that contour, not `f`: it holds about `nlive` times that share. It
+  needs about 5 live points or more there to be split off by the clustering
+  and kept by the hop, and a narrow mode can hold 2% of the live points or
+  fewer, even if it holds most of the posterior; the rule is then far too
+  low. Until the clustering splits a mode off, and for a mode it never
+  splits off, only the walk keeps the mode's points: its live count is then
+  a critical branching process (each point dies about once per e-fold of
+  prior volume and seeds about one new point), and from `n0` points it dies
+  out within `T` e-folds with probability about `(T / (1 + T))^n0`.
+  Doubling `nlive` doubles `n0` and so roughly squares the odds of losing a
+  thin mode. On a 4-D mixture of masses 0.6, 0.3 and 0.1 and widths 0.25,
+  0.5 and 0.75 (rotated Gaussians in `[-12, 12]^4`) the 0.6 mode holds 1.2%
+  of the volume when it separates, about 6 of 500 live points. On 1.1
+  (float32, CPU) it was lost in 68 of 384 runs at `nlive=500` and in 6 of 384
+  at 1000, about 1 run in 60 (97 and 19 on 1.0.0). In 6-D it holds 1.7 of
+  1000 live points there, and 1.1 lost it in 40 of 48 runs at 1000, and in
+  9, 7 and 3 of 16 at 2000, 4000 and 8000. The rule gives an `nlive` of 33
+  to 67. The prior-volume share is not known in advance: raise `nlive`, and
+  run 4 seeds (`jax.random.split(key, 4)`) and check them with
+  `tinyns.compare` (see Multimodal posteriors).
 - *`modes()` flags a mode unresolved.* The flag is a reason to raise `nlive`,
   but its absence is not proof. A mode that is lost leaves no trace in its own
-  run: every run that lost the 6% mode reported one mode and no warning, and
-  all 61 runs that lost the 0.6 mode above reported the other two and no
-  warning, with logZ 0.62 to 1.13 too low (4.6 to 10.4 `logzerr`; without
-  the mode logZ is `log(1 - 0.6) = -0.92` lower). A flag in any run means
-  that other runs may have lost the mode: 177 of the 179 runs that kept the
-  0.6 mode flagged it unresolved, and so did all 14 CPU runs that kept the
-  20% mode of the 18-D target under Limitations. At `nlive=1000` the flag
-  was raised in 7 of the 57 runs (of 360) whose minor weight was lost or off
-  by more than 0.4 in the logit, all of them at 18 and 32 dimensions. If a
-  small mode matters, run again at twice the `nlive` and compare the modes.
+  run. On 1.1, of the 768 runs of the 4-D mixture above at `nlive` 500 and
+  1000, 72 of the 74 that lost the 0.6 mode warned of nothing, with logZ
+  0.60 to 1.26 too low (4.4 to 9.9 `logzerr`; without the mode logZ is
+  `log(1 - 0.6) = -0.92` lower). A flag in any run means that other runs may
+  have lost the mode: 684 of the 694 runs that kept the 0.6 mode flagged it
+  unresolved, and so did all 127 runs (of 128) that kept the 20% mode of the
+  18-D target under Limitations. In the defaults sweep (1.0.0) every run that
+  lost the 6% mode reported one mode and no warning, and at `nlive=1000` the
+  flag was raised in 7 of the 57 runs (of 360) whose minor weight was lost or
+  off by more than 0.4 in the logit, all of them at 18 and 32 dimensions. If
+  a small mode matters, run several seeds and compare them
+  (`tinyns.compare`), and run again at twice the `nlive`.
 - *the posterior has many modes.* Each of the eggbox's two smallest peaks (2%
   of the posterior) fell below a tenth of its weight in 32% of the runs at
   `nlive=500`, 15% at 1000, 4% at 2000 and none at 4000; its 8% peaks were
@@ -409,7 +486,11 @@ shares (a lookup table) needs that axis too: tile it, or let `fn` capture it,
 which embeds it in the compiled program. A batched run agrees with the
 run of its key alone in distribution, not bit for bit. A stopped run is
 frozen, not skipped, so the device evaluates about `B` times the calls of the
-longest run: batch runs of similar length.
+longest run: batch runs of similar length. Each result records
+`metadata["batched_data"]` (new in 1.1), and `tinyns.compare` refuses the
+runs of `batched_data=True`, which are of different datasets. A result saved
+before 1.1 does not record it: before you compare such runs, make sure they
+share one likelihood and prior.
 
 ## Pytree callables
 
@@ -480,43 +561,90 @@ does.
   sampled reliably. `modes()` flags it `unresolved` in a run that kept it;
   raise `nlive`.
 - **A mode can be lost with no warning.** A run that loses a mode reports the
-  modes left, with no flag and, in every such run measured, no warning. The
-  18-D two-mode target `build_two_mode(18, 0.2)` of `bench.targets` has a 20%
-  mode whose volume is 0.035 of the main mode's. At the default `nlive` of
-  1000 that mode was lost on an H100 at commit 8851058 in 4 of 32 runs in
-  float32, 4 of 32 in x64 and 1 of 32 in float32 at matmul precision
-  `"highest"`; on a CPU in x64 in 3 of 24 runs at 8851058 and 2 of 16 on the
-  release code, where 2 more kept a minor mass of only 0.09 and 0.13 and
-  warned that the hop balanced the modes only in part. A lost run reports one
-  mode, with the hop off, and its logZ lies within 2.6 `logzerr` of the truth
-  (0.67 low to 0.05 high, 14 runs): without the mode logZ is
-  `log(1 - 0.2) = -0.22` lower, less than its `logzerr` of 0.26. All 14 CPU
-  runs on the release code that kept the mode flagged it unresolved. A heavy
-  narrow mode can be lost at the default `nlive` too (see Choosing `nlive`),
-  and logZ is then low by about `log(1 - mass)`, beyond `logzerr`: on a 4-D
-  mixture a 0.6 mode was lost in 7 of 32 runs in float32 and 4 of 32 in x64
-  at `nlive=500` and in 3 and 4 of 64 at the default, with logZ 0.62 to 1.03
-  low (4.6 to 10.4 `logzerr`), and on the same mixture in 6-D in 21 and 22 of
-  24 runs at the default. If any run flags a mode unresolved, other runs may
-  have lost it: raise `nlive` and compare runs.
+  modes left, with no flag and almost never a warning, and its logZ is low by
+  about `log(1 - mass)`, which can lie within `logzerr`. 1.1 keeps most of
+  the modes that the clustering splits off: every cluster of 3 or more
+  members takes part in the hop, and a dying cluster's frame stays in it for
+  about two e-folds (see How it works). The 18-D two-mode target
+  `build_two_mode(18, 0.2)` of `bench.targets` has a 20% mode whose volume is
+  0.035 of the main mode's; without it logZ is `log(1 - 0.2) = -0.22` lower,
+  less than its `logzerr` of 0.26, so logZ does not show the loss. At
+  `nlive=1000` (x64, CPU, 128 runs) 1.0.0 lost that mode in 11 runs and put
+  its mass more than 0.5 off in logit in 7 more; 1.1 lost it in 1 and put
+  none off (and lost it in none of 64 runs on other keys), and the logit sd
+  of the kept mass fell from 0.334 to 0.035. What 1.1 does not fix:
+  - A mode that holds 1 or 2 live points when its contour separates is never
+    split off, so no frame can keep it, and it is lost in most runs. The
+    0.6 mode of the 6-D mixture of Choosing `nlive` (1.7 of 1000 live points
+    there) was lost at `nlive=1000` in 40 of 48 runs on 1.1 (39 on 1.0.0),
+    and in 9, 7 and 3 of 16 at 2000, 4000 and 8000 (10, 12 and 4 on 1.0.0),
+    with logZ about `log(1 - 0.6) = -0.92` low. Only more live points help.
+  - A mode with a few live points when it separates is still lost now and
+    then: the 0.6 mode of the 4-D mixture (about 6 of 500 there) in 68 of 384
+    runs at `nlive=500` and 6 of 384 at 1000 on 1.1 (97 and 19 on 1.0.0),
+    with logZ 4.4 to 9.9 `logzerr` low.
+  - A mode that `modes()` does not separate from its neighbour is lost
+    unseen. On two connected modes in 32-D (`connW_d32`, nlive 1000,
+    float32, 32 runs) `modes()` reported one mode in every run and no run
+    warned; 1.1 lost the 6% mode in 1 run, and lost it or put it more than
+    0.5 off in logit in 3 (11 on 1.0.0).
+
+  Run 4 seeds of one problem and check them with `tinyns.compare` (see
+  Multimodal posteriors): it flags a lost run when another run of the batch
+  kept and separated the mode. If any run flags a mode unresolved, other
+  runs may have lost it: raise `nlive`.
+- **`compare` misses a mode that no run of the batch separated.** Its mode
+  test needs a run whose `modes()` reports the mode, so it misses a batch in
+  which every run lost the mode (with probability `p^B` for a loss rate `p`
+  and a batch of `B` runs) and a mode that the runs which kept it merged
+  with another. On 1.1, in consecutive batches of 4 of the 4-D mixture (2048
+  runs at `nlive` 300 and 500, float32 and x64), it missed 14 of the 547
+  runs that lost the 0.6 mode (2.6%; on 1.0.0 runs of the same keys, 38 of
+  704): 12 in batches that had all lost it, all at `nlive=300`, where about
+  a third of the runs lose it, and 2 against a run whose `modes()` had
+  merged it with the 0.3 mode (their logZ 2.6 and 3.8 combined `logzerr`
+  low, under the bar of 4). It missed none of the 181 lost at `nlive=500`.
+  On the 6-D mixture (1.1, nlive 1000) batches of 4 flagged the 16 lost runs
+  that shared a batch with a run that kept the mode, and none of the 24 in
+  batches that had all lost it. A larger batch makes these misses rarer,
+  and so does a higher `nlive`. But in a large batch the highest logZ is
+  high by chance, so the logZ test can flag a correct run: in batches of 32
+  of the 2048 runs above it flagged 8 of the 1501 that kept every mode (4.1
+  to 4.7 combined `logzerr` low), and none in batches of 4. The mode test's
+  bars also sit close to the scatter of correct runs where the hop does not
+  balance the modes: on 128 eggbox runs of 1.0.0 at `nlive=1000` (the
+  eggbox runs of 1.1 checked at that `nlive` were identical) a run that kept
+  every peak held at least 0.021 of the mass another run found in a peak,
+  against a bar of 0.01.
 - **Modes with thin arms or a funnel neck.** When a mode's contours are a core
   with thin arms, or narrow into a neck (a scale parameter pressed against its
   prior edge and coupled to a location), its live points are heavy-tailed
   along a few directions. The clustering cuts each mode into lumps, and the
-  hop's ellipsoids cover the modes poorly. On the 18-D `needle_d18` target of
-  `bench` the hop cut the run-to-run logit scatter of the minor mass from 0.57
-  to 0.19 (16 runs at nlive 1000), against 0.37 to 0.019 for the same modes
-  without arms; on `cauchy_d18` from 0.53 to 0.32. On an 18-D posterior with
-  a funnel neck it accepted 0.6% of its proposals and gave no gain: the
-  minor mass scattered by 0.25 over 3 runs, against 0.30 for v0.2.5, and the
-  three folds' masses differed by a logit sd of 1.0 to 1.6 within each run.
-  The mode masses then scatter as for a sampler without the hop; logZ is
-  unaffected (`needle_d18`: +0.03 +- 0.08 from the truth). `diagnostics()`
-  warns, and `run_sd` gives the scatter. `modes()` merges lumps that the
-  likelihood does not dip between, but a lump joined to its mode only along a
-  curved path, such as a funnel neck, can be reported as a small mode of its
-  own (unresolved; 1 of the 3 runs above), and the clustering's labels may
-  also be merged into one mode (2 of 16 `cauchy_d18` runs).
+  hop's ellipsoids cover the modes poorly. On 1.1 every lump of 3 or more
+  members takes part in the hop. On `cauchy_d18` of `bench` (two modes, each a
+  product of Cauchy and normal factors; nlive 1000, float32, 64 runs) no run
+  lost the minor mode or put its mass more than 0.5 off in logit, against 5 on
+  1.0.0, and the logit sd of its mass over the runs that kept it was 0.089
+  against 0.257, most of that from the poor runs (a robust spread, IQR /
+  1.349, of 0.080 against 0.162). On `needle_d18` (each mode a core with a
+  needle through it; nlive 1000, float32, 128 runs) the minor mass scattered
+  more on 1.1: by 0.279 +- 0.018 in logit, against 0.250 +- 0.016 on 1.0.0
+  (paired change +0.030, 95% interval -0.034 to +0.088), while the same two
+  modes without arms (`build_two_mode(18, 0.2, "sep", "W")`) scatter by 0.029
+  on 1.1 (32 runs). At `nlive=2000` the needle showed no measurable change
+  (0.179 against 0.197, 64 runs). No needle run lost a mode, and logZ is
+  unaffected (+0.007 +- 0.027 from the truth on 1.1). `diagnostics()` warns in
+  nearly every needle run, and there `run_sd` falls short of the scatter: on
+  1.1 its median was 0.19, and 18 of the 125 runs that gave one lay beyond 3
+  `run_sd` (0.17 and 15 of 126 on 1.0.0). On an 18-D posterior with a funnel
+  neck (1.0.0; not measured on 1.1) the hop accepted 0.6% of its proposals and
+  gave no gain: the minor mass scattered by 0.25 over 3 runs, against 0.30 for
+  v0.2.5, and the three folds' masses differed by a logit sd of 1.0 to 1.6
+  within each run. `modes()` merges lumps that the likelihood does not dip
+  between, but a lump joined to its mode only along a curved path, such as a
+  funnel neck, can be reported as a small mode of its own (unresolved; 1 of
+  the 3 runs above), and the clustering's labels may also be merged into one
+  mode (2 of 16 `cauchy_d18` runs on 1.0.0).
 - **Small modes in high dimensions go unreported.** At 32 dimensions and the
   default `nlive`, the clustering did not separate a 6% mode (about 60 live
   points, below `5 * ndim`) in 32 to 36 of 40 runs of `sepW_d32`. `modes()`
