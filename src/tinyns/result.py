@@ -957,7 +957,13 @@ class NestedSamplingResult:
         On 16 other seeds of the mixture above, one run kept 0.47 of the
         0.75 mode (logZ 9 ``logzerr`` low), and the masses scattered by
         0.31, 0.25 and 0.27; without it by 0.069, 0.058 and 0.101, against
-        a median ``run_sd`` of 0.053, 0.048 and 0.062.
+        a median ``run_sd`` of 0.053, 0.048 and 0.062. Where the hop
+        balanced the modes only in part (a warning of :meth:`diagnostics`),
+        ``run_sd`` falls short too: on the 18-D needle target at nlive 1000
+        the minor mass scattered by 0.28 in logit over 128 runs, against a
+        median ``run_sd`` of 0.19, and 18 of the 125 runs that gave one lay
+        beyond 3 ``run_sd``, each with that warning (on tinyns 1.0: 0.25,
+        0.17 and 15 of 126).
 
         Per mode: ``mass``, ``urn_sd``, ``fold_mass``, ``fold_sd``,
         ``run_sd`` (``None`` without folds), ``min_live`` (the smallest ``n``
@@ -1564,7 +1570,8 @@ class NestedSamplingResult:
         accepted less than ``HOP_ACCEPT_WARN`` of its proposals. The warning
         names only the causes that passed their threshold. The masses then
         scatter from run to run more than where the hop works, and the spread
-        of the folds' masses measures by how much (``run_sd``)."""
+        of the folds' masses measures by how much (``run_sd``), though on
+        the needle target it falls short (:meth:`modes`)."""
         if sum(mode["tracked"] for mode in modes) < 2:
             return []  # the warning about untracked modes says it
         start, stop = self._hop_window(modes)
