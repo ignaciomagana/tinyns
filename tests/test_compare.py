@@ -181,8 +181,13 @@ def test_runs_that_did_not_succeed_are_flagged_and_not_compared() -> None:
     assert report.runs[1]["logz_shortfall"] is None
     hand = dataclasses.replace(built(0.0), logwt=np.full(30, -np.inf), logz=-math.inf)
     assert compare([built(0.0), hand]).runs[1]["reason"] == (
-        "not compared: logz is not finite"
+        "not compared: logz or logzerr is not finite"
     )
+    # A logzerr that is not finite would make every shortfall infinite (or
+    # none) if that run held the highest logZ.
+    report = compare([built(0.0), built(1.0, logzerr=math.nan), built(-0.1)])
+    assert report.best == 0 and report.flagged == [1]
+    assert report.runs[1]["reason"] == "not compared: logz or logzerr is not finite"
     assert compare([stopped]).best is None
 
 

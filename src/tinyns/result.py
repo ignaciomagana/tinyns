@@ -2005,8 +2005,9 @@ class Comparison:
 
     ``runs`` holds one dictionary per run, in the order given: ``run`` (its
     index), ``flagged``, ``reason`` (why it is flagged; empty if it is not),
-    ``compared`` (False for a run that did not succeed or has no posterior
-    weight: it is flagged and plays no part in the comparison of the others),
+    ``compared`` (False for a run that did not succeed, has no posterior
+    weight or has a logzerr that is not finite: it is flagged and plays no
+    part in the comparison of the others),
     ``logz``, ``logzerr``, ``nlive``, ``nmodes`` (the number of its
     :meth:`~NestedSamplingResult.modes`), ``logz_shortfall`` (how far its
     logZ lies below the highest, in combined logzerr ``sqrt(e_best^2 +
@@ -2090,14 +2091,14 @@ def compare(results) -> Comparison:
       modes into one, or cut one into lumps, still holds their mass where
       the other run found it.
 
-    A run that did not succeed (``maxiter``, ``maxcall``, ``invalid``) or has
-    no posterior weight is flagged with its message and takes no part in the
-    comparison of the others. Runs at different ``nlive`` (or ``walks``,
-    ``num_delete``) can be compared; the run at lower ``nlive`` is the more
-    likely to lose a mode. The comparison runs no likelihood and compiles
-    nothing: it works out :meth:`modes <NestedSamplingResult.modes>` of each
-    run (cached on the result) and gives the samples of each run to the
-    modes of each other one.
+    A run that did not succeed (``maxiter``, ``maxcall``, ``invalid``), has
+    no posterior weight or has a logzerr that is not finite is flagged with
+    its message and takes no part in the comparison of the others. Runs at
+    different ``nlive`` (or ``walks``, ``num_delete``) can be compared; the
+    run at lower ``nlive`` is the more likely to lose a mode. The comparison
+    runs no likelihood and compiles nothing: it works out :meth:`modes
+    <NestedSamplingResult.modes>` of each run (cached on the result) and
+    gives the samples of each run to the modes of each other one.
 
     ``results`` is a list of results of one problem: the list that a batched
     run, ``NestedSampler(...).run(jax.random.split(key, 4))``, returns, runs
@@ -2161,11 +2162,11 @@ def compare(results) -> Comparison:
         raise ValueError("compare() needs at least one result")
     if not all(isinstance(result, NestedSamplingResult) for result in results):
         raise TypeError("compare() takes NestedSamplingResult objects")
-    ndims = ", ".join(map(str, sorted({int(result.ndim) for result in results})))
-    if "," in ndims:
+    ndims = sorted({int(result.ndim) for result in results})
+    if len(ndims) > 1:
         raise ValueError(
-            f"the runs are of different problems (ndim {ndims}): compare runs "
-            "of one likelihood and prior"
+            f"the runs are of different problems (ndim {', '.join(map(str, ndims))}): "
+            "compare runs of one likelihood and prior"
         )
     if any((result.metadata or {}).get("batched_data") for result in results):
         raise ValueError(
@@ -2178,8 +2179,10 @@ def compare(results) -> Comparison:
     for result in results:
         if not result.success:
             why.append(f"not compared: {result.message or 'the run did not succeed'}")
-        elif result._no_weight() or not math.isfinite(float(result.logz)):
-            why.append("not compared: logz is not finite")
+        elif result._no_weight() or not (
+            math.isfinite(float(result.logz)) and math.isfinite(float(result.logzerr))
+        ):
+            why.append("not compared: logz or logzerr is not finite")
         else:
             why.append(None)
     ok = [i for i, text in enumerate(why) if text is None]
