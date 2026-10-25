@@ -2178,31 +2178,51 @@ def compare(results) -> Comparison:
     more) and 4 in consecutive batches of 4, and none of the 97 runs that
     kept every peak.
 
+    On new runs of the 1.1 sampler, which loses such modes less often
+    (:meth:`modes <NestedSamplingResult.modes>`), in consecutive batches of
+    4. Of 2048 runs of the 4-D mixture at nlive 300 and 500 (float32 and
+    x64), 547 lost the 0.6 mode: it flagged 533 of them, and none of the
+    1501 that kept every mode. It missed none of the 181 lost at nlive 500,
+    and the 14 it missed at nlive 300, where about a third of the runs lose
+    the mode, are of the two kinds below: 12 in batches whose every run had
+    lost it, and 2 in a batch whose one run that kept it had merged it with
+    the 0.3 mode (their logZ 2.6 and 3.8 combined logzerr low). On
+    ``build_two_mode(18, 0.2)`` (64 runs, x64) it flagged the one lost run
+    and no other, and on a Gaussian in 8-D, ``sepW_d10``, the shape-W
+    control, ``rosen_d10`` and the eggbox (64 runs each) no run that kept
+    every mode.
+
     A mode that every run lost is not found: if a fraction ``p`` of the runs
     lose it, a batch of ``B`` runs misses it with probability ``p^B``. The
     6-D version of the mixture, whose 0.6 mode holds 1 or 2 of 1000 live
-    points when it separates, lost it in 23 of 24 runs, and only the batches
-    that held the one run that kept it were flagged. Nor does the mode test
-    find a mode that the runs which kept it did not separate: on the 4-D
-    mixture at nlive 1000, one of the 61 runs that kept every mode merged
-    the 0.6 mode with the 0.1 one, and against it the 3 runs that had lost
-    the 0.6 mode held a third of the merged mode, in their 0.1 mode (the
-    logZ test flagged them: 5.7 to 6.1 combined logzerr low). The highest
-    logZ of many runs is high by chance, so in a large batch the logZ test
-    can flag a run whose logZ scatters beyond logzerr: of 32 runs of the 4-D
-    mixture at nlive 300 (x64) it flagged one that kept every mode, and none
-    in batches of 4.
+    points when it separates, lost it in 23 of 24 runs of the 1.0.0
+    sampler, and only the batches that held the one run that kept it were
+    flagged. The 1.1 sampler lost it in 40 of 48 runs on two keys (19 of 24
+    on the first: :meth:`modes <NestedSamplingResult.modes>`); in batches of
+    4 it flagged the 16 that shared a batch with a run that kept it, and
+    none of the 24 in the 6 batches that had all lost it. Nor does the mode
+    test find a mode that the runs which kept it did not separate: on the
+    4-D mixture at nlive 1000, one of the 61 runs of the 1.0.0 sampler that
+    kept every mode merged the 0.6 mode with the 0.1 one, and against it the
+    3 runs that had lost the 0.6 mode held a third of the merged mode, in
+    their 0.1 mode (the logZ test flagged them: 5.7 to 6.1 combined logzerr
+    low). A larger batch makes both misses rarer, and so does a higher
+    ``nlive``, at which fewer runs lose the mode. The highest logZ of many
+    runs is high by chance, so in a large batch the logZ test can flag a run
+    whose logZ scatters beyond logzerr: in batches of 32 of the 2048 runs
+    above it flagged 8 of the 1501 that kept every mode (4.1 to 4.7 combined
+    logzerr low), and none in batches of 4.
 
     On two targets the bars of the mode test sit below the scatter of runs
-    that kept every mode by a factor of only 1.3 and 2. On the 18-D target,
-    a run that kept the 0.2 mode held at least 0.13 of the mass another run
-    found there (26,912 pairs; the bar is a tenth). The peaks of the eggbox
-    are untracked, and their masses differed up to 48-fold between runs
-    that kept them all (0.11 to 5.3 times the truth); a run held at least
-    0.021 of the mass another run found in a peak (89,280 pairs of the 128
-    new runs; the bar is a hundredth). On a target whose modes scatter more
-    from run to run the mode test can flag a correct run, the more likely
-    the larger the batch.
+    of the 1.0.0 sampler that kept every mode by a factor of only 1.3 and 2.
+    On the 18-D target, a run that kept the 0.2 mode held at least 0.13 of
+    the mass another run found there (26,912 pairs; the bar is a tenth). The
+    peaks of the eggbox are untracked, and their masses differed up to
+    48-fold between runs that kept them all (0.11 to 5.3 times the truth); a
+    run held at least 0.021 of the mass another run found in a peak (89,280
+    pairs of the 128 new runs; the bar is a hundredth). On a target whose
+    modes scatter more from run to run the mode test can flag a correct run,
+    the more likely the larger the batch.
 
     Example::
 
