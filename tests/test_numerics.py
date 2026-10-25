@@ -275,7 +275,7 @@ def test_float32_frames_resolve_a_narrow_axis() -> None:
     x = _narrow_cluster()
     u = jnp.asarray(x, jnp.float32)
     st = modes.stats(u, jnp.zeros(len(x), jnp.int32), modes.C_MAX)
-    fr = modes.frames(st, len(x))
+    fr = modes.frames(st)
     chol = np.asarray(fr.chol[0], np.float64)
     sd = np.sqrt(np.diag(chol @ chol.T))
     np.testing.assert_allclose(sd / x.std(axis=0, ddof=1), 1.0, rtol=0.05)
@@ -325,6 +325,21 @@ def test_host_separation_along_a_very_narrow_axis(width) -> None:
         assert _fisher(x, side) == pytest.approx(exact, rel=1e-6)
         assert _gap(x, side) == pytest.approx(_gap(z, side), rel=1e-6)
     assert _gap(x, side) > SEPARATION_SIGMA
+
+
+def test_a_set_of_copies_has_no_separation() -> None:
+    """A set whose rows are all copies of rows of the other set is empty once
+    copies count once: no direction and no gap, and no numpy warning about
+    the mean of an empty set (seen in modes() on 1.1 needle runs)."""
+    from tinyns.result import _discriminant
+
+    x = np.random.default_rng(0).normal(size=(20, 3))
+    x = np.concatenate([x, x[:2]])
+    side = np.arange(len(x)) >= 20
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        w, lo, hi = _discriminant(x, side)
+    assert np.all(w == 0.0) and lo == hi == 0.0
 
 
 # --- the precision of the internal products ----------------------------------

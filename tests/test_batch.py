@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from jax.tree_util import Partial
 
-from tinyns import NestedSampler, NestedSamplingResult, core
+from tinyns import NestedSampler, NestedSamplingResult, compare, core
 from tinyns.callables import _split_callables
 
 X64 = bool(jax.config.jax_enable_x64)
@@ -80,12 +80,17 @@ def test_batched_data_matches_separate_runs() -> None:
     keys = jax.random.split(jax.random.key(11), 4)
     results = sampler.run(keys, batched_data=True)
     assert len({r.niter for r in results}) > 1
+    # The lanes are different problems, which compare() refuses.
+    assert all(r.metadata["batched_data"] for r in results)
+    with pytest.raises(ValueError, match="batched_data=True"):
+        compare(results)
     for i, result in enumerate(results):
         alone = NestedSampler(
             core._lane_callable(loglike, i), core._lane_callable(prior, i), 2, 60,
             num_delete=6,
         ).run(keys[i])
         assert_matches(result, alone)
+        assert alone.metadata["batched_data"] is False
         np.testing.assert_allclose(
             result.samples, width[i] * np.asarray(result.samples_u), rtol=1e-6
         )
