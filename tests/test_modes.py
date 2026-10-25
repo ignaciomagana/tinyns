@@ -498,7 +498,11 @@ def test_hop_warning_ignores_the_stretch_after_the_other_modes_died() -> None:
     averages end where the second-last mode dies out. Over 25 runs each in
     float32 and x64 at nlive 500, the light mass was 0.26 to 0.33, and the
     hop was off for at most 0.04 of the mass in the window and for 0.52 to
-    0.63 up to the end."""
+    0.63 up to the end. The light mode's frame is now kept for the hop for
+    ``GHOST_RECLUSTERS`` reclusters after it dies out, which covers most of
+    that stretch: over 25 other runs each, the light mass was 0.27 to 0.36,
+    and the hop was off for at most 0.001 of the mass in the window and for
+    0.09 to 0.15 up to the end."""
 
     def heavy_and_tall(theta):
         x = -10.0 + 20.0 * theta
@@ -528,9 +532,14 @@ def test_hop_warning_ignores_the_stretch_after_the_other_modes_died() -> None:
     assert not np.any(result._alive(died) & in_light)
     start = min(m["isolation_iteration"] for m in modes)
     assert result._hop_window(modes) == (start, light["extinction_iteration"])
-    # From isolation to the end the hop was off for about half of the mass
-    # or more, but not while both modes held live points.
-    assert result._hop_off(start, int(result.niter)) > 0.4
+    # The hop was not off while both modes held live points. After the
+    # light mode died its kept frame held it on (one cluster, two eligible
+    # frames) and then it was off: for a part of the mass up to the end.
+    window = result._hop_off(*result._hop_window(modes))
+    assert result._hop_off(start, int(result.niter)) > window + 0.05
+    history = result.metadata["mode_history"]
+    assert any(row[1:] == [1, 2] for row in history)
+    assert history[-1][1:] == [1, 1]
 
 
 def test_tracked_when_the_clustering_separated_the_modes(two_mode_run) -> None:

@@ -1,4 +1,4 @@
-"""Checkpoints of the :func:`tinyns.core.run` driver (format ``tinyns-ckpt-7``).
+"""Checkpoints of the :func:`tinyns.core.run` driver (format ``tinyns-ckpt-8``).
 
 A checkpoint is one ``.npz`` file, written atomically: a temporary file in the
 same directory, ``fsync``, then ``os.replace``, so a crash leaves either the
@@ -6,7 +6,8 @@ previous checkpoint or the new one, never a torn file. It holds
 
 - ``state/<field>``: the :class:`tinyns.core.State` leaves (with a leading
   lane axis for a batched run), including the mode-tracking fields (the
-  cluster labels, frames and cluster ids of each clustering) and the
+  cluster labels, frames and cluster ids of each clustering, and the
+  countdown of the frames kept for the hop, ``mode_ghost``) and the
   plateau bookkeeping (``log_x_ties``, ``lstar_prev``, ``tie_run``). The
   PRNG key is stored as its raw ``uint32`` key data, with ``state/key_impl``
   naming the implementation of a typed key (``""`` for a raw ``uint32``
@@ -52,7 +53,7 @@ import jaxlib
 import numpy as np
 from jax import random
 
-FORMAT = "tinyns-ckpt-7"
+FORMAT = "tinyns-ckpt-8"
 
 
 def _is_typed_key(key) -> bool:
@@ -291,7 +292,7 @@ def load(path, *, config: dict, batch: int | None, batched_data: bool, key):
     """Read the checkpoint at ``path`` for a run of ``config`` from ``key``.
 
     Raises ``ValueError`` naming the mismatch when the file is not a
-    ``tinyns-ckpt-7`` checkpoint, or when its config, x64 flag, float dtype,
+    ``tinyns-ckpt-8`` checkpoint, or when its config, x64 flag, float dtype,
     lane count, ``batched_data`` or starting key differ from this run's.
     Warns when it was written by another tinyns version, JAX build or device
     (:func:`_environment`), or was resumed under another before
