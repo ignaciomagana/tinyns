@@ -951,19 +951,19 @@ class NestedSamplingResult:
         split off, and is lost in most runs. On a 4-D mixture of masses 0.6,
         0.3 and 0.1 and widths 0.25, 0.5 and 0.75 (rotated Gaussians in
         ``[-12, 12]^4``, float32) the 0.6 mode holds about 6 of 500 live
-        points when it separates; it was lost in 23 of 128 runs at nlive 500
-        (31 with the 1.0 eligibility rule) and in none of 128 at nlive 1000
-        (5), all but one without a warning and with logZ 0.74 to 1.12 low
-        (5.4 to 8.0 ``logzerr``), while 230 of the 233 runs that kept it
-        flagged it unresolved. In 6-D it holds 1.7 of 1000 live points there,
-        and was lost in 19 of 24 runs at nlive 1000 (3 of 16 at nlive 8000).
-        A light mode can be lost too, with logZ about right: on the 18-D
-        target ``build_two_mode(18, 0.2)`` of ``bench.targets`` 1 of 128 runs
-        in x64 lost its 20% mode (11 with the 1.0 rule), and all 127 that
-        kept it flagged it. So if any run flags a mode unresolved, other runs
-        may have lost it: raise ``nlive``, and run several seeds and compare
-        them. A unimodal run (or a result without :attr:`labels`, or without
-        posterior weight) gives one mode of mass 1, flagged ``unresolved`` if
+        points when it separates; it was lost in 68 of 384 runs at nlive 500
+        (97 on tinyns 1.0) and in 6 of 384 at nlive 1000 (19 on 1.0), all
+        but two without a warning and with logZ 0.60 to 1.26 low (4.4 to 9.9
+        ``logzerr``), while 684 of the 694 runs that kept it flagged it
+        unresolved. In 6-D it holds 1.7 of 1000 live points there, and was
+        lost in 19 of 24 runs at nlive 1000 (3 of 16 at nlive 8000). A light
+        mode can be lost too, with logZ about right: on the 18-D target
+        ``build_two_mode(18, 0.2)`` of ``bench.targets`` 1 of 128 runs in x64
+        lost its 20% mode (11 on 1.0), and all 127 that kept it flagged it.
+        So if any run flags a mode unresolved, other runs may have lost it:
+        raise ``nlive``, and run several seeds and compare them. A unimodal
+        run (or a result without :attr:`labels`, or without posterior
+        weight) gives one mode of mass 1, flagged ``unresolved`` if
         ``nlive`` is below ``UNRESOLVED_PER_DIM * ndim``: too few live points
         for a covariance-adapted walk to learn the shape of a mode (a
         near-Gaussian one can do with fewer: on a 32-D Gaussian logZ was 9
@@ -1621,9 +1621,9 @@ class NestedSamplingResult:
         the number of clusters per mode found (of the clustering with the
         most), and ``mode_hop_off``, the fraction during which a clustering
         had fewer than two eligible clusters (the hop was off in its fold; a
-        cluster is eligible from 3 members, and the frame of one that died
-        out stays eligible for a while, :mod:`tinyns.modes`), and
-        ``hop_acceptance`` (``None`` for a result without those records).
+        cluster is eligible from 3 members, 2 in one dimension, and the frame
+        of one that died out stays eligible for a while, :mod:`tinyns.modes`),
+        and ``hop_acceptance`` (``None`` for a result without those records).
         The warnings name each unresolved mode (a single mode too; for one of
         several modes the warning adds that in other runs such a mode may be
         lost entirely, which leaves no flag in the run that lost it) and the

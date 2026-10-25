@@ -85,9 +85,9 @@ a frame went with the last member of its cluster. On
 mode was split off with 27 to 47 points, lived for 15 to 20 e-folds as a
 cluster of 5 to 30, below that rule, and drifted to none in 11 of 128 runs;
 with both changes in 1 of 128. A 4-D mixture of masses 0.6, 0.3 and 0.1
-(float32) lost its 0.6 mode in 5 of 128 runs at nlive 1000 (now none) and
-31 of 128 at nlive 500 (now 23), where it holds about 6 live points when it
-separates. A mode that holds one or two live points when its contour
+(float32) lost its 0.6 mode in 97 of 384 runs at nlive 500 (now 68), where
+it holds about 6 live points when it separates, and in 19 of 384 at nlive
+1000 (now 6). A mode that holds one or two live points when its contour
 separates is never split off, and nothing here keeps it: the 6-D version of
 that mixture lost its 0.6 mode in 18 and 19 of 24 runs at nlive 1000,
 without and with these changes. Only more live points help there.
