@@ -20,14 +20,15 @@ install the matching JAX build first (see the JAX install guide). For
 development: clone, `python -m pip install -e '.[dev]'`, then `make test`.
 
 This README describes the development version, 1.1 (unreleased; see
-`CHANGELOG.md`). It keeps thin modes more often than 1.0.0 and adds
+`CHANGELOG.md`; until it is tagged, `tinyns.__version__` still reports
+1.0.0). It keeps thin modes more often than 1.0.0 and adds
 `tinyns.compare`, which 1.0.0 does not have. A figure that names no version
 was measured on 1.0.0 (or on the v1 code before it). The two versions give
 the same run, bit for bit, wherever the clustering never splits (Gaussians
 in 2 to 16 dimensions and the eggbox at `nlive=1000`, in float32 and x64).
 Elsewhere the runs differ; on the targets measured again, 1.1 was as
-accurate as 1.0.0 or more, except for the scatter of a mode with thin arms
-(see Limitations).
+accurate as 1.0.0 or more, except that the minor mode's mass scatters more
+on the needle targets (see Limitations).
 
 ## Quickstart
 
@@ -169,8 +170,8 @@ chain length. A kept frame is one that the same clustering fitted earlier to
 points outside the fold, so it adds nothing of the chain's fold either. On 1.1
 the hop with kept frames was run as the sampler runs it, 200,000 chains in
 each of four cases (float32 and x64): the uniform law held (chi-square p 0.22
-to 0.99), with 26,000 to 31,000 chains per case moving into a dying mode
-through a kept frame. What remains is common to every MCMC-driven nested
+to 0.99), with about 25,500 to 31,600 chains per case moving into a dying
+mode through a kept frame. What remains is common to every MCMC-driven nested
 sampler: a new point is correlated with its seed (hence `walks`), and the step
 scale adapts on past chains.
 
@@ -235,12 +236,13 @@ counted: a run whose `modes()` merged two modes or cut one into lumps is not
 flagged for it, and two runs that each lost a different mode are both
 flagged. A run that did not succeed is flagged "not compared" and takes no
 part. `report.runs` gives each run's reason, logZ shortfall and the modes it
-lacks. `compare` runs no likelihood and compiles nothing; on a CPU it takes
-about 1 s for 4 runs of an 18-D target. On 1.1, in consecutive batches of 4,
-it flagged 533 of the 547 runs of the 4-D mixture that lost its heavy mode
-(2048 runs at `nlive` 300 and 500, float32 and x64), and none of the 1501
-that kept every mode. Of 64 runs of the 18-D target under Limitations (nlive
-1000, x64) it flagged the one that lost the 20% mode, and no other. It
+lacks. `compare` runs no likelihood and compiles nothing; on 4 CPU cores it
+takes about 1 s for 4 runs of an 18-D target, most of it in their `modes()`.
+On 1.1, in consecutive batches of 4, it flagged 533 of the 547 runs of the
+4-D mixture that lost its heavy mode (2048 runs at `nlive` 300 and 500,
+float32 and x64), and none of the 1501 that kept every mode. Of 64 of the
+runs on other keys of the 18-D target under Limitations (nlive 1000, x64)
+it flagged the one that lost the 20% mode, and no other. It
 flagged no run that kept every mode of a Gaussian in 8-D, `sepW_d10`, the
 18-D control `build_two_mode(18, 0.2, "sep", "W")`, `rosen_d10` or the
 eggbox (64 runs each, nlive 1000, float32). It cannot flag a mode that no run
@@ -462,6 +464,10 @@ float32 that misses a change below about `3.5e-4 |logL|` (from about `1e5`
 data points, possibly a new noise realisation), so use one checkpoint path
 per problem, for example one per dataset of a mock or SBC loop.
 
+A checkpoint written by another tinyns version's format is refused: 1.1
+writes `tinyns-ckpt-8` and does not read the `tinyns-ckpt-7` files of
+1.0.0, so finish a run on the version it started on.
+
 ## Batched runs and SBC
 
 ```python
@@ -571,8 +577,9 @@ does.
   less than its `logzerr` of 0.26, so logZ does not show the loss. At
   `nlive=1000` (x64, CPU, 128 runs) 1.0.0 lost that mode in 11 runs and put
   its mass more than 0.5 off in logit in 7 more; 1.1 lost it in 1 and put
-  none off (and lost it in none of 64 runs on other keys), and the logit sd
-  of the kept mass fell from 0.334 to 0.035. What 1.1 does not fix:
+  none off, and the logit sd of the kept mass fell from 0.334 to 0.035. On
+  other keys 1.1 lost it in 1 of 192 runs, and 1.0.0 in 8 of 96. What 1.1
+  does not fix:
   - A mode that holds 1 or 2 live points when its contour separates is never
     split off, so no frame can keep it, and it is lost in most runs. The
     0.6 mode of the 6-D mixture of Choosing `nlive` (1.7 of 1000 live points
@@ -631,8 +638,14 @@ does.
   more on 1.1: by 0.279 +- 0.018 in logit, against 0.250 +- 0.016 on 1.0.0
   (paired change +0.030, 95% interval -0.034 to +0.088), while the same two
   modes without arms (`build_two_mode(18, 0.2, "sep", "W")`) scatter by 0.029
-  on 1.1 (32 runs). At `nlive=2000` the needle showed no measurable change
-  (0.179 against 0.197, 64 runs). No needle run lost a mode, and logZ is
+  on 1.1 (32 runs). On a GPU (an NVIDIA A100, float32, 256 paired runs on
+  each of two keys) the paired change was +0.037 and -0.001 on the two keys
+  at `nlive=1000` and -0.014 and +0.027 at 2000; on a 10-D needle with 8
+  flat coordinates added it was +0.045 on both keys at `nlive=2000` (0.18 on
+  1.0.0 against 0.22 to 0.23 on 1.1), and 18 of its 512 runs put the mass
+  more than 0.5 off in logit, against 5. So the extra scatter, about 10% on
+  average over these cells, does not go away at `nlive=2000`. No needle run
+  lost a mode, and logZ is
   unaffected (+0.007 +- 0.027 from the truth on 1.1). `diagnostics()` warns in
   nearly every needle run, and there `run_sd` falls short of the scatter: on
   1.1 its median was 0.19, and 18 of the 125 runs that gave one lay beyond 3

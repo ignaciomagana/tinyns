@@ -999,7 +999,7 @@ class NestedSamplingResult:
         could be split off then) and for how much of the posterior mass the
         hop was off while two modes held live points (``mode_hop_off``). A
         mode lost before the end leaves no trace in its own run (no
-        ``unresolved`` flag and, in the runs measured, no warning), and
+        ``unresolved`` flag and almost never a warning), and
         neither does one that never held more than about ``ndim`` live points
         per fold. A mode's share of the live points when it separates from
         the others is its share of the prior volume there, not its posterior
@@ -1017,7 +1017,8 @@ class NestedSamplingResult:
         but two without a warning and with logZ 0.60 to 1.26 low (4.4 to 9.9
         ``logzerr``), while 684 of the 694 runs that kept it flagged it
         unresolved. In 6-D it holds 1.7 of 1000 live points there, and was
-        lost in 19 of 24 runs at nlive 1000 (3 of 16 at nlive 8000). A light
+        lost in 19 of 24 runs at nlive 1000 (18 on 1.0) and 3 of 16 at
+        nlive 8000 (4 on 1.0). A light
         mode can be lost too, with logZ about right: on the 18-D target
         ``build_two_mode(18, 0.2)`` of ``bench.targets`` 1 of 128 runs in x64
         lost its 20% mode (11 on 1.0), and all 127 that kept it flagged it.
@@ -2205,7 +2206,8 @@ def compare(results) -> Comparison:
     points when it separates, lost it in 23 of 24 runs of the 1.0.0
     sampler, and only the batches that held the one run that kept it were
     flagged. The 1.1 sampler lost it in 40 of 48 runs on two keys (19 of 24
-    on the first: :meth:`modes <NestedSamplingResult.modes>`); in batches of
+    on the first: :meth:`modes <NestedSamplingResult.modes>`), and 1.0.0 in
+    39 of 48 on the same keys, so 1.1 does not change it there; in batches of
     4 it flagged the 16 that shared a batch with a run that kept it, and
     none of the 24 in the 6 batches that had all lost it. Nor does the mode
     test find a mode that the runs which kept it did not separate: on the
