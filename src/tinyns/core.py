@@ -2019,6 +2019,7 @@ def run(
                     "compile_s": compile_s,
                     "sampling_s": sampling_s,
                     "resumed": resumed,
+                    "batched_data": batched_data,
                 },
             )
         )

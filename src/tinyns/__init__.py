@@ -2,7 +2,7 @@
 
 from tinyns.api import NestedSampler
 from tinyns.core import STATUS, Config, delta_logz, finalise, init, step
-from tinyns.result import LogZBootstrap, NestedSamplingResult
+from tinyns.result import Comparison, LogZBootstrap, NestedSamplingResult, compare
 
 __all__ = [
     "NestedSampler",
@@ -14,6 +14,8 @@ __all__ = [
     "STATUS",
     "NestedSamplingResult",
     "LogZBootstrap",
+    "compare",
+    "Comparison",
 ]
 
 # The single source of the version: pyproject.toml reads it (hatch dynamic).
