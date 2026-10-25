@@ -255,6 +255,50 @@ def test_recluster_keeps_the_frame_of_a_cluster_that_died() -> None:
         assert bool(modes.walk_frames(frames)[c])
 
 
+def test_a_kept_slot_that_holds_points_is_a_cluster() -> None:
+    """Eight narrow groups fill the ``C_MAX = 8`` slots; then one group falls
+    to 2 points per clustering, below the 3 a frame needs, and its slot
+    keeps its frame. The slot still holds points, so no split can take it:
+    the recorded history counts 8 clusters (``mode_slots_full`` sees the
+    slots full, as 1.0 did) and 8 eligible frames (1.0 left the group's out
+    of the hop)."""
+    d, per = 4, 36
+    rng = np.random.default_rng(0)
+    centers = rng.uniform(0.15, 0.85, (8, d))
+    while min(np.linalg.norm(a - b) for i, a in enumerate(centers)
+              for b in centers[i + 1:]) < 0.2:
+        centers = rng.uniform(0.15, 0.85, (8, d))
+    u = np.concatenate([c + 0.01 * rng.standard_normal((per, d)) for c in centers])
+    group = np.repeat(np.arange(8), per)
+    cfg = Config(d, 8 * per, 10, 20)
+    state = core.init(0, _bowl, lambda v: v, cfg)
+    x = jnp.asarray(u, state.u.dtype)
+    state = core._recluster(state._replace(u=x, logl=jax.vmap(_bowl)(x)))
+    assert np.asarray(jnp.sum(state.mode_active, axis=1)).tolist() == [8, 8, 8]
+
+    # Group 7 keeps one point per fold; the others join group 0 and take its
+    # label in every clustering but their own fold's.
+    fold = np.arange(cfg.nlive) % cfg._folds
+    seven = np.flatnonzero(group == 7)
+    stay = [seven[fold[seven] == f][0] for f in range(cfg._folds)]
+    move = np.setdiff1d(seven, stay)
+    label = np.asarray(state.label).copy()
+    for j in range(cfg._folds):
+        zero = label[j, np.flatnonzero((group == 0) & (fold != j))[0]]
+        label[j, move] = np.where(fold[move] == j, -1, zero)
+    u[move] = centers[0] + 0.01 * rng.standard_normal((len(move), d))
+    x = jnp.asarray(u, state.u.dtype)
+    state = core._recluster(state._replace(
+        u=x, logl=jax.vmap(_bowl)(x), label=jnp.asarray(label, jnp.int32)
+    ))
+    _, rows = core._step(state, _bowl, lambda v: v, cfg)
+    assert int(rows.nclusters[0]) == modes.C_MAX
+    assert int(rows.neligible[0]) == modes.C_MAX
+    kept = np.asarray(state.mode_ghost) > 0
+    assert kept.sum(axis=1).tolist() == [1, 1, 1]
+    assert np.asarray(state.mode_count)[kept].tolist() == [2.0, 2.0, 2.0]
+
+
 def region_loglike(u):
     """0 inside either ball, -1 outside; the contour is L* = -0.5."""
     r2 = jnp.sum((u[None, :] - jnp.asarray(CENTERS)) ** 2, axis=1)

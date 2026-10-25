@@ -76,10 +76,11 @@ more (:func:`keep_frames`): active and eligible for the hop, not for the
 walk, for ``GHOST_RECLUSTERS = 8`` reclusters (about two e-folds). New
 points may take its label, so a mode the hop refills is reclustered under
 its old id; a slot that holds 3 members again is an ordinary frame, and a
-split may take a kept slot that holds none. A kept frame is not counted as a
-cluster in ``metadata["mode_history"]``. The 1.0 rule (a volume share that
-predicts ``2 d`` live points, and more than ``d`` members) left out exactly
-the thin clusters, and a frame went with the last member of its cluster. On
+split may take a kept slot that holds none. In
+``metadata["mode_history"]`` a kept frame counts as a cluster only while its
+slot holds members. The 1.0 rule (a volume share that predicts ``2 d`` live
+points, and more than ``d`` members) left out exactly the thin clusters, and
+a frame went with the last member of its cluster. On
 ``build_two_mode(18, 0.2)`` of ``bench.targets`` (nlive 1000, x64) the 20%
 mode was split off with 27 to 47 points, lived for 15 to 20 e-folds as a
 cluster of 5 to 30, below that rule, and drifted to none in 11 of 128 runs;

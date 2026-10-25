@@ -322,8 +322,9 @@ class Dead(NamedTuple):
     ``label`` is each dead point's cluster label when it died (the id of its
     cluster in clustering ``j``, the next fold's; :func:`_reported_label`), and
     ``nclusters`` / ``neligible`` the step's number of clusters (the largest
-    over the clusterings; a kept frame, :func:`tinyns.modes.keep_frames`, is
-    not one) and of frames taking part in the hop (the smallest; kept frames
+    over the clusterings: the slots that hold members, so a kept frame,
+    :func:`tinyns.modes.keep_frames`, counts only while its slot holds
+    some) and of frames taking part in the hop (the smallest; kept frames
     count), the same in every row.
     """
 
@@ -1072,8 +1073,10 @@ def _step(state: State, loglike, prior_transform, cfg: Config, level=None):
     clustering = jnp.arange(folds, dtype=i32)
     nearest = jnp.where(clustering[:, None] == dead_fold[None, :], -1, nearest)
     new = new._replace(label=state.label.at[:, worst].set(nearest))
-    # A kept frame takes part in the hop but is not a cluster.
-    n_clusters = jnp.max(jnp.sum(frames.active & (state.mode_ghost == 0), axis=1))
+    # A kept frame takes part in the hop. Its slot is a cluster while it
+    # holds members (a split cannot take it, as in 1.0), and not once empty.
+    cluster = frames.active & ((state.mode_ghost == 0) | (frames.count > 0.5))
+    n_clusters = jnp.max(jnp.sum(cluster, axis=1))
     n_eligible = jnp.min(jnp.sum(frames.eligible, axis=1))
     dead = Dead(
         state.u[worst],
