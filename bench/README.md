@@ -194,7 +194,7 @@ recomputes the cached quadrature values.
 | `sepWbox_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 (in the box [-3, 5]^d) |
 | `sepM_d{10,18,32}` | 10-32 | analytic, 0 | 0.94 / 0.06 |
 | `mix3_d10` | 10 | analytic, 0 | 0.7 / 0.2 / 0.1 |
-| `needle_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.8 / 0.2 (each mode a core with two thin arms) |
+| `needle_d{4,10,18,32}` | 4-32 | analytic: -0.5457, -0.0346, -9e-5, 0 (the arms reach the cube's faces) | 0.786 / 0.214, 0.796 / 0.204, 0.8 / 0.2 (each mode a core with two thin arms) |
 | `cauchy_d{d}` | >= 7 | analytic (CDFs, box included) | 0.797 / 0.203 (products of Cauchy and normal factors) |
 
 - **Gaussians**: covariance `Q diag(s^2) Q^T`, with `s` log-spaced over
