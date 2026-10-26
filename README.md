@@ -29,7 +29,9 @@ Elsewhere the runs differ; on the targets measured again, 1.1 was as
 accurate as 1.0.0 or more, except that the minor mode's mass scatters more
 on the needle targets (see Limitations). A likelihood call can cost a few
 percent more where 1.1 uses more frames: up to 9% on a CPU on an 18-D
-target, and up to 2% on a GPU (see `CHANGELOG.md`).
+target, and on a GPU 1 to 3% in float32 and 3 to 6% in x64, but up to 17%
+on an 18-D two-mode target in x64 in a batch of 64 runs (see
+`CHANGELOG.md`).
 
 ## Quickstart
 
