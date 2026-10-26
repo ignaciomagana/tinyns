@@ -4,8 +4,9 @@
     python bench/validate.py --tier full      # every case; a GPU or a Slurm node
     python bench/validate.py --cases gauss_d2,sepW_d10 --seeds 32 --json gate.json
 
-Each case runs ``--seeds`` independent runs of one target as one batch of keys
-(one compiled program) and compares them with the target's exact evidence,
+Each case runs its seeds (the tier's, more for a case that sets them, or
+``--seeds``) as independent runs of one target, as one batch of keys (one
+compiled program), and compares them with the target's exact evidence,
 mode masses and, for the Gaussians, posterior (``bench/targets.py``). The
 exit code is 1 if any case fails.
 
@@ -70,7 +71,9 @@ class Case(NamedTuple):
     largest number of modes a run may report, and ``small`` if the smallest
     mode is too small for ``unresolved`` to count as a failure; the largest
     logit sd of the minor-mode weights at the full-tier ``nlive`` (it scales
-    as ``1 / sqrt(nlive)`` at another ``nlive``, up to ``MAX_LOGIT_SD``)."""
+    as ``1 / sqrt(nlive)`` at another ``nlive``, up to ``MAX_LOGIT_SD``);
+    ``seeds``, the fewest seeds the case runs in a tier (0: the tier's;
+    ``--seeds`` overrides both)."""
 
     quick: int | None
     full: int
@@ -78,10 +81,22 @@ class Case(NamedTuple):
     modes: tuple[int, int] = (1, 1)
     small: bool = False
     logit_sd: float = MAX_LOGIT_SD
+    seeds: int = 0
 
 
 # - quick keeps to d <= 10 and nlive 500 (more where a mixture needs it);
 #   full runs the default nlive (1000).
+# - gauss_d2 runs 64 seeds in both tiers, about 4 s more than 16 in the quick
+#   tier. At 16 the default key 0 failed its posterior check in x64 (t 5.9
+#   against 4.3; 1.0.0 and 1.1.0 ran the same runs), a draw of about 1 in
+#   9000 for a correct sampler. The check is calibrated there: over keys 0
+#   to 255 (float32 and x64) the case failed 3 of 512 batches of 16 on
+#   posterior and 8 on bias, against 1.4 and 4.6 expected. The 64 keys of a
+#   batch begin with the 16 (the same runs in x64), and at key 0 the other
+#   48 bring t to 2.0. At 64 the case failed 3 of 512 batches (2 posterior,
+#   1 bias), and the check fails a posterior mean 0.02 sd off along an
+#   eigenvector, or a variance 3% off, in every batch (at 16: a quarter and
+#   43%).
 # - Rosenbrock runs at walks = 25 * ndim. The default walks (60 at d = 10)
 #   leave the logZ of rosen_d10 0.05 +- 0.04 low at nlive 1000 (README,
 #   Choosing walks; -0.09 +- 0.04 in 32 more float32 runs), close to the 3 se
@@ -124,7 +139,7 @@ class Case(NamedTuple):
 #     18 flagged. The floor of 3 sits below that and still fails a run that
 #     reports one or two modes.
 CASES = {
-    "gauss_d2": Case(500, 1000),
+    "gauss_d2": Case(500, 1000, seeds=64),
     "gauss_d10": Case(500, 1000),
     "gauss_d32": Case(None, 1000),
     "rosen_d4": Case(500, 1000, walks=100),
@@ -404,7 +419,10 @@ def main(argv=None) -> int:
         help="comma-separated cases, run whatever their tier (at the tier's "
         "nlive, or the full tier's for a case outside the tier)",
     )
-    p.add_argument("--seeds", type=int, default=None, help="runs per case (>= 2)")
+    p.add_argument(
+        "--seeds", type=int, default=None,
+        help="runs per case (>= 2), in place of the tier's and the cases' own",
+    )
     p.add_argument("--nlive", type=int, default=None, help="override every case")
     p.add_argument("--seed", type=int, default=0, help="the key the runs split from")
     p.add_argument("--x64", action=argparse.BooleanOptionalAction, default=True)
@@ -427,7 +445,7 @@ def main(argv=None) -> int:
     if unknown:
         raise SystemExit(f"unknown cases {unknown}; known: {list(CASES)}")
     seeds = args.seeds or tier["seeds"]
-    rows = []
+    rows, more = [], {}
     for name in names:
         case = CASES[name]
         base = (case.quick, case.full)[tier["column"]]
@@ -440,7 +458,10 @@ def main(argv=None) -> int:
         warning = unresolvable(name, nlive, case)
         if warning:
             print(f"warning: {warning}", file=sys.stderr)
-        row = run_case(name, nlive, seeds, args.seed, case)
+        n = args.seeds or max(seeds, case.seeds)
+        if n != seeds:
+            more[name] = n
+        row = run_case(name, nlive, n, args.seed, case)
         rows.append(row)
         verdict = "FAIL: " + ", ".join(row["failed"]) if row["failed"] else "PASS"
         print(f"{name}: {verdict} ({row['wall_s']:.0f} s)", file=sys.stderr, flush=True)
@@ -456,7 +477,8 @@ def main(argv=None) -> int:
     if args.json:  # before the table: the runs are kept even if printing fails
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(_finite(meta), f, indent=1)
-    custom = f", nlive {args.nlive} in every case" if args.nlive else ""
+    custom = "".join(f", {n} for {name}" for name, n in more.items())
+    custom += f", nlive {args.nlive} in every case" if args.nlive else ""
     print(
         f"tinyns {tinyns.__version__} at {sha or 'an unknown commit'}, "
         f"jax {jax.__version__} on {dev.platform}, "

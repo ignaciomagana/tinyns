@@ -592,6 +592,30 @@ def test_gate_overrides_keep_to_the_tier(monkeypatch, capsys):
     assert "expect a FAIL on flags" in capsys.readouterr().err
 
 
+def test_gate_case_seeds(monkeypatch, capsys):
+    """gauss_d2 runs 64 seeds in both tiers and the other cases the tier's;
+    --seeds sets every case's."""
+    from bench import validate
+
+    seen = []
+
+    def run_case(name, nlive, seeds, *args, **kwargs):
+        seen.append((name, seeds))
+        return _fake_run_case([])(name, nlive)
+
+    monkeypatch.setattr(validate, "run_case", run_case)
+    validate.main(["--cases", "gauss_d2,gauss_d10", _x64_flag()])
+    assert seen == [("gauss_d2", 64), ("gauss_d10", 16)]
+    assert "key 0, 16 seeds, 64 for gauss_d2" in capsys.readouterr().out
+    seen.clear()
+    validate.main(["--tier", "full", "--cases", "gauss_d2,gauss_d10", _x64_flag()])
+    assert seen == [("gauss_d2", 64), ("gauss_d10", 64)]
+    assert "key 0, 64 seeds\n" in capsys.readouterr().out
+    seen.clear()
+    validate.main(["--cases", "gauss_d2,gauss_d10", "--seeds", "8", _x64_flag()])
+    assert seen == [("gauss_d2", 8), ("gauss_d10", 8)]
+
+
 def test_gate_degenerate_inputs_and_the_record(monkeypatch, capsys, tmp_path):
     """Identical runs (se 0) print no z instead of dividing by 0; one seed is
     rejected before any run; the JSON is written before the table, with the
