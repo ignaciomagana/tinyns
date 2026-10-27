@@ -613,7 +613,10 @@ def _cube_mass(mu, cov, floor=1e-12):
     """
     mu, cov = np.asarray(mu, float), np.asarray(cov, float)
     sd = np.sqrt(np.diag(cov))
-    out = np.array([_norm_cdf(-m / s) + _norm_cdf((m - 1.0) / s) for m, s in zip(mu, sd)])
+    out = np.array([
+        _norm_cdf(-m / s) + _norm_cdf((m - 1.0) / s)
+        for m, s in zip(mu, sd, strict=True)
+    ])
     cut = np.flatnonzero(out > floor)
     if len(cut) == 0:
         return 1.0
@@ -681,7 +684,8 @@ def mixture_target(name: str, t: dict) -> Target:
     member = jnp.asarray(groups[None, :] == np.arange(groups.max() + 1)[:, None], float)
     # Each component's mass in the cube (the shear of a twisted main mode is
     # volume-preserving and its mode lies 7.9 sd or more inside every face).
-    inside = w * np.array([_cube_mass(m, S) for m, S in zip(means, t["covs"], strict=True)])
+    covs = t["covs"]
+    inside = w * np.array([_cube_mass(m, S) for m, S in zip(means, covs, strict=True)])
     mode_in = [float(inside[groups == g].sum()) for g in range(groups.max() + 1)]
 
     def loglike(x):
