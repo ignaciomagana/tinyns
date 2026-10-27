@@ -39,11 +39,16 @@ get uploaded, and the tag goes on last.
 fails a case about once in 70 cases at 16 seeds and once in 170 at 64, because
 the bias tests use the se of the seeds. So about one quick-tier run in 8 has a
 false FAIL, and one full-tier run in 14. Some cases fail more often: the
-calibration runs put single cases at up to 4% at 16 seeds, and the x64 quick
-`gauss_d2` case failed on 3 of 24 keys (the default key 0 among them, on the
-1.0.0 release code), so a false FAIL may come more often than that. Rerun
-the case with another key and more seeds (`--cases NAME --seed 1 --seeds 128`)
-before calling it a regression, and record the rerun in the release notes.
+calibration runs put single cases at up to 4% at 16 seeds. A false FAIL
+comes back on every rerun of the default key until the runs change: the x64
+quick tier failed the posterior check of `gauss_d2` at key 0 on 1.0.0 and
+1.1.0 with the same runs (t 5.9 against 4.3). The key was unlucky, not the
+check: over keys 0 to 255 that check failed 3 of 512 batches of 16 seeds and
+the bias check 8 (float32 and x64), against 1.4 and 4.6 expected.
+`gauss_d2` now runs 64 seeds, about 4 s more, and fails 3 of the 512.
+Rerun a failed case with another key and more seeds
+(`--cases NAME --seed 1 --seeds 128`) before calling it a regression, and
+record the rerun in the release notes.
 
 ## 3. Build and inspect
 

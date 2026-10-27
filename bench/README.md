@@ -33,7 +33,7 @@ python bench/validate.py --no-x64        # the same in float32
 ```
 
 It prints a PASS/FAIL table and exits with code 1 if a case fails. Each case
-is `--seeds` independent runs of one target, run as one batch of keys.
+is independent runs of one target, one per seed, run as one batch of keys.
 
 | case | quick nlive | full nlive | walks |
 |---|---|---|---|
@@ -47,7 +47,8 @@ is `--seeds` independent runs of one target, run as one batch of keys.
 | `sepW_d10` | 2000 | 2000 | default |
 | `sepW_d18` | - | 4000 | default |
 
-- The quick tier runs 16 seeds, the full tier 64 at the default `nlive`.
+- The quick tier runs 16 seeds, and 64 for `gauss_d2`, its cheapest case
+  (below); the full tier runs 64 at the default `nlive`.
 - Rosenbrock runs at `walks = 25 * ndim`, where its logZ is unbiased, so the
   two cases test the sampler on a curved valley. The default walks (60 at
   d = 10) leave the 10-D Rosenbrock 0.05 +- 0.04 low at `nlive=1000` (the
@@ -101,6 +102,14 @@ A case passes when all of these hold (se is the standard error over seeds):
   0.022 at 1000. With bounds of 4.3 to 5.1 at 16 seeds and about 3.6 to 4.4
   at 64, a case fails an offset of about 0.02 sd in one direction's mean or
   3% in its variance in the quick tier, and 0.006 sd or 1% in the full tier.
+  `gauss_d2` runs 64 seeds in both tiers. Measured by moving every run's
+  offsets on 512 batches of keys 0 to 255 (float32 and x64), its check
+  fails a mean 0.02 sd off along one eigenvector in every batch of 64 and in
+  a quarter of the batches of 16, and a variance 3% too large in every
+  batch of 64 and 43% of those of 16. Real runs agree (x64, keys 0 to 31):
+  with the likelihood's mean moved by 0.02 sd the case failed 32 of 32
+  batches of 64 and 7 of 32 of 16, and with its covariance 3% wider 32 and
+  17 of 32.
   Samples in the wrong coordinates (the unit cube instead of the box) fail
   by a t of hundreds.
 - **The limit on the mode-weight scatter** is 0.12 in logit for the `sepW`
@@ -136,9 +145,16 @@ A case passes when all of these hold (se is the standard error over seeds):
   and x64: `posterior` failed 1 of 144 batches of 16 seeds, `bias` 3). Over
   a tier that is a false FAIL in about 1 run in 8 of the quick tier and 1 in
   14 of the full one. Some cases fail more often: the calibration runs put
-  single cases at up to 4% at 16 seeds, and the x64 quick
-  `gauss_d2` case failed on 3 of 24 keys (the default key 0 among them, on
-  the release code; key 1 at 128 seeds passed with t 1.0). Rerun a failed
+  single cases at up to 4% at 16 seeds. A false FAIL also stays with its
+  key while the runs do not change: at 16 seeds the default key 0 failed
+  the posterior check of `gauss_d2` in x64 on 1.0.0 and on 1.1.0 (t 5.9
+  against 4.3), with the same runs. That check is calibrated: over keys 0
+  to 255 at 16 seeds (float32 and x64) the per-seed offsets are normal and
+  independent from seed to seed, and the case failed 3 of 512 batches on
+  `posterior` and 8 on `bias`, against 1.4 and 4.6 expected; key 0 is a
+  draw of about 1 in 9000. `gauss_d2` runs 64 seeds instead, which cost
+  about 4 s: the 64 keys begin with the 16, and the other 48 runs bring key
+  0 to t 2.0. At 64 seeds it failed 3 of the 512 batches. Rerun a failed
   case with another key and more seeds (`--cases NAME --seed 1 --seeds 128`)
   before believing it.
 - **Pair A/B comparisons.** In float32 a seed's trajectory differs between
@@ -156,7 +172,8 @@ A case passes when all of these hold (se is the standard error over seeds):
   for a case outside the tier, the full tier's. `--nlive` overrides the
   `nlive` of the cases the tier (or `--cases`) runs, and warns when a
   mixture's smallest mode then holds fewer than `5 * ndim` live points (the
-  case fails `flags`). `--seeds` overrides the tier's seeds, at least 2.
+  case fails `flags`). `--seeds` sets the seeds of every case (the tier's,
+  and the 64 of `gauss_d2`), at least 2.
 
 ## Targets
 
@@ -177,7 +194,7 @@ recomputes the cached quadrature values.
 | `sepWbox_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.94 / 0.06 (in the box [-3, 5]^d) |
 | `sepM_d{10,18,32}` | 10-32 | analytic, 0 | 0.94 / 0.06 |
 | `mix3_d10` | 10 | analytic, 0 | 0.7 / 0.2 / 0.1 |
-| `needle_d{4,10,18,32}` | 4-32 | analytic, 0 | 0.8 / 0.2 (each mode a core with two thin arms) |
+| `needle_d{4,10,18,32}` | 4-32 | analytic: -0.5457, -0.0346, -9e-5, 0 (the arms reach the cube's faces) | 0.786 / 0.214, 0.796 / 0.204, 0.8 / 0.2 (each mode a core with two thin arms) |
 | `cauchy_d{d}` | >= 7 | analytic (CDFs, box included) | 0.797 / 0.203 (products of Cauchy and normal factors) |
 
 - **Gaussians**: covariance `Q diag(s^2) Q^T`, with `s` log-spaced over
@@ -489,8 +506,8 @@ python bench/bakeoff/summarize.py results.jsonl --out report.md
 - the gate: its criteria on synthetic rows (the mode count and its
   lower-bound flag, the eggbox floor, the logit-sd limit and the hop among
   them), the posterior check on exact draws and its Student-t bounds, the
-  tier and override rules, degenerate inputs, and one run of its code path
-  on tiny settings, with the hop on and off.
+  tier, seeds and override rules, degenerate inputs, and one run of its code
+  path on tiny settings, with the hop on and off.
 
 Adapters whose package is missing are skipped. CI has only tinyns installed,
 so there it runs the tinyns adapter that matches the installed version.

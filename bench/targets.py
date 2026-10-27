@@ -601,12 +601,51 @@ def build_needle(d):
     )
 
 
+def _cube_mass(mu, cov, floor=1e-12):
+    """Mass of the normal ``N(mu, cov)`` in the unit cube.
+
+    Coordinates whose marginal mass outside ``[0, 1]`` is below ``floor`` are
+    left out (an error below ``d * floor``); the others, at most two, are
+    integrated exactly: one by its normal CDF, a pair by Gauss-Legendre over
+    the first of the CDF of the second given the first. Such a coordinate has
+    a marginal sd of 0.07 or more (7 sd fit in half the cube otherwise), so
+    400 nodes over [0, 1] are exact to roundoff.
+    """
+    mu, cov = np.asarray(mu, float), np.asarray(cov, float)
+    sd = np.sqrt(np.diag(cov))
+    out = np.array([
+        _norm_cdf(-m / s) + _norm_cdf((m - 1.0) / s)
+        for m, s in zip(mu, sd, strict=True)
+    ])
+    cut = np.flatnonzero(out > floor)
+    if len(cut) == 0:
+        return 1.0
+    if len(cut) == 1:
+        return 1.0 - float(out[cut[0]])
+    if len(cut) > 2:
+        raise NotImplementedError(f"{len(cut)} coordinates cut by the cube")
+    a, b = cut
+    beta = cov[a, b] / cov[a, a]
+    sc = math.sqrt(cov[b, b] - cov[a, b] * beta)
+    x, wq = np.polynomial.legendre.leggauss(400)
+    x, wq = 0.5 * (x + 1.0), 0.5 * wq
+    mc = mu[b] + beta * (x - mu[a])
+    pdf = np.exp(-0.5 * ((x - mu[a]) / sd[a]) ** 2) / (sd[a] * math.sqrt(2 * math.pi))
+    cdf = np.array([_norm_cdf((1.0 - m) / sc) - _norm_cdf(-m / sc) for m in mc])
+    return float(wq @ (pdf * cdf))
+
+
 def mixture_target(name: str, t: dict) -> Target:
     """The target of a mixture spec. With ``t["box"] = (lo, hi)`` the prior is
     the box ``[lo, hi]^d`` instead of the unit cube, and the likelihood is the
     mixture at ``u = (x - lo) / (hi - lo)``: the same target in the unit cube,
     so logZ and the mode masses are unchanged, but the samples are scored in
-    the box's coordinates."""
+    the box's coordinates.
+
+    logZ is the mixture's mass in the unit cube, and a mode's mass is its
+    share of it: the arms of ``needle_d4`` and ``needle_d10`` reach the faces
+    (logZ -0.5457 and -0.0346, minor mass 0.2140 and 0.2044), the other
+    mixtures lose less than 1e-4 (``needle_d18``: -9.3e-5)."""
     import jax.numpy as jnp
     from jax.scipy.special import logsumexp
 
@@ -643,6 +682,11 @@ def mixture_target(name: str, t: dict) -> Target:
     # A mode is a group of components (``t["groups"]``; default one each).
     groups = np.asarray(t.get("groups", range(len(w))))
     member = jnp.asarray(groups[None, :] == np.arange(groups.max() + 1)[:, None], float)
+    # Each component's mass in the cube (the shear of a twisted main mode is
+    # volume-preserving and its mode lies 7.9 sd or more inside every face).
+    covs = t["covs"]
+    inside = w * np.array([_cube_mass(m, S) for m, S in zip(means, covs, strict=True)])
+    mode_in = [float(inside[groups == g].sum()) for g in range(groups.max() + 1)]
 
     def loglike(x):
         return logsumexp(comps(x))
@@ -657,9 +701,9 @@ def mixture_target(name: str, t: dict) -> Target:
         loglike=loglike,
         lo=np.full(d, lo),
         hi=np.full(d, hi),
-        logz=0.0,
+        logz=math.log(sum(mode_in)),
         logz_source="analytic",
-        mode_mass=tuple(float(w[groups == g].sum()) for g in range(groups.max() + 1)),
+        mode_mass=tuple(m / sum(mode_in) for m in mode_in),
         responsibility=responsibility,
         meta=dict(
             variant=t.get("variant"),

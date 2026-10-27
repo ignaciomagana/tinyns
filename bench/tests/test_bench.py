@@ -85,10 +85,14 @@ def test_rosenbrock_lobe_mass():
     assert rosenbrock_x1_mass(2, -5.0, 5.0, n=2001) == pytest.approx(1.0, abs=1e-9)
 
 
-@pytest.mark.parametrize("name", ["sepW_d4", "connW_d10", "mix3_d10", "needle_d10"])
+@pytest.mark.parametrize(
+    "name", ["sepW_d4", "connW_d10", "mix3_d10", "needle_d4", "needle_d10"]
+)
 def test_mixture_mode_masses_are_exact(name):
-    """E_post[responsibility] = mixture weights, by exact draws from the mixture
-    (the needle's modes are two components each)."""
+    """By exact draws from the mixture (the needle's modes are two components
+    each): the fraction inside the unit cube is the evidence, and the mean
+    responsibility of the draws inside is the mode masses. The needle's arms
+    reach the faces at d = 4 and 10 (logZ -0.546 and -0.035)."""
     import jax
     from bench.targets import mixture_spec
 
@@ -96,14 +100,17 @@ def test_mixture_mode_masses_are_exact(name):
     d = t.ndim
     spec = mixture_spec(name)
     rng = np.random.default_rng(1)
-    n = 20000
+    n = 40000
     comp = rng.choice(len(spec["weights"]), size=n, p=spec["weights"])
     x = np.empty((n, d))
     for k, (mu, cov) in enumerate(zip(spec["means"], spec["covs"], strict=True)):
         sel = comp == k
         x[sel] = rng.multivariate_normal(mu, cov, size=sel.sum())
-    r = np.asarray(jax.vmap(t.responsibility)(x), float)
-    mean, se = r.mean(axis=0), r.std(axis=0) / math.sqrt(n)
+    inside = np.all((x > 0.0) & (x < 1.0), axis=1)
+    p = inside.mean()
+    assert abs(math.log(p) - t.logz) < 5 * math.sqrt((1 - p) / (n * p)) + 1e-4
+    r = np.asarray(jax.vmap(t.responsibility)(x[inside]), float)
+    mean, se = r.mean(axis=0), r.std(axis=0) / math.sqrt(len(r))
     assert np.all(np.abs(mean - np.array(t.mode_mass)) < 5 * se + 1e-4)
 
 
@@ -590,6 +597,30 @@ def test_gate_overrides_keep_to_the_tier(monkeypatch, capsys):
     validate.main(["--cases", "sepW_d10", "--nlive", "500", _x64_flag()])
     assert ran == [("sepW_d10", 500)]
     assert "expect a FAIL on flags" in capsys.readouterr().err
+
+
+def test_gate_case_seeds(monkeypatch, capsys):
+    """gauss_d2 runs 64 seeds in both tiers and the other cases the tier's;
+    --seeds sets every case's."""
+    from bench import validate
+
+    seen = []
+
+    def run_case(name, nlive, seeds, *args, **kwargs):
+        seen.append((name, seeds))
+        return _fake_run_case([])(name, nlive)
+
+    monkeypatch.setattr(validate, "run_case", run_case)
+    validate.main(["--cases", "gauss_d2,gauss_d10", _x64_flag()])
+    assert seen == [("gauss_d2", 64), ("gauss_d10", 16)]
+    assert "key 0, 16 seeds, 64 for gauss_d2" in capsys.readouterr().out
+    seen.clear()
+    validate.main(["--tier", "full", "--cases", "gauss_d2,gauss_d10", _x64_flag()])
+    assert seen == [("gauss_d2", 64), ("gauss_d10", 64)]
+    assert "key 0, 64 seeds\n" in capsys.readouterr().out
+    seen.clear()
+    validate.main(["--cases", "gauss_d2,gauss_d10", "--seeds", "8", _x64_flag()])
+    assert seen == [("gauss_d2", 8), ("gauss_d10", 8)]
 
 
 def test_gate_degenerate_inputs_and_the_record(monkeypatch, capsys, tmp_path):
